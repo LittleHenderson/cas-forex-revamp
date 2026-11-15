@@ -17,6 +17,7 @@ import argparse
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
+import logging
 import os
 from pathlib import Path
 import platform
@@ -24,6 +25,8 @@ import select
 import subprocess
 import sys
 import time
+
+_logger = logging.getLogger(__name__)
 
 from model_guest_boundary import (
     PHASES,
@@ -483,8 +486,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             public_aggregate(pub_agg, approved_digest=redaction_rec["approved_public_body_sha256"], final=True)
             write_new(out / "stage-b-public-aggregate.json", {"aggregate": pub_agg, "redaction_receipt": redaction_rec})
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.debug("Public aggregate write skipped after primary result save: %s", exc)
         stop_group(watchdog)
     return 0 if report.get("stage_b") == "PASS" else 1
 

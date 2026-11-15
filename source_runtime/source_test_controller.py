@@ -6,6 +6,7 @@ does not grant approval, appoint itself, sign reviewer records, or reset clocks.
 """
 import argparse
 import grp
+import logging
 import os
 from pathlib import Path
 import select
@@ -14,6 +15,8 @@ import stat
 import subprocess
 import sys
 import time
+
+_logger = logging.getLogger(__name__)
 
 def unit_name(role):
     return 'cas-fx-8e1a63c5-'+role
@@ -69,13 +72,20 @@ def make_dir(path,uid,gid,mode,c):
     os.chown(path,uid,gid,follow_symlinks=False)
     os.chmod(path,mode,follow_symlinks=False)
 
+def prepare_existing_dir(path,uid,gid,mode,c):
+    """Apply owner and SGID directory mode only after verifying an existing real directory."""
+    c.absolute(path)
+    st=os.lstat(path)
+    c.need(stat.S_ISDIR(st.st_mode),'Role path must be directory')
+    os.chown(path,uid,gid,follow_symlinks=False)
+    os.chmod(path,mode,follow_symlinks=False)
+
 def prepare_role_directories(role,who,gid,c,s):
     """Root-only preparation; the restricted child performs no SGID mutations."""
     c.need(os.geteuid()==0,'Root directory preparer required')
     c.need(role in s.ROLES,'Selected role')
     for leaf in (role,role+'-records'):
-        os.chown(s.IPC+'/'+leaf,who['uid'],gid,follow_symlinks=False)
-        os.chmod(s.IPC+'/'+leaf,0o2750,follow_symlinks=False)
+        prepare_existing_dir(s.IPC+'/'+leaf,who['uid'],gid,0o2750,c)
     make_dir(s.IPC+'/'+role+'-records/objects',who['uid'],gid,0o2750,c)
     return {'format':'forex.source-role-prepare/1',
         'socket_parent':s.directory_identity(s.IPC+'/'+role),
@@ -469,7 +479,7 @@ def main(argv=None):
         # Every owned unit gets an independent cleanup attempt even if one fails.
         # No receipt claims termination merely because a request was accepted.
         try:artifact(c.BASE+'/receipts/source-controller-cleanup.json',results,c)
-        except Exception:pass
+        except Exception as exc:_logger.debug('Cleanup receipt write skipped: %s',exc)
 if __name__=='__main__':
     try:raise SystemExit(main())
     except Exception:

@@ -2,7 +2,7 @@ import { createExplainer } from './explainer.mjs';
 import { decodeCockpit, parseUniqueJSON, MAX_SNAPSHOT_BYTES } from './wire.mjs';
 import { resetInspection, reviewRecords, inspectRecord } from './model.mjs';
 import { displayFreshness } from './freshness.mjs';
-import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose } from './render.mjs';
+import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose, replaceSafeHTML } from './render.mjs';
 import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decision-read.mjs';
 import { ScopedBridge } from './bridge.mjs';
 import { ALL_CHART_PAIRS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts } from './chart.mjs';
@@ -47,7 +47,7 @@ function render(focusMain = false) {
   const active = document.activeElement;
   const identity = root.contains(active) && active?.tagName === 'BUTTON' ? JSON.stringify(active.dataset) : null;
   document.documentElement.dataset.theme = state.theme;
-  root.innerHTML = renderApp(state);
+  replaceSafeHTML(root, renderApp(state));
   try { mountMarketCharts(root, state); } catch { /* Chart canvas optional in headless environments. */ }
   try { explainer?.sync(); } catch { disableExplainer(); }
   document.title = `${state.route[0].toUpperCase() + state.route.slice(1)} / CAS Forex`;
@@ -98,7 +98,7 @@ function updateDialog() {
   if (!dialog.open || !dialogContext) return;
   const active = document.activeElement;
   const identity = active?.tagName === 'BUTTON' ? JSON.stringify(active.dataset) : null;
-  dialog.innerHTML = dialogContext === 'prepared' ? renderPreparedClose(state.transport) : renderControlDialog(dialogContext, state.transport);
+  replaceSafeHTML(dialog, dialogContext === 'prepared' ? renderPreparedClose(state.transport) : renderControlDialog(dialogContext, state.transport));
   const matching = [...dialog.querySelectorAll('button')].find((item) => !item.disabled && JSON.stringify(item.dataset) === identity);
   (matching ?? dialog.querySelector('[data-dialog-close]'))?.focus();
 }
@@ -344,7 +344,7 @@ async function loadReviewFixture(cockpitGeneration) {
 
 function openDialog(html, trigger) {
   dialogTrigger = trigger;
-  dialog.innerHTML = html;
+  replaceSafeHTML(dialog, html);
   dialog.showModal();
   dialog.querySelector('[data-dialog-close]').focus();
 }
@@ -471,7 +471,7 @@ dialog.addEventListener('close', () => {
   else document.querySelector('#main')?.focus({ preventScroll: true });
   dialogTrigger = null;
   dialogContext = null;
-  dialog.innerHTML = '';
+  dialog.replaceChildren();
 });
 window.addEventListener('hashchange', () => {
   if (dialog.open) dialog.close();

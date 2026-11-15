@@ -140,7 +140,13 @@ def _quantize_price(value: Decimal, tick: Decimal, *, rounding: str = ROUND_FLOO
         return value.quantize(tick, rounding=rounding)
 
 
-def _https_get_pinned_host(url: str, *, timeout_seconds: float = 15.0, max_bytes: int = MAX_STREAM_WIRE_BYTES) -> bytes:
+def _https_get_pinned_host(
+    url: str,
+    *,
+    timeout_seconds: float = 15.0,
+    max_bytes: int = MAX_STREAM_WIRE_BYTES,
+    retries: int = 2,
+) -> bytes:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_PUBLIC_HOSTS:
         raise ContractError(f"forbidden or unpinned FX stream URL host: {parsed.hostname!r}")
@@ -157,21 +163,29 @@ def _https_get_pinned_host(url: str, *, timeout_seconds: float = 15.0, max_bytes
             "User-Agent": "CAS-Forex-Phase6-MarketStream/1.0",
         },
     )
-    try:
-        with opener.open(req, timeout=timeout_seconds) as resp:
-            chunks: list[bytes] = []
-            total = 0
-            while True:
-                block = resp.read(32_768)
-                if not block:
-                    break
-                total += len(block)
-                if total > max_bytes:
-                    raise ContractError(f"FX stream response exceeded {max_bytes} bytes")
-                chunks.append(block)
-            return b"".join(chunks)
-    except urllib.error.URLError as exc:
-        raise ContractError(f"FX stream HTTPS transport error for {parsed.hostname}: {exc.reason}") from exc
+    max_attempts = max(0, retries) + 1
+    for attempt in range(max_attempts):
+        try:
+            with opener.open(req, timeout=timeout_seconds) as resp:
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    block = resp.read(32_768)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > max_bytes:
+                        raise ContractError(f"FX stream response exceeded {max_bytes} bytes")
+                    chunks.append(block)
+                return b"".join(chunks)
+        except urllib.error.HTTPError as exc:
+            raise ContractError(f"FX stream HTTPS transport error for {parsed.hostname}: HTTP {exc.code}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt + 1 >= max_attempts:
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else str(exc)
+                raise ContractError(f"FX stream HTTPS transport error for {parsed.hostname}: {reason}") from exc
+            time.sleep(0.2 * (2 ** attempt))
+    raise ContractError(f"FX stream HTTPS transport error for {parsed.hostname}: exhausted retries")
 
 
 @dataclass(frozen=True, slots=True)

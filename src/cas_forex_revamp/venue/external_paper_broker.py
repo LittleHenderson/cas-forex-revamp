@@ -39,7 +39,6 @@ from typing import Any, Iterator
 import urllib.error
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 
 from cas_forex_revamp.composition.application import RuntimeConfig
 from cas_forex_revamp.composition.assembly import InertSimulation
@@ -94,7 +93,7 @@ ECB_DAILY_XML_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.x
 
 DEFAULT_OANDA_PRACTICE_BASE_URL = "https://api-fxpractice.oanda.com/v3"
 ALLOWED_OANDA_PRACTICE_HOST = "api-fxpractice.oanda.com"
-ENV_OANDA_PRACTICE_TOKEN = "CAS_FOREX_OANDA_PRACTICE_TOKEN"
+ENV_OANDA_PRACTICE_TOKEN = "CAS_FOREX_OANDA_PRACTICE_TOKEN"  # nosec B105: environment variable name constant, not a secret value
 ENV_OANDA_PRACTICE_ACCOUNT_ID = "CAS_FOREX_OANDA_PRACTICE_ACCOUNT_ID"
 
 SUPPORTED_FX_PAIRS: tuple[str, ...] = ("EURUSD", "GBPUSD", "USDJPY")
@@ -762,24 +761,107 @@ def _parse_kraken_ticker_bytes(
     return quotes
 
 
+_XML_FORBIDDEN_DECL_RE = re.compile(r"<!\s*(?:DOCTYPE|ENTITY|ELEMENT|ATTLIST|NOTATION|\[CDATA\[)", re.IGNORECASE)
+_XML_CUSTOM_ENTITY_RE = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)")
+_XML_ATTR_RE = re.compile(r"""\s+([A-Za-z_][A-Za-z0-9_.:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+
+
+def _parse_ecb_reference_xml(raw_bytes: bytes) -> tuple[str, dict[str, Decimal]]:
+    """Parse ECB eurofxref XML safely without stdlib XML entity/DTD expansion."""
+    try:
+        xml_text = raw_bytes.decode("utf-8").lstrip("\ufeff")
+    except UnicodeDecodeError as exc:
+        raise LiveFeedVerificationError("malformed ECB XML reference payload") from exc
+    if _XML_FORBIDDEN_DECL_RE.search(xml_text) or _XML_CUSTOM_ENTITY_RE.search(xml_text):
+        raise LiveFeedVerificationError("malformed ECB XML reference payload: forbidden DTD/entity")
+    ref_date: str | None = None
+    eur_rates: dict[str, Decimal] = {}
+    stack: list[str] = []
+    saw_root = False
+    root_closed = False
+    pos = 0
+    n = len(xml_text)
+    while pos < n:
+        lt = xml_text.find("<", pos)
+        if lt == -1:
+            if ">" in xml_text[pos:] or xml_text[pos:].strip():
+                raise LiveFeedVerificationError("malformed ECB XML reference payload")
+            break
+        between = xml_text[pos:lt]
+        if ">" in between or (not stack and between.strip()):
+            raise LiveFeedVerificationError("malformed ECB XML reference payload")
+        if xml_text.startswith("<!--", lt):
+            end = xml_text.find("-->", lt + 4)
+            if end == -1:
+                raise LiveFeedVerificationError("malformed ECB XML reference payload")
+            pos = end + 3
+            continue
+        if xml_text.startswith("<?", lt):
+            end = xml_text.find("?>", lt + 2)
+            if end == -1:
+                raise LiveFeedVerificationError("malformed ECB XML reference payload")
+            pos = end + 2
+            continue
+        gt = xml_text.find(">", lt + 1)
+        if gt == -1:
+            raise LiveFeedVerificationError("malformed ECB XML reference payload")
+        inner = xml_text[lt + 1:gt].strip()
+        if not inner or "<" in inner:
+            raise LiveFeedVerificationError("malformed ECB XML reference payload")
+        if inner.startswith("/"):
+            close_name = inner[1:].strip()
+            if not stack or stack[-1] != close_name:
+                raise LiveFeedVerificationError("malformed ECB XML reference payload")
+            stack.pop()
+            if not stack:
+                root_closed = True
+            pos = gt + 1
+            continue
+        if root_closed:
+            raise LiveFeedVerificationError("malformed ECB XML reference payload")
+        self_closing = inner.endswith("/")
+        if self_closing:
+            inner = inner[:-1].rstrip()
+        name_m = re.match(r"^([A-Za-z_][A-Za-z0-9_.:-]*)", inner)
+        if not name_m:
+            raise LiveFeedVerificationError("malformed ECB XML reference payload")
+        tag_name = name_m.group(1)
+        attr_str = inner[name_m.end():]
+        attrs: dict[str, str] = {}
+        cursor = 0
+        while cursor < len(attr_str):
+            am = _XML_ATTR_RE.match(attr_str, cursor)
+            if not am:
+                if attr_str[cursor:].strip():
+                    raise LiveFeedVerificationError("malformed ECB XML reference payload")
+                break
+            attrs[am.group(1)] = am.group(2) if am.group(2) is not None else am.group(3)
+            cursor = am.end()
+        if self_closing:
+            if not stack:
+                root_closed = True
+        else:
+            stack.append(tag_name)
+        saw_root = True
+        if tag_name.rsplit(":", 1)[-1] == "Cube":
+            if attrs.get("time") and ref_date is None:
+                ref_date = attrs["time"]
+            ccy = attrs.get("currency")
+            rate_txt = attrs.get("rate")
+            if ccy in ("USD", "GBP", "JPY") and rate_txt is not None:
+                eur_rates[ccy] = parse_decimal(rate_txt, f"ECB.{ccy}")
+        pos = gt + 1
+    if not saw_root or stack:
+        raise LiveFeedVerificationError("malformed ECB XML reference payload")
+    if ref_date is None or set(eur_rates) != {"USD", "GBP", "JPY"}:
+        raise LiveFeedVerificationError("ECB XML missing date or USD/GBP/JPY rates")
+    return ref_date, eur_rates
+
+
 def _parse_ecb_reference_bytes(raw_bytes: bytes) -> tuple[str, dict[str, Decimal]]:
     stripped = raw_bytes.lstrip()
     if stripped.startswith(b"<"):
-        try:
-            root = ET.fromstring(raw_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, ET.ParseError) as exc:
-            raise LiveFeedVerificationError("malformed ECB XML reference payload") from exc
-        ref_date = None
-        eur_rates: dict[str, Decimal] = {}
-        for elem in root.iter():
-            if elem.attrib.get("time") and ref_date is None:
-                ref_date = elem.attrib["time"]
-            ccy = elem.attrib.get("currency")
-            rate_txt = elem.attrib.get("rate")
-            if ccy in ("USD", "GBP", "JPY") and rate_txt is not None:
-                eur_rates[ccy] = parse_decimal(rate_txt, f"ECB.{ccy}")
-        if ref_date is None or set(eur_rates) != {"USD", "GBP", "JPY"}:
-            raise LiveFeedVerificationError("ECB XML missing date or USD/GBP/JPY rates")
+        ref_date, eur_rates = _parse_ecb_reference_xml(raw_bytes)
     else:
         doc = _parse_external_wire_json(raw_bytes, label="ecb_frankfurter")
         if type(doc) is not dict:
@@ -1743,7 +1825,8 @@ class SealedLiveFeedPaperVenue:
             )
             expected_prev = row["record_sha256"]
             prev_seq = seq
-        assert genesis_payload is not None
+        if genesis_payload is None:
+            raise VenueStorageError("broker audit store contains no genesis checkpoint")
         return receipts, genesis_payload
 
     def _append_audit(self, event_kind: str, observed_at: datetime, payload: dict[str, Any]) -> BrokerAuditReceipt:

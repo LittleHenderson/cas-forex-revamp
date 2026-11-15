@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
+import logging
 import secrets
 from threading import Lock
 from typing import Callable
@@ -19,6 +20,8 @@ from cas_forex_operational_contracts.common import (
     ContractError, MAX_OBJECT, canonical_bytes, decode_canonical, digest, require, utc,
 )
 from .consumption_store import ConsumptionStore
+
+_logger = logging.getLogger(__name__)
 
 
 def _copy(value):
@@ -393,10 +396,10 @@ class ControllerReleaseConsumer:
             spent = prior["state"] in ("COMMITTED", "CHECKED", "EXPOSURE_STARTED")
             result = {**record, "status": "SPENT_NO_EXPOSURE" if spent else "UNAVAILABLE"}
             self.store.transition(attempt_id, expected=(prior["state"],), state="FAILED", record=result)
-        except Exception:
+        except Exception as exc:
             # Persistence unavailable: original READ_STARTED/COMMITTED remains
             # non-replayable. Never replace missing timestamps with guessed ones.
-            pass
+            _logger.debug("Retaining original non-replayable state on failure write error: %s", exc)
 
     def read_retained(self, *, consume_attempt_id: str, now: method.Stamp) -> release.ConsumptionRecord:
         with self._lock:

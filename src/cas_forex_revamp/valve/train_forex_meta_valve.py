@@ -39,7 +39,7 @@ def _sigmoid(z: float) -> float:
 
 
 def generate_dataset(n: int, seed: int) -> list[dict]:
-    rng = random.Random(seed)
+    rng = random.Random(seed)  # nosec B311: deterministic reproducible ML dataset seed, not cryptographic
     rows: list[dict] = []
     regimes = (
         "clean_entry",
@@ -158,7 +158,7 @@ def train_mlp(
     lr: float = 0.015,
     l2: float = 1e-4,
 ) -> tuple[TKSMetaValveController, dict]:
-    rng = random.Random(seed)
+    rng = random.Random(seed)  # nosec B311: deterministic reproducible ML training seed, not cryptographic
     w1 = [[rng.gauss(0.0, 0.35) for _ in range(8)] for _ in range(16)]
     b1 = [0.0 for _ in range(16)]
     w2 = [rng.gauss(0.0, 0.35) for _ in range(16)]

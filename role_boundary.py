@@ -16,6 +16,7 @@ READ = (1 << 2) | (1 << 3)
 EXEC = 1
 WRITE = (1 << 1) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8) | (1 << 14)
 HANDLED = (1 << 15) - 1
+_FORBIDDEN_BROAD_ROOTS = frozenset({'/', *(f'/{seg}' for seg in ('opt', 'var', 'var/lib', 'tmp', 'home'))})
 
 
 def need(ok, why):
@@ -50,7 +51,7 @@ def normalized_policy(policy):
             path = Path(text)
             need(type(text) is str and path.is_absolute() and '..' not in path.parts
                  and path.resolve() == path and path.exists(), 'canonical existing rule target required')
-            need(text not in ('/', '/opt', '/var', '/var/lib', '/tmp', '/home'), 'broad role rule forbidden')
+            need(text not in _FORBIDDEN_BROAD_ROOTS, 'broad role rule forbidden')
             rights = READ if kind == 'read' else READ | EXEC if kind == 'execute' else READ | WRITE
             if not path.is_dir():
                 rights &= EXEC | (1 << 1) | (1 << 2) | (1 << 14)

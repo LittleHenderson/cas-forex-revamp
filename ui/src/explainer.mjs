@@ -2,6 +2,8 @@
  * Local guide only: no model, network, transport, control dispatch or authority.
  * Persistence is limited to the three visual layout preferences below.
  */
+import { replaceSafeHTML } from './render.mjs';
+
 const STORAGE_KEY = 'cas.forex.explainer.layout.v1';
 const EDGES = ['left', 'right', 'top', 'bottom'];
 const DEFAULT_LAYOUT = Object.freeze({ edge: 'right', frac: 0.62, collapsed: false });
@@ -75,7 +77,7 @@ export function createExplainer({ getContext }) {
   host.id = 'forex-explainer';
   host.className = 'forex-explainer-host';
   // This template contains only authored UI strings. Source data uses textContent.
-  host.innerHTML = `
+  replaceSafeHTML(host, `
     <div class="forex-explainer-zones" aria-hidden="true">
       <span data-dock-zone="left"></span><span data-dock-zone="right"></span>
       <span data-dock-zone="top"></span><span data-dock-zone="bottom"></span>
@@ -116,7 +118,7 @@ export function createExplainer({ getContext }) {
       </div>
       <footer class="forex-explainer-footer"><label for="forex-explainer-prompt">Ask a model</label><input id="forex-explainer-prompt" type="text" disabled placeholder="No AI provider attached" aria-describedby="forex-explainer-unavailable"><p id="forex-explainer-unavailable">AI explanations are unavailable. The local guide and all source records remain readable.</p></footer>
     </aside>
-    <div class="forex-explainer-sr-only" role="status" aria-live="polite" data-guide-announcement></div>`;
+    <div class="forex-explainer-sr-only" role="status" aria-live="polite" data-guide-announcement></div>`);
   const mark = host.querySelector('.forex-explainer-mark');
   const panel = host.querySelector('.forex-explainer-panel');
   const closeButton = host.querySelector('.forex-explainer-close');
