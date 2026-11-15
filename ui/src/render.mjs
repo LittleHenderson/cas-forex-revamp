@@ -1,6 +1,7 @@
 import { CONTROL_COPY, moneyLabel, formatDecimal, positionSummary, pendingEffects, commandEffect, decisionIdentity, reviewRecords, closeReview } from './model.mjs';
 import { envelopeRecords, canonicalJSON } from './decision-read.mjs';
 import { displayFreshness } from './freshness.mjs';
+import { renderMarketChartSection } from './chart.mjs';
 
 export function escapeHTML(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
@@ -81,7 +82,7 @@ function effects(projection) {
 }
 
 function operate(projection, state) {
-  return `<section class="workspace-intro" aria-label="Workspace introduction"><div><p class="eyebrow">PERSONAL FOREX / OBSERVATION FIRST</p><h2>Every decision, with its evidence.</h2></div><p>Inspect the account snapshot, review proposals, and keep unobserved outcomes visible.</p></section><div class="route-index">${sectionNumber('01')}<h2>Permissions &amp; control</h2></div><div class="context-grid">${permissions(projection, state.transport)}${controls(state.transport)}</div><div class="route-index">${sectionNumber('02')}<h2>Account snapshot</h2></div>${metrics(projection)}<p class="account-coverage">P/L period, fees and cashflow coverage are unavailable in this projection.</p><div class="route-index">${sectionNumber('03')}<h2>Positions, proposals &amp; effects</h2></div><div class="operate-grid">${positions(projection)}${decision(projection)}${effects(projection)}</div>`;
+  return `<section class="workspace-intro" aria-label="Workspace introduction"><div><p class="eyebrow">PERSONAL FOREX / OBSERVATION FIRST</p><h2>Every decision, with its evidence.</h2></div><p>Inspect the account snapshot, review proposals, and keep unobserved outcomes visible.</p></section><div class="route-index">${sectionNumber('01')}<h2>Permissions &amp; control</h2></div><div class="context-grid">${permissions(projection, state.transport)}${controls(state.transport)}</div><div class="route-index">${sectionNumber('02')}<h2>Account snapshot</h2></div>${metrics(projection)}<p class="account-coverage">P/L period, fees and cashflow coverage are unavailable in this projection.</p><div class="route-index">${sectionNumber('03')}<h2>Live market &amp; candlestick chart</h2></div>${renderMarketChartSection(projection, state)}<div class="route-index">${sectionNumber('04')}<h2>Positions, proposals &amp; effects</h2></div><div class="operate-grid">${positions(projection)}${decision(projection)}${effects(projection)}</div>`;
 }
 
 function catalogInspection(read, source = null) {
