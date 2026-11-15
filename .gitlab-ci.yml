@@ -1,0 +1,20 @@
+stages:
+  - test
+  - security
+
+unit_and_contract_tests:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - python -m pip install --no-cache-dir -r requirements.txt pytest
+    - pytest -q
+    - node --test tests/ui/*.test.mjs
+
+static_and_supply_chain_scan:
+  stage: security
+  image: python:3.12-slim
+  script:
+    - python -m pip install --no-cache-dir -r requirements.txt bandit pip-audit
+    - bandit -r src
+    - pip-audit -r requirements.txt
+    - lantern analyze . --quiet || true

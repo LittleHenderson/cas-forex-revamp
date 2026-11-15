@@ -6,6 +6,11 @@ import { renderMarketChartSection } from './chart.mjs';
 export function escapeHTML(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
 }
+
+export function replaceSafeHTML(target, markup) {
+  const doc = new DOMParser().parseFromString(String(markup), 'text/html');
+  target.replaceChildren(...doc.body.childNodes);
+}
 const e = escapeHTML;
 const text = (value) => value === null || value === undefined ? 'Unknown' : String(value);
 const tag = (label, warning = false) => `<span class="tag${warning ? ' tag-warning' : ''}"><span class="state-rule" aria-hidden="true"></span>${e(label)}</span>`;

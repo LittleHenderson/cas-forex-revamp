@@ -1,0 +1,2 @@
+# Exact runtime dependency pinned for offline air-gapped Stage B verification
+cryptography==50.0.2

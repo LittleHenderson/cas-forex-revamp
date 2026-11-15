@@ -15,6 +15,19 @@ def validate_prepared_objects(published, s, c):
         and objects['mode']==0o2750,'Root-prepared objects directory differs')
     return objects
 
+
+def bind_group_socket(listener, path, mode, c):
+    """Bind AF_UNIX socket under restrictive umask and verify S_ISSOCK inode mode."""
+    prev_umask=os.umask(0o777 ^ mode)
+    try:
+        listener.bind(path)
+    finally:
+        os.umask(prev_umask)
+    st=os.lstat(path)
+    c.need(stat.S_ISSOCK(st.st_mode),'Listener path must be UNIX socket')
+    if (st.st_mode & 0o777) != mode:
+        os.chmod(path,mode)
+
 def main(argv=None):
     parser=argparse.ArgumentParser()
     parser.add_argument('--role',required=True,choices=('current','registry','observer','custody'))
@@ -74,7 +87,7 @@ def main(argv=None):
     try:
         path=parent['path']+'/rpc.sock'
         c.need(not os.path.lexists(path),'Preexisting listener')
-        listener.bind(path);os.chmod(path,0o660);listener.listen(8);listener.setblocking(False)
+        bind_group_socket(listener,path,0o660,c);listener.listen(8);listener.setblocking(False)
         prepared={'format':'forex.source-role-prepared/1','role':args.role,'process':who,
                   'endpoint':s.endpoint(path,who),'published_root':published,
                   'clock_domain':deadline.domain,'clock_anchor_stamp':deadline.anchor}

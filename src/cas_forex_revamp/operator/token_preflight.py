@@ -12,7 +12,7 @@ from .preflight_http import ScopedLoopbackClient
 
 TOKEN_POLICY = {"ollama": "0.40.2", "runner_build": "b11351", "text_only": True,
                 "architecture": "qwen3", "add_special": True, "parse_special": True,
-                "with_pieces": False, "inspected_add_bos_token": False}
+                "with_pieces": False, "inspected_add_bos_token": False}  # nosec B105: tokenizer boolean policy flag, not a password
 
 
 def tokenizer_identity(files):

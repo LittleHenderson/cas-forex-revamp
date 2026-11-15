@@ -32,6 +32,14 @@ import stat
 import sys
 from typing import Any
 
+def _chmod_verified_directory(dir_path: Path, dir_mode: int) -> None:
+    """Apply restrictive directory permissions only after verifying the inode is a directory."""
+    st = os.lstat(dir_path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"Refusing directory mode {oct(dir_mode)} on non-directory: {dir_path}")
+    os.chmod(dir_path, dir_mode)
+
+
 CEREMONY_SCHEMA_VERSION = "forex.stageb-custody-ceremony-bundle/1"
 DEFAULT_CEREMONY_SEED = "cas-forex-phase5-owner-stageb-ceremony-20261115-v1"
 DEFAULT_RUN_ID = "fx-b-2026111501ce5b01"
@@ -1390,7 +1398,7 @@ def prepare_guest_stageb_root(
     for root_d, _, files in os.walk(dst_base):
         rp = Path(root_d)
         os.chown(rp, 0, 0)
-        os.chmod(rp, 0o755)
+        _chmod_verified_directory(rp, 0o755)
         for fn in files:
             fp = rp / fn
             os.chown(fp, 0, 0)
@@ -1534,7 +1542,7 @@ def prepare_guest_stageb_root(
     for root_d, _, files in os.walk(dst_base / "ceremony"):
         rp = Path(root_d)
         os.chown(rp, 0, 0)
-        os.chmod(rp, 0o755)
+        _chmod_verified_directory(rp, 0o755)
         for fn in files:
             fp = rp / fn
             os.chown(fp, 0, 0)

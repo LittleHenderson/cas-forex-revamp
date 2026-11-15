@@ -6,6 +6,7 @@ cannot open a database or appoint a callback, file, principal or future event.
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
+import logging
 import os
 from pathlib import Path
 import socket
@@ -22,6 +23,8 @@ from .model_evidence_bridge import ModelDecisionReader
 from .observed_model_ports import ObservedModelPorts
 from .remote_pending import ControllerDueEvents
 from .role_channel import RoleChannel
+
+_logger = logging.getLogger(__name__)
 
 RUNNER_KINDS={
     'MODEL_HTTP_RESPONSE','MODEL_HTTP_ERROR','MODEL_TOKEN_PREFLIGHT','MODEL_RUNTIME_OBSERVATION',
@@ -207,7 +210,7 @@ class IsolatedController:
                 try:self.channel.reply(self._handle(method,value))
                 except Exception:
                     try:self.channel.send('RETURN',{'ok':False,'value':None})
-                    except Exception:pass  # preserve the original failure, never reset its deadline
+                    except Exception as exc:_logger.debug('Failed to deliver RETURN error frame: %s',exc)  # preserve original failure
                     raise
         except Exception:
             # A missing response still has a durable original attempt outcome.
@@ -262,7 +265,7 @@ class IsolatedController:
                 try:
                     if self.child.poll() is None and self.channel is not None and not self.channel.closed:
                         self.channel.send('SHUTDOWN',{},deadline=self.clock()+timedelta(seconds=.25))
-                except Exception:pass
+                except Exception as exc:_logger.debug('Best-effort child shutdown send skipped: %s',exc)
                 stop_group(self.child)  # fixed bounded waits; no channel acknowledgement
         finally:
             try:

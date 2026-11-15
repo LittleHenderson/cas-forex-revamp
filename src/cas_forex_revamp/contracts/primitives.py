@@ -149,7 +149,7 @@ class EvidenceKind(StrEnum):
 
 
 class CheckStatus(StrEnum):
-    PASS = "PASS"
+    PASS = "PASS"  # nosec B105: check status enum literal, not a password
     FAIL = "FAIL"
     ERROR = "ERROR"
     NOT_RUN = "NOT_RUN"
