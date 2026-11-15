@@ -1,0 +1,511 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:cockpit:1.0",
+  "title": "Personal cockpit projection; unknown never means zero or stopped",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "scope",
+    "recovery",
+    "permissions",
+    "observed_at",
+    "state_id",
+    "balance",
+    "equity",
+    "realized_pnl",
+    "open_pnl",
+    "positions",
+    "commands",
+    "last_decision",
+    "unresolved_command_ids",
+    "schema_version",
+    "admissions_enabled"
+  ],
+  "properties": {
+    "scope": {
+      "$ref": "#/$defs/scope"
+    },
+    "recovery": {
+      "enum": [
+        "UNOBSERVED",
+        "RECONCILING",
+        "COHERENT",
+        "UNRESOLVED",
+        "QUARANTINED"
+      ]
+    },
+    "permissions": {
+      "$ref": "#/$defs/permissions"
+    },
+    "observed_at": {
+      "anyOf": [
+        {
+          "type": "string",
+          "format": "date-time",
+          "description": "UTC, not an unspecified local timestamp."
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "state_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "balance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/money"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "equity": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/money"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "realized_pnl": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/money"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "open_pnl": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/money"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "positions": {
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/position"
+          },
+          "maxItems": 128
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/command"
+      },
+      "maxItems": 128
+    },
+    "last_decision": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/decision"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "unresolved_command_ids": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/id"
+      },
+      "maxItems": 128
+    },
+    "schema_version": {
+      "const": "1.0"
+    },
+    "admissions_enabled": {
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+    },
+    "money": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "amount",
+        "currency"
+      ],
+      "properties": {
+        "amount": {
+          "type": "string",
+          "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "account_id",
+        "run_id",
+        "epoch",
+        "build_id",
+        "policy_id",
+        "scenario_id",
+        "adapter_id",
+        "environment"
+      ],
+      "properties": {
+        "account_id": {
+          "$ref": "#/$defs/id"
+        },
+        "run_id": {
+          "$ref": "#/$defs/id"
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "build_id": {
+          "$ref": "#/$defs/id"
+        },
+        "policy_id": {
+          "$ref": "#/$defs/id"
+        },
+        "scenario_id": {
+          "$ref": "#/$defs/id"
+        },
+        "adapter_id": {
+          "$ref": "#/$defs/id"
+        },
+        "environment": {
+          "const": "DISCONNECTED_SIMULATION"
+        }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "new_risk",
+        "management",
+        "generation",
+        "confirmed_barrier_id"
+      ],
+      "properties": {
+        "new_risk": {
+          "enum": [
+            "ALLOWED",
+            "PAUSED",
+            "UNKNOWN"
+          ]
+        },
+        "management": {
+          "enum": [
+            "ALLOWED",
+            "STOPPED",
+            "UNKNOWN"
+          ]
+        },
+        "generation": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "confirmed_barrier_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "position": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "position_id",
+        "version",
+        "instrument_id",
+        "side",
+        "quantity",
+        "entry_price",
+        "stop_price"
+      ],
+      "properties": {
+        "position_id": {
+          "$ref": "#/$defs/id"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "instrument_id": {
+          "$ref": "#/$defs/id"
+        },
+        "side": {
+          "enum": [
+            "BUY",
+            "SELL"
+          ]
+        },
+        "quantity": {
+          "type": "string",
+          "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+        },
+        "entry_price": {
+          "type": "string",
+          "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+        },
+        "stop_price": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command_id",
+        "payload_sha256",
+        "state",
+        "last_venue_receipt_id",
+        "reservation_held",
+        "reason_code"
+      ],
+      "properties": {
+        "command_id": {
+          "$ref": "#/$defs/id"
+        },
+        "payload_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "state": {
+          "enum": [
+            "RESERVED",
+            "QUEUED",
+            "SUBMITTED",
+            "UNRESOLVED",
+            "OBSERVED",
+            "REJECTED"
+          ]
+        },
+        "last_venue_receipt_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reservation_held": {
+          "type": "boolean"
+        },
+        "reason_code": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "opportunity_set_id",
+        "source_state_id",
+        "selected_action_ref",
+        "reason",
+        "evidence_ids"
+      ],
+      "properties": {
+        "request_id": {
+          "$ref": "#/$defs/id"
+        },
+        "opportunity_set_id": {
+          "$ref": "#/$defs/id"
+        },
+        "source_state_id": {
+          "$ref": "#/$defs/id"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "evidence_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          },
+          "maxItems": 128
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "origin",
+        "adapter_id",
+        "request_sha256",
+        "response_sha256",
+        "prompt_version",
+        "started_at",
+        "completed_at",
+        "model_id",
+        "model_artifact_sha256",
+        "inference_receipt_id"
+      ],
+      "properties": {
+        "origin": {
+          "enum": [
+            "SCRIPTED",
+            "REPLAY",
+            "ACTUAL_MODEL",
+            "OWNER_REVIEWED",
+            "POLICY"
+          ]
+        },
+        "adapter_id": {
+          "$ref": "#/$defs/id"
+        },
+        "request_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "response_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "prompt_version": {
+          "$ref": "#/$defs/id"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "UTC, not an unspecified local timestamp."
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "UTC, not an unspecified local timestamp."
+        },
+        "model_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model_artifact_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inference_receipt_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision_id",
+        "selection",
+        "provenance"
+      ],
+      "properties": {
+        "decision_id": {
+          "$ref": "#/$defs/id"
+        },
+        "selection": {
+          "$ref": "#/$defs/selection"
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        }
+      }
+    }
+  },
+  "$comment": "Shape contract only. Python boundary and independent ledger checks additionally enforce freshness, coherent scope/cursor, Decimal positivity, permission/barrier binding, provenance receipts and byte limits. Conformance tests NOT_RUN."
+}

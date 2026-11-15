@@ -1,0 +1,40 @@
+{
+  "format": "forex.public-custodian-aggregate-feedback-contract/1",
+  "document_class": "SOURCE_ALLOWLIST_NOT_A_RESULT",
+  "status": "CUSTODIAN_PROPOSED_FOR_STEWARD_ACKNOWLEDGEMENT",
+  "allowed_when": "Final or aborted bounded run only; no interactive per-step tuning feedback during execution.",
+  "required_fields": {
+    "format": "Literal forex.stage-b-public-aggregate/1",
+    "run_id": "Public authorized execution identity, not private case identity",
+    "source_freeze_manifest_sha256": "64 lowercase hex digest",
+    "custody_public_manifest_sha256": "64 lowercase hex digest",
+    "status": "BLOCKED, INCOMPLETE, FAIL or ACCEPT",
+    "broad_failure_codes": "Unique array from the fixed enum; empty allowed",
+    "generation_attempts_spent": "Integer from zero through the frozen total ceiling",
+    "mandatory_steps_accounted": "Aggregate integer from zero through the mandatory graph size",
+    "mandatory_steps_incomplete": "Aggregate integer from zero through the mandatory graph size",
+    "all_mandatory_assertions_passed": "Boolean true only from accepted independent complete scoring",
+    "retained_evaluation_bundle_sha256": "Aggregate bundle digest only; no individual private request digests",
+    "independent_redaction_receipt_sha256": "Designated custodian/reviewer redaction approval digest"
+  },
+  "broad_failure_code_enum": [
+    "CUSTODY_GATE", "ISOLATION_GATE", "PIN_MISMATCH", "TOKEN_GATE", "TRANSPORT_GATE",
+    "MODEL_PROTOCOL_GATE", "MANDATORY_CHECK_FAILED", "TIME_BUDGET", "CALL_BUDGET", "EVIDENCE_UNAVAILABLE"
+  ],
+  "forbidden_fields_or_contents": [
+    "PRIVATE_CASE_STEP_OBLIGATION_OR_COUNTERPART_ID",
+    "INDIVIDUAL_REQUEST_OR_PROMPT_DIGEST",
+    "RAW_PROMPT_RESPONSE_OR_EXCEPTION",
+    "PRIVATE_PATH_OR_KEY_REFERENCE",
+    "PER_CASE_OR_PER_OBLIGATION_RESULT",
+    "ACTION_OR_EXPECTED_ACTION",
+    "EXACT_TOKEN_COUNT_OR_TOKEN_IDS",
+    "PRIVATE_EVENT_ORDER_OR_TIMING",
+    "SEED_OR_PERMUTATION_TRACE",
+    "FREE_TEXT_ERROR_DETAILS"
+  ],
+  "missing_redaction_or_unknown_field": "WITHHOLD_PUBLIC_RESULT_RETAIN_PRIVATE_EVIDENCE",
+  "changing_source_after_feedback": "NEW_REVIEWED_FREEZE_AND_HONEST_CONSUMED_CASE_ACCOUNTING; NO_SAME_CASE_FRESH_HOLDOUT_CLAIM",
+  "runtime_result_exists": false,
+  "release_enabled": false
+}

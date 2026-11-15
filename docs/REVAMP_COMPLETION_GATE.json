@@ -1,0 +1,16 @@
+{
+  "project": "cas-forex-revamp",
+  "repository": "https://github.com/LittleHenderson/cas-forex-revamp",
+  "revamp_completed": false,
+  "continuous_agent_pr_merge_enabled": true,
+  "cadence_cron_utc": "*/15 * * * *",
+  "phases": {
+    "phase_1_contracts_and_core": "VALIDATED",
+    "phase_2_venue_and_operator": "VALIDATED",
+    "phase_3_forex_meta_valve_gate": "VALIDATED",
+    "phase_4_airgapped_aws_pilot": "VALIDATED",
+    "phase_5_external_broker_and_stageb_custody": "ENGINEERED-NOT-VALIDATED",
+    "phase_6_16pair_live_chart_and_lantern_hardening": "IN_PROGRESS"
+  },
+  "stop_condition": "Keep merging passing AI-agent PRs continuously while revamp_completed is false. Set revamp_completed to true only after Lantern ameliorations and Phase 5+6 AWS end-to-end pilot validation pass."
+}

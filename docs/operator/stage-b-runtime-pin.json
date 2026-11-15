@@ -1,0 +1,196 @@
+{
+  "runtime": {
+    "version": "0.40.2",
+    "platform": "linux-amd64",
+    "asset": "ollama-linux-amd64.tar.zst",
+    "url": "https://github.com/ollama/ollama/releases/download/v0.40.2/ollama-linux-amd64.tar.zst",
+    "bytes": 1436368794,
+    "publisher_sha256": "726bee78706c281b0eeef00746efe51a044d71c592c3f0b195820707f31fdf04",
+    "local_archive_sha256_verified": false,
+    "downloaded": false,
+    "metadata_source": "https://api.github.com/repos/ollama/ollama/releases/tags/v0.40.2",
+    "migration_caveat": "Pinned migration registry has no plain qwen3 entry; missing migrator returns before conversion/write. This is a scoped source finding, not read-only startup compatibility proof."
+  },
+  "model_candidate": {
+    "observed_pdt": "2026-10-10T13:28:29.607879-07:00",
+    "tag": "qwen3:0.6b",
+    "manifest_sha256": "7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435",
+    "manifest_bytes": 858,
+    "blobs": [
+      {
+        "digest": "sha256:b0830f4ff6a0220cfd995455206353b0ed23c0aee865218b154b7a75087b4e55",
+        "media_type": "application/vnd.docker.container.image.v1+json",
+        "declared_bytes": 490,
+        "observed_bytes": 490
+      },
+      {
+        "digest": "sha256:7f4030143c1c477224c5434f8272c662a8b042079a0a584f0a27a1684fe2e1fa",
+        "media_type": "application/vnd.ollama.image.model",
+        "declared_bytes": 522640096,
+        "observed_bytes": 522640096
+      },
+      {
+        "digest": "sha256:ae370d884f108d16e7cc8fd5259ebc5773a0afa6e078b11f4ed7e39a27e0dfc4",
+        "media_type": "application/vnd.ollama.image.template",
+        "declared_bytes": 1723,
+        "observed_bytes": 1723
+      },
+      {
+        "digest": "sha256:d18a5cc71b84bc4af394a31116bd3932b42241de70c77d2b76d69a314ec8aa12",
+        "media_type": "application/vnd.ollama.image.license",
+        "declared_bytes": 11338,
+        "observed_bytes": 11338
+      },
+      {
+        "digest": "sha256:cff3f395ef3756ab63e58b0ad1b32bb6f802905cae1472e6a12034e4246fbbdb",
+        "media_type": "application/vnd.ollama.image.params",
+        "declared_bytes": 120,
+        "observed_bytes": 120
+      }
+    ],
+    "blob_hashes_verified": false
+  },
+  "wire": {
+    "endpoint": "http://127.0.0.1:11434/api/chat",
+    "method": "POST",
+    "stream": false,
+    "think": false,
+    "truncate": false,
+    "shift": false,
+    "keep_alive": 0,
+    "seed": "explicit integer 0..2147483647, same in matched arms",
+    "options": {
+      "temperature": 0,
+      "num_gpu": 0,
+      "num_thread": 2,
+      "num_ctx": 8192,
+      "num_predict": "invocation generated-token ceiling",
+      "num_batch": 128,
+      "top_k": 1,
+      "top_p": 1,
+      "min_p": 0,
+      "repeat_penalty": 1,
+      "use_mmap": true
+    },
+    "selection_schema_sha256": "f3331a67da4f77c2df8f0ebf28bdc8450416b4f53e356886b76457eca1960089",
+    "schema_hash_basis": "raw shared file bytes",
+    "tools": false,
+    "retries": 0,
+    "redirects": false,
+    "paid_fallback": false
+  },
+  "read_schema": {
+    "version": "forex.decision-read/0.1",
+    "raw_bytes_sha256": "e65e8d15b9f5ca19adbb86c2faa41f971ba8380f867a25253e41dea34cfd4567",
+    "validator": "cas_forex_revamp.rpa.schema_validation.PinnedDecisionReadValidator",
+    "schema_conformance": "NOT_RUN",
+    "source_binding": "NOT_RUN"
+  },
+  "limits": {
+    "probe_calls": 2,
+    "probe_minutes": 10,
+    "acceptance_calls": 32,
+    "acceptance_minutes": 90,
+    "bootstrap_test_minutes": 120,
+    "absolute_window_minutes": 220,
+    "absolute_deadline": null,
+    "additive_windows": false
+  },
+  "infra_guest_source_handoff": {
+    "status": "AUTHORED_NOT_RUN",
+    "read_only_root": "/opt/cas-forex/fx-20261010-8e1a63c5",
+    "state_write_root": "STATE_DIRECTORY",
+    "isolation": "one DynamicUser/PrivateNetwork sandbox",
+    "OLLAMA_HOST": "127.0.0.1:11434",
+    "OLLAMA_NO_CLOUD": "1",
+    "model_start": "driver explicit only",
+    "migration_write_policy": "HARD_COMPATIBILITY_GATE; frozen model/runtime/source must remain read-only"
+  },
+  "format": "cas-forex-stage-b-source-pin/1",
+  "prepared_at_pdt": "2026-10-10T15:08:03.791953-07:00",
+  "status": "HELPER_AND_EVIDENCE_AUTHORED_RUNTIME_NOT_RUN",
+  "assigned_worker_model": "GPT-6 Astra",
+  "assigned_worker_effort": "xhigh",
+  "observed_worker_model": null,
+  "observed_worker_effort": null,
+  "historical_pin": "docs/operator/runtime-pin.json; preserved 14:23 handoff, superseded only for B helper/migration status",
+  "expected_test_status": "NOT_RUN",
+  "binary_or_model_execution": "NOT_RUN",
+  "tokenizer": {
+    "status": "AUTHORED_RUNTIME_PARITY_NOT_RUN",
+    "helper": "cas_forex_revamp.operator.token_preflight.RenderTokenPreflight",
+    "runner_build": "b11351",
+    "render_endpoint": "http://127.0.0.1:11434/api/chat",
+    "render_only_changed_fields": {
+      "_debug_render_only": true,
+      "keep_alive": 30
+    },
+    "tokenize_endpoint": "http://127.0.0.1:<independently observed direct child port>/tokenize",
+    "tokenize_body": {
+      "content": "EXACT_RENDERED_UTF8_TEXT",
+      "add_special": true,
+      "parse_special": true,
+      "with_pieces": false
+    },
+    "inspected_architecture": "qwen3",
+    "inspected_add_bos_token": false,
+    "add_eos_default": "NOT_INVENTED; pinned runner tokenizer decides",
+    "identity_formula": "shared content_digest({policy:TOKEN_POLICY,ollama_sha256:hashed ollama role,runner_sha256:hashed runner role,weight_sha256:hashed weight role})",
+    "identity_value": null,
+    "identity_unavailable_reason": "Exact extracted executable/runner SHA values await approved B staging; no fabricated tokenizer asset hash.",
+    "additional_package_or_tokenizer_download_required": false,
+    "provider_count_policy": "Require prompt_eval_count == independently observed preflight token ID count. Retain mismatch response, consume generation attempt, stop; no retry or substitute."
+  },
+  "evidence": {
+    "store": "cas_forex_revamp.operator.model_evidence.ModelEvidenceStore",
+    "runtime_observer": "cas_forex_revamp.operator.runtime_observer.LinuxRuntimeObserver",
+    "ports": "cas_forex_revamp.operator.stage_b.StageBModelPorts",
+    "required_roles": [
+      "ollama",
+      "runner",
+      "manifest",
+      "weight",
+      "template",
+      "parameters",
+      "config",
+      "license"
+    ],
+    "extracted_ollama_path_sha256": null,
+    "extracted_runner_path_sha256": null,
+    "observed_internal_sampling_settings": null,
+    "setting_claim": "Exact requested options are retained. argv/process/file identity and provider usage are observed separately; internal numerical sampling state is not claimed observed.",
+    "restart": "External EvidenceJournal checkpoint required for existing model evidence store; hash chain alone is not source authenticity or complete rollback protection.",
+    "execution_authority": false,
+    "successful_runtime_observation": false
+  },
+  "remaining_source_work_outside_lane": [
+    "Steward-owned separate Stage B driver/launcher composition and full-project source cut using these ports.",
+    "Driver gate must validate complete frozen runtime library/extraction inventory, current approved phase/absolute deadline and independent isolation/stop proof."
+  ],
+  "remaining_staging_or_runtime_gates": [
+    "Verify publisher-pinned archive and complete extracted executable/runner/library inventory; pin exact guest paths, bytes and SHA values.",
+    "Verify all model blob/manifest hashes and read-only frozen mounts.",
+    "Independently prove stop/deadline, network/egress isolation and CPU-only route before any model request.",
+    "Observe actual server/runner identity, child socket, mapped model inode and read-only startup compatibility.",
+    "Use an already approved probe generation for tokenizer/provider count parity; no extra counting inference.",
+    "Run source-authored tests and continuous Stage B management within existing caps.",
+    "U0/U1 outcomes and RPA benefit remain unmeasured; no new inference allocation inferred from this helper."
+  ],
+  "entrypoints": {
+    "static": "python -I docs/operator/stage_b_static_inspect.py",
+    "operator_unit_future": "python -m unittest discover -s tests/operator -p \"test_*.py\"",
+    "rpa_unit_future": "python -m unittest discover -s tests/rpa -p \"test_*.py\"",
+    "test_environment": "Approved guest driver supplies new src import root. Standard library only. No commands executed here.",
+    "model": "Explicit StageBModelPorts.backend + ActualModelDecisionAdapter(receipt_verifier=ports) + OperatorSession; no lane-owned automatic model CLI.",
+    "browser": "Steward/UI-owned approved guest entrypoint; this lane has none.",
+    "bootstrap": "Infra/steward-owned runtime-lock and bounded guest launcher; no pip/npm install added."
+  },
+  "primary_sources": [
+    "https://raw.githubusercontent.com/ollama/ollama/v0.40.2/LLAMA_CPP_VERSION",
+    "https://raw.githubusercontent.com/ollama/ollama/v0.40.2/api/types.go",
+    "https://raw.githubusercontent.com/ollama/ollama/v0.40.2/server/routes.go",
+    "https://raw.githubusercontent.com/ollama/ollama/v0.40.2/llm/llama_server.go",
+    "https://raw.githubusercontent.com/ollama/ollama/v0.40.2/compatmigrate/migrate.go",
+    "https://raw.githubusercontent.com/ggml-org/llama.cpp/b11351/tools/server/server-context.cpp"
+  ]
+}

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cas-forex-revamp"
+version = "0.6.0"
+description = "CAS Forex Revamp — Deterministic Spot-FX Execution, ForexMetaValveGate Safety Controller, Stage B Custody, and 16-Pair Live Candlestick Cockpit"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography==50.0.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = [
+    ".",
+    "src",
+    "shared-interface",
+    "authority_component/provider_source04",
+    "operational/authority/source",
+    "operational/measurement/source",
+    "operational/custody/source",
+    "operational/policy-inheritance02/source",
+]
+testpaths = ["tests"]

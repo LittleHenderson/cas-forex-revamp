@@ -1,0 +1,135 @@
+name: Continuous AI-Agent PR Auto-Merger
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_run:
+    workflows: ["CAS Forex Revamp CI"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: read
+  statuses: read
+
+concurrency:
+  group: cas-forex-revamp-agent-pr-automerge
+  cancel-in-progress: false
+
+jobs:
+  merge-ready-agent-prs:
+    name: Periodically Verify & Merge Passing AI-Agent PRs
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Evaluate completion gate and merge passing PRs
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess, sys
+
+          repo = os.environ["REPO"]
+          owner = repo.split("/")[0]
+
+          gate_path = pathlib.Path("docs/REVAMP_COMPLETION_GATE.json")
+          if gate_path.is_file():
+              gate = json.loads(gate_path.read_text(encoding="utf-8"))
+              if gate.get("revamp_completed") is True:
+                  print("CAS Forex Revamp completion gate is TRUE — halting continuous auto-merge.")
+                  sys.exit(0)
+
+          res = subprocess.run(
+              [
+                  "gh", "pr", "list",
+                  "--repo", repo,
+                  "--base", "main",
+                  "--state", "open",
+                  "--json", "number,title,isDraft,headRefName,headRefOid,headRepositoryOwner,mergeable,mergeStateStatus,labels,author",
+              ],
+              capture_output=True, text=True, check=True,
+          )
+          prs = json.loads(res.stdout)
+          print(f"Found {len(prs)} open PR(s) targeting main.")
+
+          required_jobs = {
+              "Secret & Strict-CSP Gate",
+              "Node UI Suite",
+              "Python Unit & Contract Suites",
+          }
+
+          for pr in sorted(prs, key=lambda x: x["number"]):
+              num = pr["number"]
+              title = pr["title"]
+              if pr.get("isDraft"):
+                  print(f"PR #{num} ({title}): draft — skipping.")
+                  continue
+
+              head_owner = (pr.get("headRepositoryOwner") or {}).get("login", "")
+              if head_owner != owner:
+                  print(f"PR #{num} ({title}): external fork ({head_owner}) — skipping for safety.")
+                  continue
+
+              labels = {lb["name"] for lb in (pr.get("labels") or [])}
+              author_login = (pr.get("author") or {}).get("login", "")
+              if "do-not-merge" in labels or "hold" in labels:
+                  print(f"PR #{num} ({title}): hold label present — skipping.")
+                  continue
+              if not ("agent-pr" in labels or "automerge-ready" in labels or author_login == owner or author_login.endswith("[bot]")):
+                  print(f"PR #{num} ({title}): not marked agent-pr / owner — skipping.")
+                  continue
+
+              merge_state = pr.get("mergeStateStatus") or ""
+              if merge_state == "BEHIND":
+                  print(f"PR #{num} ({title}): branch is BEHIND main — updating branch for next CI cycle.")
+                  subprocess.run(
+                      ["gh", "api", f"repos/{repo}/pulls/{num}/update-branch", "-X", "PUT"],
+                      check=False,
+                  )
+                  continue
+
+              sha = pr["headRefOid"]
+              cr_res = subprocess.run(
+                  ["gh", "api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100"],
+                  capture_output=True, text=True, check=True,
+              )
+              check_runs = json.loads(cr_res.stdout).get("check_runs", [])
+              latest_by_name = {}
+              for cr in check_runs:
+                  name = cr["name"]
+                  if name == "Periodically Verify & Merge Passing AI-Agent PRs":
+                      continue
+                  prev = latest_by_name.get(name)
+                  if prev is None or cr["id"] > prev["id"]:
+                      latest_by_name[name] = cr
+
+              missing = sorted(required_jobs - set(latest_by_name.keys()))
+              if missing:
+                  print(f"PR #{num} ({title}): waiting for required CI jobs {missing}.")
+                  continue
+
+              bad = [
+                  f"{n}:{c.get('status')}/{c.get('conclusion')}"
+                  for n, c in latest_by_name.items()
+                  if c.get("status") != "completed" or c.get("conclusion") not in ("success", "skipped", "neutral")
+              ]
+              if bad:
+                  print(f"PR #{num} ({title}): checks not yet all green ({bad}) — waiting.")
+                  continue
+
+              print(f"PR #{num} ({title}): all required CI checks PASSED on {sha[:12]} — merging now!")
+              m_res = subprocess.run(
+                  ["gh", "pr", "merge", str(num), "--repo", repo, "--squash", "--delete-branch"],
+                  capture_output=True, text=True,
+              )
+              print(m_res.stdout, m_res.stderr)
+              if m_res.returncode == 0:
+                  print(f"PR #{num} MERGED successfully.")
+                  # Merge one PR per cycle so subsequent open PRs cleanly rebase & re-verify against new main!
+                  break

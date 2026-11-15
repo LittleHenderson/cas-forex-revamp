@@ -1,0 +1,107 @@
+name: CAS Forex Revamp CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  secret-and-csp-gate:
+    name: Secret & Strict-CSP Gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify zero secrets and zero inline style attributes in UI
+        shell: python
+        run: |
+          import pathlib, re, sys
+          secret_pats = [
+              re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"),
+              re.compile(r"\b(ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})\b"),
+              re.compile(r"BEGIN [A-Z ]*PRIVATE KEY"),
+          ]
+          for p in pathlib.Path(".").rglob("*"):
+              if ".git" in p.parts or not p.is_file():
+                  continue
+              try:
+                  txt = p.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
+                  continue
+              for pat in secret_pats:
+                  if pat.search(txt):
+                      sys.exit(f"Forbidden secret pattern detected in {p}")
+          for ui_file in pathlib.Path("ui").rglob("*"):
+              if ui_file.is_file() and ui_file.suffix in (".html", ".mjs", ".js"):
+                  txt = ui_file.read_text(encoding="utf-8")
+                  if re.search(r'\bstyle\s*=\s*["\']', txt):
+                      sys.exit(f"Strict CSP violation (inline style=) in {ui_file}")
+          print("Secret & Strict-CSP Gate PASSED.")
+
+  node-ui-suite:
+    name: Node UI Suite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run strict-CSP Node UI test suite
+        run: node --test tests/ui/*.test.mjs
+
+  python-unit-suites:
+    name: Python Unit & Contract Suites
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned cryptography==50.0.2
+        run: python -m pip install --upgrade pip cryptography==50.0.2
+      - name: Run deterministic Python unit suites
+        shell: python
+        run: |
+          import os, pathlib, subprocess, sys
+          base_paths = [
+              ".",
+              "src",
+              "shared-interface",
+              "authority_component/provider_source04",
+              "operational/authority/source",
+              "operational/measurement/source",
+              "operational/custody/source",
+              "operational/policy-inheritance02/source",
+          ]
+          suites = [
+              ("tests/contracts", ["tests/contracts"] + base_paths),
+              ("tests/core", ["tests/core"] + base_paths),
+              ("tests/venue", ["tests/venue"] + base_paths),
+              ("tests/operator", ["tests/operator"] + base_paths),
+              ("tests/rpa", ["tests/rpa"] + base_paths),
+              ("authority_component/provider_source04/tests", ["authority_component/provider_source04/tests"] + base_paths),
+              ("operational/policy-inheritance02/tests", ["operational/policy-inheritance02/tests"] + base_paths),
+              ("operational/measurement/tests", ["operational/measurement/tests"] + base_paths),
+              ("operational/authority/tests", ["operational/authority/tests"] + base_paths),
+              ("operational/custody/tests", ["operational/custody/tests"] + base_paths),
+              ("tests/phase3", ["tests/phase3"] + base_paths),
+              ("tests/phase4", ["tests/phase4"] + base_paths),
+              ("tests/phase5", ["tests/phase5"] + base_paths),
+          ]
+          if pathlib.Path("tests/phase6").is_dir():
+              suites.append(("tests/phase6", ["tests/phase6"] + base_paths))
+
+          for suite_dir, py_paths in suites:
+              print(f"=== Running {suite_dir} ===", flush=True)
+              env = dict(os.environ)
+              env["PYTHONPATH"] = os.pathsep.join(py_paths)
+              res = subprocess.run(
+                  [sys.executable, "-m", "unittest", "discover", "-s", suite_dir, "-p", "test_*.py"],
+                  env=env,
+              )
+              if res.returncode != 0:
+                  sys.exit(f"Suite failed: {suite_dir}")
+          print("All deterministic Python suites PASSED.")

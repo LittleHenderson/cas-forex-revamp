@@ -1,0 +1,109 @@
+{
+  "format": "forex.release-consumption-contract-candidate/2",
+  "status": "SOURCE_ONLY_REQUIRES_REREVIEW",
+  "runtime_authorized": false,
+  "imports": [
+    "ProtectedRecordRef/Use, EvaluationBinding, ReleaseReceipt3 from protected-records.candidate.json",
+    "CheckpointRpcRequest/Response,RpcSignature from interface.candidate.json",
+    "ClockDomain,OriginalSetupKey,Stamp,ObjectRef,ExposedOutput from method-contract.candidate.json",
+    "role-release-evidence.candidate.json exact wrapper/current role checks and receipt-expiry cap"
+  ],
+  "exact_object_fields": {
+    "CheckpointAccessSelection": {
+      "format": "literal:forex.checkpoint-access-selection/2",
+      "binding": "Binding",
+      "checkpoint_authority_id": "Id",
+      "store_instance_id": "Id",
+      "endpoint_id": "Id",
+      "endpoint_binding_sha256": "Sha256",
+      "callers": "array<CheckpointCallerGrant>[2,8]",
+      "authorizer_id": "Id",
+      "not_before_utc": "Utc",
+      "expires_at_utc": "Utc"
+    },
+    "CheckpointCallerGrant": {
+      "principal_id": "Id",
+      "signer_public_sha256": "Sha256",
+      "component_manifest_sha256": "Sha256",
+      "actual_process": "CaptureSubject",
+      "operations": "array<CheckpointOperation>[1,3]",
+      "uses": "array<CheckpointUse>[1,3]"
+    },
+    "ConsumptionReadBinding": {
+      "release_ref": "ProtectedRecordRef",
+      "release_id": "Id",
+      "consume_attempt_id": "Id",
+      "controller_id": "Id",
+      "controller_process": "CaptureSubject",
+      "channel_binding_sha256": "Sha256",
+      "method_decision_ref": "ObjectRef",
+      "method_exposure_ref": "ObjectRef",
+      "expected_decision_generation": "PositiveInt",
+      "expected_decision_head_sha256": "Sha256"
+    },
+    "ConsumptionPreparation": {
+      "format": "literal:forex.release-consumption-preparation/1",
+      "binding": "EvaluationBinding",
+      "preparation_id": "Id",
+      "consume_attempt_id": "Id",
+      "release_ref": "ProtectedRecordRef",
+      "controller_id": "Id",
+      "controller_process": "CaptureSubject",
+      "channel_binding_sha256": "Sha256",
+      "original_setup_key": "OriginalSetupKey",
+      "setup_budget_sha256": "Sha256",
+      "method_appointment_sha256": "Sha256",
+      "checkpoint_access_selection_sha256": "Sha256",
+      "prepared_at": "Stamp",
+      "deadline": "Stamp",
+      "read_request_sha256": "Sha256"
+    },
+    "ConsumptionRecord": {
+      "format": "literal:forex.release-consumption-record/1",
+      "binding": "EvaluationBinding",
+      "consume_attempt_id": "Id",
+      "preparation_sha256": "Sha256",
+      "release_ref": "ProtectedRecordRef",
+      "controller_id": "Id",
+      "controller_process": "CaptureSubject",
+      "channel_binding_sha256": "Sha256",
+      "checkpoint_request_sha256": "Sha256",
+      "checkpoint_response_sha256": "Nullable<Sha256>",
+      "verified_checkpoint_generation": "Nullable<PositiveInt>",
+      "verified_checkpoint_head_sha256": "Nullable<Sha256>",
+      "authority_status_sha256": "Nullable<Sha256>",
+      "validated_at": "Nullable<Stamp>",
+      "committed_at": "Nullable<Stamp>",
+      "post_commit_checked_at": "Nullable<Stamp>",
+      "status": "CONSUMED_VALID|SPENT_NO_EXPOSURE|UNAVAILABLE"
+    }
+  },
+  "enums": {
+    "CheckpointOperation": [
+      "READ_CURRENT",
+      "ADVANCE",
+      "LOOKUP_TRANSITION"
+    ],
+    "CheckpointUse": [
+      "SETUP_PROTOCOL",
+      "RELEASE_ISSUANCE",
+      "RELEASE_CONSUMPTION"
+    ]
+  },
+  "selected_route": "DIRECT_CONTROLLER_AUTHENTICATED_READ_ONLY",
+  "rules": [
+    "Checkpoint service explicitly permits the selected live controller witness principal to READ_CURRENT for RELEASE_CONSUMPTION only. Its existing appointed witness signing identity authenticates RPC; it receives no ADVANCE permission, checkpoint key, store path access or consumer key.",
+    "READ_CURRENT request body includes ConsumptionReadBinding and minimum_generation/head equal the issued release's expected decision checkpoint. The exact request is durably retained in ConsumptionPreparation before send. Fresh nonce/request ID are selected for this consume attempt, not copied from the issuer.",
+    "Service verifies current caller signature, permitted operation/use, actual per-fragment credentials/PID/start, exact binding/store/clock domain, current authority and original setup deadline. Response signs request hash and nonce, so all consumption fields are transitively bound.",
+    "Service response must be PRESENT with complete history, current head exactly equal to the expected accepted decision checkpoint, and that certificate bound to the exact method decision/exposure in the release. Any later abort, changed head, expired authority, stale nonce, missing/unavailable history or changed controller/channel rejects consumption.",
+    "Controller first validates all release/custody/completion/method/role/current-authority dependencies and retains one-use preparation. Its final external evidence acquisition is its own fresh checkpoint READ_CURRENT. It authenticates that response and original-time/current-authority checks immediately before an atomic PREPARED->CONSUMED local commit.",
+    "No other blocking verification between the completed fresh read and consumption commit except the bounded exact local commit. If more I/O is needed, do not consume on the old read. Fail closed; any explicitly authorized reread retains the same consume attempt/release/clock and creates no fresh release allowance.",
+    "After commit recheck original deadlines/authority and process/channel continuity before private exposure. If commit or post-commit checks cross a deadline or become uncertain, record SPENT_NO_EXPOSURE/UNAVAILABLE and expose no private input. Commit success is not itself private-read permission.",
+    "Lost read/commit responses do not create a new release ID/consume attempt/budget or automatically resend/distribute custody. Exact retained state may be reconciled only within original validity; no automatic restart or repeated release is authorized.",
+    "This is a fresh observation plus exact local one-use commit, not a distributed transaction freezing all future checkpoint/authority changes. Later record retention supplies audit evidence, never renewed permission. Existing per-invocation role/clock guards remain.",
+    "Issuer READ_CURRENT is separately useful for issuance but never satisfies controller consumption. The controller endpoint/client descriptor and signing material are excluded from all child pass_fds/descriptor plans; absence/forwarding bounds remain under the accepted trusted-controller claim and require runtime observation.",
+    "CONSUMED_VALID requires every response/generation/head/authority/time field non-null and causally ordered; failure/uncertainty leaves unavailable fields null without fabricated timestamps. No null can satisfy the successful exposure gate.",
+    "Setup decision/current checkpoint/appointment must be valid at consumption inside the original180-second interval. The successfully consumed release authorizes only the already fixed model/global window and ongoing guards; its later model phase does not renew setup authority or permit another consumption.",
+    "Candidate03 NR01..NR12 applies before the final controller READ_CURRENT and at the prescribed postcommit guard. Wrapper/release expiry is an admission limit capped by the original setup/dependency validity, not a replacement model deadline; no fresh observation is fabricated from the wrapper itself."
+  ]
+}

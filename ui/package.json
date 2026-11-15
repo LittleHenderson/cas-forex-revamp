@@ -1,0 +1,13 @@
+{
+  "name": "cas-forex-personal-cockpit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Disconnected personal cockpit with explicit scoped bridge attachment; no broker or model client.",
+  "scripts": {
+    "test": "node --test ../tests/ui/wire.test.mjs ../tests/ui/presentation.test.mjs ../tests/ui/decision-read.test.mjs ../tests/ui/control-observation.test.mjs ../tests/ui/bridge.test.mjs ../tests/ui/freshness.test.mjs ../tests/ui/catalog.test.mjs ../tests/ui/modernist.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

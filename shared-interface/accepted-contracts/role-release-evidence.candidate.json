@@ -1,0 +1,193 @@
+{
+  "format": "forex.narrow-role-release-evidence-contract-candidate/1",
+  "status": "PROPOSED_REQUIRES_REREVIEW_NOT_ACTIVATED",
+  "release_enabled": false,
+  "runtime_authorized": false,
+  "ownership": {
+    "shared_type": "INTEGRATION_STEWARD",
+    "publisher": "EXISTING_APPOINTED_CONTROLLER_WITNESS",
+    "release_validation": "CUSTODY_RELEASE_VALIDATOR",
+    "controller_consumption": "INTEGRATION_STEWARD",
+    "new_service": false
+  },
+  "imports": {
+    "method": "method-contract.candidate.json exact /3 candidate; Scope, Binding, Stamp, ObjectRef, ProcessIdentity, DescriptorIdentity, SignedEnvelope, AcceptedClaim and fixed_unsupported_routes",
+    "capture": "interface.candidate.json: AuthenticatedMethodObject, CaptureSubject, CaptureBatch, CaptureOperation, ProcessBoundary, ProcRead, ListenerRead, CredentialTriple",
+    "protected": "protected-records.candidate.json: EvaluationBinding, ProtectedReferenceUse, ProtectedRecordRef, PublicationGrant and PublisherRootSelection",
+    "consumption": "release-consumption.candidate.json: ConsumptionReadBinding and exact one-use transition"
+  },
+  "notation": "All fields mandatory, exact sets; no undeclared keys. Nullable allows null, not omission. Utc is YYYY-MM-DDTHH:MM:SS.ffffffZ, as in method contract. Explicit numbered arrays preserve order.",
+  "release_slot": "role_read_isolation_receipt_sha256",
+  "exact_object_fields": {
+    "NarrowRoleReleaseEvidence1": {
+      "format": "literal:forex.narrow-role-release-evidence/1",
+      "binding": "EvaluationBinding",
+      "evidence_id": "Id",
+      "method_binding": "Binding",
+      "observer_id": "Id",
+      "observer_binding": "ProtectedReferenceUse",
+      "controller_id": "Id",
+      "channel_id": "Id",
+      "channel_binding_sha256": "Sha256",
+      "boot_id": "Uuid",
+      "setup_budget_sha256": "Sha256",
+      "method_decision": "AuthenticatedMethodObject",
+      "method_exposure": "ObjectRef:EXPOSED_OUTPUT",
+      "decision_generation": "literal-integer:22",
+      "decision_head_sha256": "Sha256",
+      "setup_records": "RoleSetupRecords",
+      "role_setup_sha256": "Sha256",
+      "roles": "CurrentRoles",
+      "channel": "CurrentChannel",
+      "model_listener": "CurrentListener",
+      "observed": "Stamp",
+      "observed_at_utc": "Utc",
+      "issued": "Stamp",
+      "not_before_utc": "Utc",
+      "expires": "Stamp",
+      "expires_at_utc": "Utc",
+      "original_clock_binding": "ProtectedReferenceUse",
+      "accepted_claims": "exact:method.enums.AcceptedClaim",
+      "non_forwarding_status": "literal:ASSUMPTION_BOUND_NON_FORWARDING",
+      "unsupported_routes": "exact:method.fixed_unsupported_routes",
+      "every_task_post_exec_probes_claimed": "literal-bool:false",
+      "broad_role_read_denial_claimed": "literal-bool:false",
+      "completion_scoring_publication_authority": "literal-bool:false",
+      "supporting_objects": "array<AuthenticatedMethodObject>[1,64]"
+    },
+    "RoleSetupRecords": {
+      "runner_install": "AuthenticatedMethodObject",
+      "model_install": "AuthenticatedMethodObject",
+      "model_post_exec": "AuthenticatedMethodObject",
+      "final_peer_bound": "AuthenticatedMethodObject",
+      "policy_argument": "AuthenticatedMethodObject"
+    },
+    "CurrentRoles": {
+      "controller": "CurrentRoleReadback",
+      "decision_runner": "CurrentRoleReadback",
+      "model_service": "CurrentRoleReadback"
+    },
+    "CurrentRoleReadback": {
+      "role": "CONTROLLER|DECISION_RUNNER|MODEL_SERVICE",
+      "process": "ProcessIdentity",
+      "parent": "ParentIdentity",
+      "process_boundary": "CapturedOperationUse",
+      "observed": "Stamp"
+    },
+    "CapturedOperationUse": {
+      "capture": "AuthenticatedMethodObject",
+      "operation_index": "PositiveInt",
+      "operation_kind": "PROCESS_BOUNDARY|PROC_READ|LISTENER_READ"
+    },
+    "CurrentChannel": {
+      "channel_id": "Id",
+      "channel_binding_sha256": "Sha256",
+      "key_operation_id": "Id",
+      "created_record_id": "Id",
+      "peer_record_id": "Id",
+      "controller_endpoint": "DescriptorIdentity",
+      "runner_endpoint": "DescriptorIdentity",
+      "controller_fd_link": "CapturedOperationUse",
+      "controller_fdinfo": "CapturedOperationUse",
+      "runner_fd_link": "CapturedOperationUse",
+      "runner_fdinfo": "CapturedOperationUse",
+      "accepted_first_receive": "ObjectRef:IPC_RECEIVE",
+      "accepted_ucred": "CredentialTriple",
+      "observed": "Stamp"
+    },
+    "CurrentListener": {
+      "listener": "CapturedOperationUse",
+      "observed": "Stamp"
+    },
+    "ParentIdentity": {
+      "boot_id": "Uuid",
+      "pid": "PositiveInt",
+      "start_ticks": "PositiveInt",
+      "uid": "UInt",
+      "gid": "UInt"
+    }
+  },
+  "publisher_grant": {
+    "record_kind": "EXTERNAL_RELEASE_EVIDENCE",
+    "purpose": "release-evidence:role_read_isolation_receipt_sha256",
+    "permitted_use": "PRIVATE_RELEASE",
+    "publisher_role": "CONTROLLER",
+    "publisher_identity_rule": "Exactly the active method appointment's trusted controller witness. Its independently selected observer binding selects the same witness identity, signing public key and component hash; no self-appointment or issuer-created observer.",
+    "payload_schema_pin": "SHA256 of raw bytes of role-release-evidence.candidate.json. External PublisherRootSelection must pin this exact candidate only after agreement; the contract contains no own digest.",
+    "root_rule": "Existing externally selected protected root and PublicationGrant. Publisher ID, signer, component, root instance/device/inode, schema pin, use, all EvaluationBinding fields and validity must match.",
+    "authentication_domain": "CAS_FOREX_PROTECTED_RECORD_V1\n",
+    "registration_domain": "CAS_FOREX_PROTECTED_REGISTRATION_V2\n",
+    "method_dependency_domain": "CAS_FOREX_POLICY_INHERITANCE_V3\n"
+  },
+  "validation_steps": [
+    {
+      "id": "NR01_SHAPE_ROUTE",
+      "owner": "CUSTODY",
+      "check": "Resolve the exact selected release-evidence reference through current authenticated PublisherRootSelection/registration. Require EXTERNAL_RELEASE_EVIDENCE, the exact slot purpose, PRIVATE_RELEASE and the exact schema pin above. Parse only forex.narrow-role-release-evidence/1 with these exact fields. Reject observed-role-read-isolation/1, generic wrapper, missing or additional fields."
+    },
+    {
+      "id": "NR02_EXTERNAL_BINDINGS",
+      "owner": "CUSTODY",
+      "check": "Wrapper binding equals release selection.binding and external execution/source/config/topology/original-window pins. Method scope fields equal binding plus the externally selected method/spec/setup identity; appointment and budget equal release selection. observer_binding is byte-for-byte the selected trusted_observer_binding_sha256 evidence use; observer_id matches selection and the externally selected controller-witness observer. controller_id, boot_id and channel values match independently selected controller/channel records, not wrapper-declared expectations. original_clock_binding equals the selected original_clock_and_budget_binding_sha256 use."
+    },
+    {
+      "id": "NR03_METHOD_DECISION",
+      "owner": "CUSTODY",
+      "check": "Authenticate method_decision.object_ref as METHOD_DECISION and envelope as SIGNED_ENVELOPE using the appointed setup consumer's exact -v3 purpose/key/domain and full current validity intersection. Require ACCEPTED_NARROW_METHOD, no failure, nineteen retained accepted records, accepted sealed head, both exact limited claims, all eight exact unsupported routes and no completion/scoring/publication authority. Resolve authenticated_interval_ref and complete required sealed history/semantic validation; signatures and labels alone cannot replace it."
+    },
+    {
+      "id": "NR04_EXPOSURE_AND_SETUP",
+      "owner": "CUSTODY",
+      "check": "method_exposure equals selection.method_exposure, resolves exact ExposedOutput(kind METHOD_DECISION), and names this exact decision body and attestation plus independently authenticated DECISION_EXPOSURE checkpoint at generation 22/head decision_head_sha256. It equals selection's expected decision generation/head. Each setup_records member is an authenticated EVENT_RECORD in that accepted sealed stream with the exact corresponding kind RUNNER_INSTALL, MODEL_INSTALL, MODEL_POST_EXEC, FINAL_PEER_BOUND or POLICY_ARGUMENT. role_setup_sha256 is SHA256(canonical JSON of the complete RoleSetupRecords object), never the hash of a legacy broad probe report. All nested capture/decode/selection records remain required."
+    },
+    {
+      "id": "NR05_CAPTURE_PROVENANCE",
+      "owner": "CUSTODY",
+      "check": "Every CapturedOperationUse points to the exact indexed operation in a TRUSTED_CAPTURE_BATCH plus its appointed witness SIGNED_ENVELOPE. Select by the operation's explicit operation_index value, not a zero-based array offset; exactly one matching index and the exact operation_kind are required. Require same method binding/budget, CONTROLLER reporting_origin and CONTROLLER_OS_READBACK evidence_class for these current controller reads, current witness authority, authenticated native raw manifests/leaves and exact selected parser/component pins. Resolve the complete bounded graph and reparse raw bytes; no supplied process/descriptor/clock value is accepted solely because it appears in the wrapper. supporting_objects is the exact deduplicated set of authenticated RAW_BLOB_MANIFEST, PROC_IDENTITY, NAMESPACE_INVENTORY, MOUNT_INVENTORY, DESCRIPTOR_INVENTORY and LISTENER_IDENTITY objects needed by these current captures/readbacks. No unrelated objects. Each raw manifest is authenticated and resolves its own exact native leaf; every nested dependency must resolve within the original per-object/64MiB complete-graph limits. Envelope bodies bind exact object kind/hash/length and same method binding/budget. Previously accepted setup records and their original inputs are resolved through their accepted EventInputs, not reinterpreted as current capture. The batch producer_id is the appointed controller witness; its subject and each selected operation's subject match the exact current target role identity. Parent-subject data remain separately checked. An authenticated batch from another origin, evidence class, producer or target cannot be relabeled."
+    },
+    {
+      "id": "NR06_CURRENT_ROLES",
+      "owner": "CUSTODY",
+      "check": "CurrentRoles has exactly controller, decision_runner and model_service with matching role tags. Reconstruct each ProcessIdentity/parent from the selected PROCESS_BOUNDARY raw before/after stat, status, complete task identities, namespaces, mountinfo, exe link/stat and previously authenticated immutable executable content binding. Both samples agree on boot/PID/start/parent/UID/GID/exe and role's selected identity; failure or inaccessible/changed identity blocks. Controller equals appointed controller. Runner equals accepted RUNNER_INSTALL identity and final peer. Model equals accepted MODEL_POST_EXEC identity with accepted MODEL_INSTALL/exec lineage and current exact parent. No PID-only substitution, role rebinding, asset hash invention, or proof against a compromised observer. ParentIdentity is reconstructed from the ProcessBoundary.parent_subject and actual parent stat/start verification; its PID equals process.parent_pid. Compare these exact parent fields with the accepted lineage and current externally selected parent. It does not invent the parent's executable or namespace inventory."
+    },
+    {
+      "id": "NR07_CURRENT_CHANNEL",
+      "owner": "CUSTODY",
+      "check": "Channel ID/key-operation/endpoints/created_record_id match accepted final-channel creation and selected authorized-current-frame-channel evidence; peer_record_id and first receive match accepted FINAL_PEER_BOUND. accepted_ucred is the authenticated first packet's PID/UID/GID and equals the current runner identity. Four PROC_READ operations must be exact successful FD_LINK/FDINFO reads for the current controller/runner endpoint FDs, same respective subject identities, selected socket objects/inodes/access flags and counterpart pair. Reparse values and compare with accepted endpoint/ownership inventory. These observations establish narrow current endpoint continuity; they do not claim a fresh calibration, new private frame, arbitrary IPC denial or non-forwarding proof."
+    },
+    {
+      "id": "NR08_CURRENT_LISTENER",
+      "owner": "CUSTODY",
+      "check": "Revalidate selected LISTENER_READ: exact current model subject/identity, selected 127.0.0.1 port and socket identity, actual LISTEN table entry plus owning descriptor inventory, and accepted MODEL_POST_EXEC listener. Table membership alone cannot prove ownership. Reference to an old listener sample cannot satisfy the current interval."
+    },
+    {
+      "id": "NR09_TIME_AND_SCOPE",
+      "owner": "CUSTODY",
+      "check": "All current role/channel/listener operation intervals occur after the exposed decision's decided stamp and within the same original SetupBudget clock domain; all depended-on captures finish no later than observed. Each subordinate observed stamp equals its last referenced current operation.finished; top observed is the latest of these by boottime, with UTC nonregression. observed_at_utc equals observed.utc; expires_at_utc equals expires.utc. Require observed <= issued, not_before_utc == observed_at_utc, and at issuance/revalidation observed_at_utc <= now.utc < expires_at_utc with now.boottime < expires.boottime_ns. expires is no later in either clock than method decision expiry, all authenticated dependency/appointment/publisher/registry validity, original setup deadline, original model deadline and global deadline. Original clocks are read, never recomputed from issuance. Missing/stale/domain-mismatched observations block. Readback stamps are actual paired observations of the externally selected original clock; stamp equality does not invent missing observations. Supporting raw manifests may describe individual earlier read calls in the same bounded current capture, but neither copied old complete batches nor after-expiry evidence satisfies these reads."
+    },
+    {
+      "id": "NR10_RECONSTRUCTION",
+      "owner": "CUSTODY",
+      "check": "The custody validator reconstructs the exact role/channel/listener values and binding/claims/expiry from authenticated dependencies and external selection. It compares the entire reconstructed NarrowRoleReleaseEvidence1 to submitted bytes, including explicit reference bindings and IDs, before returning a validated typed value. Never set independently_validated_observed_roles to the supplied wrapper merely to satisfy equality; no broad-denial observer_adapter call or compatibility cast is used."
+    },
+    {
+      "id": "NR11_RELEASE_CAP",
+      "owner": "CUSTODY",
+      "check": "Release selection and receipt references, expected decision generation/head, controller, method/appointment/budget, source completion and all other sixteen evidence gates must match. Receipt issued_at and not_before are within wrapper validity and receipt expires_at_utc <= wrapper.expires_at_utc. This expiry caps the one-use admission/consumption window; it cannot be enlarged to the model deadline. Once validly consumed, only the already fixed model/global window and continuing role/channel/authority guards govern authorized continuation; no new setup grant or time is created."
+    },
+    {
+      "id": "NR12_CONSUMPTION",
+      "owner": "INTEGRATION",
+      "check": "Controller revalidates the same exact selected wrapper/current authority and exact live role/channel identities, then performs its own authenticated consumption-bound READ_CURRENT. Exact generation22/head/decision/release/attempt/channel required, as candidate02. No other blocking verification occurs between final read validation and durable one-use commit. Postcommit continuity/clock/authority failure is SPENT_NO_EXPOSURE. Issuer reads and this wrapper's stored observations cannot replace fresh controller checks."
+    }
+  ],
+  "compatibility_mapping": {
+    "predecessor_evidence_validator_observed": "Replace only the role_read_isolation_receipt_sha256 branch with NR01..NR12; do not pass new body to legacy observer_adapter or alias its /1 format.",
+    "predecessor_independently_validated_observed_roles": "Successor internal typed result named validated_narrow_role_evidence, reconstructed under NR01..NR10. It is not a new externally trusted payload field or caller boolean.",
+    "predecessor_observed_at_utc": "Preserved explicit field with exact equality to observed.utc; six fractional digits.",
+    "predecessor_expires_at_utc": "Preserved explicit field with exact equality to expires.utc, plus monotonic and current-authority caps.",
+    "predecessor_release_expiry_comparison": "Retain and tighten: receipt expiry <= validated_narrow_role_evidence.expires_at_utc. Do not extend the wrapper to fill the model window.",
+    "predecessor_roles": "Replaced by closed CurrentRoles and accepted lineage/current authenticated readbacks; no old access_probes, sentinel verified flags or broad-denial fields survive.",
+    "scope": "No new service, no broader claim, no new private-case access; semantic failures remain blocked."
+  }
+}

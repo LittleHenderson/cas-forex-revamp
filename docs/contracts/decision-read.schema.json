@@ -1,0 +1,1477 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:decision-read:0.1",
+  "title": "Read-only decision records; payload checks do not mint source trust",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "scope",
+    "cursor",
+    "as_of",
+    "current_state",
+    "decisions",
+    "events",
+    "evidence",
+    "validation",
+    "coverage",
+    "domain_digest"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "forex.decision-read/0.1"
+    },
+    "scope": {
+      "$ref": "#/$defs/scope"
+    },
+    "cursor": {
+      "$ref": "#/$defs/cursor"
+    },
+    "as_of": {
+      "$ref": "#/$defs/as_of"
+    },
+    "current_state": {
+      "$ref": "#/$defs/state"
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/decision"
+      },
+      "maxItems": 16
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/event"
+      },
+      "maxItems": 256
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidence"
+      },
+      "maxItems": 64
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "integrity",
+        "source_binding",
+        "reconciliation"
+      ],
+      "properties": {
+        "schema": {
+          "$ref": "#/$defs/check"
+        },
+        "integrity": {
+          "$ref": "#/$defs/check"
+        },
+        "source_binding": {
+          "$ref": "#/$defs/check"
+        },
+        "reconciliation": {
+          "$ref": "#/$defs/check"
+        }
+      }
+    },
+    "coverage": {
+      "$ref": "#/$defs/coverage"
+    },
+    "domain_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "$defs": {
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "environment_id",
+        "account_id",
+        "run_id",
+        "epoch",
+        "mode",
+        "ledger_schema",
+        "policy_id",
+        "policy_version",
+        "build_id",
+        "scenario_id",
+        "adapter_id"
+      ],
+      "properties": {
+        "environment_id": {
+          "const": "DISCONNECTED_SIMULATION"
+        },
+        "account_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "run_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mode": {
+          "const": "SIMULATED"
+        },
+        "ledger_schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "policy_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "policy_version": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "build_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "scenario_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "adapter_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        }
+      }
+    },
+    "cursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "ledger_prefix_sha256",
+        "current_state_revision",
+        "read_model_version"
+      ],
+      "properties": {
+        "sequence": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ledger_prefix_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "current_state_revision": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "read_model_version": {
+          "const": "forex.decision-read/0.1"
+        }
+      }
+    },
+    "as_of": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observed_at",
+        "available_at",
+        "generated_at",
+        "clock_basis",
+        "sequence_basis"
+      ],
+      "properties": {
+        "observed_at": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "available_at": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "generated_at": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "clock_basis": {
+          "enum": [
+            "SYNTHETIC_UTC",
+            "UNAVAILABLE"
+          ]
+        },
+        "sequence_basis": {
+          "enum": [
+            "CORE_LEDGER",
+            "UNAVAILABLE"
+          ]
+        }
+      }
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_id",
+        "record_version",
+        "record_sha256",
+        "unavailable_reason"
+      ],
+      "properties": {
+        "record_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "record_version": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "record_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 1024,
+              "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "uncertainty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field_or_claim",
+        "reason",
+        "action_effect",
+        "required_observation",
+        "origin_record_id"
+      ],
+      "properties": {
+        "field_or_claim": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+        },
+        "action_effect": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+        },
+        "required_observation": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+        },
+        "origin_record_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "complete",
+        "from_sequence",
+        "through_sequence",
+        "retained_count",
+        "total_known_count",
+        "omitted_ids",
+        "deferred_ids",
+        "reasons",
+        "next_cursor"
+      ],
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "from_sequence": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "through_sequence": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retained_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_known_count": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "omitted_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+          },
+          "maxItems": 128
+        },
+        "deferred_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+          },
+          "maxItems": 128
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 1024,
+            "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+          },
+          "maxItems": 32
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fact_id",
+        "label",
+        "value",
+        "evidence_ids"
+      ],
+      "properties": {
+        "fact_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+        },
+        "value": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+        },
+        "evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+          },
+          "maxItems": 128
+        }
+      }
+    },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "quantity",
+        "quantity_unit",
+        "side",
+        "limit_price",
+        "stop_price",
+        "quote_currency"
+      ],
+      "properties": {
+        "quantity": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quantity_unit": {
+          "const": "BASE_UNITS"
+        },
+        "side": {
+          "anyOf": [
+            {
+              "enum": [
+                "BUY",
+                "SELL"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "limit_price": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stop_price": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quote_currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "strategy_id",
+        "strategy_version",
+        "instrument_id",
+        "timeframe",
+        "action_kind",
+        "target",
+        "proposed_parameters",
+        "preconditions",
+        "known_facts",
+        "assumptions",
+        "reason_ids",
+        "evidence_ids",
+        "evaluation",
+        "eligibility",
+        "disposition",
+        "status_event_ref",
+        "uncertainty"
+      ],
+      "properties": {
+        "candidate_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "strategy_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "strategy_version": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "instrument_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "timeframe": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "action_kind": {
+          "enum": [
+            "OPEN",
+            "ADD",
+            "REDUCE",
+            "CLOSE",
+            "AMEND_STOP",
+            "CANCEL_ORDER",
+            "WAIT",
+            "HOLD",
+            "STAND_DOWN"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/reference"
+        },
+        "proposed_parameters": {
+          "$ref": "#/$defs/parameters"
+        },
+        "preconditions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 1024,
+            "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+          },
+          "maxItems": 32
+        },
+        "known_facts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/fact"
+          },
+          "maxItems": 64
+        },
+        "assumptions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 1024,
+            "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+          },
+          "maxItems": 32
+        },
+        "reason_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+          },
+          "maxItems": 128
+        },
+        "evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+          },
+          "maxItems": 128
+        },
+        "evaluation": {
+          "enum": [
+            "evaluated",
+            "not_evaluated",
+            "deferred"
+          ]
+        },
+        "eligibility": {
+          "enum": [
+            "eligible",
+            "blocked",
+            "unknown"
+          ]
+        },
+        "disposition": {
+          "enum": [
+            "selected",
+            "not_selected",
+            "rejected",
+            "expired",
+            "superseded"
+          ]
+        },
+        "status_event_ref": {
+          "$ref": "#/$defs/reference"
+        },
+        "uncertainty": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/uncertainty"
+          },
+          "maxItems": 32
+        }
+      }
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "provider",
+        "model_id",
+        "model_artifact_sha256",
+        "adapter_id",
+        "prompt_version",
+        "policy_version",
+        "request_sha256",
+        "response_sha256",
+        "invocation_sha256",
+        "effective_reasoning",
+        "started_at",
+        "completed_at",
+        "latency_ms",
+        "inference_receipt",
+        "budget_receipt"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "actual-inference",
+            "scripted",
+            "replay",
+            "deterministic-policy"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model_artifact_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "adapter_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "prompt_version": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "policy_version": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "request_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "response_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "invocation_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effective_reasoning": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 1024,
+              "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "latency_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inference_receipt": {
+          "$ref": "#/$defs/reference"
+        },
+        "budget_receipt": {
+          "$ref": "#/$defs/reference"
+        }
+      }
+    },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "wait",
+        "public_rationale",
+        "evidence_ids",
+        "reason_ids",
+        "unresolved_questions",
+        "proposed_bounds",
+        "source_state_id",
+        "source_state_revision",
+        "target"
+      ],
+      "properties": {
+        "candidate_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wait": {
+          "type": "boolean"
+        },
+        "public_rationale": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+        },
+        "evidence_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+          },
+          "maxItems": 128
+        },
+        "reason_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+          },
+          "maxItems": 128
+        },
+        "unresolved_questions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 1024,
+            "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+          },
+          "maxItems": 32
+        },
+        "proposed_bounds": {
+          "$ref": "#/$defs/parameters"
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "source_state_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "target": {
+          "$ref": "#/$defs/reference"
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision_id",
+        "revision",
+        "decision_kind",
+        "scope",
+        "cursor",
+        "observation_set_sha256",
+        "decided_at",
+        "opportunity_set_id",
+        "opportunity_set_version",
+        "opportunity_set_sha256",
+        "candidates",
+        "coverage",
+        "origin",
+        "selection",
+        "decision_status",
+        "status_reason",
+        "status_event_ref",
+        "admission_ref",
+        "intent_ref",
+        "dispatch_ref",
+        "outcome_refs",
+        "revision_of",
+        "revision_trigger_refs",
+        "superseded_by"
+      ],
+      "properties": {
+        "decision_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "decision_kind": {
+          "enum": [
+            "entry",
+            "management"
+          ]
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "cursor": {
+          "$ref": "#/$defs/cursor"
+        },
+        "observation_set_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "decided_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "opportunity_set_version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "opportunity_set_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/candidate"
+          },
+          "maxItems": 8
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage"
+        },
+        "origin": {
+          "$ref": "#/$defs/origin"
+        },
+        "selection": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/selection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "decision_status": {
+          "enum": [
+            "proposed",
+            "superseded",
+            "expired",
+            "invalid"
+          ]
+        },
+        "status_reason": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+        },
+        "status_event_ref": {
+          "$ref": "#/$defs/reference"
+        },
+        "admission_ref": {
+          "$ref": "#/$defs/reference"
+        },
+        "intent_ref": {
+          "$ref": "#/$defs/reference"
+        },
+        "dispatch_ref": {
+          "$ref": "#/$defs/reference"
+        },
+        "outcome_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reference"
+          },
+          "maxItems": 32
+        },
+        "revision_of": {
+          "$ref": "#/$defs/reference"
+        },
+        "revision_trigger_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reference"
+          },
+          "maxItems": 32
+        },
+        "superseded_by": {
+          "$ref": "#/$defs/reference"
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "sequence",
+        "event_kind",
+        "record",
+        "scope",
+        "observed_at",
+        "available_at",
+        "predecessor_ids",
+        "decision_id",
+        "command_id",
+        "effect",
+        "public_summary"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "event_kind": {
+          "enum": [
+            "DECISION",
+            "ADMISSION",
+            "DISPATCH",
+            "RECONCILIATION",
+            "REVISION",
+            "VENUE_RECEIPT",
+            "CONTROL"
+          ]
+        },
+        "record": {
+          "$ref": "#/$defs/reference"
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "available_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "predecessor_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+          },
+          "maxItems": 128
+        },
+        "decision_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "command_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effect": {
+          "anyOf": [
+            {
+              "enum": [
+                "ACKNOWLEDGED",
+                "PARTIALLY_FILLED",
+                "FILLED",
+                "CANCELLED",
+                "REJECTED",
+                "APPLIED",
+                "UNKNOWN"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "public_summary": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+        }
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "verifier_id",
+        "verifier_version",
+        "checked_scope_sha256",
+        "checked_cursor_sha256",
+        "external_anchor_id",
+        "reason"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "PASS",
+            "FAIL",
+            "NOT_RUN",
+            "UNKNOWN"
+          ]
+        },
+        "verifier_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "verifier_version": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "checked_scope_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "checked_cursor_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "external_anchor_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_id",
+        "source_record",
+        "producer_class",
+        "scope",
+        "observed_at",
+        "available_at",
+        "claim",
+        "assessment",
+        "locator",
+        "validation"
+      ],
+      "properties": {
+        "evidence_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+        },
+        "source_record": {
+          "$ref": "#/$defs/reference"
+        },
+        "producer_class": {
+          "enum": [
+            "MODEL_ASSERTION",
+            "AUTHORED_FIXTURE",
+            "ACTUAL_INFERENCE_RECEIPT",
+            "POLICY_EVALUATION",
+            "SIMULATOR_EVENT",
+            "RECONCILED_LEDGER_FACT"
+          ]
+        },
+        "scope": {
+          "$ref": "#/$defs/scope"
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "available_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "claim": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Producer and consumer additionally enforce at most 1024 UTF-8 bytes."
+        },
+        "assessment": {
+          "enum": [
+            "supported",
+            "contradicted",
+            "unresolved",
+            "missing"
+          ]
+        },
+        "locator": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "catalog_id",
+            "record_id"
+          ],
+          "properties": {
+            "catalog_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            "record_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            }
+          }
+        },
+        "validation": {
+          "$ref": "#/$defs/check"
+        }
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state_id",
+        "state_sha256",
+        "revision",
+        "observation_refs",
+        "permissions",
+        "exposure_facts",
+        "position_refs",
+        "unknowns",
+        "observed_at",
+        "valid_until",
+        "freshness",
+        "reconciliation"
+      ],
+      "properties": {
+        "state_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observation_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reference"
+          },
+          "maxItems": 64
+        },
+        "permissions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "new_risk",
+            "management",
+            "fence_ref"
+          ],
+          "properties": {
+            "new_risk": {
+              "enum": [
+                "ALLOWED",
+                "PAUSED",
+                "UNKNOWN"
+              ]
+            },
+            "management": {
+              "enum": [
+                "ALLOWED",
+                "STOPPED",
+                "UNKNOWN"
+              ]
+            },
+            "fence_ref": {
+              "$ref": "#/$defs/reference"
+            }
+          }
+        },
+        "exposure_facts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/fact"
+          },
+          "maxItems": 64
+        },
+        "position_refs": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/reference"
+              },
+              "maxItems": 64
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unknowns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/uncertainty"
+          },
+          "maxItems": 64
+        },
+        "observed_at": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "valid_until": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "freshness": {
+          "enum": [
+            "CURRENT",
+            "STALE",
+            "UNKNOWN"
+          ]
+        },
+        "reconciliation": {
+          "enum": [
+            "UNOBSERVED",
+            "RECONCILING",
+            "COHERENT",
+            "UNRESOLVED",
+            "QUARANTINED"
+          ]
+        }
+      }
+    }
+  },
+  "description": "Maximum serialized page 1 MiB, enforced before JSON parsing. Semantic rules and trusted external anchors are mandatory in DECISION_READ_V01.md."
+}

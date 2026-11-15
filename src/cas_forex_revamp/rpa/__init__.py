@@ -1,0 +1,1 @@
+"""Optional pure decision organization; no authority, dispatcher, or model client."""

@@ -1,0 +1,112 @@
+{
+  "$id": "urn:forex:custody-interface:counterparts",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "format": {
+      "const": "forex.custody-counterparts/1"
+    },
+    "pairs": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "equivalence": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "members": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "case_id": {
+                  "pattern": "^[a-f0-9]{32}$",
+                  "type": "string"
+                },
+                "steps": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "ordered_action_refs": {
+                        "items": {
+                          "pattern": "^[a-f0-9]{24}$",
+                          "type": "string"
+                        },
+                        "maxItems": 8,
+                        "minItems": 2,
+                        "type": "array",
+                        "uniqueItems": true
+                      },
+                      "semantic_action_refs": {
+                        "additionalProperties": {
+                          "pattern": "^[a-f0-9]{24}$",
+                          "type": "string"
+                        },
+                        "minProperties": 1,
+                        "propertyNames": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "type": "object"
+                      },
+                      "step_id": {
+                        "pattern": "^[a-f0-9]{24}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "step_id",
+                      "semantic_action_refs",
+                      "ordered_action_refs"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 5,
+                  "minItems": 1,
+                  "type": "array"
+                },
+                "strategy_role_map": {
+                  "additionalProperties": {
+                    "pattern": "^strategy-[a-f0-9]{24}$",
+                    "type": "string"
+                  },
+                  "minProperties": 1,
+                  "propertyNames": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "type": "object"
+                }
+              },
+              "required": [
+                "case_id",
+                "steps",
+                "strategy_role_map"
+              ],
+              "type": "object"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "type": "array"
+          },
+          "obligation_id": {
+            "$ref": "urn:forex:custody-interface:common#/$defs/obligation_id"
+          }
+        },
+        "required": [
+          "obligation_id",
+          "members",
+          "equivalence"
+        ],
+        "type": "object"
+      },
+      "maxItems": 8,
+      "minItems": 8,
+      "type": "array"
+    }
+  },
+  "required": [
+    "format",
+    "pairs"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,31 @@
+{
+  "scope": {
+    "account_id": "synthetic-account-1",
+    "run_id": "rehearsal-1",
+    "epoch": 1,
+    "build_id": "source-scaffold-0.1.0",
+    "policy_id": "synthetic-policy-1",
+    "scenario_id": "continuous-a-1",
+    "adapter_id": "independent-simulator-1",
+    "environment": "DISCONNECTED_SIMULATION"
+  },
+  "recovery": "UNOBSERVED",
+  "permissions": {
+    "new_risk": "UNKNOWN",
+    "management": "UNKNOWN",
+    "generation": null,
+    "confirmed_barrier_id": null
+  },
+  "observed_at": null,
+  "state_id": null,
+  "balance": null,
+  "equity": null,
+  "realized_pnl": null,
+  "open_pnl": null,
+  "positions": null,
+  "commands": [],
+  "last_decision": null,
+  "unresolved_command_ids": [],
+  "schema_version": "1.0",
+  "admissions_enabled": false
+}

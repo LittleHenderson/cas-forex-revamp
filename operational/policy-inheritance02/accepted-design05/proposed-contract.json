@@ -1,0 +1,1114 @@
+{
+  "format": "forex.policy-inheritance.proposed-spec/2",
+  "classification": "TYPED_SOURCE_DESIGN_NOT_REGISTERED_RUNTIME_SCHEMA",
+  "method_agreement": "ACCEPTED_FOR_SOURCE_SUCCESSOR_AS_COORDINATOR_RELAY",
+  "exact_contract_review": "STAGE_LOCAL_ORDERING_CORRECTION_FOR_REREVIEW_NOT_ACCEPTED",
+  "release_enabled": false,
+  "runtime_authorized": false,
+  "topology_activated": false,
+  "source04_accepts_method": false,
+  "normative_companion": "PROTOCOL.md",
+  "fixed_unsupported_routes": [
+    "PROC_ROOT_ACQUISITION",
+    "PROC_FD_REOPEN_OR_DUPLICATION",
+    "PROC_MEM_ACCESS",
+    "PTRACE_ACCESS",
+    "PROCESS_VM_READ_WRITE",
+    "PIDFD_GETFD",
+    "ARBITRARY_IPC_CAPABILITY_ACQUISITION",
+    "COMPROMISED_ADAPTER_KEY_OR_DESCRIPTOR_FORWARDING"
+  ],
+  "notation": {
+    "object_fields": "Every listed field is mandatory and the field set is exact. Nullable<T> permits explicit null; it does not permit field omission.",
+    "arrays": "array<T>[minimum,maximum] is ordered; identifiers are unique wherever protocol requires a set.",
+    "literals": "literal:text is an exact string; literal-integer:N and literal-bool:value enforce the corresponding exact JSON type; exact:fixed_unsupported_routes is the complete ordered constant array above.",
+    "primitives": {
+      "Id": "ASCII [A-Za-z0-9][A-Za-z0-9_.:-]{0,191}",
+      "Sha256": "64 lowercase hexadecimal characters",
+      "Hex128": "128 lowercase hexadecimal characters",
+      "Uuid": "canonical lowercase UUID text",
+      "Utc": "YYYY-MM-DDTHH:MM:SS.ffffffZ, actual UTC calendar time, no leap-second or alternate offset notation",
+      "UInt": "integer 0..9223372036854775807, never bool",
+      "PositiveInt": "integer 1..9223372036854775807, never bool",
+      "SignedInt": "integer -9223372036854775808..9223372036854775807, never bool",
+      "Bool": "exact JSON true or false",
+      "Int[low,high]": "inclusive exact integer bounds, never bool"
+    }
+  },
+  "enums": {
+    "AuthorityRole": [
+      "TRUSTED_CONTROLLER_WITNESS",
+      "INDEPENDENT_SETUP_CONSUMER",
+      "SETUP_BUDGET_ISSUER",
+      "INDEPENDENT_CHECKPOINT_CUSTODIAN"
+    ],
+    "Purpose": [
+      "policy-inheritance-witness-v2",
+      "policy-inheritance-setup-budget-v2",
+      "policy-inheritance-method-decision-v2",
+      "policy-inheritance-ingestion-ack-v2",
+      "policy-inheritance-checkpoint-v2",
+      "policy-inheritance-checkpoint-transition-v2"
+    ],
+    "Origin": [
+      "CONTROLLER",
+      "DECISION_BOOTSTRAP",
+      "MODEL_BOOTSTRAP"
+    ],
+    "EventKind": [
+      "SETUP_BEGIN",
+      "CALIBRATION_BEGIN",
+      "CALIBRATION_CASE",
+      "CALIBRATION_RETIRED",
+      "FINAL_CHANNEL_CREATED",
+      "RUNNER_INSTALL",
+      "MODEL_INSTALL",
+      "ASSET_BINDINGS",
+      "MODEL_POST_EXEC",
+      "FINAL_PEER_BOUND",
+      "POLICY_ARGUMENT",
+      "SETUP_SEAL",
+      "FAILURE"
+    ],
+    "EvidenceClass": [
+      "TRUSTED_BOOTSTRAP_REPORT",
+      "CONTROLLER_OS_READBACK",
+      "PUBLIC_RECEIVER_OBSERVATION",
+      "TRUSTED_SOURCE_ARGUMENT",
+      "INSTALLATION_INHERITANCE_ARGUMENT",
+      "CONTROLLER_STREAM_METADATA"
+    ],
+    "ArtifactKind": [
+      "CANONICAL_PAYLOAD",
+      "COVERAGE_PLAN",
+      "PUBLIC_FIXTURE",
+      "EXECUTABLE_PIN",
+      "PROC_IDENTITY",
+      "NAMESPACE_INVENTORY",
+      "MOUNT_INVENTORY",
+      "DESCRIPTOR_INVENTORY",
+      "INSTALL_ARGUMENTS",
+      "NORMALIZED_RULES",
+      "RULE_TARGET_INVENTORY",
+      "ASSET_INVENTORY",
+      "LISTENER_IDENTITY",
+      "EXEC_LINEAGE",
+      "IPC_SEND",
+      "IPC_RECEIVE",
+      "DESCRIPTOR_CLOSES",
+      "ENDPOINT_RETIREMENT",
+      "PROCESS_RETIREMENT",
+      "SOURCE_ARGUMENT",
+      "CHECKPOINT",
+      "TOPOLOGY_APPROVAL",
+      "WATCHDOG_BINDING",
+      "SETUP_BUDGET",
+      "SIGNED_ENVELOPE",
+      "EVENT_RECORD",
+      "METHOD_DECISION",
+      "INGESTION_ACK",
+      "AUTHENTICATED_INTERVAL",
+      "CHECKPOINT_TRANSITION",
+      "CHECKPOINT_CERTIFICATE",
+      "EXPOSED_OUTPUT",
+      "VERIFIER_TRACE"
+    ],
+    "CalibrationKind": [
+      "POSITIVE_INERT",
+      "BAD_MAC",
+      "BAD_SEQUENCE",
+      "BAD_CHANNEL_ID",
+      "BAD_FRAME",
+      "DELIVERED_RIGHTS",
+      "TRUNCATED_RIGHTS",
+      "WRONG_PEER_PID"
+    ],
+    "CalibrationVerdict": [
+      "ACCEPTED_INERT",
+      "AUTH_REJECTED",
+      "FRAMING_REJECTED",
+      "RIGHTS_REJECTED"
+    ],
+    "DescriptorType": [
+      "REGULAR",
+      "PIPE",
+      "SOCKET",
+      "CHAR",
+      "ANON",
+      "OTHER"
+    ],
+    "InstallOperation": [
+      "LANDLOCK_CREATE_RULESET",
+      "LANDLOCK_ADD_RULE",
+      "PR_SET_NO_NEW_PRIVS",
+      "LANDLOCK_RESTRICT_SELF"
+    ],
+    "DecisionStatus": [
+      "ACCEPTED_NARROW_METHOD",
+      "REJECTED",
+      "UNAVAILABLE"
+    ],
+    "AcceptedClaim": [
+      "TRUSTED_INSTALLATION_AND_INHERITANCE",
+      "PUBLIC_RECEIVER_CALIBRATION"
+    ],
+    "CleanupStatus": [
+      "CONFIRMED",
+      "FAILED",
+      "UNKNOWN"
+    ],
+    "FailureCode": [
+      "APPOINTMENT_UNAVAILABLE",
+      "SIGNER_UNAPPOINTED",
+      "SIGNATURE_DEPENDENCY_UNAVAILABLE",
+      "SIGNATURE_REJECTED",
+      "RAW_BYTES_MISMATCH",
+      "NONCANONICAL_RECORD",
+      "CONTEXT_MISMATCH",
+      "PURPOSE_MISMATCH",
+      "CLAIM_OUTSIDE_METHOD_SCOPE",
+      "UNSUPPORTED_ROUTE_RELABELED",
+      "CLOCK_DOMAIN_UNSUPPORTED",
+      "CLOCK_DRIFT",
+      "SETUP_DEADLINE_EXPIRED",
+      "BUDGET_RESET_ATTEMPT",
+      "SOURCE_OR_EXEC_IDENTITY_MISMATCH",
+      "INSTALLATION_FAILED_OR_UNOBSERVED",
+      "DESCRIPTOR_IDENTITY_MISMATCH",
+      "CALIBRATION_INCOMPLETE",
+      "CALIBRATION_WRONG_ORIGIN",
+      "CALIBRATION_UNEXPECTED_OUTCOME",
+      "CLEANUP_UNCONFIRMED",
+      "AUTHORITY_CREATED_EARLY",
+      "MISSING_SLOT",
+      "EXTRA_SLOT",
+      "SEQUENCE_GAP",
+      "DEPENDENCY_ORDER",
+      "REPLAY_OR_EQUIVOCATION",
+      "RETENTION_UNAVAILABLE",
+      "RETENTION_COMMIT_FAILED",
+      "CHECKPOINT_MISMATCH",
+      "INCOMPLETE_STREAM",
+      "DECODER_UNAVAILABLE",
+      "RAW_EVIDENCE_UNAVAILABLE",
+      "INDEPENDENT_WATCHDOG_UNAVAILABLE",
+      "RUNTIME_APPROVAL_ABSENT",
+      "APPOINTMENT_INTERVAL_INSUFFICIENT",
+      "APPOINTMENT_EXPIRED_OR_UNAVAILABLE",
+      "AUTHENTICATED_INTERVAL_EXPIRED",
+      "CALIBRATION_BASELINE_MISMATCH",
+      "CALIBRATION_REPLAY_NOT_DEMONSTRATED",
+      "CALIBRATION_EMPTY_RIGHTS",
+      "CALIBRATION_DESCRIPTOR_CLEANUP_INCOMPLETE",
+      "CHECKPOINT_ADVANCE_UNCONFIRMED",
+      "CHECKPOINT_AUTHORITY_UNAVAILABLE",
+      "CHECKPOINT_LEDGER_DIVERGENCE",
+      "BUDGET_ALREADY_CLAIMED",
+      "OUTPUT_NOT_CHECKPOINTED"
+    ],
+    "RejectionStage": [
+      "NONE",
+      "MAC",
+      "SEQUENCE",
+      "CHANNEL_ID",
+      "FRAME",
+      "ANCILLARY",
+      "PEER_CREDENTIALS"
+    ],
+    "CheckpointTransitionKind": [
+      "SETUP_RESERVATION",
+      "BUDGET_CLAIM",
+      "ACK_EXPOSURE",
+      "DECISION_EXPOSURE",
+      "TERMINAL_ABORT"
+    ],
+    "CheckpointClaimState": [
+      "RESERVED",
+      "CLAIMED",
+      "ABORTED"
+    ],
+    "OutputKind": [
+      "SETUP_BUDGET",
+      "INGESTION_ACK",
+      "METHOD_DECISION",
+      "NONE"
+    ],
+    "ExposedKind": [
+      "SETUP_BUDGET",
+      "INGESTION_ACK",
+      "METHOD_DECISION"
+    ]
+  },
+  "exact_object_fields": {
+    "Scope": {
+      "method_id": "literal:POLICY_INHERITANCE_TRUSTED_ADAPTER_V1",
+      "method_spec_sha256": "Sha256",
+      "source_manifest_sha256": "Sha256",
+      "config_sha256": "Sha256",
+      "topology_sha256": "Sha256",
+      "run_id": "Id",
+      "epoch": "PositiveInt",
+      "original_window_sha256": "Sha256",
+      "setup_identity": "Id"
+    },
+    "Binding": {
+      "scope": "Scope",
+      "appointment_sha256": "Sha256"
+    },
+    "ClockDomain": {
+      "boot_id": "Uuid",
+      "time_namespace_inode": "PositiveInt",
+      "clock_id": "literal:CLOCK_BOOTTIME"
+    },
+    "Stamp": {
+      "utc": "Utc",
+      "boottime_ns": "UInt"
+    },
+    "ObjectRef": {
+      "object_id": "Sha256",
+      "bytes": "Int[1,4194304]",
+      "sha256": "Sha256",
+      "artifact_kind": "ArtifactKind"
+    },
+    "Principal": {
+      "principal_id": "Id",
+      "role": "AuthorityRole",
+      "component_manifest_sha256": "Sha256",
+      "signer_public_sha256": "Sha256",
+      "allowed_purposes": "array<Purpose>[1,4]",
+      "not_before_utc": "Utc",
+      "expires_at_utc": "Utc"
+    },
+    "CoverageSlot": {
+      "slot_id": "Id",
+      "kind": "EventKind",
+      "origin": "Origin",
+      "after_slots": "array<Id>[0,255]",
+      "payload_decoder_sha256": "Sha256",
+      "expected_subject_id": "Id",
+      "required_raw_kinds": "array<ArtifactKind>[0,16]"
+    },
+    "CoveragePlan": {
+      "format": "literal:forex.policy-inheritance-coverage-plan/2",
+      "scope": "Scope",
+      "plan_id": "Id",
+      "slots": "array<CoverageSlot>[19,19]",
+      "calibration_plan": "array<CalibrationExpectation>[8,8]",
+      "max_records": "literal-integer:19",
+      "max_raw_bytes": "Int[1,67108864]",
+      "unsupported_routes": "exact:fixed_unsupported_routes"
+    },
+    "CalibrationExpectation": {
+      "case_id": "Id",
+      "slot_id": "Id",
+      "fixture_ref": "ObjectRef",
+      "case_kind": "CalibrationKind",
+      "expected_exchange_verdicts": "array<CalibrationVerdict>[1,2]",
+      "receiver_component_sha256": "Sha256",
+      "requires_foreign_pid": "Bool"
+    },
+    "Appointment": {
+      "format": "literal:forex.policy-inheritance-appointment/2",
+      "appointment_id": "Id",
+      "scope": "Scope",
+      "coverage_plan_sha256": "Sha256",
+      "principals": "array<Principal>[3,4]",
+      "clock_domain": "ClockDomain",
+      "not_before_utc": "Utc",
+      "expires_at_utc": "Utc",
+      "producer_staging_root_id": "Id",
+      "consumer_retention_root_id": "Id",
+      "independent_checkpoint_root_id": "Id",
+      "approved_runtime_topology_ref": "ObjectRef",
+      "watchdog_binding_ref": "ObjectRef",
+      "stream_id": "Id",
+      "checkpoint_authority_id": "Id"
+    },
+    "SetupBudget": {
+      "format": "literal:forex.policy-inheritance-setup-budget/2",
+      "binding": "Binding",
+      "budget_id": "Id",
+      "issuer_id": "Id",
+      "clock_domain": "ClockDomain",
+      "started": "Stamp",
+      "deadline": "Stamp",
+      "outer_deadline": "Stamp",
+      "maximum_seconds": "literal-integer:180",
+      "coverage_plan_sha256": "Sha256",
+      "appointment_interval_ref": "ObjectRef"
+    },
+    "AttestationBody": {
+      "format": "literal:forex.policy-inheritance-attestation/2",
+      "binding": "Binding",
+      "attestation_id": "Id",
+      "purpose": "Purpose",
+      "producer_id": "Id",
+      "record_sha256": "Sha256",
+      "record_bytes": "Int[1,1048576]",
+      "budget_sha256": "Nullable<Sha256>",
+      "issued": "Stamp",
+      "expires": "Stamp"
+    },
+    "SignedEnvelope": {
+      "body": "AttestationBody",
+      "algorithm": "literal:Ed25519",
+      "signer_sha256": "Sha256",
+      "signature_hex": "Hex128"
+    },
+    "Event": {
+      "format": "literal:forex.policy-inheritance-event/2",
+      "binding": "Binding",
+      "budget_sha256": "Sha256",
+      "stream_id": "Id",
+      "record_id": "Id",
+      "producer_id": "Id",
+      "sequence": "PositiveInt",
+      "previous_record_sha256": "Sha256",
+      "slot_id": "Id",
+      "kind": "EventKind",
+      "origin": "Origin",
+      "evidence_class": "EvidenceClass",
+      "observed_start": "Stamp",
+      "observed_end": "Stamp",
+      "recorded": "Stamp",
+      "payload_ref": "ObjectRef",
+      "raw_refs": "array<ObjectRef>[0,64]"
+    },
+    "ProcessIdentity": {
+      "boot_id": "Uuid",
+      "pid": "PositiveInt",
+      "start_ticks": "PositiveInt",
+      "parent_pid": "PositiveInt",
+      "uid": "UInt",
+      "gid": "UInt",
+      "exe_object_ref": "ObjectRef",
+      "exe_device": "UInt",
+      "exe_inode": "PositiveInt",
+      "namespace_inventory_ref": "ObjectRef",
+      "mount_inventory_ref": "ObjectRef"
+    },
+    "ThreadIdentity": {
+      "tid": "PositiveInt",
+      "start_ticks": "PositiveInt"
+    },
+    "DescriptorIdentity": {
+      "fd": "UInt",
+      "object_type": "DescriptorType",
+      "device": "UInt",
+      "inode": "UInt",
+      "access_flags": "UInt",
+      "close_on_exec": "Bool",
+      "selected_target_id": "Id"
+    },
+    "SyscallOutcome": {
+      "operation": "InstallOperation",
+      "arguments_ref": "ObjectRef",
+      "return_value": "SignedInt",
+      "errno": "Int[0,4095]",
+      "observed": "Stamp"
+    },
+    "SetupBeginPayload": {
+      "coverage_plan_sha256": "Sha256",
+      "producer_identity": "ProcessIdentity",
+      "budget_sha256": "Sha256"
+    },
+    "CalibrationBeginPayload": {
+      "receiver_identity": "ProcessIdentity",
+      "receiver_component_sha256": "Sha256",
+      "planned_case_ids": "array<Id>[8,8]",
+      "final_key_created": "literal-bool:false",
+      "private_documents_opened": "literal-bool:false"
+    },
+    "CalibrationCasePayload": {
+      "case_id": "Id",
+      "case_kind": "CalibrationKind",
+      "slot_id": "Id",
+      "fixture_ref": "ObjectRef",
+      "receiver_identity": "ProcessIdentity",
+      "receiver_component_sha256": "Sha256",
+      "expected_peer_identity": "ProcessIdentity",
+      "channel_instance_id": "Id",
+      "verifier_instance_id": "Id",
+      "channel_object_ids": "array<Id>[2,2]",
+      "public_fixture_key_id": "Id",
+      "exchanges": "array<CalibrationExchange>[1,2]"
+    },
+    "CalibrationRetiredPayload": {
+      "completed_case_ids": "array<Id>[8,8]",
+      "endpoint_retirement_ref": "ObjectRef",
+      "challenger_identity": "ProcessIdentity",
+      "process_retirement_ref": "ObjectRef",
+      "remaining_challenger_descendants": "literal-integer:0",
+      "unclosed_delivered_fds": "literal-integer:0",
+      "final_key_created": "literal-bool:false"
+    },
+    "FinalChannelCreatedPayload": {
+      "channel_id": "Id",
+      "endpoint_inventory_ref": "ObjectRef",
+      "key_generation_operation_id": "Id",
+      "calibration_retired_record_id": "Id",
+      "key_material_recorded": "literal-bool:false"
+    },
+    "InstallationPayload": {
+      "process_identity": "ProcessIdentity",
+      "threads": "array<ThreadIdentity>[1,1]",
+      "initial_descriptors": "array<DescriptorIdentity>[3,16]",
+      "expected_descriptor_plan_ref": "ObjectRef",
+      "normalized_rules_ref": "ObjectRef",
+      "rule_target_inventory_ref": "ObjectRef",
+      "landlock_abi": "Int[4,2147483647]",
+      "handled_fs": "UInt",
+      "syscalls": "array<SyscallOutcome>[4,256]",
+      "no_new_privs_readback": "literal-integer:1",
+      "parent_installation_record_id": "Nullable<Id>"
+    },
+    "AssetBindingsPayload": {
+      "selected_asset_manifest_sha256": "Sha256",
+      "actual_file_inventory_ref": "ObjectRef",
+      "hash_scan_started": "Stamp",
+      "hash_scan_completed": "Stamp"
+    },
+    "PostExecPayload": {
+      "wrapper_installation_record_id": "Id",
+      "actual_server_identity": "ProcessIdentity",
+      "asset_binding_record_id": "Id",
+      "owned_listener_ref": "ObjectRef",
+      "wrapper_to_exec_identity_ref": "ObjectRef"
+    },
+    "FinalPeerPayload": {
+      "channel_created_record_id": "Id",
+      "channel_id": "Id",
+      "actual_peer_identity": "ProcessIdentity",
+      "first_packet_ref": "ObjectRef",
+      "actual_ucred": "array<UInt>[3,3]",
+      "model_post_exec_record_id": "Id"
+    },
+    "PolicyArgumentPayload": {
+      "installation_record_ids": "array<Id>[2,2]",
+      "post_exec_record_id": "Id",
+      "source_argument_ref": "ObjectRef",
+      "claim": "literal:TRUSTED_INSTALLATION_AND_INHERITANCE",
+      "non_forwarding_status": "literal:ASSUMPTION_BOUND_NON_FORWARDING",
+      "unsupported_routes": "exact:fixed_unsupported_routes",
+      "every_task_post_exec_probes_claimed": "literal-bool:false"
+    },
+    "SealEntry": {
+      "sequence": "PositiveInt",
+      "record_id": "Id",
+      "record_sha256": "Sha256"
+    },
+    "SetupSealPayload": {
+      "entries": "array<SealEntry>[18,18]",
+      "covered_slot_ids": "array<Id>[18,18]",
+      "previous_head_sha256": "Sha256",
+      "previous_record_count": "literal-integer:18",
+      "unsupported_routes": "exact:fixed_unsupported_routes"
+    },
+    "FailurePayload": {
+      "failed_slot_id": "Nullable<Id>",
+      "code": "FailureCode",
+      "last_retained_record_id": "Nullable<Id>",
+      "authority_created": "Bool",
+      "cleanup_status": "CleanupStatus"
+    },
+    "ConsumerDecision": {
+      "format": "literal:forex.policy-inheritance-method-decision/2",
+      "binding": "Binding",
+      "consumer_id": "Id",
+      "decision_id": "Id",
+      "budget_sha256": "Sha256",
+      "stream_id": "Id",
+      "status": "DecisionStatus",
+      "failure_code": "Nullable<FailureCode>",
+      "sealed_head_sha256": "Nullable<Sha256>",
+      "retained_prefix_head_sha256": "Nullable<Sha256>",
+      "retained_record_count": "Int[0,19]",
+      "retention_commit_id": "Id",
+      "decided": "Stamp",
+      "expires": "Stamp",
+      "accepted_claims": "array<AcceptedClaim>[0,2]",
+      "unsupported_routes": "exact:fixed_unsupported_routes",
+      "evidence_classes": "array<EvidenceClass>[0,6]",
+      "completion_scoring_publication_authority": "literal-bool:false",
+      "authenticated_interval_ref": "ObjectRef"
+    },
+    "IngestionAck": {
+      "format": "literal:forex.policy-inheritance-ingestion-ack/2",
+      "binding": "Binding",
+      "consumer_id": "Id",
+      "stream_id": "Id",
+      "sequence": "PositiveInt",
+      "record_sha256": "Sha256",
+      "retention_commit_id": "Id",
+      "acknowledged": "Stamp",
+      "budget_sha256": "Sha256"
+    },
+    "ConsumerCheckpoint": {
+      "format": "literal:forex.policy-inheritance-checkpoint/2",
+      "binding": "Binding",
+      "original_setup_key": "OriginalSetupKey",
+      "checkpoint_authority_id": "Id",
+      "checkpoint_id": "Id",
+      "generation": "PositiveInt",
+      "previous_checkpoint_sha256": "Sha256",
+      "transition_request_ref": "ObjectRef",
+      "transition_kind": "CheckpointTransitionKind",
+      "budget_id": "Id",
+      "budget_sha256": "Sha256",
+      "stream_id": "Id",
+      "event_sequence": "UInt",
+      "event_head_sha256": "Sha256",
+      "consumer_prepare_commit_id": "Id",
+      "output": "OutputBinding",
+      "claim_state": "CheckpointClaimState",
+      "checkpointed_at": "Stamp",
+      "original_budget_body_ref": "ObjectRef"
+    },
+    "EvaluationResult": {
+      "status": "DecisionStatus",
+      "decision_ref": "Nullable<ObjectRef>",
+      "failure_code": "Nullable<FailureCode>"
+    },
+    "CloseOutcome": {
+      "descriptor": "DescriptorIdentity",
+      "close_return": "literal-integer:0",
+      "close_errno": "literal-integer:0",
+      "closed_at": "Stamp",
+      "raw_close_ref": "ObjectRef"
+    },
+    "CalibrationExchange": {
+      "exchange_index": "Int[1,2]",
+      "observed_start": "Stamp",
+      "observed_end": "Stamp",
+      "actual_sender_identity": "ProcessIdentity",
+      "sent_record_ref": "ObjectRef",
+      "recv_record_ref": "ObjectRef",
+      "sent_application_packet_sha256": "Sha256",
+      "sent_frames_sha256": "Sha256",
+      "received_frames_sha256": "Sha256",
+      "send_return": "PositiveInt",
+      "send_errno": "literal-integer:0",
+      "recv_return": "PositiveInt",
+      "recv_errno": "literal-integer:0",
+      "actual_ucred": "Nullable<CredentialTriple>",
+      "msg_trunc": "Bool",
+      "msg_ctrunc": "Bool",
+      "recv_seq_before": "UInt",
+      "recv_seq_after": "UInt",
+      "receiver_closed_before": "Bool",
+      "receiver_closed_after": "Bool",
+      "verdict": "CalibrationVerdict",
+      "rejection_stage": "RejectionStage",
+      "verifier_trace_ref": "ObjectRef",
+      "handler_entries_before": "literal-integer:0",
+      "handler_entries_after": "literal-integer:0",
+      "delivered_fds": "array<DescriptorIdentity>[0,256]",
+      "close_outcomes": "array<CloseOutcome>[0,256]"
+    },
+    "CredentialTriple": {
+      "pid": "PositiveInt",
+      "uid": "UInt",
+      "gid": "UInt"
+    },
+    "AuthenticatedInterval": {
+      "binding": "Binding",
+      "not_before_utc": "Utc",
+      "expires_at_utc": "Utc",
+      "appointment_authentication_refs": "array<ObjectRef>[1,16]",
+      "principal_authority_refs": "array<ObjectRef>[3,16]",
+      "dependency_attestation_refs": "array<ObjectRef>[0,256]",
+      "validated_at": "Stamp"
+    },
+    "OriginalSetupKey": {
+      "run_id": "Id",
+      "original_window_sha256": "Sha256",
+      "setup_identity": "Id"
+    },
+    "OutputBinding": {
+      "kind": "OutputKind",
+      "body_ref": "Nullable<ObjectRef>",
+      "attestation_ref": "Nullable<ObjectRef>"
+    },
+    "CheckpointAdvanceRequest": {
+      "format": "literal:forex.policy-inheritance-checkpoint-transition/2",
+      "binding": "Binding",
+      "original_setup_key": "OriginalSetupKey",
+      "transition_id": "Id",
+      "transition_kind": "CheckpointTransitionKind",
+      "requester_id": "Id",
+      "expected_generation": "UInt",
+      "expected_checkpoint_sha256": "Sha256",
+      "budget_id": "Id",
+      "budget_sha256": "Sha256",
+      "stream_id": "Id",
+      "event_sequence": "UInt",
+      "event_head_sha256": "Sha256",
+      "consumer_prepare_commit_id": "Id",
+      "output": "OutputBinding",
+      "claim_state": "CheckpointClaimState",
+      "prepared_at": "Stamp",
+      "original_budget_body_ref": "ObjectRef"
+    },
+    "ExposedOutput": {
+      "format": "literal:forex.policy-inheritance-exposed-output/2",
+      "binding": "Binding",
+      "kind": "ExposedKind",
+      "body_ref": "ObjectRef",
+      "attestation_ref": "ObjectRef",
+      "checkpoint_ref": "ObjectRef",
+      "checkpoint_attestation_ref": "ObjectRef"
+    }
+  },
+  "payload_type_by_event_kind": {
+    "SETUP_BEGIN": "SetupBeginPayload",
+    "CALIBRATION_BEGIN": "CalibrationBeginPayload",
+    "CALIBRATION_CASE": "CalibrationCasePayload",
+    "CALIBRATION_RETIRED": "CalibrationRetiredPayload",
+    "FINAL_CHANNEL_CREATED": "FinalChannelCreatedPayload",
+    "RUNNER_INSTALL": "InstallationPayload",
+    "MODEL_INSTALL": "InstallationPayload",
+    "ASSET_BINDINGS": "AssetBindingsPayload",
+    "MODEL_POST_EXEC": "PostExecPayload",
+    "FINAL_PEER_BOUND": "FinalPeerPayload",
+    "POLICY_ARGUMENT": "PolicyArgumentPayload",
+    "SETUP_SEAL": "SetupSealPayload",
+    "FAILURE": "FailurePayload"
+  },
+  "authentication": {
+    "algorithm": "Ed25519",
+    "domain_separator_ascii": "CAS_FOREX_POLICY_INHERITANCE_V2\n",
+    "signature_message": "domain_separator_ascii bytes followed by canonical AttestationBody bytes",
+    "key_selection": "external authenticated Appointment, not envelope or model input",
+    "raw_binding": "attestation record_sha256 and record_bytes bind exact canonical record bytes; nested ObjectRef hashes/lengths bind exact authenticated artifacts",
+    "object_resolution": "ObjectRef.object_id equals sha256; resolve only under externally selected roots, never record-supplied path/URL",
+    "budget_signature": "The SetupBudget attestation has budget_sha256=null because its record_sha256 binds that budget. Every other envelope binds its exact hash. Budget exposure additionally requires an independently committed checkpoint certificate."
+  },
+  "scope_limits": {
+    "accepted_method_claims": [
+      "TRUSTED_INSTALLATION_AND_INHERITANCE",
+      "PUBLIC_RECEIVER_CALIBRATION"
+    ],
+    "non_forwarding": "ASSUMPTION_BOUND_NON_FORWARDING",
+    "no_equivalence": [
+      "every-task post-exec denial matrix",
+      "compromised-controller safety",
+      "complete syscall or transient-task trace",
+      "test completion",
+      "independent original-attempt score",
+      "redaction approval",
+      "private release or publication"
+    ]
+  },
+  "activation_gates": [
+    "exact-byte contract/semantics review",
+    "successor implementation and independent integration review",
+    "real external appointments and pinned signature dependency",
+    "protected retention/checkpoint and watchdog route",
+    "temporary public challenger approval and confirmed retirement before final authority",
+    "separately authorized original runtime window"
+  ],
+  "current_execution_status": {
+    "application_imports": 0,
+    "tests": "NOT_RUN",
+    "model_calls": 0,
+    "aws_calls": 0,
+    "private_data_read": false,
+    "credential_operations": 0
+  },
+  "role_purpose_allowlists": {
+    "TRUSTED_CONTROLLER_WITNESS": [
+      "policy-inheritance-witness-v2"
+    ],
+    "INDEPENDENT_SETUP_CONSUMER": [
+      "policy-inheritance-method-decision-v2",
+      "policy-inheritance-ingestion-ack-v2",
+      "policy-inheritance-setup-budget-v2",
+      "policy-inheritance-checkpoint-transition-v2"
+    ],
+    "SETUP_BUDGET_ISSUER": [
+      "policy-inheritance-setup-budget-v2",
+      "policy-inheritance-checkpoint-transition-v2"
+    ],
+    "INDEPENDENT_CHECKPOINT_CUSTODIAN": [
+      "policy-inheritance-checkpoint-v2"
+    ]
+  },
+  "proposed_ports": {
+    "constructor": "Inert typed configuration validation only; no runtime/key/store action.",
+    "issue_setup_budget": "Load the exact independently reserved original budget -> signed local durable prepare -> independent BUDGET_CLAIM generation 2 -> current authority/time checks -> ExposedOutput. No reservation/claim confirmation means no issuance.",
+    "accept_witness": "Exact authenticated Event/raw artifacts -> local durable prepare -> independent ACK_EXPOSURE checkpoint binding exact ack bytes -> fresh guards -> ExposedOutput.",
+    "evaluate_setup": "Complete required stream and full authority validity -> local exact decision -> independent DECISION_EXPOSURE checkpoint -> fresh guards -> EvaluationResult referring to ExposedOutput.",
+    "checkpoint_compare_and_append": "Independently selected custodian authenticates initial reservation authorization or later transition purpose, exact previous generation/head and original setup key; durably appends and returns retained certificate. Recovery only reads/reuses exact requests, never retries with new IDs/start/head.",
+    "checkpoint_read_current": "Authenticated fresh read from independent failure/restore domain; unavailable/uncertain current state fails closed. Not a new budget/ack/decision or reset.",
+    "recover_exposure": "Only exact complete durable pending output plus matching independent committed transition can resume exposure under current original bounds; otherwise UNAVAILABLE. No replacement IDs or signatures.",
+    "release_consume": "Separate release authority checks current appointment/decision/evidence intervals and independent high-water checkpoint immediately before one-use consumption. No release implementation or approval here.",
+    "reserve_original_setup": "Exactly one externally authorized initial invocation durably reserves OriginalSetupKey and exact unsigned budget bytes/start/ID in the independent store before signing/exposure; generation 1, output NONE. Recovery never calls this port anew."
+  },
+  "cross_field_rules": [
+    "All nested bindings match independently selected context. Raw canonical bytes and exact attestation purpose/signer/context are authenticated; hashes alone confer no authority. Proposed /2 records and V2 signature domain cannot be interpreted as prior /1 records.",
+    "Appointment principal count is exactly producer, independent consumer and independent checkpoint custodian, with optional separate budget issuer. Producer/consumer/checkpoint identities and keys differ. Checkpoint store is outside consumer-ledger backup/restore and write authority.",
+    "Compute the effective appointment/principal/authorizer authenticated interval. It must contain the entire original SetupBudget interval: effective_not_before <= budget.started.utc and budget.deadline.utc <= effective_expires. Compute the original deadline from start+180/outer first; do not shorten it to fit authority expiry. Reject insufficient coverage.",
+    "Require current appointment/principal/authorizer validity and fresh UTC/boot-time budget checks before and after every blocking read/hash/signature/checkpoint operation, before and after local/independent commits, and immediately before output acceptance/exposure and release consumption. Unknown authority validity fails closed.",
+    "Decision and its attestation expiry cannot exceed the minimum of original setup deadline, effective authenticated appointment/principal interval, all relied-on attestation expiries and original outer window. Decision authenticated_interval_ref binds that independently verified intersection; no expired dependency can be used.",
+    "One original 180-second budget covers all method work; no clock reset or new allowance after a retry/startup/recovery. Appointments must cover its entire interval, while shorter witness intervals can only shorten decision validity or cause rejection, never renew setup.",
+    "CoveragePlan contains exactly 19 required slots: one each nonfailure EventKind except CALIBRATION_CASE, which has exactly eight slots. CalibrationExpectation has exactly one entry for each CalibrationKind; unique case IDs and slot IDs map bijectively to those eight CALIBRATION_CASE slots. No optional/substitute/duplicate cases.",
+    "Every calibration case follows fixed_calibration_baseline exactly. BAD_SEQUENCE has two exchanges on one unchanged verifier/channel/key: initial accepted packet, then identical application and frame bytes rejected as replay; no reset or changed sequence/MAC/body.",
+    "WRONG_PEER_PID carries actual live independently identified foreign sender and real kernel credentials: actual_ucred.pid equals sender.pid and differs from live expected_peer.pid; same expected UID/GID and otherwise valid packet. No configured PID swap or failed-before-receive operation counts.",
+    "DELIVERED_RIGHTS and TRUNCATED_RIGHTS each have a nonempty actual delivered_fds set and one successful close outcome per delivered FD identity, before rejection/exposure. TRUNCATED_RIGHTS additionally requires actual MSG_CTRUNC and no MSG_TRUNC. Missing/empty rights or uncertain close fails; undelivered kernel-closed descriptors are not claimed as observed closes.",
+    "All eight cases use actual controller receiver/verifier, public data, successful actual send and recv, zero handler entries and unique disposable channel instances. Only BAD_SEQUENCE reuses its own channel for its second exchange. All calibration endpoints/challenger/descendants retire before final key/channel authority.",
+    "OriginalSetupKey deliberately excludes replaceable appointment/source/config/epoch. Independent checkpoint authority serializes one claim per original run/window/setup identity. A changed binding cannot obtain a fresh budget under that key.",
+    "Prepare exact signed budget/ack/decision bytes and immutable IDs in durable local pending state. Advance the independent checkpoint by authenticated compare-and-append against the exact previous generation/head, binding those exact output bytes. Durably confirm and freshly reread it, commit local exposure state, refresh all validity/time checks, then expose an ExposedOutput. Never expose before the independent advance is confirmed.",
+    "Independent checkpoint must be durably outside consumer-ledger rollback, not merely a hash or another table in its database. Missing/rolled-back/uncertain checkpoint, local/independent divergence without an exact durable pending transition, expired validity or unavailable authority returns UNAVAILABLE. No automatic reminting or inferred-empty reset.",
+    "A crash with complete matching local prepared bytes and an authenticated matching committed checkpoint may finish exposing only those same bytes/IDs after fresh validity checks. All other ambiguous recovery fails closed; no re-signing/replacement acknowledgement, no new decision/budget. Retrieval of an old exposed output grants no fresh authority/time/release.",
+    "ExposedOutput references signed body/envelope and signed independent checkpoint certificate. The certificate must bind exactly those body/envelope references. Output bodies do not refer to the checkpoint that hashes them; no self-referential digest cycle. Verify the checkpoint against current independent high-water history before acceptance/release.",
+    "Producer events remain consecutive 1..N with exact prior raw hash, selected origins/evidence classes and dependencies; observation_start <= observation_end <= recorded. Each normal event fills one selected slot. FAILURE uses reserved terminal-failure and terminates an incomplete prefix; no later success or seal.",
+    "The successful seal is sequence 19 and covers exactly the prior 18 entries/slots; union with its own slot equals the required plan. Failure prefixes are retained but cannot satisfy required coverage.",
+    "Accepted decision carries exactly both AcceptedClaim values, all fixed unsupported routes, no failure code and complete retained coverage. Broad acquisition/every-task-denial purposes are rejected even if signatures are valid; non-forwarding remains assumption-bound.",
+    "After setup or authority expiry no new signed method decision/ack/budget is exposed. Return UNAVAILABLE with no active receipt; any outer-window failure audit is separate and cannot confer acceptance. A signature/checkpoint/commit that crosses the deadline grants no grace.",
+    "Future native workers still require existing per-invocation identity/mapping/socket/token gates and original call budgets. Prior staging/test hashes do not fill in-budget method ASSET_BINDINGS. No model/test/runtime execution is authorized by this design.",
+    "One separately authorized initial invocation performs SETUP_RESERVATION generation 1 in the independent store, pinning and retaining the original unsigned budget body, ID/start/deadline and binding with output NONE before signing or local consumer preparation can lead to exposure. It spends the OriginalSetupKey. Only exact read/recovery follows an uncertain result; missing local state or absent readback never permits a new initial invocation.",
+    "BUDGET_CLAIM generation 2 must match the reserved original budget body/ID/start/deadline exactly, with event sequence 0/zero event head and the exact signed budget output. It is independently committed and confirmed before budget exposure. No change of binding/time/ID or second candidate is permitted.",
+    "Every authority refresh recomputes the authenticated validity intersection from externally selected authority inputs, not a producer-provided interval or cached boolean. Full original-budget coverage is checked at reservation, claim and later acceptance; existing shortest dependency validity additionally caps decision expiry.",
+    "CALIBRATION_CASE slot expected_subject_id equals its unique expectation case_id; payload slot_id/case_kind/case_id match that entry. Begin/retired case lists equal the eight expected IDs in CalibrationKind order. Exchange vectors and all preconditions match fixed_calibration_baseline; no expected outcome field is freely selectable.",
+    "Every nontruncated calibration exchange requires actual_ucred matching actual sender identity; all cases except WRONG_PEER_PID also match the expected peer. Msg flags, delivery cardinality, receiver sequence/closure and exact close bijection are mandatory, not producer truth flags. Zero delivery cannot satisfy a rights case.",
+    "OutputBinding NONE has both references null and appears only for reservation/terminal abort. Every other output has nonnull exact body and attestation references with matching kind. No ExposedOutput can use NONE.",
+    "Checkpoint generation increments exactly once from expected generation and binds the exact expected predecessor. SETUP_RESERVATION is only absent->generation1/RESERVED with sequence0/zero head; BUDGET_CLAIM is only generation1->2/CLAIMED with the same budget. ACK_EXPOSURE follows the next retained event sequence; DECISION_EXPOSURE binds the unchanged retained head, which must be sealed for acceptance. Aborted/decided terminal streams cannot advance to fresh success.",
+    "After authenticated checkpoint freshness confirmation, a release validator must also refresh the appointment/principal/dependency expiry intersection and both original clock bounds immediately before one-use consumption. A checkpoint that remains stored cannot revive expired authority.",
+    "Attestation issuance is within the original budget and no earlier than the bound record observation/recording time; budget attestation issuance is no earlier than its original start. Require issued < expires <= original setup deadline in both clocks, effective authenticated authority interval coverage, and issued <= fresh current time < expires. Future-issued, expired or mismatched-clock attestations reject.",
+    "Each event and signature retains the exact selected source/config/run/epoch/appointment/method/budget bindings and purpose. A valid checkpoint signature does not excuse a bad or expired underlying body signature, missing raw artifact, wrong origin or unsupported semantic claim.",
+    "Every mandatory_payload_checks entry is normative. The independent consumer must decode and enforce each applicable non-calibration payload predicate before positive ACK_EXPOSURE, slot acceptance or a method decision. Authenticated slot presence, signatures and checkpoint persistence do not substitute for successful outcomes or cross-record identity/policy matching.",
+    "Preserve evidence labels: trusted-bootstrap results remain TRUSTED_BOOTSTRAP_REPORT, controller actual reads remain CONTROLLER_OS_READBACK, and neither is independent kernel tracing. Raw failure evidence may be retained for audit but cannot fill a successful required slot or receive a positive successful-slot acknowledgement.",
+    "Validate the selected coverage dependency graph before reserving setup: known unique slots, no self-edge, no cycle, no omitted mandatory dependency and a topological order compatible with fixed calibration order, policy sequence 18 and seal sequence 19. Each event requires only its accepted predecessor slots, current authenticated payload/raw facts and independently selected inputs. In the chosen event order all prerequisites must precede the event; a future or implicit forward prerequisite is DEPENDENCY_ORDER.",
+    "Semantic validation of a current event precedes preparation of its exact ACK and independent checkpoint/exposure. Current seal validation uses eighteen accepted predecessors plus the current seal, not its own already accepted record. Accepted decision validation uses all nineteen accepted records and the confirmed seal checkpoint, then prepares and anchors its own exact decision. No stage requires its own later output/certificate to construct or semantically validate itself.",
+    "Raw observation/capture is distinct from successful-slot acceptance. Trusted controller transport can collect and authenticate raw bootstrap/peer observations before emitting the corresponding ordered witness records. Installation authentication must not depend on an already accepted FINAL_PEER_BOUND record; actual transport checks and appointed producer/decoder/raw authentication remain required. Raw selected identity facts do not require a future accepted ASSET_BINDINGS slot, while MODEL_POST_EXEC still requires accepted ASSET_BINDINGS. No capture, label or transport success alone grants acceptance or private release."
+  ],
+  "reserved_failure_slot_id": "terminal-failure",
+  "event_origin_and_evidence_class": {
+    "SETUP_BEGIN": {
+      "origin": "CONTROLLER",
+      "evidence_class": "CONTROLLER_STREAM_METADATA"
+    },
+    "CALIBRATION_BEGIN": {
+      "origin": "CONTROLLER",
+      "evidence_class": "PUBLIC_RECEIVER_OBSERVATION"
+    },
+    "CALIBRATION_CASE": {
+      "origin": "CONTROLLER",
+      "evidence_class": "PUBLIC_RECEIVER_OBSERVATION"
+    },
+    "CALIBRATION_RETIRED": {
+      "origin": "CONTROLLER",
+      "evidence_class": "PUBLIC_RECEIVER_OBSERVATION"
+    },
+    "FINAL_CHANNEL_CREATED": {
+      "origin": "CONTROLLER",
+      "evidence_class": "CONTROLLER_OS_READBACK"
+    },
+    "RUNNER_INSTALL": {
+      "origin": "DECISION_BOOTSTRAP",
+      "evidence_class": "TRUSTED_BOOTSTRAP_REPORT"
+    },
+    "MODEL_INSTALL": {
+      "origin": "MODEL_BOOTSTRAP",
+      "evidence_class": "TRUSTED_BOOTSTRAP_REPORT"
+    },
+    "ASSET_BINDINGS": {
+      "origin": "CONTROLLER",
+      "evidence_class": "CONTROLLER_OS_READBACK"
+    },
+    "MODEL_POST_EXEC": {
+      "origin": "CONTROLLER",
+      "evidence_class": "CONTROLLER_OS_READBACK"
+    },
+    "FINAL_PEER_BOUND": {
+      "origin": "CONTROLLER",
+      "evidence_class": "CONTROLLER_OS_READBACK"
+    },
+    "POLICY_ARGUMENT": {
+      "origin": "CONTROLLER",
+      "evidence_class": "INSTALLATION_INHERITANCE_ARGUMENT"
+    },
+    "SETUP_SEAL": {
+      "origin": "CONTROLLER",
+      "evidence_class": "CONTROLLER_STREAM_METADATA"
+    },
+    "FAILURE": {
+      "origin": "CONTROLLER",
+      "evidence_class": "CONTROLLER_STREAM_METADATA"
+    }
+  },
+  "design_successor": "05",
+  "calibration_semantics_companion": "CALIBRATION.md",
+  "checkpoint_protocol_companion": "CHECKPOINTS.md",
+  "fixed_calibration_baseline": {
+    "POSITIVE_INERT": {
+      "exchange_verdicts": [
+        "ACCEPTED_INERT"
+      ],
+      "rejection_stages": [
+        "NONE"
+      ],
+      "foreign_pid": false,
+      "delivered_rights_minimum": 0,
+      "delivered_rights_maximum": 0,
+      "recv_sequences": [
+        [
+          0,
+          1
+        ]
+      ],
+      "closed_after": [
+        false
+      ],
+      "predicate": "Valid exact packet/MAC/channel/first sequence and actual expected credentials; return inert fixture, no handler dispatch."
+    },
+    "BAD_MAC": {
+      "exchange_verdicts": [
+        "AUTH_REJECTED"
+      ],
+      "rejection_stages": [
+        "MAC"
+      ],
+      "foreign_pid": false,
+      "delivered_rights_minimum": 0,
+      "delivered_rights_maximum": 0,
+      "recv_sequences": [
+        [
+          0,
+          0
+        ]
+      ],
+      "closed_after": [
+        true
+      ],
+      "predicate": "Only MAC invalid; valid body/channel/sequence/frame and expected credentials; actual verifier reaches MAC gate."
+    },
+    "BAD_SEQUENCE": {
+      "exchange_verdicts": [
+        "ACCEPTED_INERT",
+        "AUTH_REJECTED"
+      ],
+      "rejection_stages": [
+        "NONE",
+        "SEQUENCE"
+      ],
+      "foreign_pid": false,
+      "delivered_rights_minimum": 0,
+      "delivered_rights_maximum": 0,
+      "recv_sequences": [
+        [
+          0,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "closed_after": [
+        false,
+        true
+      ],
+      "predicate": "Replay identical first accepted application packet and wire frames on same unchanged receiver/verifier/channel/key and expected sender. Exactly two exchanges, no reset."
+    },
+    "BAD_CHANNEL_ID": {
+      "exchange_verdicts": [
+        "AUTH_REJECTED"
+      ],
+      "rejection_stages": [
+        "CHANNEL_ID"
+      ],
+      "foreign_pid": false,
+      "delivered_rights_minimum": 0,
+      "delivered_rights_maximum": 0,
+      "recv_sequences": [
+        [
+          0,
+          0
+        ]
+      ],
+      "closed_after": [
+        true
+      ],
+      "predicate": "Only channel ID mismatches receiver; MAC valid for supplied body and sequence 1, valid frame and expected credentials."
+    },
+    "BAD_FRAME": {
+      "exchange_verdicts": [
+        "FRAMING_REJECTED"
+      ],
+      "rejection_stages": [
+        "FRAME"
+      ],
+      "foreign_pid": false,
+      "delivered_rights_minimum": 0,
+      "delivered_rights_maximum": 0,
+      "recv_sequences": [
+        [
+          0,
+          0
+        ]
+      ],
+      "closed_after": [
+        true
+      ],
+      "predicate": "Actual received complete datagram has deliberately invalid offset/length framing selected in public fixture; credentials valid, no ancillary rights or truncation. Missing packet/timeout cannot count."
+    },
+    "DELIVERED_RIGHTS": {
+      "exchange_verdicts": [
+        "RIGHTS_REJECTED"
+      ],
+      "rejection_stages": [
+        "ANCILLARY"
+      ],
+      "foreign_pid": false,
+      "delivered_rights_minimum": 1,
+      "delivered_rights_maximum": 256,
+      "recv_sequences": [
+        [
+          0,
+          0
+        ]
+      ],
+      "closed_after": [
+        true
+      ],
+      "predicate": "Actual nonempty SCM_RIGHTS delivered with otherwise valid frame/body/expected credentials; no MSG_CTRUNC/MSG_TRUNC; every delivered descriptor closed before rejection."
+    },
+    "TRUNCATED_RIGHTS": {
+      "exchange_verdicts": [
+        "FRAMING_REJECTED"
+      ],
+      "rejection_stages": [
+        "ANCILLARY"
+      ],
+      "foreign_pid": false,
+      "delivered_rights_minimum": 1,
+      "delivered_rights_maximum": 256,
+      "recv_sequences": [
+        [
+          0,
+          0
+        ]
+      ],
+      "closed_after": [
+        true
+      ],
+      "predicate": "Actual ancillary MSG_CTRUNC, no MSG_TRUNC, nonempty delivered SCM_RIGHTS prefix; close every actually delivered descriptor before truncated-record rejection. Credentials may be unavailable only in this case; no expected-credential claim substitutes for observation."
+    },
+    "WRONG_PEER_PID": {
+      "exchange_verdicts": [
+        "AUTH_REJECTED"
+      ],
+      "rejection_stages": [
+        "PEER_CREDENTIALS"
+      ],
+      "foreign_pid": true,
+      "delivered_rights_minimum": 0,
+      "delivered_rights_maximum": 0,
+      "recv_sequences": [
+        [
+          0,
+          0
+        ]
+      ],
+      "closed_after": [
+        true
+      ],
+      "predicate": "Actual live public challenger sends valid MAC/body/channel/sequence/frame; real received credentials identify its distinct PID, with expected UID/GID. Receiver remains bound to original live expected peer."
+    }
+  },
+  "checkpoint_order_companion": "CHECKPOINTS.md",
+  "predecessor_spec_sha256": "f8ef5ba5c15ecb59114690222b4fcc33be50ee589557d19e4e5564a41a1b0812",
+  "mandatory_payload_checks": {
+    "PAYLOAD-01-AUTHENTICATED-RAW": {
+      "applies_to": [
+        "ALL_EVENTS"
+      ],
+      "required": "Authenticate and repin every referenced raw artifact under the exact selected producer, source/config/run/epoch/appointment/method/budget binding; use only the plan-appointed decoder and artifact role. Retain exact bytes before any positive ingestion acknowledgement. Hash/slot/signature presence without decoded semantics cannot pass.",
+      "failure": "Missing/unreadable/unsupported decoder or raw evidence is UNAVAILABLE; definite context or content mismatch is REJECTED."
+    },
+    "PAYLOAD-02-SINGLE-THREAD-LINEAGE": {
+      "applies_to": [
+        "RUNNER_INSTALL",
+        "MODEL_INSTALL"
+      ],
+      "required": "Decode actual task inventory and process identity. Exactly one actual thread exists at installation, its TID/start identity matches the installing process, and the observation precedes later model execution/threads. Bind runner parent to the actual selected controller and model-wrapper parent to the actual runner; parent installation record links cannot name an unrelated or stale PID/start identity.",
+      "failure": "INSTALLATION_FAILED_OR_UNOBSERVED or SOURCE_OR_EXEC_IDENTITY_MISMATCH; absent actual evidence is UNAVAILABLE."
+    },
+    "PAYLOAD-03-DESCRIPTOR-MATCH": {
+      "applies_to": [
+        "RUNNER_INSTALL",
+        "MODEL_INSTALL"
+      ],
+      "required": "Decode the selected trusted spawn/descriptor plan and actual initial inventory. Every required descriptor is present exactly once and matches expected object type, device/inode or selected socket/pipe identity, access flags and close-on-exec state. Reject unexpected descriptors, missing required descriptors, number-only matches and model-supplied plans. A subset of allowed FD numbers alone is insufficient; dynamic allocated numbers/objects must be bound by the selected trusted spawn record, not inferred from the inspected inventory itself.",
+      "failure": "DESCRIPTOR_IDENTITY_MISMATCH or UNAVAILABLE on incomplete inventory/closure evidence."
+    },
+    "PAYLOAD-04-SELECTED-RULE-TARGETS": {
+      "applies_to": [
+        "RUNNER_INSTALL",
+        "MODEL_INSTALL"
+      ],
+      "required": "Decode normalized rules and actual rule-target inventory. They must equal the selected role policy derived by the appointed decoder from the pinned source/config and trusted spawn records: all expected targets/rights, correct handled filesystem mask and required ABI, no omitted target or widened/unselected grant. Bind actual opened rule-target identities/resolution to that selected policy; configured path text or producer-chosen replacement references alone cannot satisfy it.",
+      "failure": "INSTALLATION_FAILED_OR_UNOBSERVED or CONTEXT_MISMATCH; unknown target/decoder is UNAVAILABLE."
+    },
+    "PAYLOAD-05-SUCCESSFUL-CALLS": {
+      "applies_to": [
+        "RUNNER_INSTALL",
+        "MODEL_INSTALL"
+      ],
+      "required": "Decode real arguments and returns in causal order. ABI query must actually report the selected supported ABI (at least 4); actual ruleset creation must return a valid nonnegative descriptor. Every required add-rule call must use that ruleset and the selected actual target/rights and return 0. PR_SET_NO_NEW_PRIVS must set 1 and return 0 before LANDLOCK_RESTRICT_SELF on the populated ruleset, whose actual return must be 0. Require actual no-new-privileges readback 1. Normalize errno to 0 for successful outcomes; only failed returns have meaningful failure errno. No missing/failed call can be converted into installation success by a label, signature or final readback alone.",
+      "failure": "INSTALLATION_FAILED_OR_UNOBSERVED; raw uncertainty is UNAVAILABLE."
+    },
+    "PAYLOAD-06-ASSET-BINDINGS": {
+      "applies_to": [
+        "ASSET_BINDINGS"
+      ],
+      "required": "Decode actual file inventory and in-budget hash interval. Match every required selected asset path/object, byte count, raw SHA-256 and device/inode/read-only identity against the selected manifest. Missing, substituted, stale or unverified assets cannot support later executable claims. Earlier preflight hashes or an expected configured hash alone do not fill this slot.",
+      "failure": "SOURCE_OR_EXEC_IDENTITY_MISMATCH or RAW_EVIDENCE_UNAVAILABLE."
+    },
+    "PAYLOAD-07-POST-EXEC-IDENTITY": {
+      "applies_to": [
+        "MODEL_POST_EXEC"
+      ],
+      "required": "Resolve the successful MODEL_INSTALL and ASSET_BINDINGS records. Actual post-exec PID and start ticks must equal the confined wrapper identity, with the expected live parent/start lineage, UID/GID, boot/namespace/mount context. Decode actual executable path/device/inode/hash and require equality to the selected verified executable asset; do not substitute configured exe text. Require actual owned loopback-listener evidence for the selected endpoint tied to that process/socket, and reject stale/PID-reused, unavailable or inconsistent observations.",
+      "failure": "SOURCE_OR_EXEC_IDENTITY_MISMATCH; missing actual process/listener observation is UNAVAILABLE."
+    },
+    "PAYLOAD-08A-FINAL-CHANNEL-CREATION": {
+      "applies_to": [
+        "FINAL_CHANNEL_CREATED"
+      ],
+      "required": "Require the accepted CALIBRATION_RETIRED record first, including all eight checked cases, delivered-descriptor closure and endpoint/challenger/descendant retirement. Decode actual newly created final endpoint identities and the new key-generation operation identity, distinct from every calibration or rejected pair/key operation. Match the externally selected channel and trusted creation record; retain no key material. At creation both endpoints may still be held by the controller. Require actual creation ownership, not future runner ownership. RUNNER_INSTALL, first peer packet/credentials and MODEL_POST_EXEC are not prerequisites of creation; all of their substantive checks remain mandatory at FINAL_PEER_BOUND. Creation alone confers no accepted peer, method decision or private release.",
+      "failure": "CLEANUP_UNCONFIRMED or CONTEXT_MISMATCH for definite contradiction; missing creation/retirement evidence is UNAVAILABLE. A forward prerequisite is DEPENDENCY_ORDER."
+    },
+    "PAYLOAD-08B-FINAL-PEER-BINDING": {
+      "applies_to": [
+        "FINAL_PEER_BOUND"
+      ],
+      "required": "Resolve the accepted FINAL_CHANNEL_CREATED, RUNNER_INSTALL and MODEL_POST_EXEC records and their checked dependencies. Match the exact new channel/endpoints/key-operation binding from creation, with no calibration/rejected pair revival. Resolve the actual selected decision-runner identity from its accepted installation and current peer readback; compare PID/start/UID/GID and actual endpoint ownership/transfer against the trusted spawn record. Decode the actual first received credentials and require exact peer PID/UID/GID equality, fresh PID-start verification and valid MAC/channel/sequence for this channel. Bind the successful referenced MODEL_POST_EXEC result. Configured expected PID, self-labeled match, mere slot presence or creation alone is insufficient.",
+      "failure": "SOURCE_OR_EXEC_IDENTITY_MISMATCH or CONTEXT_MISMATCH; missing actual credentials/readback is UNAVAILABLE. Missing or unaccepted predecessor is INCOMPLETE_STREAM."
+    },
+    "PAYLOAD-09A-POLICY-PREFIX": {
+      "applies_to": [
+        "POLICY_ARGUMENT"
+      ],
+      "required": "Require exactly the seventeen accepted required predecessor slots: SETUP_BEGIN, CALIBRATION_BEGIN, all eight CALIBRATION_CASE slots, CALIBRATION_RETIRED, FINAL_CHANNEL_CREATED, RUNNER_INSTALL, MODEL_INSTALL, ASSET_BINDINGS, MODEL_POST_EXEC and FINAL_PEER_BOUND. Authenticate/retain and validate the current POLICY_ARGUMENT as sequence 18 under all common guards. Its exact two installation references must select the checked runner/model installations, its post-exec reference the checked lineage, and its source argument the externally selected source argument. Require all applicable preceding/current payload predicates, all eight exact calibration predicates, selected dependency order, current authority and confirmed predecessor checkpoints. Repeat all fixed unsupported routes and assumption-bound non-forwarding; reject broader claims. Do not require SETUP_SEAL, its ACK/checkpoint, nineteen-slot coverage or a final decision at this stage. Current policy ACK/checkpoint follows successful semantic validation.",
+      "failure": "INCOMPLETE_STREAM, CLAIM_OUTSIDE_METHOD_SCOPE or underlying predicate failure; uncertainty remains UNAVAILABLE. Forward/self prerequisite is DEPENDENCY_ORDER."
+    },
+    "PAYLOAD-09B-SEAL-CURRENT": {
+      "applies_to": [
+        "SETUP_SEAL"
+      ],
+      "required": "Require exactly eighteen accepted preceding records/required slots and validate the current seal as sequence 19. Revalidate applicable semantics/authority and predecessor checkpoint history. The seal entries and covered_slot_ids name exactly those eighteen prior records/slots in stream order, with exact IDs/raw hashes, previous head and count 18; union with the current seal slot equals all nineteen required slots. The seal must preserve every fixed unsupported route. Never include its own hash in its entries, require prior acceptance of itself, its own ACK/checkpoint or a final decision to validate it. Only after semantic validation prepare the exact seal ACK, independently commit/confirm its checkpoint and expose that ACK under fresh guards. A retained but unaccepted seal cannot support a decision.",
+      "failure": "INCOMPLETE_STREAM, RAW_BYTES_MISMATCH, CLAIM_OUTSIDE_METHOD_SCOPE or underlying predicate failure; uncertainty remains UNAVAILABLE. Forward/self prerequisite is DEPENDENCY_ORDER."
+    },
+    "PAYLOAD-09C-FINAL-DECISION": {
+      "applies_to": [
+        "ACCEPTED_NARROW_METHOD"
+      ],
+      "required": "Require the complete nineteen-record accepted sealed stream, successful applicable payload checks and all eight exact calibration predicates, exact selected coverage/dependency order and current full authority/budget checks. Require the independently committed/confirmed seal ACK checkpoint and fresh independent history readback before preparing an accepted decision. Bind that sealed head, both limited accepted claims, all unsupported routes and the authenticated expiry intersection. Then prepare the one exact decision, independently commit/confirm its DECISION_EXPOSURE checkpoint, refresh guards and expose it. The decision semantic check does not require its own future exposure certificate. A separately authorized one-use release must independently validate the exposed decision and all current guards; method acceptance alone is not release.",
+      "failure": "INCOMPLETE_STREAM, OUTPUT_NOT_CHECKPOINTED, CLAIM_OUTSIDE_METHOD_SCOPE or underlying predicate failure; uncertainty remains UNAVAILABLE."
+    }
+  },
+  "ordering_semantics_companion": "ORDERING_WALKTHROUGH.md",
+  "dependency_catalogue_companion": "dependency-plan.json"
+}

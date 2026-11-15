@@ -1,0 +1,179 @@
+{
+  "$id": "urn:forex:custody-interface:keys",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cases": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "pattern": "^acct-[a-f0-9]{24}$",
+            "type": "string"
+          },
+          "case_id": {
+            "pattern": "^[a-f0-9]{32}$",
+            "type": "string"
+          },
+          "continuous_required": {
+            "type": "boolean"
+          },
+          "obligation_id": {
+            "$ref": "urn:forex:custody-interface:common#/$defs/obligation_id"
+          },
+          "plan_id": {
+            "pattern": "^plan-[a-f0-9]{24}$",
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "current_decision_must_change_venue": {
+                  "type": "boolean"
+                },
+                "current_decision_must_dispatch": {
+                  "type": "boolean"
+                },
+                "expected_post": {
+                  "$ref": "urn:forex:custody-interface:common#/$defs/expected_state"
+                },
+                "expected_pre": {
+                  "anyOf": [
+                    {
+                      "$ref": "urn:forex:custody-interface:common#/$defs/expected_state"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "first_attempt_only": {
+                  "const": true
+                },
+                "independent_reason": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "inference_required": {
+                  "const": true
+                },
+                "mandatory_assertions": {
+                  "items": {
+                    "$ref": "urn:forex:custody-interface:common#/$defs/assertion_name"
+                  },
+                  "minItems": 1,
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "permissible_action_refs": {
+                  "items": {
+                    "anyOf": [
+                      {
+                        "pattern": "^[a-f0-9]{24}$",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "minItems": 1,
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "previous_snapshot_must_be_cited": {
+                  "type": "boolean"
+                },
+                "required_disposition": {
+                  "enum": [
+                    "ACT",
+                    "WAIT",
+                    "HOLD",
+                    "STAND_DOWN"
+                  ]
+                },
+                "required_evidence_ids": {
+                  "items": {
+                    "pattern": "^(evidence|case|policy)-[a-f0-9]{24}$",
+                    "type": "string"
+                  },
+                  "minItems": 1,
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "stale_proof": {
+                  "$ref": "urn:forex:custody-interface:common#/$defs/stale_proof"
+                },
+                "step_id": {
+                  "pattern": "^[a-f0-9]{24}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "step_id",
+                "permissible_action_refs",
+                "required_disposition",
+                "required_evidence_ids",
+                "mandatory_assertions",
+                "expected_post",
+                "expected_pre",
+                "current_decision_must_dispatch",
+                "current_decision_must_change_venue",
+                "independent_reason",
+                "previous_snapshot_must_be_cited",
+                "inference_required",
+                "first_attempt_only"
+              ],
+              "type": "object"
+            },
+            "maxItems": 5,
+            "minItems": 1,
+            "type": "array"
+          },
+          "variant": {
+            "enum": [
+              "PRIMARY",
+              "COUNTERPART"
+            ]
+          }
+        },
+        "required": [
+          "case_id",
+          "obligation_id",
+          "variant",
+          "continuous_required",
+          "account_id",
+          "plan_id",
+          "steps"
+        ],
+        "type": "object"
+      },
+      "maxItems": 16,
+      "minItems": 16,
+      "type": "array"
+    },
+    "expected_outcome_author": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "format": {
+      "const": "forex.custody-independent-keys/1"
+    },
+    "global_assertions": {
+      "items": {
+        "$ref": "urn:forex:custody-interface:common#/$defs/global_assertion_name"
+      },
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "format",
+    "expected_outcome_author",
+    "cases",
+    "global_assertions"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,112 @@
+{
+  "$id": "urn:forex:custody-interface:schedules",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "format": {
+      "const": "forex.custody-schedules/1"
+    },
+    "steps": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "after_events": {
+            "items": {
+              "$ref": "urn:forex:custody-interface:common#/$defs/market_event"
+            },
+            "minItems": 0,
+            "type": "array"
+          },
+          "before_events": {
+            "items": {
+              "$ref": "urn:forex:custody-interface:common#/$defs/market_event"
+            },
+            "minItems": 0,
+            "type": "array"
+          },
+          "before_mode": {
+            "enum": [
+              "REUSE_LAST_OBSERVATION",
+              "ADVANCE_DECLARED_EVENTS"
+            ]
+          },
+          "case_id": {
+            "pattern": "^[a-f0-9]{32}$",
+            "type": "string"
+          },
+          "fill_quotas": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pending_change": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "after_http_started": {
+                    "const": true
+                  },
+                  "before_http_finished": {
+                    "const": true
+                  },
+                  "events": {
+                    "items": {
+                      "$ref": "urn:forex:custody-interface:common#/$defs/pending_event"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  "reject_if_response_wins_race": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "after_http_started",
+                  "before_http_finished",
+                  "events",
+                  "reject_if_response_wins_race"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "step_id": {
+            "pattern": "^[a-f0-9]{24}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_id",
+          "step_id",
+          "before_mode",
+          "before_events",
+          "after_events",
+          "pending_change",
+          "fill_quotas"
+        ],
+        "type": "object"
+      },
+      "maxItems": 32,
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "format",
+    "steps"
+  ],
+  "type": "object"
+}

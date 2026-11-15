@@ -1,0 +1,122 @@
+/* Modernist local Explainer. No external resources, network fonts or inline source CSS. */
+.forex-explainer-host {
+  --fxe-sheet: 396px;
+  --fxe-mark: 48px;
+  --fxe-canvas: var(--canvas, #f3f2f2);
+  --fxe-panel: var(--panel, #fff);
+  --fxe-ink: var(--ink, #201e1d);
+  --fxe-muted: var(--muted, #676361);
+  --fxe-line: var(--line, #d7d3d3);
+  --fxe-rule: var(--rule, #000000);
+  --fxe-accent: var(--orange, #ff7900);
+  --fxe-deep: var(--accent-deep, #9c4300);
+  font-family: var(--font-body, "Archivo", Arial, sans-serif);
+  color: var(--fxe-ink);
+}
+.forex-explainer-host *, .forex-explainer-host *::before, .forex-explainer-host *::after { box-sizing: border-box; }
+.forex-explainer-host [hidden] { display: none !important; }
+.forex-explainer-host button { appearance: none; border-radius: 0; box-shadow: none; font: inherit; color: inherit; text-align: left; cursor: pointer; }
+.forex-explainer-host button:focus-visible, .forex-explainer-host summary:focus-visible, .forex-explainer-host pre:focus-visible { outline: 2px solid var(--focus, #9c4300); outline-offset: 2px; }
+.forex-explainer-mark {
+  position: fixed; z-index: 70; display: flex; flex-direction: column; justify-content: center;
+  gap: 4px; padding: 0 12px; border: 2px dashed var(--fxe-muted); background: var(--fxe-canvas);
+  color: var(--fxe-ink); touch-action: none; user-select: none; cursor: grab !important;
+  transition: left 140ms linear, top 140ms linear, width 140ms linear, height 140ms linear;
+}
+.forex-explainer-mark > span { height: 2px; width: 100%; background: var(--fxe-ink); pointer-events: none; }
+.forex-explainer-mark > span + span { width: 60%; background: var(--fxe-accent); }
+.forex-explainer-mark:hover { background: var(--fxe-panel); border-style: solid; }
+.forex-explainer-mark:active { border-color: var(--fxe-deep); }
+.forex-explainer-mark.is-dragging { opacity: .7; cursor: grabbing !important; transition: none; }
+.forex-explainer-mark[data-collapsed="true"] { padding: 0; border: 0; background: var(--fxe-ink); }
+.forex-explainer-mark[data-collapsed="true"]::before { content: ""; position: absolute; inset: -16px; }
+.forex-explainer-mark[data-collapsed="true"] > span { display: none; }
+.forex-explainer-panel {
+  background: var(--fxe-panel); border: var(--border-strong, 4px) solid var(--fxe-rule); min-width: 0;
+  display: flex; flex-direction: column; font-size: 13px; line-height: 1.6;
+}
+.forex-explainer-heading { display: flex; gap: 12px; align-items: center; padding: 16px 20px; border-bottom: var(--border-section, 3px) solid var(--fxe-rule); }
+.forex-explainer-heading h2 { font: 800 11px/1.3 var(--font-body, "Archivo", Arial, sans-serif); letter-spacing: .1em; text-transform: uppercase; margin: 0; }
+.forex-explainer-heading p { font: 400 10px/1.5 var(--font-mono, "IBM Plex Mono", Consolas, monospace); margin: 3px 0 0; color: var(--fxe-muted); }
+.forex-explainer-small-mark { display: flex; flex-direction: column; justify-content: center; gap: 3px; background: var(--fxe-ink); width: 26px; height: 26px; padding: 0 6px; flex: none; }
+.forex-explainer-small-mark > span { height: 2px; width: 100%; background: var(--fxe-canvas); }
+.forex-explainer-small-mark > span + span { width: 60%; background: var(--fxe-accent); }
+.forex-explainer-close { margin-left: auto; padding: 4px 10px; min-width: 36px; min-height: 36px; border: 1px solid transparent; background: transparent; font-size: 21px !important; line-height: 1; }
+.forex-explainer-close:hover { border-color: var(--fxe-rule); }
+.forex-explainer-close:active { background: var(--fxe-line); }
+.forex-explainer-suggestions { display: grid; gap: 7px; padding: 16px 20px; border-bottom: 1px solid var(--fxe-line); flex: none; }
+.forex-explainer-suggestions button { padding: 9px 11px; border: var(--border-control, 2px) solid var(--fxe-rule); background: transparent; min-height: 40px; font-weight: 600; font-size: 12px; }
+.forex-explainer-suggestions button[aria-pressed="true"] { border-color: var(--fxe-deep); color: var(--fxe-deep); }
+.forex-explainer-suggestions button:hover, .forex-explainer-layout button:hover { background: var(--fxe-canvas); border-color: var(--fxe-ink); }
+.forex-explainer-suggestions button:active, .forex-explainer-layout button:active { background: var(--fxe-line); }
+.forex-explainer-content { padding: 18px 20px; overflow: auto; min-height: 0; overscroll-behavior: contain; }
+.forex-explainer-question { font-size: 12px; font-weight: 600; line-height: 1.5; color: var(--fxe-muted); margin: 0 0 10px; }
+.forex-explainer-answer { white-space: pre-line; margin: 0; overflow-wrap: anywhere; }
+.forex-explainer-source { margin: 20px 0 0; padding: 14px 0; border-top: 1px solid var(--fxe-line); border-bottom: 1px solid var(--fxe-line); font: 400 11px/1.55 var(--font-mono, "IBM Plex Mono", Consolas, monospace); }
+.forex-explainer-source > div { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 12px; margin: 5px 0; }
+.forex-explainer-source dt { color: var(--fxe-muted); }
+.forex-explainer-source dd { margin: 0; overflow-wrap: anywhere; }
+.forex-explainer-record, .forex-explainer-layout { padding: 14px 0; border-bottom: 1px solid var(--fxe-line); }
+.forex-explainer-record summary, .forex-explainer-layout summary { cursor: pointer; font-weight: 600; font-size: 12px; }
+.forex-explainer-record summary:hover, .forex-explainer-layout summary:hover { color: var(--fxe-deep); }
+.forex-explainer-record p, .forex-explainer-layout p { font-size: 11px; color: var(--fxe-muted); margin: 12px 0; }
+.forex-explainer-record pre { max-height: 350px; margin: 12px 0 0; padding: 12px; overflow: auto; white-space: pre; background: var(--fxe-canvas); border: var(--border-control, 2px) solid var(--fxe-rule); font: 400 10px/1.6 var(--font-mono, "IBM Plex Mono", Consolas, monospace); }
+.forex-explainer-dock-buttons { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; }
+.forex-explainer-layout button { padding: 8px; border: var(--border-control, 2px) solid var(--fxe-rule); background: transparent; min-height: 36px; font-size: 11px; }
+.forex-explainer-dock-buttons button[aria-pressed="true"] { border-color: var(--fxe-ink); font-weight: 800; }
+.forex-explainer-layout-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.forex-explainer-footer { margin-top: auto; flex: none; padding: 14px 20px; border-top: var(--border-section, 3px) solid var(--fxe-rule); background: var(--fxe-canvas); }
+.forex-explainer-footer label { display: block; font-size: 11px; font-weight: 600; margin-bottom: 6px; }
+.forex-explainer-footer input { width: 100%; min-width: 0; padding: 10px 12px; border: var(--border-control, 2px) dashed var(--fxe-muted); border-radius: 0; background: var(--fxe-panel); color: var(--fxe-muted); font: inherit; opacity: .7; cursor: not-allowed; }
+.forex-explainer-footer p { color: var(--fxe-muted); font-size: 10px; line-height: 1.5; margin: 8px 0 0; }
+.forex-explainer-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+.forex-explainer-zones { display: none; pointer-events: none; }
+.forex-explainer-host.is-dragging .forex-explainer-zones { display: block; }
+.forex-explainer-zones > span { position: fixed; z-index: 65; background: transparent; border: 1px dashed transparent; }
+.forex-explainer-zones [data-dock-zone="left"] { inset: 0 auto 0 0; width: 56px; }
+.forex-explainer-zones [data-dock-zone="right"] { inset: 0 0 0 auto; width: 56px; }
+.forex-explainer-zones [data-dock-zone="top"] { inset: 0 0 auto 0; height: 44px; }
+.forex-explainer-zones [data-dock-zone="bottom"] { inset: auto 0 0 0; height: 44px; }
+.forex-explainer-zones .is-target { background: color-mix(in srgb, var(--fxe-accent) 8%, transparent); border-color: var(--fxe-accent); }
+/* The bounded scroll area keeps every dock rail clear through the full scroll.
+   No transform/contain is used: fixed marks and the desktop sheet retain the
+   viewport as their containing block and sit outside this scrolling content. */
+body.forex-explainer-ready { overflow: hidden; }
+.forex-explainer-workspace { position: fixed; inset: 0; overflow: auto; overscroll-behavior: contain; }
+.forex-explainer-workspace:focus-visible { outline: 2px solid var(--focus, #9c4300); outline-offset: -2px; }
+body.forex-explainer-ready[data-forex-explainer-edge="left"] .forex-explainer-workspace { left: 48px; }
+body.forex-explainer-ready[data-forex-explainer-edge="right"] .forex-explainer-workspace { right: 48px; }
+body.forex-explainer-ready[data-forex-explainer-edge="top"] .forex-explainer-workspace { top: 48px; }
+body.forex-explainer-ready[data-forex-explainer-edge="bottom"] .forex-explainer-workspace { bottom: 48px; }
+@media (min-width: 1100px) {
+  /* 396px sheet + 48px rail. The page reflows; the sheet is never a modal. */
+  body.forex-explainer-ready.forex-explainer-open .forex-explainer-workspace { top: 0; bottom: 0; }
+  body.forex-explainer-ready.forex-explainer-open[data-forex-explainer-side="left"] .forex-explainer-workspace { left: 444px; right: 0; }
+  body.forex-explainer-ready.forex-explainer-open[data-forex-explainer-side="right"] .forex-explainer-workspace { right: 444px; left: 0; }
+  .forex-explainer-panel { position: fixed; z-index: 60; inset-block: 0; width: 396px; height: 100dvh; border-block: 0; }
+  body[data-forex-explainer-side="right"] .forex-explainer-panel { right: 0; border-right: 0; }
+  body[data-forex-explainer-side="left"] .forex-explainer-panel { left: 0; border-left: 0; }
+  body.forex-explainer-open[data-forex-explainer-side="left"] .forex-explainer-zones [data-dock-zone="left"],
+  body.forex-explainer-open[data-forex-explainer-side="left"] .forex-explainer-zones [data-dock-zone="top"],
+  body.forex-explainer-open[data-forex-explainer-side="left"] .forex-explainer-zones [data-dock-zone="bottom"] { left: 396px; }
+  body.forex-explainer-open[data-forex-explainer-side="right"] .forex-explainer-zones [data-dock-zone="right"],
+  body.forex-explainer-open[data-forex-explainer-side="right"] .forex-explainer-zones [data-dock-zone="top"],
+  body.forex-explainer-open[data-forex-explainer-side="right"] .forex-explainer-zones [data-dock-zone="bottom"] { right: 396px; }
+}
+@media (max-width: 1099px) {
+  .forex-explainer-panel { position: relative; width: auto; margin: 20px 16px 64px; max-width: none; min-height: 0; }
+  .forex-explainer-content { max-height: none; overflow: visible; }
+  .forex-explainer-footer { margin-top: 0; }
+  .forex-explainer-suggestions { grid-template-columns: 1fr; }
+}
+@media (min-width: 1100px) and (max-height: 620px) {
+  .forex-explainer-panel { overflow: auto; }
+  .forex-explainer-content { overflow: visible; flex: none; }
+  .forex-explainer-footer { margin-top: 0; }
+}
+@media (prefers-reduced-motion: reduce) { .forex-explainer-mark { transition: none; } }
+@media print {
+  .forex-explainer-host { display: none !important; }
+  body.forex-explainer-ready { overflow: visible; }
+  .forex-explainer-workspace { position: static !important; inset: auto !important; overflow: visible !important; }
+}

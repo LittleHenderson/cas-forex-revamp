@@ -1,0 +1,115 @@
+{
+  "schema_version": "forex.decision-read/0.1",
+  "scope": {
+    "environment_id": "DISCONNECTED_SIMULATION",
+    "account_id": "synthetic-account-1",
+    "run_id": "rehearsal-1",
+    "epoch": 1,
+    "mode": "SIMULATED",
+    "ledger_schema": "forex-ledger/1",
+    "policy_id": "synthetic-policy-1",
+    "policy_version": "1",
+    "build_id": "source-scaffold-0.1.0",
+    "scenario_id": "continuous-a-1",
+    "adapter_id": "independent-simulator-1"
+  },
+  "cursor": {
+    "sequence": null,
+    "ledger_prefix_sha256": null,
+    "current_state_revision": null,
+    "read_model_version": "forex.decision-read/0.1"
+  },
+  "as_of": {
+    "observed_at": null,
+    "available_at": null,
+    "generated_at": null,
+    "clock_basis": "UNAVAILABLE",
+    "sequence_basis": "UNAVAILABLE"
+  },
+  "current_state": {
+    "state_id": null,
+    "state_sha256": null,
+    "revision": null,
+    "observation_refs": [],
+    "permissions": {
+      "new_risk": "UNKNOWN",
+      "management": "UNKNOWN",
+      "fence_ref": {
+        "record_id": null,
+        "record_version": null,
+        "record_sha256": null,
+        "unavailable_reason": "No source record has been read."
+      }
+    },
+    "exposure_facts": [],
+    "position_refs": null,
+    "unknowns": [
+      {
+        "field_or_claim": "current_state",
+        "reason": "No independent source observed.",
+        "action_effect": "No current account or permission claim.",
+        "required_observation": "Compatible trusted ledger/venue reconciliation.",
+        "origin_record_id": null
+      }
+    ],
+    "observed_at": null,
+    "valid_until": null,
+    "freshness": "UNKNOWN",
+    "reconciliation": "UNOBSERVED"
+  },
+  "decisions": [],
+  "events": [],
+  "evidence": [],
+  "validation": {
+    "schema": {
+      "status": "NOT_RUN",
+      "verifier_id": null,
+      "verifier_version": null,
+      "checked_scope_sha256": null,
+      "checked_cursor_sha256": null,
+      "external_anchor_id": null,
+      "reason": "Authored fixture only; no source binding or runtime verification."
+    },
+    "integrity": {
+      "status": "NOT_RUN",
+      "verifier_id": null,
+      "verifier_version": null,
+      "checked_scope_sha256": null,
+      "checked_cursor_sha256": null,
+      "external_anchor_id": null,
+      "reason": "Authored fixture only; no source binding or runtime verification."
+    },
+    "source_binding": {
+      "status": "NOT_RUN",
+      "verifier_id": null,
+      "verifier_version": null,
+      "checked_scope_sha256": null,
+      "checked_cursor_sha256": null,
+      "external_anchor_id": null,
+      "reason": "Authored fixture only; no source binding or runtime verification."
+    },
+    "reconciliation": {
+      "status": "NOT_RUN",
+      "verifier_id": null,
+      "verifier_version": null,
+      "checked_scope_sha256": null,
+      "checked_cursor_sha256": null,
+      "external_anchor_id": null,
+      "reason": "Authored fixture only; no source binding or runtime verification."
+    }
+  },
+  "coverage": {
+    "complete": false,
+    "from_sequence": null,
+    "through_sequence": null,
+    "retained_count": 0,
+    "total_known_count": null,
+    "omitted_ids": [],
+    "deferred_ids": [],
+    "reasons": [
+      "Authored initial fixture. No runtime ledger read or trusted producer is connected."
+    ],
+    "next_cursor": null
+  },
+  "domain_digest": "f97ae78e89fca66bdbdbf36aba8417f9fdd2494bfa35fe58bc5947dbeb21ef37"
+}

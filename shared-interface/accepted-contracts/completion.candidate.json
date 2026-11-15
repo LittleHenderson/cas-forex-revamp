@@ -1,0 +1,261 @@
+{
+  "format": "forex.completion-contract-candidate/2",
+  "status": "SOURCE_ONLY_REQUIRES_REREVIEW",
+  "runtime_authorized": false,
+  "imports": [
+    "ProtectedRecordRef, ProtectedReferenceUse, EvaluationBinding from protected-records.candidate.json",
+    "CaptureSubject, ExecutableAssetIdentity from interface.candidate.json",
+    "source04 original completion semantics and original clock bounds, without old path Ref"
+  ],
+  "group_order": [
+    "contracts",
+    "core",
+    "venue",
+    "operator",
+    "rpa",
+    "integration",
+    "provider04",
+    "policy-inheritance02",
+    "operational-measurement",
+    "operational-authority",
+    "operational-custody",
+    "node-version",
+    "ui"
+  ],
+  "exact_object_fields": {
+    "CompletionSelection2": {
+      "format": "literal:forex.runtime-completion-selection/2",
+      "selection_id": "Id",
+      "binding": "EvaluationBinding",
+      "publisher_selection_sha256": "Sha256",
+      "observer_id": "Id",
+      "verifier_id": "Id",
+      "verifier_component_sha256": "Sha256",
+      "original_clock_ref": "ProtectedReferenceUse",
+      "source_inventory_ref": "ProtectedReferenceUse",
+      "groups": "array<GroupSelection>[13,13]",
+      "not_before_utc": "Utc",
+      "expires_at_utc": "Utc"
+    },
+    "GroupSelection": {
+      "group_id": "CompletionGroup",
+      "command": "ProtectedReferenceUse",
+      "parser": "ProtectedReferenceUse",
+      "expected_inventory": "ProtectedReferenceUse",
+      "expected_test_count": "UInt",
+      "mode": "PYTHON_METHODS|NODE_TAP|NODE_VERSION"
+    },
+    "CommandPin": {
+      "format": "literal:forex.test-command-pin/1",
+      "binding": "EvaluationBinding",
+      "group_id": "CompletionGroup",
+      "executable": "ExecutableAssetIdentity",
+      "argv": "array<BoundedString>[1,64]",
+      "cwd": "AbsoluteSelectedPath",
+      "environment_profile_sha256": "Sha256",
+      "stdin_policy": "literal:CLOSED",
+      "source_manifest_sha256": "Sha256",
+      "command_sha256": "Sha256"
+    },
+    "ParserPin": {
+      "format": "literal:forex.test-parser-pin/1",
+      "binding": "EvaluationBinding",
+      "parser_id": "Id",
+      "component_manifest_sha256": "Sha256",
+      "entrypoint": "Id",
+      "mode": "PYTHON_METHODS|NODE_TAP|NODE_VERSION",
+      "accepted_report_format": "forex.python-framework-report/2|forex.node-tap-report/1|forex.node-version-report/1",
+      "report_schema_sha256": "Sha256",
+      "test_id_encoding": "QUALIFIED_UNITTEST_ID|FULL_NODE_TEST_NAME|NO_TEST_IDS",
+      "expected_stdout_utf8": "Nullable<BoundedString>",
+      "maximum_stream_bytes": "Int[1,524288]",
+      "maximum_report_bytes": "Int[1,1048576]",
+      "expected_stderr_utf8": "Nullable<BoundedString>"
+    },
+    "CollectionInventory": {
+      "format": "literal:forex.test-collection-inventory/1",
+      "binding": "EvaluationBinding",
+      "group_id": "CompletionGroup",
+      "source_manifest_sha256": "Sha256",
+      "entries": "array<TestInventoryEntry>[0,100000]",
+      "expected_count": "UInt",
+      "test_ids_sha256": "Sha256"
+    },
+    "TestInventoryEntry": {
+      "test_id": "BoundedString",
+      "source_relative_path": "SafeRelativeSourcePath",
+      "source_file_sha256": "Sha256"
+    },
+    "SourceInventory": {
+      "format": "literal:forex.completion-source-inventory/1",
+      "binding": "EvaluationBinding",
+      "source_manifest_sha256": "Sha256",
+      "test_files": "array<TestFileAssignment>[1,10000]",
+      "group_order": "array<CompletionGroup>[13,13]",
+      "test_roots": "array<SourceTestRoot>[1,32]"
+    },
+    "TestFileAssignment": {
+      "source_relative_path": "SafeRelativeSourcePath",
+      "source_file_sha256": "Sha256",
+      "group_id": "CompletionGroup"
+    },
+    "TestStream2": {
+      "format": "literal:forex.test-stream/2",
+      "binding": "EvaluationBinding",
+      "group_id": "CompletionGroup",
+      "process": "CaptureSubject",
+      "stream": "STDOUT|STDERR",
+      "encoding": "literal:UTF8_STRICT",
+      "utf8": "String bounded by selected parser maximum",
+      "raw_sha256": "Sha256",
+      "bytes": "UInt",
+      "complete": "literal-bool:true"
+    },
+    "ProcessCapture2": {
+      "format": "literal:forex.test-process-capture/2",
+      "binding": "EvaluationBinding",
+      "selection_sha256": "Sha256",
+      "group_id": "CompletionGroup",
+      "command_sha256": "Sha256",
+      "executable_sha256": "Sha256",
+      "events": "array<TestProcessEvent>[2,2]",
+      "lost_events": "literal-integer:0",
+      "stdout_ref": "ProtectedReferenceUse",
+      "stderr_ref": "ProtectedReferenceUse"
+    },
+    "TestProcessEvent": {
+      "sequence": "Int[1,2]",
+      "kind": "SPAWN|EXIT",
+      "process": "CaptureSubject",
+      "at_utc": "Utc",
+      "exit_code": "Nullable<SignedInt>"
+    },
+    "GroupReport2": {
+      "format": "literal:forex.observed-test-group/2",
+      "binding": "EvaluationBinding",
+      "selection_sha256": "Sha256",
+      "group_id": "CompletionGroup",
+      "process": "CaptureSubject",
+      "command_ref": "ProtectedReferenceUse",
+      "parser_ref": "ProtectedReferenceUse",
+      "expected_inventory_ref": "ProtectedReferenceUse",
+      "capture_ref": "ProtectedReferenceUse",
+      "stdout_ref": "ProtectedReferenceUse",
+      "stderr_ref": "ProtectedReferenceUse",
+      "original_framework_report_ref": "ProtectedReferenceUse",
+      "started_at_utc": "Utc",
+      "finished_at_utc": "Utc",
+      "exit_code": "SignedInt",
+      "collected_test_ids": "array<BoundedString>[0,100000]",
+      "executed_test_ids": "array<BoundedString>[0,100000]",
+      "counts": "CompletionCounts",
+      "node_version_utf8": "Nullable<BoundedString>",
+      "discovery_report_ref": "ProtectedReferenceUse"
+    },
+    "CompletionCounts": {
+      "discovered": "UInt",
+      "ran": "UInt",
+      "passed": "UInt",
+      "skipped": "UInt",
+      "failures": "UInt",
+      "errors": "UInt",
+      "cancelled": "UInt",
+      "todo": "UInt"
+    },
+    "CompletionObservation2": {
+      "format": "literal:forex.source-test-observation/2",
+      "binding": "EvaluationBinding",
+      "selection_sha256": "Sha256",
+      "observer_id": "Id",
+      "groups": "array<ProtectedReferenceUse>[13,13]",
+      "completed_at_utc": "Utc"
+    },
+    "SourceTestReport2": {
+      "format": "literal:forex.original-source-test-report/2",
+      "binding": "EvaluationBinding",
+      "selection_sha256": "Sha256",
+      "group_reports": "array<ProtectedReferenceUse>[13,13]",
+      "status": "PASS|FAIL|INCOMPLETE",
+      "finished_utc": "Utc",
+      "original_bootstrap_started_utc": "Utc",
+      "test_deadline_utc": "Utc"
+    },
+    "CompletionReceipt2": {
+      "format": "literal:forex.observed-source-test-completion/2",
+      "binding": "EvaluationBinding",
+      "selection_ref": "ProtectedReferenceUse",
+      "observer_id": "Id",
+      "verifier_id": "Id",
+      "verifier_component_sha256": "Sha256",
+      "original_clock_record_content_sha256": "Sha256",
+      "completed_at_utc": "Utc",
+      "original_source_test_report": "ProtectedReferenceUse",
+      "observation_evidence": "ProtectedReferenceUse",
+      "group_reports_sha256": "Sha256"
+    },
+    "PythonFrameworkReport2": {
+      "format": "literal:forex.python-framework-report/2",
+      "group_id": "CompletionGroup excluding node-version/ui",
+      "collected_test_ids": "array<BoundedString>[1,100000]",
+      "executed_test_ids": "array<BoundedString>[0,100000]",
+      "counts": "CompletionCounts",
+      "status": "PASS|FAIL|INCOMPLETE"
+    },
+    "NodeTapReport1": {
+      "format": "literal:forex.node-tap-report/1",
+      "group_id": "literal:ui",
+      "collected_test_ids": "array<BoundedString>[1,100000]",
+      "test_results": "array<NodeTestResult>[0,100000]",
+      "counts": "CompletionCounts",
+      "complete": "Bool"
+    },
+    "NodeTestResult": {
+      "test_id": "BoundedString",
+      "result": "PASS|FAIL|SKIP|CANCELLED|TODO"
+    },
+    "NodeVersionReport1": {
+      "format": "literal:forex.node-version-report/1",
+      "group_id": "literal:node-version",
+      "stdout_utf8": "BoundedString",
+      "stderr_utf8": "BoundedString"
+    },
+    "SourceTestRoot": {
+      "source_relative_directory": "SafeRelativeSourcePath",
+      "suffixes": "array<.py|.mjs>[1,2]",
+      "group_id": "CompletionGroup"
+    },
+    "TestDiscoveryReport": {
+      "format": "literal:forex.test-discovery-report/1",
+      "binding": "EvaluationBinding",
+      "selection_sha256": "Sha256",
+      "group_id": "CompletionGroup",
+      "process": "CaptureSubject",
+      "source_inventory_sha256": "Sha256",
+      "collected_test_ids": "array<BoundedString>[0,100000]",
+      "collected_at_utc": "Utc"
+    }
+  },
+  "producer_consumer": {
+    "selection_inventory": "Externally selected freeze reviewer declares exact command/parser/source inventory and expected IDs/counts after complete source freeze, before any group starts.",
+    "observation": "Measurement completion.py owns subprocess capture, raw streams and observed reports under the independently appointed completion-observer role.",
+    "verifier": "Custody-owned source/custody_runtime/completion_verifier.py validates independently selected records and actual capture/report/collection equivalence. It does not generate observations or choose expected counts from observed results.",
+    "issuer": "Custody release_issuer consumes the authentic CompletionReceipt2 only after independently revalidating the verifier result and all original clock bindings."
+  },
+  "required_rules": [
+    "Exactly13 groups in group_order, each once, no extra/missing/duplicate/subset and no reordered group substitution. Groups contracts through operational-custody use PYTHON_METHODS; node-version uses NODE_VERSION; ui uses NODE_TAP.",
+    "Every frozen test source file is assigned exactly once in SourceInventory. This includes every added integration test, not only the historical B10 list. Expected collection IDs/counts are frozen independently before running; no count is inferred from the app's PASS label or copied from the actual observed count.",
+    "CollectionInventory.entries contain unique IDs; expected_count equals entry count and GroupSelection.expected_test_count; test_ids_sha256 hashes canonical sorted ID array. Non-version groups require count>0. Node-version requires empty inventory/count0 and exact pinned expected stdout including newline.",
+    "Command SHA256 hashes canonical {executable,argv,cwd,environment_profile_sha256,stdin_policy,source_manifest_sha256,group_id}; exclude command_sha256 itself. No shell substitution, secret argv/env or command selected by a report.",
+    "Actual SPAWN then EXIT has one exact PID/start identity and selected command/executable; before/after observation must detect PID reuse. Exit0 alone does not establish completion. Capture and streams must be complete and independently signed/registered; truncation, overflow or unreadable output yields INCOMPLETE.",
+    "ParserPin fixes exact parser component, schema, mode and test-ID encoding. Verifier re-parses raw retained streams/framework report, compares every report field and compares collected/executed IDs to the selected inventory; observed collection must equal expected, with no unlisted or omitted test.",
+    "Python reports preserve framework counters and add explicit discovered/executed qualified IDs under the reviewed driver; old seven-field reports cannot supply missing IDs by inference. UI requires a pinned TAP parser/report writer that retains full unique test names and exact totals; duplicate names, ambiguous nesting or unavailable membership fail. Node version is never counted as a test.",
+    "For non-version groups: discovered=ran=passed=expected_count and both sorted ID sets equal inventory. skipped/failures/errors/cancelled/todo all0. For version group all counts0, IDs empty, exact pinned stdout, exit0. Reports never accept a lower expected count because new integration tests were added.",
+    "Group timestamps remain within the original test window and selected validity; groups do not overlap. Source-test completion precedes original model-window start. The completion receipt's completed time equals final group/report finish; all13 report refs and selection binding agree.",
+    "Protected record grants must bind command/parser/inventory to freeze-review authority, capture/streams/observed reports to completion-observer, and original source report to custody. Completion verification cannot be delegated to the application PASS label.",
+    "All records are source formats. Actual expected inventories/counts for future operational modules remain to be populated at complete source freeze; source examples are not that inventory. No test has been executed here.",
+    "All three normalized framework report types are closed above and retained as TEST_FRAMEWORK_REPORT. A pinned parser independently reconstructs them from complete source streams/report files and selected test IDs. For UI, collected IDs require independently captured reviewed runner discovery output as well as TAP results; absent discovery cannot be inferred from the passed tests alone.",
+    "Raw streams are capped at512KiB to fit a bounded protected JSON object even with escaping. Exceeding any selected bound yields incomplete evidence, never truncation. Node-version compares exact pinned stdout/stderr; other groups use the selected parser's complete report.",
+    "SourceInventory.test_roots are externally frozen and cover every test directory in the complete source package; every matching source file in those roots is assigned once, with no omission/exclusion. New integration files under the integration root therefore change the required inventory. A new test root requires a new reviewed selection before running.",
+    "GroupReport2 always includes authenticated TEST_DISCOVERY_REPORT emitted before group execution and captured by the observer. For NODE_VERSION it has an empty ID list. Discovery, selected inventory, actual executed results and selected command/source/parser all agree; a UI TAP pass list alone cannot establish discovery completeness."
+  ]
+}

@@ -1,0 +1,678 @@
+{
+  "$defs": {
+    "account_id": {
+      "pattern": "^acct-[a-f0-9]{24}$",
+      "type": "string"
+    },
+    "assertion_name": {
+      "enum": [
+        "actual_entry",
+        "bounded_authority",
+        "changed_context_observed",
+        "choice_A",
+        "choice_B",
+        "different_downstream_effect",
+        "entry_observed",
+        "expansion_rejected",
+        "explicit_wait",
+        "fresh_inference",
+        "full_exit",
+        "missing_fact_preserved",
+        "no_dispatch_or_venue_change",
+        "no_new_risk",
+        "none_eligible",
+        "pending_change_ordering",
+        "policy_unchanged",
+        "positive_partial_remainder",
+        "prior_A_observed",
+        "protection_modified",
+        "relevant_change_observed",
+        "same_position_quantity",
+        "same_position_stop_quantity",
+        "stable_identity_evolving_ledger",
+        "stale_rejected",
+        "stand_down",
+        "valid_bounded_action_observed",
+        "valid_position_held"
+      ]
+    },
+    "context": {
+      "additionalProperties": false,
+      "properties": {
+        "exit_due": {
+          "type": "boolean"
+        },
+        "imported_note": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "protection_band": {
+          "items": {
+            "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "protection_due": {
+          "type": "boolean"
+        },
+        "range_score": {
+          "$ref": "urn:forex:custody-interface:common#/$defs/decimal"
+        },
+        "thesis_valid": {
+          "type": "boolean"
+        },
+        "trend_score": {
+          "$ref": "urn:forex:custody-interface:common#/$defs/decimal"
+        },
+        "trim_due": {
+          "type": "boolean"
+        },
+        "trim_quantity": {
+          "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+        }
+      },
+      "required": [
+        "trend_score",
+        "range_score",
+        "thesis_valid",
+        "protection_due",
+        "trim_due",
+        "exit_due"
+      ],
+      "type": "object"
+    },
+    "decimal": {
+      "pattern": "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]{1,12})?$",
+      "type": "string"
+    },
+    "expected_state": {
+      "additionalProperties": false,
+      "properties": {
+        "balance": {
+          "$ref": "urn:forex:custody-interface:common#/$defs/decimal"
+        },
+        "decision_outcome": {
+          "enum": [
+            "ACT",
+            "WAIT",
+            "HOLD",
+            "STAND_DOWN",
+            "STALE_REJECTED",
+            "VENUE_STOP"
+          ]
+        },
+        "open_quantity": {
+          "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+        },
+        "pending_quantity": {
+          "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+        },
+        "policy_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "position_identity": {
+          "enum": [
+            "NEW_AFTER_PRIOR_STOP"
+          ]
+        },
+        "position_version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prior_position_terminal_quantity": {
+          "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+        },
+        "receipt_effect": {
+          "anyOf": [
+            {
+              "enum": [
+                "ACKNOWLEDGED",
+                "PARTIALLY_FILLED",
+                "FILLED",
+                "CANCELLED",
+                "REJECTED",
+                "APPLIED",
+                "UNKNOWN"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "side": {
+          "anyOf": [
+            {
+              "enum": [
+                "BUY",
+                "SELL"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stop_price": {
+          "anyOf": [
+            {
+              "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+            },
+            {
+              "type": "null"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "by_action_ref": {
+                  "additionalProperties": {
+                    "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+                  },
+                  "minProperties": 1,
+                  "propertyNames": {
+                    "pattern": "^[a-f0-9]{24}$",
+                    "type": "string"
+                  },
+                  "type": "object"
+                }
+              },
+              "required": [
+                "by_action_ref"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": [
+        "open_quantity",
+        "balance",
+        "position_version",
+        "stop_price",
+        "side",
+        "receipt_effect",
+        "decision_outcome"
+      ],
+      "type": "object"
+    },
+    "global_assertion_name": {
+      "enum": [
+        "all_30_first_attempts_have_verified_actual_inference",
+        "every_mandatory_assertion_passes",
+        "all_16_trajectories_present",
+        "counterparts_equivalent_after_normalization",
+        "no_future_or_oracle_fields_in_model_packet",
+        "proposal_authorization_receipt_observation_separated",
+        "first_attempt_failures_never_replaced",
+        "continuous_account_plan_position_stable",
+        "ledger_cursor_strictly_advances_for_real_effects",
+        "no_application_computation_of_expected_values",
+        "safe_refusal_does_not_pass_required_valid_action"
+      ]
+    },
+    "hex24": {
+      "pattern": "^[a-f0-9]{24}$",
+      "type": "string"
+    },
+    "hex32": {
+      "pattern": "^[a-f0-9]{32}$",
+      "type": "string"
+    },
+    "market_event": {
+      "additionalProperties": false,
+      "properties": {
+        "quote": {
+          "$ref": "urn:forex:custody-interface:common#/$defs/quote"
+        },
+        "type": {
+          "const": "MARKET"
+        }
+      },
+      "required": [
+        "type",
+        "quote"
+      ],
+      "type": "object"
+    },
+    "nonnegative_decimal": {
+      "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]{1,12})?$",
+      "type": "string"
+    },
+    "obligation_id": {
+      "enum": [
+        "R6-01",
+        "R6-02",
+        "R6-03",
+        "R6-04",
+        "R6-05",
+        "R6-06",
+        "R6-07",
+        "R6-08"
+      ]
+    },
+    "option": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action_ref": {
+              "pattern": "^[a-f0-9]{24}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "OPEN"
+            },
+            "label": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "limit_price": {
+              "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+            },
+            "quantity": {
+              "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+            },
+            "side": {
+              "enum": [
+                "BUY",
+                "SELL"
+              ]
+            },
+            "stop_price": {
+              "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+            },
+            "strategy_id": {
+              "pattern": "^strategy-[a-f0-9]{24}$",
+              "type": "string"
+            },
+            "timeframe": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "action_ref",
+            "strategy_id",
+            "timeframe",
+            "label",
+            "kind",
+            "side",
+            "quantity",
+            "limit_price",
+            "stop_price"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action_ref": {
+              "pattern": "^[a-f0-9]{24}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "REDUCE"
+            },
+            "label": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "limit_price": {
+              "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+            },
+            "quantity": {
+              "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+            },
+            "side": {
+              "enum": [
+                "BUY",
+                "SELL"
+              ]
+            },
+            "strategy_id": {
+              "pattern": "^strategy-[a-f0-9]{24}$",
+              "type": "string"
+            },
+            "timeframe": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "action_ref",
+            "strategy_id",
+            "timeframe",
+            "label",
+            "kind",
+            "side",
+            "quantity",
+            "limit_price"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action_ref": {
+              "pattern": "^[a-f0-9]{24}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "CLOSE"
+            },
+            "label": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "limit_price": {
+              "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+            },
+            "quantity": {
+              "anyOf": [
+                {
+                  "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+                },
+                {
+                  "const": "ALL"
+                }
+              ]
+            },
+            "side": {
+              "enum": [
+                "BUY",
+                "SELL"
+              ]
+            },
+            "strategy_id": {
+              "pattern": "^strategy-[a-f0-9]{24}$",
+              "type": "string"
+            },
+            "timeframe": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "action_ref",
+            "strategy_id",
+            "timeframe",
+            "label",
+            "kind",
+            "side",
+            "quantity",
+            "limit_price"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action_ref": {
+              "pattern": "^[a-f0-9]{24}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "AMEND_STOP"
+            },
+            "label": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "stop_price": {
+              "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+            },
+            "strategy_id": {
+              "pattern": "^strategy-[a-f0-9]{24}$",
+              "type": "string"
+            },
+            "timeframe": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "action_ref",
+            "strategy_id",
+            "timeframe",
+            "label",
+            "kind",
+            "stop_price"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "pending_event": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "quote": {
+              "$ref": "urn:forex:custody-interface:common#/$defs/quote"
+            },
+            "type": {
+              "const": "MARKET"
+            }
+          },
+          "required": [
+            "type",
+            "quote"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "context": {
+              "$ref": "urn:forex:custody-interface:common#/$defs/context"
+            },
+            "type": {
+              "const": "CONTEXT_CHANGE"
+            }
+          },
+          "required": [
+            "type",
+            "context"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "changes": {
+              "additionalProperties": false,
+              "properties": {
+                "max_entry_quantity": {
+                  "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+                },
+                "policy_revision": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "policy_revision",
+                "max_entry_quantity"
+              ],
+              "type": "object"
+            },
+            "type": {
+              "const": "POLICY_CHANGE"
+            }
+          },
+          "required": [
+            "type",
+            "changes"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "plan_id": {
+      "pattern": "^plan-[a-f0-9]{24}$",
+      "type": "string"
+    },
+    "policy": {
+      "additionalProperties": false,
+      "properties": {
+        "accounting_required": {
+          "items": {
+            "enum": [
+              "balance",
+              "equity",
+              "available_margin",
+              "position_inventory"
+            ]
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "management_permission": {
+          "enum": [
+            "ALLOWED",
+            "STOPPED",
+            "UNKNOWN"
+          ]
+        },
+        "management_rules": {
+          "additionalProperties": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "anyOf": [
+              {
+                "pattern": "^strategy-[a-f0-9]{24}$",
+                "type": "string"
+              },
+              {
+                "const": "HOLD"
+              }
+            ]
+          },
+          "type": "object"
+        },
+        "max_entry_quantity": {
+          "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+        },
+        "new_risk_permission": {
+          "enum": [
+            "ALLOWED",
+            "PAUSED",
+            "UNKNOWN"
+          ]
+        },
+        "policy_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "rules": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "strategy_rules": {
+          "additionalProperties": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "pattern": "^strategy-[a-f0-9]{24}$",
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "policy_revision",
+        "max_entry_quantity",
+        "new_risk_permission",
+        "management_permission",
+        "accounting_required",
+        "strategy_rules",
+        "management_rules",
+        "rules"
+      ],
+      "type": "object"
+    },
+    "quote": {
+      "additionalProperties": false,
+      "properties": {
+        "ask": {
+          "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+        },
+        "bid": {
+          "$ref": "urn:forex:custody-interface:common#/$defs/nonnegative_decimal"
+        }
+      },
+      "required": [
+        "bid",
+        "ask"
+      ],
+      "type": "object"
+    },
+    "stale_proof": {
+      "additionalProperties": false,
+      "properties": {
+        "all_changes_lt_http_finish": {
+          "const": true
+        },
+        "context_digest_changed": {
+          "const": true
+        },
+        "dispatch_count_for_stale_selection": {
+          "const": 0
+        },
+        "fresh_request_id_and_opportunity_id_required_next": {
+          "const": true
+        },
+        "http_start_lt_first_change": {
+          "const": true
+        },
+        "policy_revision_changed": {
+          "const": true
+        },
+        "position_version_changed": {
+          "const": true
+        },
+        "stale_selection_rejected_before_admission": {
+          "const": true
+        }
+      },
+      "required": [
+        "http_start_lt_first_change",
+        "all_changes_lt_http_finish",
+        "policy_revision_changed",
+        "context_digest_changed",
+        "position_version_changed",
+        "stale_selection_rejected_before_admission",
+        "dispatch_count_for_stale_selection",
+        "fresh_request_id_and_opportunity_id_required_next"
+      ],
+      "type": "object"
+    },
+    "strategy_id": {
+      "pattern": "^strategy-[a-f0-9]{24}$",
+      "type": "string"
+    }
+  },
+  "$id": "urn:forex:custody-interface:common",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

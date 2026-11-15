@@ -1,0 +1,1032 @@
+{
+  "classification": "SYNTHETIC_TEST_ONLY_SELECTION_NOT_COMPLETION_EVIDENCE",
+  "warning": "Synthetic input for schema/selection tests only. No observed completion, signed selection, registration or execution authority.",
+  "selection": {
+    "format": "forex.runtime-completion-selection/2",
+    "selection_id": "public-test-only-completion-selection",
+    "binding": {
+      "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+      "epoch": 1,
+      "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+      "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+      "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+      "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+    },
+    "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+    "observer_id": "public-test-only-observer",
+    "verifier_id": "public-test-only-verifier",
+    "verifier_component_sha256": "dc0954355f4d8cf9b224736aab8501b8990659ed582a57963885b1ff0256220c",
+    "original_clock_ref": {
+      "reference": {
+        "format": "forex.protected-record-ref/1",
+        "binding": {
+          "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+          "epoch": 1,
+          "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+          "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+          "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+          "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+        },
+        "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+        "root_id": "public-example-retention",
+        "object_id": "26f46ac9311a1c2a75d9d8151cbcd3576c9961aec13e81e16f16652acbc828bb",
+        "bytes": 70,
+        "sha256": "26f46ac9311a1c2a75d9d8151cbcd3576c9961aec13e81e16f16652acbc828bb",
+        "record_kind": "EXTERNAL_RELEASE_EVIDENCE",
+        "publisher_id": "public-test-only-reviewer",
+        "purpose": "release-evidence:original_clock_and_budget_binding_sha256"
+      },
+      "registration_sha256": "90208cf2f335b2e5f8d5c226f57143210051f9c3a9cb1132bcc3ed4e9f032399",
+      "required_use": "SOURCE_COMPLETION"
+    },
+    "source_inventory_ref": {
+      "reference": {
+        "format": "forex.protected-record-ref/1",
+        "binding": {
+          "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+          "epoch": 1,
+          "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+          "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+          "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+          "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+        },
+        "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+        "root_id": "public-example-retention",
+        "object_id": "214929317ad70e65dd7f48802df47d984929a775b09dd3a3d4e5d34fe10cb579",
+        "bytes": 72,
+        "sha256": "214929317ad70e65dd7f48802df47d984929a775b09dd3a3d4e5d34fe10cb579",
+        "record_kind": "SOURCE_INVENTORY",
+        "publisher_id": "public-test-only-reviewer",
+        "purpose": "completion-source-inventory"
+      },
+      "registration_sha256": "fbc7dfd412ffa08307af4e5801b66b687c30eb8ce407798a4b36737cbc1b0eba",
+      "required_use": "SOURCE_COMPLETION"
+    },
+    "groups": [
+      {
+        "group_id": "contracts",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "1792a542050efd8144245ff6e74c4e3b2bddd53652268243d168e1ac1b9ac12c",
+            "bytes": 1068,
+            "sha256": "1792a542050efd8144245ff6e74c4e3b2bddd53652268243d168e1ac1b9ac12c",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "047278ddd41ea09151e768c353ea83ae5e9d7da07f6250147f45c19a0601f61e",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "e5a725dd8fe3d6b31272d2b68f3ca623138d56dd2d7534ca6fd46f41aecbc6e9",
+            "bytes": 941,
+            "sha256": "e5a725dd8fe3d6b31272d2b68f3ca623138d56dd2d7534ca6fd46f41aecbc6e9",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "d9f7956a1900c3ad0b6154761ac06216ab869f0500ee88ce6256eee5adfb136b",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "18438554eb953b65bb41b4801e4ca322f3a55cc36b3cd4b23ce0773ab5dc2d86",
+            "bytes": 881,
+            "sha256": "18438554eb953b65bb41b4801e4ca322f3a55cc36b3cd4b23ce0773ab5dc2d86",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "259edad3577d0bc893092d3ebe78441a3ca13967c9e98908322d322bf5eb68fa",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 1,
+        "mode": "PYTHON_METHODS"
+      },
+      {
+        "group_id": "core",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "10acdefd0f5060a120c95c789b58bfe7ff555a8f33bd43ec0025ec3c460deb1c",
+            "bytes": 1058,
+            "sha256": "10acdefd0f5060a120c95c789b58bfe7ff555a8f33bd43ec0025ec3c460deb1c",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "0cfbb03bee76a79b768ddac0d139aa92ae74d64c41c7071ff186cc8910c21a2c",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "e1a61f43b123bc9a92a84de650b7561b84665dd5a60e071698316baee6c563b2",
+            "bytes": 936,
+            "sha256": "e1a61f43b123bc9a92a84de650b7561b84665dd5a60e071698316baee6c563b2",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "573e2152c51eadfdfb71fbaa4759100ec48a30fc5fb4a50dfbe301f72df53b95",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "4bd4d5ba85cd998bc5b7c1bc78e87fecfcd8689d3b235c8165cea6aabe41c898",
+            "bytes": 866,
+            "sha256": "4bd4d5ba85cd998bc5b7c1bc78e87fecfcd8689d3b235c8165cea6aabe41c898",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "836cdb59de1e4b336b5c0fd3a5a6dedf02ae7b0dfa3d5319f1a6f1a4975b1d86",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 1,
+        "mode": "PYTHON_METHODS"
+      },
+      {
+        "group_id": "venue",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "5d7dbb25d515fd988d42f104cfcf4c235272255863b076407916cc0fc5f7ca06",
+            "bytes": 1060,
+            "sha256": "5d7dbb25d515fd988d42f104cfcf4c235272255863b076407916cc0fc5f7ca06",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "5cb4fe2d37456d8c6737a8f8a341806b73273151aec9c1f02621768ba6b9cf3b",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "039aa4890228706a002054f08cf1c3ccd935be3978fdb1ec70e0d2b993a3a738",
+            "bytes": 937,
+            "sha256": "039aa4890228706a002054f08cf1c3ccd935be3978fdb1ec70e0d2b993a3a738",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "38bdaa6a31e2218f86d26e02a5de0865a893cd97190260c0ad8abf2aad64e064",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "6c40bd22264fe52c8be63b6cc11afc148042eb455214d3843e38ed6452121c98",
+            "bytes": 869,
+            "sha256": "6c40bd22264fe52c8be63b6cc11afc148042eb455214d3843e38ed6452121c98",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "8a4e86658f6ffda9c3309a0d5444dab00721803ef47cccae65d802fb146c2616",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 1,
+        "mode": "PYTHON_METHODS"
+      },
+      {
+        "group_id": "operator",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "4c70169fadfd7176f884bc09b1166e801c80675ec636c9d65300a90d9f4e1642",
+            "bytes": 1066,
+            "sha256": "4c70169fadfd7176f884bc09b1166e801c80675ec636c9d65300a90d9f4e1642",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "236ed9c76d3fec0d94dc54e01d7da78f9f0e5c3471381918427bcc52b323b8f8",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "9ed45cd63e5d9a29c3697b6aba7b4753d6645bc2711970445f63066669a7b9b4",
+            "bytes": 940,
+            "sha256": "9ed45cd63e5d9a29c3697b6aba7b4753d6645bc2711970445f63066669a7b9b4",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "86985833e0e1c8c715e6704f4f0f209e494566a63cd55823009909fbf3e88955",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "8846424dd4fab6c1385ae8e5114882a48d844f3a19c7baa647640a10fe380b94",
+            "bytes": 878,
+            "sha256": "8846424dd4fab6c1385ae8e5114882a48d844f3a19c7baa647640a10fe380b94",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "00010d63a4625304a9fb0521bcc71f8fff521921c163c1b462f59e1e0a85307c",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 1,
+        "mode": "PYTHON_METHODS"
+      },
+      {
+        "group_id": "rpa",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "e888f4ac53407306b6155e272c668a6b6c6a2a5fec606a433ca2fc10ca2a6f17",
+            "bytes": 1056,
+            "sha256": "e888f4ac53407306b6155e272c668a6b6c6a2a5fec606a433ca2fc10ca2a6f17",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "fff4cf299241bd828329e226840a695fd135b45320031967e9fe9db1cc0f534a",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "b10e7db4f5acfc7d696187e5d1ae2e0882bc12dc529064d1f14ae08658b872ed",
+            "bytes": 935,
+            "sha256": "b10e7db4f5acfc7d696187e5d1ae2e0882bc12dc529064d1f14ae08658b872ed",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "ea1b7839c16c30a18d5917a3e9b49e08364d2a050462a76233b6842d0f17456a",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "68e3da8cfa6b3c8bba34fa9e44f4c6e8d5df88cc59c77964bdfd336a22936a3e",
+            "bytes": 863,
+            "sha256": "68e3da8cfa6b3c8bba34fa9e44f4c6e8d5df88cc59c77964bdfd336a22936a3e",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "697a7b3c4a20d1da8a09efa2cf6c5be47c061c806be7eca4deabc78780ce88d1",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 1,
+        "mode": "PYTHON_METHODS"
+      },
+      {
+        "group_id": "integration",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "3c6f2b74e555dac4daef4db5c44b33da33119a8205347c24b413ba0cb76a0364",
+            "bytes": 1072,
+            "sha256": "3c6f2b74e555dac4daef4db5c44b33da33119a8205347c24b413ba0cb76a0364",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "14185c09a92e33b88bbff5b520cc4c073c22f31c79854f705054f2389a0b08b6",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "7a764fda4180f5859f0004fa4e1baef71ff0cc9c9ed1124809f64b67300915ad",
+            "bytes": 943,
+            "sha256": "7a764fda4180f5859f0004fa4e1baef71ff0cc9c9ed1124809f64b67300915ad",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "01cf7b354cec480e269b186ec4a971c84726b26b290efe42b9c13b09008da1b7",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "d31b09885e7fd03c9b6034cfe5bbb95d0c6ee54a9f09c1a7d4a35e041c88836f",
+            "bytes": 887,
+            "sha256": "d31b09885e7fd03c9b6034cfe5bbb95d0c6ee54a9f09c1a7d4a35e041c88836f",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "f2d41ca59ea6160b5764b8afd2e5ac1e69dfe4aadd23de515cb9951a4c5da1cd",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 1,
+        "mode": "PYTHON_METHODS"
+      },
+      {
+        "group_id": "provider04",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "5577736fefd58c6b4f28c01d51100901e4d831275a6daf7061a30f2a89fdbbb5",
+            "bytes": 1070,
+            "sha256": "5577736fefd58c6b4f28c01d51100901e4d831275a6daf7061a30f2a89fdbbb5",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "6cb547d5a942690d29ea5275607d66bcbc3b22728ab66abebc3256d2183055e3",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "12edb9acc2a7056e7d51ebf6d27a30e39e3cd64b77945e941401c505fefcd850",
+            "bytes": 942,
+            "sha256": "12edb9acc2a7056e7d51ebf6d27a30e39e3cd64b77945e941401c505fefcd850",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "8ff082b1311db0a2a4bb3549704e175ef7c9d1158ecc0642bbdef6dcf4635162",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "7eaae13369bb405264459c5b99ac0979a4bc352edbf49e8792656b318b4af0ea",
+            "bytes": 884,
+            "sha256": "7eaae13369bb405264459c5b99ac0979a4bc352edbf49e8792656b318b4af0ea",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "e74f90e62d9f5e245c6ddd7b5fa2525331a7e8dd362ce9fa28fd40437ffab7b0",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 1,
+        "mode": "PYTHON_METHODS"
+      },
+      {
+        "group_id": "policy-inheritance02",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "4afac8d6bee761839ce86e31549a77dddfec4ed3a6998a3c2489df356210aa66",
+            "bytes": 1090,
+            "sha256": "4afac8d6bee761839ce86e31549a77dddfec4ed3a6998a3c2489df356210aa66",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "584b03883976550ee98ccf87fa1ebabcbd4673348c51934103dd59b8728de7f6",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "eec499baa1f7d078cf34533ddb6293fe3a97353c435accf57d5dddbfc04b55f1",
+            "bytes": 952,
+            "sha256": "eec499baa1f7d078cf34533ddb6293fe3a97353c435accf57d5dddbfc04b55f1",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "9a80dff91d085586d1c75c3ba31df84b5481f55e55f11a7c0c0a608cdad65259",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "6541da9811a7358e2d3c5abd3ebfa080f0d88173afcac37521ee0458740602eb",
+            "bytes": 914,
+            "sha256": "6541da9811a7358e2d3c5abd3ebfa080f0d88173afcac37521ee0458740602eb",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "420a00a2e34bbe4be7b7c91ce727877d5676167b2c7a977684a59cf590049d99",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 1,
+        "mode": "PYTHON_METHODS"
+      },
+      {
+        "group_id": "operational-measurement",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "9c87c2312ed7ede470d30b7499ab4f1a3a2e6fc59bee48eae81daa171ccd8d0e",
+            "bytes": 1096,
+            "sha256": "9c87c2312ed7ede470d30b7499ab4f1a3a2e6fc59bee48eae81daa171ccd8d0e",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "e1dc8cb97898275910027df4587c4249198a4971382d474269448cfb62669697",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "4a0ecaf3207db771b222ea0ea83d68daa46f2cec0d1638a8bb961c5a361f533b",
+            "bytes": 955,
+            "sha256": "4a0ecaf3207db771b222ea0ea83d68daa46f2cec0d1638a8bb961c5a361f533b",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "e6ee4983682f3bb242132547c95279e9d7edd323cba583589c543a1b3103da14",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "779d8454466e0e587b884d433928f80b04d3b2a33a9b04975e103fdac7b4542b",
+            "bytes": 923,
+            "sha256": "779d8454466e0e587b884d433928f80b04d3b2a33a9b04975e103fdac7b4542b",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "fac37913d8441e8634ffc1b6956be3e445423146fc99b8065ac6330fd64ad6f5",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 1,
+        "mode": "PYTHON_METHODS"
+      },
+      {
+        "group_id": "operational-authority",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "9a64970f1cde3f053f69cd34efbcc0f1ffcb02f654b0a4760f50ac5290781599",
+            "bytes": 1092,
+            "sha256": "9a64970f1cde3f053f69cd34efbcc0f1ffcb02f654b0a4760f50ac5290781599",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "97c074da1b6fd09c867f48d43cd339b0394df433c15add335734117a08c493b3",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "a37fc8e6882b39c070074baa5542e592900c7c16935bc9aef2b4697139521b86",
+            "bytes": 953,
+            "sha256": "a37fc8e6882b39c070074baa5542e592900c7c16935bc9aef2b4697139521b86",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "a7321e2e956baba1fab644f37674619bbd58a4e1abee0585c86219a404e85dab",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "e42b844bcfaf47b3529ddc510c7c2680a7d9044ca255487f4dc1e87e381794ec",
+            "bytes": 917,
+            "sha256": "e42b844bcfaf47b3529ddc510c7c2680a7d9044ca255487f4dc1e87e381794ec",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "36a311e314b73089a30759d9444887da8fe55ad2efd642c5677618d21689f313",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 1,
+        "mode": "PYTHON_METHODS"
+      },
+      {
+        "group_id": "operational-custody",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "2e0810bdf64d4b2dc3324768cab9336dc02e2fe2c0dee91fc1d43a15a46adfca",
+            "bytes": 1088,
+            "sha256": "2e0810bdf64d4b2dc3324768cab9336dc02e2fe2c0dee91fc1d43a15a46adfca",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "eb71949762c944b5ece89deed4c2510134efc3efe620a937c6bd011e56bcefc2",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "02970a68a1c2814552cde40638f9f5113e02d03c723f4ecd84743c9461a90fc1",
+            "bytes": 951,
+            "sha256": "02970a68a1c2814552cde40638f9f5113e02d03c723f4ecd84743c9461a90fc1",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "07a2d33b245685f6a38e1e0d0ae271b1be02e580235c3db5f138486a678fae64",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "9746340abd13934ba3d448e05d3b4a4a266bf0af7611a27a378d3e6b6cf9c22c",
+            "bytes": 911,
+            "sha256": "9746340abd13934ba3d448e05d3b4a4a266bf0af7611a27a378d3e6b6cf9c22c",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "ac78f9c8a41b3b986064f090ce522ac9ac174bcb6300c9c830479d6c02902b9e",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 1,
+        "mode": "PYTHON_METHODS"
+      },
+      {
+        "group_id": "node-version",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "dd94227d8f23c7ca124eb6240a8e9848269aa59ca656528a5ef1c85e777b3c4b",
+            "bytes": 1042,
+            "sha256": "dd94227d8f23c7ca124eb6240a8e9848269aa59ca656528a5ef1c85e777b3c4b",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "3b593789bfc7665c7dda56df5fcaa39c258484aaafa88c7a8826dc2d57b6603a",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "1e4177e8eed138cfb7c49f78e99a98236f043882d226c0618cd8516874d50fc9",
+            "bytes": 934,
+            "sha256": "1e4177e8eed138cfb7c49f78e99a98236f043882d226c0618cd8516874d50fc9",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "0d283ff7ff2d2d5c63affd62f5dbd47120ddeff5bfedc4d6a547883546cc70c7",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "96923b0cdb3c42243d04671181772c1582027fef40159110a9af28afacc26a62",
+            "bytes": 691,
+            "sha256": "96923b0cdb3c42243d04671181772c1582027fef40159110a9af28afacc26a62",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "bd6db40e0aee97f09460c28ddc174827c9f8de807bd90935527448b49043a7f7",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 0,
+        "mode": "NODE_VERSION"
+      },
+      {
+        "group_id": "ui",
+        "command": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "aa002f57850158bbe055b34c6d8a8019e5ac0e4831e34c73f9fbd75096d68655",
+            "bytes": 1048,
+            "sha256": "aa002f57850158bbe055b34c6d8a8019e5ac0e4831e34c73f9fbd75096d68655",
+            "record_kind": "COMMAND_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-command-pin"
+          },
+          "registration_sha256": "be94752d7748a5f860a26554e6f7fd3e41282c0652088fff0444d5a75e47e524",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "parser": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "e7571d0a79b33f7e963c0e0f73fb45ea60baa09e10f4776d84674e057758318b",
+            "bytes": 918,
+            "sha256": "e7571d0a79b33f7e963c0e0f73fb45ea60baa09e10f4776d84674e057758318b",
+            "record_kind": "PARSER_PIN",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-parser-pin"
+          },
+          "registration_sha256": "536c3513e88c05967101b26356dda0ff555cffdb3b586d610b92bc85a4d1cd43",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_inventory": {
+          "reference": {
+            "format": "forex.protected-record-ref/1",
+            "binding": {
+              "run_id": "PUBLIC-EXAMPLE-NOT-A-RUN",
+              "epoch": 1,
+              "source_manifest_sha256": "fa8bc45f97034729cd1494a5e575c2208d13d70475549bf32ef973a0187b252f",
+              "config_sha256": "4a0699d45da9b4fdb30621ec345460045889665d249b6ddf2c3294c812ececa4",
+              "topology_sha256": "1f09dd464c34edaa552168a54110cc4939c2f773ecb828e4f940439bccc76389",
+              "original_window_sha256": "bb93a2e16f77583883474c0b303714b03d445263b7cd1c2b7c75ded9108759ce"
+            },
+            "publisher_selection_sha256": "e832f48af2e6ca7f074dce403dbca7eabcbd744ff32ad50850bcc24164950af3",
+            "root_id": "public-example-retention",
+            "object_id": "6b68b2407e6b60fe15d160f326d694d5b910fde5efb389ad98a7538e34d681cd",
+            "bytes": 860,
+            "sha256": "6b68b2407e6b60fe15d160f326d694d5b910fde5efb389ad98a7538e34d681cd",
+            "record_kind": "COLLECTION_INVENTORY",
+            "publisher_id": "example-reviewer",
+            "purpose": "test-collection-inventory"
+          },
+          "registration_sha256": "06ecf126bd7579322abaf8fac7cde7828942d65889025cf69c268f15eb0d1768",
+          "required_use": "SOURCE_COMPLETION"
+        },
+        "expected_test_count": 1,
+        "mode": "NODE_TAP"
+      }
+    ],
+    "not_before_utc": "2030-01-01T00:00:00.000000Z",
+    "expires_at_utc": "2030-01-01T00:03:00.000000Z"
+  }
+}

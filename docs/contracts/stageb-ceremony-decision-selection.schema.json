@@ -1,0 +1,1591 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:decision-selection:1.0",
+  "title": "Bounded action selection only; no execution authority",
+  "anyOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^probe-fact-1$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^probe-set-1$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^probe-request-1$"
+        },
+        "selected_action_ref": {
+          "type": "null"
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^probe-state-1$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^probe-fact-2$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^probe-set-2$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^probe-request-2$"
+        },
+        "selected_action_ref": {
+          "type": "null"
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^probe-state-2$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-34454d48acbc48d5eb759fe7$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-34454d48acbc48d5eb759fe7$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-34454d48acbc48d5eb759fe7$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(1f3f78dd4c7d53a6da04b19e|15578198638ba58bfb79a714)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-68a9007add5c616cf7d74a41$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-68a9007add5c616cf7d74a41$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-68a9007add5c616cf7d74a41$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(ccad2be28398f38fbdcade9d|825d61e55bbf3f464633d469)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-ee10d092cb407ac9f115b8d3$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-ee10d092cb407ac9f115b8d3$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-ee10d092cb407ac9f115b8d3$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(991de94a9970f4a1680c6a38|f169a08202087d8f9779b4ed)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-7a051a8381af22f589f7ecb4$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-7a051a8381af22f589f7ecb4$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-7a051a8381af22f589f7ecb4$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(533978f7e75039ab80387953|1521a51a7ad7c0da1cfb4baf)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-5d672aac39846c8681beef2a$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-5d672aac39846c8681beef2a$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-5d672aac39846c8681beef2a$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(045b8ef30d1b57de09fcf73f|db9806e3881da613f13c9c54)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-d31acacf68cc02b5c9c2cd64$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-d31acacf68cc02b5c9c2cd64$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-d31acacf68cc02b5c9c2cd64$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(4ee4ff7295b48f3d4816c8ea|197623ee571a41f7cdd2f336)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-863e8d46f03e57578dd77d8f$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-863e8d46f03e57578dd77d8f$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-863e8d46f03e57578dd77d8f$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(46b545392426eaa939bfd20f|024c5c39490e07de6f40e3ad)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-da01c35576b3cd90bb0521cc$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-da01c35576b3cd90bb0521cc$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-da01c35576b3cd90bb0521cc$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(1d3ca07835542e2539093c2d|30d211485051299471cdacb3)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-38477d4e23f06823abafdc09$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-38477d4e23f06823abafdc09$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-38477d4e23f06823abafdc09$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(16f1ce895647f7bad06b8ef9|718fcfe6b8eba85111183914)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-6788a750d13c36ac5bb17b44$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-6788a750d13c36ac5bb17b44$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-6788a750d13c36ac5bb17b44$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(c623614da6d4d6972521891f|0ab5fb199b55cf01df7234ae)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-d66c14324a266822d773c9dd$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-d66c14324a266822d773c9dd$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-d66c14324a266822d773c9dd$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(96b546889244c0c89665e7ba|933a9cabe467d729165440d2)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-186124118b11fdccd281f0c0$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-186124118b11fdccd281f0c0$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-186124118b11fdccd281f0c0$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(238872eab26d2aaefbdd18f6|0856b028bf955238dd5e47f4)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-f04108b00874c5c52c7c5c1d$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-f04108b00874c5c52c7c5c1d$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-f04108b00874c5c52c7c5c1d$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(9bf961a34dd0b7f62d33497b|7468c3cdbd0aa816e1852eca)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-0ff3c65e37ead2cf5f118e5c$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-0ff3c65e37ead2cf5f118e5c$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-0ff3c65e37ead2cf5f118e5c$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(93c676d8ef20a8e93c889119|41514ce40c33ecb7460a485c)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-f7ff58c2f6b34dfcba76ddbd$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-f7ff58c2f6b34dfcba76ddbd$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-f7ff58c2f6b34dfcba76ddbd$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(d6266a8bf32ac010924a133a|5bcab68c1e86c4e76774ed7c)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-b332b8be6120f14c8db53609$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-b332b8be6120f14c8db53609$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-b332b8be6120f14c8db53609$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(51a3882570a989671cec20f7|eafa10e2d14659498be7b032)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-df90d36d5616d3d5b4fbdd35$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-df90d36d5616d3d5b4fbdd35$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-df90d36d5616d3d5b4fbdd35$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(d0178289d0ce8ba4aef6e358|a43fc23a3c3b6b357e8ca85e)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-e76d94d6b5e9eaaaca2084c7$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-e76d94d6b5e9eaaaca2084c7$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-e76d94d6b5e9eaaaca2084c7$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(8f7da52e87f05fb5da9fb626|34e9f5d282fd8fa9a92b9445)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-0807284e89897bf78df05fb3$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-0807284e89897bf78df05fb3$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-0807284e89897bf78df05fb3$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(bb9e676d76e34f045863ed70|edd0e5187d22a7481a283d8c)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-59dc91986a8ff63ad6a9707e$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-59dc91986a8ff63ad6a9707e$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-59dc91986a8ff63ad6a9707e$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(b53568260fd470e226fe2cae|bec9a030db3ec2fdeab3e2e1)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-c36ea9e4a391b61ecb5d4b27$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-c36ea9e4a391b61ecb5d4b27$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-c36ea9e4a391b61ecb5d4b27$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(12a37395f9740d799ba716ce|8a6ef729f26eff2539139106)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-fa2d6f4a5af83457ffd5d5bf$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-fa2d6f4a5af83457ffd5d5bf$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-fa2d6f4a5af83457ffd5d5bf$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(a1a351a733bd73160bfcd202|9f0b73117b8725524a1f717d)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-9abb74acca44d1b7fdd7a122$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-9abb74acca44d1b7fdd7a122$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-9abb74acca44d1b7fdd7a122$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(2cb11d0eb3c175fef2a4f785|6d66542d152373d2706e69d8)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-341a753469de22b139fa6bb0$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-341a753469de22b139fa6bb0$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-341a753469de22b139fa6bb0$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(904162a36ad81e95d2044a40|9649b023d6de79f9bdb62da2)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-8d397916af0441f468fdda46$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-8d397916af0441f468fdda46$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-8d397916af0441f468fdda46$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(6ffcec39c39f9531dea5836f|2c676da77bf5213380cbe272)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-c00be4dbc11328d27cc6201d$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-c00be4dbc11328d27cc6201d$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-c00be4dbc11328d27cc6201d$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(79fa1976fd95bf336af9c7b1|f4e013ad40b7e529c7ddb911)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-824f8b169c71cd60a49c458b$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-824f8b169c71cd60a49c458b$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-824f8b169c71cd60a49c458b$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(15867e56c1c5b8cb8bea5228|afc1b1be3db349a279bf412a)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-83224217a09bd8a60f318779$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-83224217a09bd8a60f318779$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-83224217a09bd8a60f318779$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(b6f5aece11ac573877e604b6|5a3c97a98cc1caa1d48b423d)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-5e9416ec7f9474cdd955090c$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-5e9416ec7f9474cdd955090c$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-5e9416ec7f9474cdd955090c$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(6a2de7c702c13de5c4644349|7baf6e6fcecc831d2e51e36e)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^evidence-ee7b6eb3c5ea42419a92b2a1$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-ee7b6eb3c5ea42419a92b2a1$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-ee7b6eb3c5ea42419a92b2a1$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(69a9372ded3eff25256b6861|cd6a3be07e25fcadac1716cb)$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]+$"
+        }
+      }
+    }
+  ]
+}

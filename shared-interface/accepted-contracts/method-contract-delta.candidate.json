@@ -1,0 +1,127 @@
+{
+  "format": "forex.method-contract-delta-candidate/2",
+  "status": "PROPOSED_REQUIRES_REVIEW_NOT_ACTIVATED",
+  "base_sha256": "19240b1c8ef186bd1e09965595f1ce0a53c54c9de34d2b3d8eeb2fb6b9b15e45",
+  "method_id_unchanged": "POLICY_INHERITANCE_TRUSTED_ADAPTER_V1",
+  "exact_object_field_operations": [
+    {
+      "op": "remove",
+      "path": "/exact_object_fields/ProcessIdentity/exe_object_ref"
+    },
+    {
+      "op": "add",
+      "path": "/exact_object_fields/ProcessIdentity/exe_asset",
+      "value": "ExecutableAssetIdentity"
+    },
+    {
+      "op": "add",
+      "path": "/exact_object_fields/ExecutableAssetIdentity",
+      "value": {
+        "asset_id": "Id",
+        "selected_path": "AbsoluteSelectedPath",
+        "bytes": "Int[1,2147483648]",
+        "sha256": "Sha256",
+        "device": "UInt",
+        "inode": "PositiveInt"
+      }
+    },
+    {
+      "op": "replace",
+      "path": "/exact_object_fields/CoveragePlan/format",
+      "value": "literal:forex.policy-inheritance-coverage-plan/3"
+    },
+    {
+      "op": "replace",
+      "path": "/exact_object_fields/Appointment/format",
+      "value": "literal:forex.policy-inheritance-appointment/3"
+    },
+    {
+      "op": "replace",
+      "path": "/exact_object_fields/SetupBudget/format",
+      "value": "literal:forex.policy-inheritance-setup-budget/3"
+    },
+    {
+      "op": "replace",
+      "path": "/exact_object_fields/AttestationBody/format",
+      "value": "literal:forex.policy-inheritance-attestation/3"
+    },
+    {
+      "op": "replace",
+      "path": "/exact_object_fields/Event/format",
+      "value": "literal:forex.policy-inheritance-event/3"
+    },
+    {
+      "op": "replace",
+      "path": "/exact_object_fields/ConsumerDecision/format",
+      "value": "literal:forex.policy-inheritance-method-decision/3"
+    },
+    {
+      "op": "replace",
+      "path": "/exact_object_fields/IngestionAck/format",
+      "value": "literal:forex.policy-inheritance-ingestion-ack/3"
+    },
+    {
+      "op": "replace",
+      "path": "/exact_object_fields/ConsumerCheckpoint/format",
+      "value": "literal:forex.policy-inheritance-checkpoint/3"
+    },
+    {
+      "op": "replace",
+      "path": "/exact_object_fields/CheckpointAdvanceRequest/format",
+      "value": "literal:forex.policy-inheritance-checkpoint-transition/3"
+    },
+    {
+      "op": "replace",
+      "path": "/exact_object_fields/ExposedOutput/format",
+      "value": "literal:forex.policy-inheritance-exposed-output/3"
+    }
+  ],
+  "exact_purpose_renaming": {
+    "policy-inheritance-witness-v2": "policy-inheritance-witness-v3",
+    "policy-inheritance-setup-budget-v2": "policy-inheritance-setup-budget-v3",
+    "policy-inheritance-method-decision-v2": "policy-inheritance-method-decision-v3",
+    "policy-inheritance-ingestion-ack-v2": "policy-inheritance-ingestion-ack-v3",
+    "policy-inheritance-checkpoint-v2": "policy-inheritance-checkpoint-v3",
+    "policy-inheritance-checkpoint-transition-v2": "policy-inheritance-checkpoint-transition-v3"
+  },
+  "purpose_rename_scope": "Apply exactly to Purpose enum, role purpose allowlists and all normative purpose references; no aliases or dual acceptance.",
+  "signature_domain_ascii": "CAS_FOREX_POLICY_INHERITANCE_V3\n",
+  "signature_domain_note": "Final byte is LF. Old V2 remains exclusive to historical /2. RPC domains remain separate.",
+  "predicate_changes": [
+    "Process executable size/hash compare to exe_asset.bytes/sha256, with actual selected_path/device/inode equality and authenticated in-budget FileHashMeasurement; never compare the hash of metadata with the hash of a binary.",
+    "Runtime origin is authenticated SpawnSelection and decoded capture; PUBLIC_TRUSTED_SPAWN_PREMISE remains confined to preserved analysis tests.",
+    "Nested raw ObjectRefs retain exact retained bytes and existing limits; executable asset is a separately pinned actual file, not an implicit unbounded resolver ObjectRef."
+  ],
+  "unchanged": [
+    "Original 180-second interval and clock guards",
+    "Three distinct required principals and keys",
+    "Independent consumer-rollback checkpoint boundary",
+    "Eight exact calibration cases and 19 ordered slots",
+    "Checkpoint stage ordering/exact recovery/no remint",
+    "Both limited accepted claims and all eight unsupported routes",
+    "No completion/scoring/publication authority from setup method",
+    "All R6 custody, original-attempt, call/token and aggregate-only obligations"
+  ],
+  "freeze_condition": "Complete derived spec materialized in method-contract.candidate.json with CANDIDATE_PROTOCOL_BINDING.md. Independent review of this full packet is required before implementation uses an accepted runtime interface pin; no predecessor is modified.",
+  "predecessor_candidate01_manifest_sha256": "a3beb3b31e31e8be58d2e5bb335190903e0a940d805b50297b1338ec0acc312e",
+  "candidate02_additions": [
+    "Closed ProtectedRecordRef/1 and PublisherRootSelection/1 with exact root/content/publisher/purpose/use/schema binding; explicit successor retained fact/release versions.",
+    "Closed eight artifact-kind routes; authenticated EventInputs required by Event; SPAWN capture; decode and runtime-selection provenance; signed native-byte manifest.",
+    "Closed thirteen-group completion selection, commands/executables, parser/discovery/collection/execution reports and custody completion verifier.",
+    "Controller authenticated READ_CURRENT at release consumption with exact release/attempt/channel/head binding; issuer observations cannot substitute."
+  ],
+  "complete_normative_companions": [
+    "interface.candidate.json",
+    "method-contract.candidate.json",
+    "protected-records.candidate.json",
+    "completion.candidate.json",
+    "release-consumption.candidate.json",
+    "role-release-evidence.candidate.json"
+  ],
+  "candidate03_additions": [
+    "Materialize NarrowRoleReleaseEvidence1 and exact custody NR01..NR12 checks; no method wire/accepted-claim change.",
+    "Remove unused registry_entry V1 domain; V2 ProtectedRegistration exclusively applies.",
+    "Explicit inherited RECORDS.md path/hash and canonical six-fractional-digit public timestamps."
+  ],
+  "predecessor_candidate02_manifest_sha256": "efbfd7e2a629df5d14587538d1638ec6874c61f2bfb99f030706c3841b4e2755"
+}

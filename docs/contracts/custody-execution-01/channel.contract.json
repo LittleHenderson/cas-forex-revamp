@@ -1,0 +1,110 @@
+{
+  "format": "forex.public-custodian-current-channel-contract/1",
+  "document_class": "SOURCE_INTERFACE_NOT_AN_ACTIVE_CHANNEL",
+  "status": "CUSTODIAN_PROPOSED_FOR_STEWARD_ACKNOWLEDGEMENT",
+  "release_enabled": false,
+  "workload_roles": ["CUSTODY_CONTROLLER", "DECISION_RUNNER", "MODEL_SERVICE"],
+  "observer_role": "INDEPENDENT_OBSERVER_SELECTED_OUTSIDE_PAYLOAD",
+  "controller_owned_only": [
+    "FULL_SUITE", "FUTURE_SCHEDULE", "VENUE_ORDER_PLANS_AND_FILL_QUOTAS",
+    "AUTHORITATIVE_PENDING_MUTATIONS", "EXPECTED_KEYS_FOR_SCORING_ONLY", "COUNTERPART_MAP"
+  ],
+  "execution_excluded": ["PERMUTATION_ENTROPY", "PRIVATE_PERMUTATION_TRACE"],
+  "transport": {
+    "peer_authentication": "Actual externally pinned peer identity; payload role/ID is not authority.",
+    "process_creation": "Clean exec and allowlisted descriptors; no fork from private-loaded controller state.",
+    "maximum_envelope_bytes": "Positive finite limit fixed in channel freeze; unbound/unlimited is invalid.",
+    "sequence": "Strictly increasing per channel/run/epoch; exact duplicate may return retained acknowledgement only.",
+    "conflicting_duplicate": "BLOCK_PRESERVE_ORIGINAL",
+    "unknown_fields_or_duplicate_keys": "BLOCK",
+    "imported_path_callback_principal": "FORBIDDEN"
+  },
+  "common_required_fields": {
+    "format": "Literal forex.custody-current-channel/1",
+    "kind": "One of message_kinds",
+    "message_id": "Opaque bounded ASCII identifier",
+    "channel_id": "Opaque bounded identifier bound by the release receipt",
+    "run_id": "Exact authorized run identifier",
+    "epoch": "Positive JSON integer",
+    "sequence": "Positive JSON integer, monotonic for this authenticated channel",
+    "scope_sha256": "64 lowercase hex digest",
+    "release_receipt_sha256": "64 lowercase hex digest of consumed authenticated receipt",
+    "request_id": "Opaque exact current request identifier",
+    "not_before_utc": "RFC3339 UTC timestamp",
+    "expires_at_utc": "RFC3339 UTC timestamp within all original deadlines",
+    "payload_sha256": "64 lowercase hex digest of exact canonical payload"
+  },
+  "message_kinds": {
+    "CURRENT_FRAME": {
+      "direction": "CUSTODY_CONTROLLER_TO_DECISION_RUNNER",
+      "required_payload_fields": {
+        "delivery_id": "Opaque one-use identity",
+        "opportunity_set_id": "Opaque current identity; new for fresh inference",
+        "current_packet": "Exact pinned forex.current-decision-packet/2 object",
+        "current_packet_sha256": "Exact digest; independently checked against packet bytes",
+        "source_state_reference_sha256": "Current actual state reference digest",
+        "current_policy_binding_sha256": "Current independently bound policy digest/version reference",
+        "current_context_binding_sha256": "Current context digest/version reference",
+        "current_venue_readback_sha256": "Independent current venue readback receipt digest",
+        "current_evidence_bundle_sha256": "Exact permitted current evidence bundle digest"
+      },
+      "forbidden": ["FUTURE_EVENT", "EXPECTED_STATE", "CASE_OR_OBLIGATION_LABEL", "VARIANT_OR_PAIR_ROLE", "KEY", "SEED", "ANSWER_LINKED_ASSERTION", "ORDER_PLAN"]
+    },
+    "GENERATION_SUBMITTED": {
+      "direction": "DECISION_RUNNER_TO_CUSTODY_CONTROLLER",
+      "required_payload_fields": {
+        "generation_attempt_id": "Exact durably reserved one-shot identity",
+        "generation_http_id": "Exact generation transport exchange identity",
+        "invocation_sha256": "Exact frozen invocation digest",
+        "generation_body_sha256": "Exact submitted HTTP body digest",
+        "transport_sent_receipt_sha256": "Independently resolvable actual complete-send receipt digest",
+        "transport_capture_binding_sha256": "Exact transport capture/producer binding digest",
+        "preflight_receipt_sha256": "Exact current render/token count receipt digest",
+        "clock_binding_sha256": "Pinned UTC/monotonic clock binding digest"
+      },
+      "effect": "May trigger only the next due controller-owned event after receipt verification; no mutation authority conveyed by caller."
+    },
+    "PENDING_APPLIED_ACK": {
+      "direction": "CUSTODY_CONTROLLER_TO_DECISION_RUNNER",
+      "required_payload_fields": {
+        "generation_attempt_id": "Same exact one-shot identity",
+        "generation_http_id": "Same exact transport exchange identity",
+        "invocation_sha256": "Same exact invocation digest",
+        "generation_body_sha256": "Same exact submitted body digest",
+        "transport_sent_receipt_sha256": "Same verified complete-send receipt digest",
+        "event_receipt_id": "Opaque one-use observed event identity",
+        "event_ordinal": "Positive monotonic integer for applied events only; no remaining schedule count",
+        "previous_event_receipt_sha256": "Previous applied-event receipt digest, or explicit null for first event",
+        "changed_domain": "MARKET, CONTEXT or POLICY",
+        "before_state_reference_sha256": "Actual independently read pre-event state digest",
+        "after_state_reference_sha256": "Actual independently read post-event state digest",
+        "applied_effect_receipt_sha256": "Independent actual effect/revision receipt digest",
+        "applied_timing_receipt_sha256": "Actual verified complete-send and applied-event times only; does not claim a future response-finish observation",
+        "current_readback_bundle_sha256": "Current actual readback bundle digest for stale validation"
+      },
+      "forbidden": ["NEXT_EVENT_PAYLOAD", "FULL_SCHEDULE", "EXPECTED_EFFECT", "CALLBACK_OR_PATH_AUTHORITY"],
+      "effect": "Records observed application only; channel acceptance alone is insufficient."
+    },
+    "DECISION_RESULT": {
+      "direction": "DECISION_RUNNER_TO_CUSTODY_CONTROLLER",
+      "required_payload_fields": {
+        "generation_attempt_id": "Same exact one-shot identity",
+        "generation_http_id": "Same exact transport exchange identity",
+        "invocation_sha256": "Same exact invocation digest",
+        "result_status": "COMPLETE, FAILED or UNKNOWN; only COMPLETE can enter valid-selection checks",
+        "selection": "Exact bounded existing selection-schema object for COMPLETE; explicit null otherwise. A null object is not a valid WAIT selection object.",
+        "attempt_outcome_receipt_sha256": "Required retained private completion/failure/unknown record digest for the original spent attempt",
+        "raw_response_receipt_sha256": "Retained private raw response digest, or explicit null only when no response exists; a failure/unknown outcome record remains required",
+        "transport_capture_receipt_sha256": "Actual transport-capture digest; explicit null only on unavailable evidence and result_status cannot be COMPLETE",
+        "token_usage_receipt_sha256": "Independent usage/parity digest; explicit null only on unavailable evidence and result_status cannot be COMPLETE",
+        "pending_window_completion_receipt_sha256": "Final actual send/change/response window proof; required for pending-event success, explicit null only when no pending event exists or result is FAILED/UNKNOWN",
+        "current_state_readback_sha256": "Fresh current state binding before admission; unavailable means FAILED/UNKNOWN with no admission"
+      },
+      "effect": "Proposal only; core independently checks authority/current state before reservation/admission."
+    }
+  },
+  "unavailable_receipt_or_effect": "BLOCK_RETAIN_UNKNOWN_NO_SYNTHETIC_SUCCESS_ACK",
+  "private_channel_metadata_in_model_body": "FORBIDDEN_UNLESS_ALREADY_ALLOWED_BY_PINNED_CURRENT_PACKET_SCHEMA",
+  "authoritative_state_mutation_location": "TRUSTED_CONTROLLER_SIDE_WITH_SEPARATE_DURABLE_CORE_AND_VENUE_RESPONSIBILITIES",
+  "runtime_implemented_or_observed": false
+}

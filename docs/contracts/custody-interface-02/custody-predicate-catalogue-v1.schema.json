@@ -1,0 +1,207 @@
+{
+  "$id": "urn:forex:custody-interface:predicates",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "assertions": {
+      "additionalProperties": false,
+      "properties": {
+        "actual_entry": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "bounded_authority": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "changed_context_observed": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "choice_A": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "choice_B": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "different_downstream_effect": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "entry_observed": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "expansion_rejected": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "explicit_wait": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "fresh_inference": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "full_exit": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "missing_fact_preserved": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "no_dispatch_or_venue_change": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "no_new_risk": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "none_eligible": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "pending_change_ordering": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "policy_unchanged": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "positive_partial_remainder": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "prior_A_observed": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "protection_modified": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "relevant_change_observed": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "same_position_quantity": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "same_position_stop_quantity": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "stable_identity_evolving_ledger": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "stale_rejected": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "stand_down": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "valid_bounded_action_observed": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "valid_position_held": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "actual_entry",
+        "bounded_authority",
+        "changed_context_observed",
+        "choice_A",
+        "choice_B",
+        "different_downstream_effect",
+        "entry_observed",
+        "expansion_rejected",
+        "explicit_wait",
+        "fresh_inference",
+        "full_exit",
+        "missing_fact_preserved",
+        "no_dispatch_or_venue_change",
+        "no_new_risk",
+        "none_eligible",
+        "pending_change_ordering",
+        "policy_unchanged",
+        "positive_partial_remainder",
+        "prior_A_observed",
+        "protection_modified",
+        "relevant_change_observed",
+        "same_position_quantity",
+        "same_position_stop_quantity",
+        "stable_identity_evolving_ledger",
+        "stale_rejected",
+        "stand_down",
+        "valid_bounded_action_observed",
+        "valid_position_held"
+      ],
+      "type": "object"
+    },
+    "common_every_step": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "format": {
+      "const": "forex.custody-predicates/1"
+    },
+    "global_acceptance": {
+      "additionalProperties": false,
+      "properties": {
+        "application_or_model_execution_status": {
+          "const": "NOT_RUN"
+        },
+        "missing_rows_policy": {
+          "const": "INCOMPLETE"
+        },
+        "required_independent_review": {
+          "const": true
+        },
+        "rule": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "unknown_predicate_policy": {
+          "const": "BLOCK"
+        }
+      },
+      "required": [
+        "rule",
+        "required_independent_review",
+        "unknown_predicate_policy",
+        "missing_rows_policy",
+        "application_or_model_execution_status"
+      ],
+      "type": "object"
+    },
+    "interpretation": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "format",
+    "interpretation",
+    "common_every_step",
+    "assertions",
+    "global_acceptance"
+  ],
+  "type": "object"
+}

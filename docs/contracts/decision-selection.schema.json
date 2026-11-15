@@ -1,0 +1,858 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:decision-selection:1.0",
+  "title": "Bounded action selection only; no execution authority",
+  "anyOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^probe-fact-1$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^probe-set-1$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^probe-request-1$"
+        },
+        "selected_action_ref": {
+          "type": "null"
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^probe-state-1$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^probe-fact-2$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^probe-set-2$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^probe-request-2$"
+        },
+        "selected_action_ref": {
+          "type": "null"
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^probe-state-2$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case|policy)-s101$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-s101$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-s101$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-c1s101$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case|policy)-s201$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-s201$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-s201$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-c2s201$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case|policy)-s301$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-s301$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-s301$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-c3s301$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case|policy)-s401$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-s401$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-s401$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-c4s401$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case|policy)-s501$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-s501$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-s501$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-c5s501$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case|policy)-p4s101$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-p4s101$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-p4s101$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-p4s101$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case|policy)-p4s102$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-p4s102$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-p4s102$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-p4s102$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case|policy)-p4s103$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-p4s103$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-p4s103$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-p4s103$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case|policy)-p4s104$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-p4s104$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-p4s104$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-p4s104$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case|policy)-p4s105$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-p4s105$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-p4s105$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-p4s105$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case|policy)-p4s106$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-p4s106$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-p4s106$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-p4s106$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case)-p4b201$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-p4b201$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-p4b201$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-p4b201$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case)-p4b202$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-p4b202$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-p4b202$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-p4b202$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case)-p4n301$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-p4n301$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-p4n301$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-p4n301$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_ids",
+        "opportunity_set_id",
+        "reason",
+        "request_id",
+        "selected_action_ref",
+        "source_state_id"
+      ],
+      "properties": {
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^(evidence|case)-p4n302$"
+          }
+        },
+        "opportunity_set_id": {
+          "type": "string",
+          "pattern": "^set-p4n302$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^request-p4n302$"
+        },
+        "selected_action_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^fxopt-p4n302$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_state_id": {
+          "type": "string",
+          "pattern": "^state-[0-9a-f]{64}$"
+        }
+      }
+    }
+  ]
+}

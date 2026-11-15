@@ -1,0 +1,165 @@
+{
+  "$id": "urn:forex:custody-interface:trajectories",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "format": {
+      "const": "forex.custody-trajectories/1"
+    },
+    "integration_compatibility": {
+      "const": "NOT_EXECUTABLE_UNDER_MODEL_SUITE_V1"
+    },
+    "purpose": {
+      "const": "SEALED_B_ACCEPTANCE"
+    },
+    "r6_definition_sha256": {
+      "pattern": "^[a-f0-9]{64}$",
+      "type": "string"
+    },
+    "trajectories": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "pattern": "^acct-[a-f0-9]{24}$",
+            "type": "string"
+          },
+          "case_id": {
+            "pattern": "^[a-f0-9]{32}$",
+            "type": "string"
+          },
+          "initial_account": {
+            "additionalProperties": false,
+            "properties": {
+              "available_margin": {
+                "anyOf": [
+                  {
+                    "$ref": "urn:forex:custody-interface:common#/$defs/decimal"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "balance": {
+                "$ref": "urn:forex:custody-interface:common#/$defs/decimal"
+              },
+              "equity": {
+                "$ref": "urn:forex:custody-interface:common#/$defs/decimal"
+              },
+              "position_inventory": {
+                "items": {},
+                "maxItems": 0,
+                "minItems": 0,
+                "type": "array"
+              }
+            },
+            "required": [
+              "balance",
+              "equity",
+              "available_margin",
+              "position_inventory"
+            ],
+            "type": "object"
+          },
+          "initial_market": {
+            "$ref": "urn:forex:custody-interface:common#/$defs/quote"
+          },
+          "instrument": {
+            "const": "EURUSD"
+          },
+          "plan_id": {
+            "pattern": "^plan-[a-f0-9]{24}$",
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "urn:forex:custody-interface:common#/$defs/policy"
+          },
+          "steps": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "context": {
+                  "$ref": "urn:forex:custody-interface:common#/$defs/context"
+                },
+                "current_market": {
+                  "$ref": "urn:forex:custody-interface:common#/$defs/quote"
+                },
+                "observation_binding": {
+                  "const": "FRESH_INDEPENDENT_VENUE_SNAPSHOT"
+                },
+                "observed_accounting_override": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "available_margin": {
+                      "type": "null"
+                    }
+                  },
+                  "required": [
+                    "available_margin"
+                  ],
+                  "type": "object"
+                },
+                "options": {
+                  "items": {
+                    "$ref": "urn:forex:custody-interface:common#/$defs/option"
+                  },
+                  "maxItems": 8,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "policy_revision": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "presentation_note": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "step_id": {
+                  "pattern": "^[a-f0-9]{24}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "step_id",
+                "context",
+                "options",
+                "observation_binding",
+                "current_market",
+                "policy_revision",
+                "presentation_note"
+              ],
+              "type": "object"
+            },
+            "maxItems": 5,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "case_id",
+          "account_id",
+          "plan_id",
+          "instrument",
+          "initial_account",
+          "initial_market",
+          "policy",
+          "steps"
+        ],
+        "type": "object"
+      },
+      "maxItems": 16,
+      "minItems": 16,
+      "type": "array"
+    }
+  },
+  "required": [
+    "format",
+    "purpose",
+    "integration_compatibility",
+    "r6_definition_sha256",
+    "trajectories"
+  ],
+  "type": "object"
+}

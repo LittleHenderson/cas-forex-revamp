@@ -1,0 +1,784 @@
+{
+  "format": "forex.stage-b-operational-interface-candidate/3",
+  "status": "PROPOSED_ROLE_EVIDENCE_REPAIR_REQUIRES_REREVIEW",
+  "release_enabled": false,
+  "runtime_authorized": false,
+  "baseline": {
+    "method_spec_sha256": "19240b1c8ef186bd1e09965595f1ce0a53c54c9de34d2b3d8eeb2fb6b9b15e45",
+    "implementation02_archive_sha256": "a4234ded99e5f7854edabec9479077f13eb63d8194381cb22cd15bb12d798d97",
+    "b10_archive_sha256": "60e40471e01ebbefafe87cd9a5d629bf460a331af4cfd3ded21591d485a284f1",
+    "required_method_delta": "method-contract-delta.candidate.json plus complete method-contract.candidate.json and CANDIDATE_PROTOCOL_BINDING.md; proposed /3, -v3 and V3; independent review pending"
+  },
+  "notation": {
+    "closed": "All listed fields required; exact field sets; null only where Nullable. Integers exclude booleans. Tagged bodies use exactly the named kind's fields. No free extension map.",
+    "encoding": "Inherit design05 strict canonical UTF-8 JSON, depth32 and no floats/duplicate keys/BOM. Binary capture uses lowercase even-length hex or ObjectRef to bounded retained raw bytes.",
+    "imports": "Import design05 types unchanged unless explicitly listed in required_contract_deltas. Import source04 fact/completion/scoring types by pinned source; no authenticity inferred from shape.",
+    "reference": "ObjectRef always hashes the actual retained object bytes; no executable or model binary is placed in the bounded evidence object store.",
+    "type_strings": "Existing design05 type grammar plus union tags and Nullable. This descriptive interface is not an executable validator.",
+    "bounds": "Per method record <=1MiB, each retained raw object <=4MiB, total method raw <=64MiB. Entire RPC signature frame <=4MiB; advance attachments <=64KiB each; checkpoint/attestation text <=8KiB each; history <=23. Reject overflow. Smaller bounds never renew clocks."
+  },
+  "required_contract_deltas": [
+    {
+      "id": "OC-01",
+      "issue": "ProcessIdentity.exe_object_ref is a <=4MiB ObjectRef, but current semantics compare its hash/size directly with the executable binary and recursively resolve it as evidence. Large selected executables cannot use that representation.",
+      "proposal": "In a separately versioned method contract successor, replace exe_object_ref with exe_asset: ExecutableAssetIdentity. Keep ObjectRef bounds unchanged. Recompute hashes from selected actual files during original budget; bind raw FileHashMeasurement and actual exe device/inode/path; compare content hash/size, never metadata hash.",
+      "claim_effect": "Preserves executable-content identity; separates large immutable assets from bounded evidence. No acceptance until reviewed successor and consumers agree."
+    },
+    {
+      "id": "OC-02",
+      "issue": "Implementation02 requires PUBLIC_TRUSTED_SPAWN_PREMISE and exact PublicSelections/PublicEvidence classes.",
+      "proposal": "Runtime selection and evidence adapters use authenticated SpawnSelection and raw decode bindings below. Pure fixture API stays analysis-only. Reviewed runtime predicate port uses identical substantive checks plus origin/authentication; no cast or label replacement gives a fixture authority.",
+      "claim_effect": "Adds real provenance rather than upgrading public fixtures."
+    },
+    {
+      "id": "OC-03",
+      "issue": "Source04 Ref and immutable registry assume /opt/cas-forex paths and preselected raw hashes; future records need protected writable publication.",
+      "proposal": "A purpose-specific source04 successor uses externally selected protected root IDs and authenticated RegistryEntry additions; record IDs are content hashes. Existing /1 path semantics remain historical. No arbitrary path expansion or old-provider success override.",
+      "claim_effect": "Authenticates actual future records under fixed pre-execution roots/signers/purposes, not a mutable trust selection."
+    },
+    {
+      "id": "OC-04",
+      "issue": "Source04 completion group list excludes standalone provider and pure-method suites.",
+      "proposal": "Freeze one new complete ordered group manifest including provider04, policy-inheritance02 and operational adapter suites; observer and completion consumer agree exact selected commands/counts.",
+      "claim_effect": "Adds coverage; historical counts remain authored and unrun."
+    }
+  ],
+  "imports": [
+    "Scope",
+    "Binding",
+    "Stamp",
+    "ClockDomain",
+    "ObjectRef",
+    "SignedEnvelope",
+    "SetupBudget",
+    "CheckpointAdvanceRequest",
+    "ConsumerCheckpoint",
+    "OriginalSetupKey",
+    "ExposedOutput",
+    "DescriptorIdentity",
+    "ThreadIdentity",
+    "CalibrationKind",
+    "Origin",
+    "EvidenceClass",
+    "InstallationPayload (with reviewed ProcessIdentity successor)",
+    "protected-records.candidate.json exact protected references/grants and explicitly versioned source04 semantic imports",
+    "completion.candidate.json thirteen-group selection/report types",
+    "release-consumption.candidate.json direct controller read-only route",
+    "role-release-evidence.candidate.json: closed NarrowRoleReleaseEvidence1 for the exact role_read_isolation_receipt_sha256 slot"
+  ],
+  "exact_object_fields": {
+    "ExecutableAssetIdentity": {
+      "asset_id": "Id",
+      "selected_path": "AbsoluteSelectedPath",
+      "bytes": "Int[1,2147483648]",
+      "sha256": "Sha256",
+      "device": "UInt",
+      "inode": "PositiveInt"
+    },
+    "CaptureSubject": {
+      "role": "CONTROLLER|DECISION_BOOTSTRAP|MODEL_BOOTSTRAP|MODEL_SERVICE|TEMPORARY_CHALLENGER|SETUP_CONSUMER|CHECKPOINT_CUSTODIAN|COMPLETION_OBSERVER",
+      "boot_id": "Uuid",
+      "pid": "PositiveInt",
+      "start_ticks": "PositiveInt",
+      "parent_pid": "PositiveInt",
+      "parent_start_ticks": "PositiveInt",
+      "uid": "UInt",
+      "gid": "UInt"
+    },
+    "CaptureBatch": {
+      "format": "literal:forex.trusted-setup-capture/2",
+      "binding": "Binding",
+      "budget_sha256": "Sha256",
+      "capture_id": "Id",
+      "producer_id": "Id",
+      "reporting_origin": "Origin",
+      "evidence_class": "EvidenceClass",
+      "subject": "CaptureSubject",
+      "receiver_component_sha256": "Nullable<Sha256>",
+      "started": "Stamp",
+      "finished": "Stamp",
+      "operations": "array<CaptureOperation>[1,4096]",
+      "previous_batch_sha256": "Sha256"
+    },
+    "CaptureOperation": {
+      "operation_index": "PositiveInt",
+      "kind": "CaptureKind",
+      "started": "Stamp",
+      "finished": "Stamp",
+      "data": "exact body selected by kind"
+    },
+    "ProcRead": {
+      "subject": "CaptureSubject",
+      "selector": "STAT|STATUS|TASK_STAT|NAMESPACE_LINK|MOUNTINFO|EXE_LINK|FD_LINK|FDINFO|NET_TCP|NET_TCP6",
+      "selector_argument": "Nullable<IdOrDecimalIdentifier>",
+      "raw_ref": "ObjectRef",
+      "return_value": "SignedInt",
+      "errno": "Int[0,4095]"
+    },
+    "ProcessBoundary": {
+      "subject": "CaptureSubject",
+      "parent_subject": "CaptureSubject",
+      "before_stat_ref": "ObjectRef",
+      "after_stat_ref": "ObjectRef",
+      "status_ref": "ObjectRef",
+      "task_stat_refs": "array<ObjectRef>[1,256]",
+      "namespace_reads": "array<NamespaceRead>[4,8]",
+      "mountinfo_ref": "ObjectRef",
+      "exe_link_ref": "ObjectRef",
+      "exe_stat": "StatObservation"
+    },
+    "NamespaceRead": {
+      "namespace": "mnt|pid|net|time|user|ipc|uts|cgroup",
+      "link_text": "BoundedString",
+      "device": "UInt",
+      "inode": "PositiveInt",
+      "raw_ref": "ObjectRef"
+    },
+    "StatObservation": {
+      "device": "UInt",
+      "inode": "UInt",
+      "mode": "UInt",
+      "uid": "UInt",
+      "gid": "UInt",
+      "bytes": "UInt",
+      "mtime_ns": "UInt",
+      "ctime_ns": "UInt"
+    },
+    "FdInventory": {
+      "subject": "CaptureSubject",
+      "paused_boundary_id": "Id",
+      "before_process_ref": "ObjectRef",
+      "after_process_ref": "ObjectRef",
+      "enumerated_fds": "array<UInt>[3,16]",
+      "entries": "array<FdObservation>[3,16]",
+      "enumeration_complete": "literal-bool:true"
+    },
+    "FdObservation": {
+      "descriptor": "DescriptorIdentity",
+      "link_ref": "ObjectRef",
+      "fdinfo_ref": "ObjectRef",
+      "stat": "StatObservation",
+      "fstat_return": "SignedInt",
+      "fstat_errno": "Int[0,4095]"
+    },
+    "SpawnSelection": {
+      "format": "literal:forex.trusted-spawn-selection/2",
+      "binding": "Binding",
+      "budget_sha256": "Sha256",
+      "spawn_id": "Id",
+      "role": "RUNNER_INSTALL|MODEL_INSTALL",
+      "parent": "CaptureSubject",
+      "child": "CaptureSubject",
+      "component_sha256": "Sha256",
+      "selected_executable_asset_id": "Id",
+      "selected_policy_sha256": "Sha256",
+      "descriptor_bindings": "array<SpawnDescriptor>[3,16]",
+      "created": "Stamp",
+      "selection_origin": "literal:AUTHENTICATED_CONTROLLER_SPAWN",
+      "spawn_capture_ref": "ObjectRef:TRUSTED_CAPTURE_BATCH",
+      "spawn_operation_index": "PositiveInt"
+    },
+    "SpawnDescriptor": {
+      "parent_fd": "UInt",
+      "child_fd": "UInt",
+      "object_identity": "DescriptorIdentity",
+      "target_id": "Id",
+      "inheritance": "PASS_FDS|STDIO_DUP",
+      "parent_observation_ref": "ObjectRef"
+    },
+    "RuleTargetOpen": {
+      "target_id": "Id",
+      "selected_path": "AbsoluteSelectedPath",
+      "access_mask": "UInt",
+      "open_flags": "UInt",
+      "returned_fd": "SignedInt",
+      "errno": "Int[0,4095]",
+      "stat": "Nullable<StatObservation>",
+      "resolved_link_ref": "Nullable<ObjectRef>"
+    },
+    "InstallCall": {
+      "subject": "CaptureSubject",
+      "operation": "ABI_QUERY|RULESET_CREATE|ADD_PATH_RULE|PR_SET_NO_NEW_PRIVS|RESTRICT_SELF|PR_GET_NO_NEW_PRIVS",
+      "abi_layout_sha256": "Sha256",
+      "arguments": "InstallArgumentsByOperation",
+      "return_value": "SignedInt",
+      "errno": "Int[0,4095]"
+    },
+    "FileHashMeasurement": {
+      "asset_id": "Id",
+      "selected_path": "AbsoluteSelectedPath",
+      "fd_stat_before": "StatObservation",
+      "fd_stat_after": "StatObservation",
+      "opened_read_only": "literal-bool:true",
+      "mount_read_only_evidence_ref": "ObjectRef",
+      "bytes_read": "UInt",
+      "content_sha256": "Sha256",
+      "hash_started": "Stamp",
+      "hash_finished": "Stamp"
+    },
+    "SendCall": {
+      "exchange_id": "Id",
+      "sender": "CaptureSubject",
+      "socket_descriptor": "DescriptorIdentity",
+      "frame_ref": "ObjectRef",
+      "application_ref": "ObjectRef",
+      "ancillary_sent": "array<AncillaryInput>[0,8]",
+      "return_value": "SignedInt",
+      "errno": "Int[0,4095]"
+    },
+    "RecvCall": {
+      "exchange_id": "Id",
+      "receiver": "CaptureSubject",
+      "socket_descriptor": "DescriptorIdentity",
+      "data_ref": "ObjectRef",
+      "ancillary_raw_ref": "ObjectRef",
+      "msg_flags": "UInt",
+      "return_value": "SignedInt",
+      "errno": "Int[0,4095]",
+      "ucred": "Nullable<CredentialTriple>",
+      "delivered_descriptors": "array<DescriptorIdentity>[0,256]"
+    },
+    "AncillaryInput": {
+      "level": "SignedInt",
+      "type": "SignedInt",
+      "raw_ref": "ObjectRef"
+    },
+    "CredentialTriple": {
+      "pid": "PositiveInt",
+      "uid": "UInt",
+      "gid": "UInt"
+    },
+    "VerifierGate": {
+      "exchange_id": "Id",
+      "receiver_component_sha256": "Sha256",
+      "instance_id": "Id",
+      "channel_instance_id": "Id",
+      "key_operation_id": "Id",
+      "gate": "FRAME|ANCILLARY|PEER_CREDENTIALS|MAC|CHANNEL_ID|SEQUENCE|VERDICT|EXPOSURE",
+      "input_refs": "array<ObjectRef>[0,16]",
+      "outcome": "CHECK_PASS|CHECK_FAIL|ACCEPTED_INERT|AUTH_REJECTED|FRAMING_REJECTED|RIGHTS_REJECTED",
+      "sequence_before": "UInt",
+      "sequence_after": "UInt",
+      "handler_entries_before": "literal-integer:0",
+      "handler_entries_after": "literal-integer:0",
+      "receiver_closed": "Bool"
+    },
+    "DescriptorClose": {
+      "exchange_id": "Nullable<Id>",
+      "descriptor": "DescriptorIdentity",
+      "return_value": "SignedInt",
+      "errno": "Int[0,4095]"
+    },
+    "EndpointCreate": {
+      "channel_id": "Id",
+      "owner": "CaptureSubject",
+      "endpoints": "array<DescriptorIdentity>[2,2]",
+      "key_operation_id": "Id",
+      "random_source_call_succeeded": "Bool",
+      "key_material_recorded": "literal-bool:false"
+    },
+    "ChildRetirement": {
+      "subject": "CaptureSubject",
+      "known_descendants": "array<CaptureSubject>[0,256]",
+      "wait_result": "EXITED|SIGNALED|UNAVAILABLE",
+      "wait_status": "Nullable<SignedInt>",
+      "remaining_live_subjects": "array<CaptureSubject>[0,256]",
+      "endpoint_close_refs": "array<ObjectRef>[0,256]",
+      "delivered_close_refs": "array<ObjectRef>[0,256]"
+    },
+    "ListenerRead": {
+      "subject": "CaptureSubject",
+      "address": "literal:127.0.0.1",
+      "port": "Int[1,65535]",
+      "socket_descriptor": "DescriptorIdentity",
+      "process_snapshot_ref": "ObjectRef",
+      "tcp_table_ref": "ObjectRef",
+      "fd_inventory_ref": "ObjectRef"
+    },
+    "DecodeBinding": {
+      "format": "literal:forex.runtime-decode-binding/2",
+      "binding": "Binding",
+      "budget_sha256": "Sha256",
+      "event_kind": "EventKind",
+      "decoder_component_sha256": "Sha256",
+      "decoder_format_sha256": "Sha256",
+      "capture_refs": "array<ObjectRef>[1,64]",
+      "capture_envelope_refs": "array<ObjectRef>[1,64]",
+      "selected_input_refs": "array<ObjectRef>[1,32] (authenticated through EventInputs selections)",
+      "normalized_ref": "ObjectRef",
+      "normalized_artifact_kind": "ArtifactKind",
+      "decoded": "Stamp"
+    },
+    "CheckpointRpcRequest": {
+      "format": "literal:forex.checkpoint-rpc-request/2",
+      "request_id": "Id",
+      "binding": "Binding",
+      "original_setup_key": "OriginalSetupKey",
+      "caller_id": "Id",
+      "operation": "READ_CURRENT|ADVANCE|LOOKUP_TRANSITION",
+      "nonce_hex": "Hex64",
+      "issued": "Stamp",
+      "deadline": "Stamp",
+      "body": "CheckpointRequestBodyByOperation",
+      "use": "CheckpointUse from release-consumption.candidate.json"
+    },
+    "CheckpointReadBody": {
+      "minimum_generation": "UInt",
+      "minimum_head_sha256": "Sha256",
+      "consumption_binding": "Nullable<ConsumptionReadBinding from release-consumption.candidate.json>"
+    },
+    "CheckpointLookupBody": {
+      "transition_id": "Id",
+      "exact_request_sha256": "Sha256",
+      "minimum_generation": "UInt",
+      "minimum_head_sha256": "Sha256"
+    },
+    "CheckpointAdvanceBody": {
+      "transition_utf8": "CanonicalJSONText<=64KiB",
+      "transition_attestation_utf8": "CanonicalJSONText<=64KiB",
+      "initial_authorization_utf8": "Nullable<CanonicalJSONText<=64KiB>",
+      "unsigned_budget_utf8": "CanonicalJSONText<=64KiB",
+      "output_body_utf8": "Nullable<CanonicalJSONText<=64KiB>",
+      "output_attestation_utf8": "Nullable<CanonicalJSONText<=64KiB>"
+    },
+    "CheckpointRpcResponse": {
+      "format": "literal:forex.checkpoint-rpc-response/2",
+      "request_sha256": "Sha256",
+      "nonce_hex": "Hex64",
+      "binding": "Binding",
+      "original_setup_key": "OriginalSetupKey",
+      "checkpoint_authority_id": "Id",
+      "store_instance_id": "Id",
+      "status": "ABSENT|PRESENT|COMMITTED|EXACT_RECOVERY|REJECTED|UNAVAILABLE",
+      "observed": "Stamp",
+      "clock_domain": "ClockDomain",
+      "authority_view_sha256": "Sha256",
+      "generation": "Nullable<UInt>",
+      "head_sha256": "Nullable<Sha256>",
+      "checkpoint_utf8": "Nullable<CanonicalJSONText<=8KiB>",
+      "checkpoint_attestation_utf8": "Nullable<CanonicalJSONText<=8KiB>",
+      "history": "array<RetainedTransition>[0,23]",
+      "failure_code": "Nullable<FailureCode>",
+      "access_selection_sha256": "Sha256"
+    },
+    "RetainedTransition": {
+      "generation": "PositiveInt",
+      "request_sha256": "Sha256",
+      "checkpoint_sha256": "Sha256",
+      "checkpoint_utf8": "CanonicalJSONText<=8KiB",
+      "checkpoint_attestation_utf8": "CanonicalJSONText<=8KiB"
+    },
+    "RpcSignature": {
+      "body_utf8": "CanonicalJSONText; complete signed frame <=4MiB",
+      "signer_sha256": "Sha256",
+      "algorithm": "literal:Ed25519",
+      "signature_hex": "Hex128"
+    },
+    "AuthorityStatus": {
+      "format": "literal:forex.runtime-authority-status/1",
+      "appointment_sha256": "Sha256",
+      "authorizer_id": "Id",
+      "revision": "PositiveInt",
+      "status": "ACTIVE|WITHDRAWN",
+      "principal_ids": "array<Id>[3,4]",
+      "not_before_utc": "Utc",
+      "expires_at_utc": "Utc"
+    },
+    "InitialSetupAuthorization": {
+      "format": "literal:forex.original-setup-authorization/1",
+      "authorization_id": "Id",
+      "authorizer_id": "Id",
+      "binding": "Binding",
+      "original_setup_key": "OriginalSetupKey",
+      "authorized_issuer_id": "Id",
+      "budget_id": "Id",
+      "clock_domain": "ClockDomain",
+      "original_outer_window_ref": "ObjectRef",
+      "not_before_utc": "Utc",
+      "expires_at_utc": "Utc",
+      "maximum_seconds": "literal-integer:180",
+      "max_reservations": "literal-integer:1"
+    },
+    "RuntimeSelectionBinding": {
+      "format": "literal:forex.runtime-selection-binding/2",
+      "binding": "Binding",
+      "budget_sha256": "Sha256",
+      "slot_id": "Id",
+      "subject_id": "Id",
+      "selected_source_refs": "array<ObjectRef>[1,32]",
+      "selected_decoder_sha256": "Sha256",
+      "selection_ref": "ObjectRef:RUNTIME_SELECTED_VALUES",
+      "selected_at": "Stamp"
+    },
+    "AuthenticatedMethodObject": {
+      "object_ref": "ObjectRef",
+      "envelope_ref": "ObjectRef"
+    },
+    "SpawnCapture": {
+      "spawn_id": "Id",
+      "role": "RUNNER_INSTALL|MODEL_INSTALL",
+      "parent": "CaptureSubject",
+      "selected_component_sha256": "Sha256",
+      "selected_executable_asset_id": "Id",
+      "selected_policy_sha256": "Sha256",
+      "descriptor_bindings": "array<SpawnDescriptor>[3,16]",
+      "returned_pid": "SignedInt",
+      "errno": "Int[0,4095]",
+      "paused_child": "Nullable<CaptureSubject>",
+      "child_process_boundary_ref": "Nullable<ObjectRef>",
+      "result": "SPAWNED_AND_PAUSED|FAILED|UNAVAILABLE"
+    },
+    "StreamMarker": {
+      "marker": "SETUP_BEGIN|CALIBRATION_BEGIN|POLICY_ARGUMENT|SETUP_SEAL",
+      "slot_id": "Id",
+      "sequence": "PositiveInt",
+      "accepted_predecessor_refs": "array<ObjectRef>[0,18]",
+      "source_argument_ref": "Nullable<ObjectRef>"
+    },
+    "EventInputs": {
+      "format": "literal:forex.authenticated-event-inputs/1",
+      "binding": "Binding",
+      "budget_sha256": "Sha256",
+      "stream_id": "Id",
+      "record_id": "Id",
+      "slot_id": "Id",
+      "event_kind": "EventKind",
+      "capture_objects": "array<AuthenticatedMethodObject>[1,64]",
+      "decode_objects": "array<AuthenticatedMethodObject>[1,64]",
+      "runtime_selection": "AuthenticatedMethodObject",
+      "selected_values": "AuthenticatedMethodObject",
+      "spawn_selection": "Nullable<AuthenticatedMethodObject>",
+      "selected_source_refs": "array<ObjectRef>[1,32]",
+      "raw_blob_manifests": "array<AuthenticatedMethodObject>[0,256]"
+    },
+    "RuntimeSelectedValues": {
+      "format": "literal:forex.runtime-selected-values/1",
+      "binding": "Binding",
+      "budget_sha256": "Sha256",
+      "slot_id": "Id",
+      "event_kind": "EventKind",
+      "subject_id": "Id",
+      "values": "exact stage-selected shape defined by runtime_selection_shapes"
+    },
+    "CalibrationSelection": {
+      "receiver_component_sha256": "Sha256",
+      "expected_peer": "ProcessIdentity",
+      "foreign_sender": "ProcessIdentity",
+      "retired_pids": "array<PositiveInt>[1,256]",
+      "temporary_actors": "array<ProcessIdentity>[1,256]"
+    },
+    "InstallationSelection": {
+      "process": "ProcessIdentity",
+      "descriptors": "array<DescriptorIdentity>[3,16]",
+      "descriptor_plan_ref": "ObjectRef:TRUSTED_SPAWN_SELECTION",
+      "rules": "array<RuleSelection>[0,252]",
+      "targets": "array<TargetSelection>[0,252]",
+      "abi": "Int[4,2147483647]",
+      "handled_fs": "UInt"
+    },
+    "RuleSelection": {
+      "target_id": "Id",
+      "rights": "PositiveInt"
+    },
+    "TargetSelection": {
+      "target_id": "Id",
+      "device": "UInt",
+      "inode": "PositiveInt",
+      "resolved_path": "AbsoluteSelectedPath"
+    },
+    "AssetSelection": {
+      "asset_id": "Id",
+      "path": "AbsoluteSelectedPath",
+      "bytes": "Int[1,2147483648]",
+      "sha256": "Sha256",
+      "device": "UInt",
+      "inode": "PositiveInt",
+      "read_only": "literal-bool:true"
+    },
+    "ChannelSelection": {
+      "channel_id": "Id",
+      "endpoint_ids": "array<Id>[2,2]",
+      "owner": "ProcessIdentity",
+      "key_operation_id": "Id",
+      "created_at": "Stamp"
+    },
+    "PostExecSelection": {
+      "process": "ProcessIdentity",
+      "parent": "ProcessIdentity",
+      "exe_path": "AbsoluteSelectedPath",
+      "executable_asset_id": "Id",
+      "listener": "SelectedListener"
+    },
+    "SelectedListener": {
+      "process": "ProcessIdentity",
+      "address": "literal:127.0.0.1",
+      "port": "Int[1,65535]",
+      "socket_inode": "PositiveInt",
+      "observed": "Stamp"
+    },
+    "PeerSelection": {
+      "first_packet_ref": "ObjectRef:IPC_RECEIVE",
+      "current_peer_ref": "ObjectRef:PROC_IDENTITY"
+    },
+    "RawBlobManifest": {
+      "format": "literal:forex.raw-capture-blob/1",
+      "binding": "Binding",
+      "budget_sha256": "Sha256",
+      "producer_id": "Id",
+      "origin": "Origin",
+      "subject": "CaptureSubject",
+      "started": "Stamp",
+      "finished": "Stamp",
+      "blob_ref": "Nullable<ObjectRef:NATIVE_CAPTURE_BYTES>",
+      "encoding": "RAW_BYTES",
+      "source_selector": "closed ProcRead.selector or WIRE_FRAME|APPLICATION_PACKET|ANCILLARY_BYTES|NATIVE_INSTALL_ARGUMENTS",
+      "raw_bytes": "UInt",
+      "raw_sha256": "Sha256"
+    }
+  },
+  "rpc_signature_domains": {
+    "request": "CAS_FOREX_CHECKPOINT_RPC_REQUEST_V2\n",
+    "response": "CAS_FOREX_CHECKPOINT_RPC_RESPONSE_V2\n",
+    "authority_status": "CAS_FOREX_RUNTIME_AUTHORITY_STATUS_V1\n",
+    "note": "RPC request/response V2 are unchanged. ProtectedRegistration uses only CAS_FOREX_PROTECTED_REGISTRATION_V2 followed by LF from protected-records.candidate.json; retired CAS_FOREX_RECORD_REGISTRATION_V1 is not accepted. Method uses separate V3 domain.",
+    "initial_setup_authorization": "CAS_FOREX_ORIGINAL_SETUP_AUTHORIZATION_V1\n"
+  },
+  "capture_kind_to_body": {
+    "PROC_READ": "ProcRead",
+    "PROCESS_BOUNDARY": "ProcessBoundary",
+    "FD_INVENTORY": "FdInventory",
+    "RULE_TARGET_OPEN": "RuleTargetOpen",
+    "INSTALL_CALL": "InstallCall",
+    "FILE_HASH": "FileHashMeasurement",
+    "SEND": "SendCall",
+    "RECV": "RecvCall",
+    "VERIFIER_GATE": "VerifierGate",
+    "CLOSE": "DescriptorClose",
+    "ENDPOINT_CREATE": "EndpointCreate",
+    "CHILD_RETIREMENT": "ChildRetirement",
+    "LISTENER_READ": "ListenerRead",
+    "SPAWN": "SpawnCapture",
+    "STREAM_MARKER": "StreamMarker"
+  },
+  "install_arguments": {
+    "ABI_QUERY": {
+      "flags": "literal-integer:1",
+      "attr_pointer_null": "literal-bool:true",
+      "size": "literal-integer:0"
+    },
+    "RULESET_CREATE": {
+      "handled_fs": "UInt",
+      "handled_net": "literal-integer:0",
+      "attr_bytes_hex": "Hex",
+      "size": "PositiveInt",
+      "flags": "literal-integer:0"
+    },
+    "ADD_PATH_RULE": {
+      "ruleset_fd": "UInt",
+      "rule_type": "literal-integer:1",
+      "parent_fd": "UInt",
+      "allowed_access": "UInt",
+      "attr_bytes_hex": "Hex",
+      "flags": "literal-integer:0"
+    },
+    "PR_SET_NO_NEW_PRIVS": {
+      "option": "literal-integer:38",
+      "value": "literal-integer:1",
+      "arg3": "literal-integer:0",
+      "arg4": "literal-integer:0",
+      "arg5": "literal-integer:0"
+    },
+    "RESTRICT_SELF": {
+      "ruleset_fd": "UInt",
+      "flags": "literal-integer:0"
+    },
+    "PR_GET_NO_NEW_PRIVS": {
+      "option": "literal-integer:39",
+      "arg2": "literal-integer:0",
+      "arg3": "literal-integer:0",
+      "arg4": "literal-integer:0",
+      "arg5": "literal-integer:0"
+    }
+  },
+  "required_behavior": [
+    "No object in this candidate is an appointment, receipt, key, private case or runtime observation.",
+    "Unknown/missing operation, raw bytes, decoder, root, signer or type is unavailable/rejected; no fixture fallback.",
+    "Capture operation indices are allocated synchronously by the one pinned reporting process at the actual call boundary; no post-hoc numeric reconstruction. Indices strictly increase within the batch; exchange close < verdict < exposure is enforced.",
+    "Raw reports are trusted bootstrap/controller statements, not kernel tracing or compromised-controller proof.",
+    "Expected descriptor/policy selections come from pinned launch rules and independently retained parent-spawn operations, never the inspected child's claimed inventory.",
+    "Checkpoint response ABSENT is only an authenticated initial state observation; only separately authorized atomic reservation can consume an unused key.",
+    "Exactly the retained transition request bytes may be recovered after uncertainty; no new transition ID/time/output signature. Fresh read nonce does not create new mutation authority.",
+    "Full R6 private mapping, original denominators, two probes plus30 mandatory calls and zero retries/U1 remain unchanged.",
+    "Imported parent types remain exact in the preserved baseline. A reviewed method-contract successor must transitively replace ProcessIdentity.exe_object_ref with exe_asset and re-pin all dependent schemas, payloads, decoder and source argument. Old /2 meanings are never silently reinterpreted.",
+    "The service validates the initial authorization under the external authorizer key, binds issuer/budget/key/context/outer window, and atomically spends it with the original setup key. The unsigned budget start must be a current paired observation inside that authorization and the original window; no new start is derived after uncertainty.",
+    "Record-size and 23-transition bounds are enforced before mutation. A response unable to return complete required history is UNAVAILABLE, never a truncated accepted proof.",
+    "RPC domain strings contain a single trailing LF byte, not two literal backslash/n bytes. Verify the externally selected domain concatenated with canonical body bytes; body fields never select their own verification key or domain.",
+    "Checkpoint ABSENT = generation0/zero head/no history/no certificate from initialized authenticated store. Positive states require complete consecutive per-key history and matching head. REJECTED/UNAVAILABLE expose no usable checkpoint. Fresh response binds exact request hash/nonce, store, authority-view hash and clock domain.",
+    "Candidate02 protected refs/completion/controller consumption records are normative companions. Earlier issuer reads cannot substitute for the controller's fresh nonce/request bound read immediately before its one-use consumption commit.",
+    "Every raw byte reference in ProcRead, NamespaceRead, FdObservation, SendCall, RecvCall and native argument observations resolves a RAW_BLOB_MANIFEST authenticated in EventInputs; that manifest in turn binds NATIVE_CAPTURE_BYTES. Empty raw data is explicitly zero bytes/hash-of-empty/null leaf, not a missing invented ObjectRef.",
+    "Candidate03 fixes only the role-release wrapper and its exact validation/publisher route, the explicit inherited RECORDS path, canonical example Utc and removal of the unused V1 registry domain. Candidate02's four repairs remain required."
+  ],
+  "companions": [
+    "protected-records.candidate.json",
+    "completion.candidate.json",
+    "release-consumption.candidate.json",
+    "AUTHENTICATED_ROUTES.md",
+    "REFERENCE_MIGRATION.md",
+    "END_TO_END.md",
+    "role-release-evidence.candidate.json",
+    "ROLE_RELEASE_MAPPING.md"
+  ],
+  "runtime_selection_shapes": {
+    "SETUP_BEGIN": {
+      "controller": "ProcessIdentity"
+    },
+    "CALIBRATION_BEGIN": {
+      "controller": "ProcessIdentity",
+      "calibration": "CalibrationSelection"
+    },
+    "CALIBRATION_CASE": {
+      "controller": "ProcessIdentity",
+      "calibration": "CalibrationSelection"
+    },
+    "CALIBRATION_RETIRED": {
+      "calibration": "CalibrationSelection"
+    },
+    "FINAL_CHANNEL_CREATED": {
+      "controller": "ProcessIdentity",
+      "channel": "ChannelSelection"
+    },
+    "RUNNER_INSTALL": {
+      "controller": "ProcessIdentity",
+      "installation": "InstallationSelection"
+    },
+    "MODEL_INSTALL": {
+      "installation": "InstallationSelection"
+    },
+    "ASSET_BINDINGS": {
+      "assets": "array<AssetSelection>[1,256]",
+      "asset_manifest_sha256": "Sha256"
+    },
+    "MODEL_POST_EXEC": {
+      "assets": "array<AssetSelection>[1,256]",
+      "post_exec": "PostExecSelection"
+    },
+    "FINAL_PEER_BOUND": {
+      "channel": "ChannelSelection",
+      "peer": "PeerSelection"
+    },
+    "POLICY_ARGUMENT": {
+      "source_argument_ref": "ObjectRef:SOURCE_ARGUMENT"
+    },
+    "SETUP_SEAL": {},
+    "FAILURE": {
+      "failed_slot_id": "Nullable<Id>"
+    }
+  },
+  "artifact_authentication_routes": [
+    {
+      "type": "CaptureBatch",
+      "artifact_kind": "TRUSTED_CAPTURE_BATCH",
+      "format": "forex.trusted-setup-capture/2",
+      "publisher_role": "TRUSTED_CONTROLLER_WITNESS",
+      "purpose": "policy-inheritance-witness-v3",
+      "envelope_type": "SignedEnvelope",
+      "envelope_artifact_kind": "SIGNED_ENVELOPE",
+      "signature_domain": "CAS_FOREX_POLICY_INHERITANCE_V3\n",
+      "consumer": "INDEPENDENT_SETUP_CONSUMER",
+      "rule": "Exact context/budget/content hash/length and current appointment first; consumer independently verifies provenance, captures and decode semantics. Signature authenticates reporter, not kernel truth."
+    },
+    {
+      "type": "DecodeBinding",
+      "artifact_kind": "RUNTIME_DECODE_BINDING",
+      "format": "forex.runtime-decode-binding/2",
+      "publisher_role": "TRUSTED_CONTROLLER_WITNESS",
+      "purpose": "policy-inheritance-witness-v3",
+      "envelope_type": "SignedEnvelope",
+      "envelope_artifact_kind": "SIGNED_ENVELOPE",
+      "signature_domain": "CAS_FOREX_POLICY_INHERITANCE_V3\n",
+      "consumer": "INDEPENDENT_SETUP_CONSUMER",
+      "rule": "Exact context/budget/content hash/length and current appointment first; consumer independently verifies provenance, captures and decode semantics. Signature authenticates reporter, not kernel truth."
+    },
+    {
+      "type": "SpawnSelection",
+      "artifact_kind": "TRUSTED_SPAWN_SELECTION",
+      "format": "forex.trusted-spawn-selection/2",
+      "publisher_role": "TRUSTED_CONTROLLER_WITNESS",
+      "purpose": "policy-inheritance-witness-v3",
+      "envelope_type": "SignedEnvelope",
+      "envelope_artifact_kind": "SIGNED_ENVELOPE",
+      "signature_domain": "CAS_FOREX_POLICY_INHERITANCE_V3\n",
+      "consumer": "INDEPENDENT_SETUP_CONSUMER",
+      "rule": "Exact context/budget/content hash/length and current appointment first; consumer independently verifies provenance, captures and decode semantics. Signature authenticates reporter, not kernel truth."
+    },
+    {
+      "type": "RuntimeSelectionBinding",
+      "artifact_kind": "RUNTIME_SELECTION_BINDING",
+      "format": "forex.runtime-selection-binding/2",
+      "publisher_role": "TRUSTED_CONTROLLER_WITNESS",
+      "purpose": "policy-inheritance-witness-v3",
+      "envelope_type": "SignedEnvelope",
+      "envelope_artifact_kind": "SIGNED_ENVELOPE",
+      "signature_domain": "CAS_FOREX_POLICY_INHERITANCE_V3\n",
+      "consumer": "INDEPENDENT_SETUP_CONSUMER",
+      "rule": "Exact context/budget/content hash/length and current appointment first; consumer independently verifies provenance, captures and decode semantics. Signature authenticates reporter, not kernel truth."
+    },
+    {
+      "type": "RuntimeSelectedValues",
+      "artifact_kind": "RUNTIME_SELECTED_VALUES",
+      "format": "forex.runtime-selected-values/1",
+      "publisher_role": "TRUSTED_CONTROLLER_WITNESS",
+      "purpose": "policy-inheritance-witness-v3",
+      "envelope_type": "SignedEnvelope",
+      "envelope_artifact_kind": "SIGNED_ENVELOPE",
+      "signature_domain": "CAS_FOREX_POLICY_INHERITANCE_V3\n",
+      "consumer": "INDEPENDENT_SETUP_CONSUMER",
+      "rule": "Exact context/budget/content hash/length and current appointment first; consumer independently verifies provenance, captures and decode semantics. Signature authenticates reporter, not kernel truth."
+    },
+    {
+      "type": "EventInputs",
+      "artifact_kind": "AUTHENTICATED_EVENT_INPUTS",
+      "format": "forex.authenticated-event-inputs/1",
+      "publisher_role": "TRUSTED_CONTROLLER_WITNESS",
+      "purpose": "policy-inheritance-witness-v3",
+      "envelope_type": "SignedEnvelope",
+      "envelope_artifact_kind": "SIGNED_ENVELOPE",
+      "signature_domain": "CAS_FOREX_POLICY_INHERITANCE_V3\n",
+      "consumer": "INDEPENDENT_SETUP_CONSUMER",
+      "rule": "Exact context/budget/content hash/length and current appointment first; consumer independently verifies provenance, captures and decode semantics. Signature authenticates reporter, not kernel truth."
+    },
+    {
+      "type": "NativeBytes",
+      "artifact_kind": "NATIVE_CAPTURE_BYTES",
+      "format": "BINARY",
+      "publisher_role": "TRUSTED_CONTROLLER_WITNESS",
+      "purpose": "policy-inheritance-witness-v3",
+      "envelope_type": "SignedEnvelope over canonical RawBlobManifest",
+      "envelope_artifact_kind": "SIGNED_ENVELOPE",
+      "signature_domain": "CAS_FOREX_POLICY_INHERITANCE_V3\n",
+      "consumer": "INDEPENDENT_SETUP_CONSUMER",
+      "rule": "RawBlobManifest (RAW_BLOB_MANIFEST) binds raw ObjectRef, origin, capture subject, clock interval and budget; native bytes need no JSON rewrite. CaptureBatch references the exact manifest and raw object."
+    },
+    {
+      "type": "RawBlobManifest",
+      "artifact_kind": "RAW_BLOB_MANIFEST",
+      "format": "forex.raw-capture-blob/1",
+      "publisher_role": "TRUSTED_CONTROLLER_WITNESS",
+      "purpose": "policy-inheritance-witness-v3",
+      "envelope_type": "SignedEnvelope",
+      "envelope_artifact_kind": "SIGNED_ENVELOPE",
+      "signature_domain": "CAS_FOREX_POLICY_INHERITANCE_V3\n",
+      "consumer": "INDEPENDENT_SETUP_CONSUMER",
+      "rule": "Authenticates exact native byte hash/length and origin; empty bytes require null blob_ref and SHA256(empty). Nonempty bytes require exact NATIVE_CAPTURE_BYTES reference. Native bytes are not parsed as JSON."
+    }
+  ],
+  "event_input_rules": [
+    "Event has input_bundle_ref:AUTHENTICATED_EVENT_INPUTS and input_bundle_envelope_ref:SIGNED_ENVELOPE. Both are signed/bound before event ACK; Event itself retains its own method-witness signature. EventInputs repeats binding/budget/stream/record/slot/kind, never the event hash, avoiding a digest cycle.",
+    "Event.raw_refs is exactly the deduplicated input bundle, its envelope, and all normalized object refs named by DecodeBinding, capped at64. The input bundle transitively and explicitly names every authenticated capture/decode/selection/spawn/blob-manifest object and envelope. Resolve/re-pin the complete typed acyclic reference graph under total limits; never omit a nested dependency. Larger native byte blobs remain authenticated leaves, not direct event fields.",
+    "Each DecodeBinding.capture_refs/capture_envelope_refs is an ordered exact pairing within EventInputs.capture_objects. Each normalized_ref has the declared normalized_artifact_kind and must equal the consumer decoder result under exact selected input/code/format pins. RawBlobManifest references authenticate retained native bytes; bare raw refs alone cannot confer observation authority.",
+    "RuntimeSelectionBinding.selection_ref must equal EventInputs.selected_values.object_ref; slot/subject/decoder/source references equal the externally selected CoveragePlan and authenticated stage inputs. Expected policy never derives from observed enforcement.",
+    "RUNNER_INSTALL and MODEL_INSTALL require exactly one SpawnSelection object in EventInputs, with SPAWN operation in its referenced authenticated capture and an index selecting that operation. Role/parent/child/executable/policy/descriptors match, result must be SPAWNED_AND_PAUSED, returned_pid equals paused_child.pid. Other slots set spawn_selection null and may reference prior accepted spawn evidence through selected_source_refs.",
+    "Event normalized raw kinds required by design05 payload checks remain present exactly as needed; the added container kinds do not replace PROC_IDENTITY, DESCRIPTOR_INVENTORY, INSTALL_ARGUMENTS or any substantive predicate.",
+    "All six structured artifact classes and RawBlobManifest use the witness-v3 purpose with exact allowed format/kind checks. Consumer redoes decode/selection checks; no additional signer role or independent-kernel-trace claim is created."
+  ]
+}
