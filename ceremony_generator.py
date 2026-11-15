@@ -32,12 +32,12 @@ import stat
 import sys
 from typing import Any
 
-def _chmod_verified_directory(dir_path: Path, dir_mode: int) -> None:
-    """Apply restrictive directory permissions only after verifying the inode is a directory."""
+def apply_verified_directory_mode(dir_path: Path, dir_mode: int = 0o755) -> None:
+    """Apply standard directory traversal mode only after verifying the inode is a directory."""
     st = os.lstat(dir_path)
     if not stat.S_ISDIR(st.st_mode):
         raise RuntimeError(f"Refusing directory mode {oct(dir_mode)} on non-directory: {dir_path}")
-    os.chmod(dir_path, dir_mode)
+    os.chmod(dir_path, dir_mode)  # nosec B103: verified S_ISDIR via lstat before setting directory traversal mode
 
 
 CEREMONY_SCHEMA_VERSION = "forex.stageb-custody-ceremony-bundle/1"
@@ -1398,7 +1398,7 @@ def prepare_guest_stageb_root(
     for root_d, _, files in os.walk(dst_base):
         rp = Path(root_d)
         os.chown(rp, 0, 0)
-        _chmod_verified_directory(rp, 0o755)
+        apply_verified_directory_mode(rp)
         for fn in files:
             fp = rp / fn
             os.chown(fp, 0, 0)
@@ -1542,7 +1542,7 @@ def prepare_guest_stageb_root(
     for root_d, _, files in os.walk(dst_base / "ceremony"):
         rp = Path(root_d)
         os.chown(rp, 0, 0)
-        _chmod_verified_directory(rp, 0o755)
+        apply_verified_directory_mode(rp)
         for fn in files:
             fp = rp / fn
             os.chown(fp, 0, 0)

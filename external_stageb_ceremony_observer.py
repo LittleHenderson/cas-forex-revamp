@@ -29,7 +29,7 @@ from ceremony_generator import (
     DEFAULT_CEREMONY_SEED,
     Ed25519Keypair,
     PureRFC8032Verifier,
-    _chmod_verified_directory,
+    apply_verified_directory_mode,
     canonical_json_bytes,
     canonical_sha256,
     maybe_prepend_guest_python_site,
@@ -75,7 +75,7 @@ def _write_protected_record(
     is_root_posix = os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0
     if is_root_posix:
         os.chown(target.parent, 0, 0)
-        _chmod_verified_directory(target.parent, 0o755)
+        apply_verified_directory_mode(target.parent)
     if atomic:
         tmp = target.with_name(target.name + f".tmp.{os.getpid()}")
         if tmp.exists():
@@ -818,7 +818,7 @@ def orchestrate_guest_ceremony(
     verify_controller_evidence(cfg, base, readonly=False)
     (base / "ceremony_live").mkdir(parents=True, exist_ok=True)
     os.chown(base / "ceremony_live", 0, 0)
-    _chmod_verified_directory(base / "ceremony_live", 0o755)
+    apply_verified_directory_mode(base / "ceremony_live")
 
     receipts_dir = base / "receipts"
     receipts_dir.mkdir(mode=0o700, exist_ok=True)
