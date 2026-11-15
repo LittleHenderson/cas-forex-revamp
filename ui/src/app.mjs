@@ -5,18 +5,23 @@ import { displayFreshness } from './freshness.mjs';
 import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose } from './render.mjs';
 import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decision-read.mjs';
 import { ScopedBridge } from './bridge.mjs';
+import { ALL_CHART_PAIRS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts } from './chart.mjs';
 
 // Fixed same-origin assets. Only explicit trusted bootstrap may inject a scoped bridge.
 const schemaURL = new URL('../docs/contracts/cockpit.schema.json', document.baseURI);
 const fixtureURL = new URL('../docs/contracts/initial-cockpit.json', document.baseURI);
 const reviewSchemaURL = new URL('../docs/contracts/decision-read.schema.json', document.baseURI);
 const reviewFixtureURL = new URL('../docs/contracts/initial-decision-read.json', document.baseURI);
+const marketSchemaURL = new URL('../docs/contracts/market-stream.schema.json', document.baseURI);
+const marketFixtureURL = new URL('../docs/contracts/initial-market-stream.json', document.baseURI);
 const root = document.querySelector('#app');
 const dialog = document.querySelector('#review-dialog');
 const announcer = document.querySelector('#announcer');
 let sharedSchema = null;
 let reviewSchema = null;
 let rawReviewSchema = null;
+let marketSchema = null;
+let liveEventSource = null;
 let controller = null;
 let dialogContext = null;
 let lastBridgeProjection = null;
@@ -29,6 +34,8 @@ let state = {
   error: null, loading: false, route: routeFromHash(), theme: 'system',
   reviewView: 'list', reviewFilter: 'all', explainerIssue: null, inspection: resetInspection(),
   reviewEnvelope: null, reviewIssue: null, reviewSchemaReady: false, lastLoaded: null, transport: null,
+  marketStream: null, chartPair: 'EURUSD', chartTimeframe: 'M5', chartLayout: 'single', chartCategory: 'all',
+  liveStreamConnected: false, chartMicroBars: {},
 };
 
 function routeFromHash() {
@@ -41,6 +48,7 @@ function render(focusMain = false) {
   const identity = root.contains(active) && active?.tagName === 'BUTTON' ? JSON.stringify(active.dataset) : null;
   document.documentElement.dataset.theme = state.theme;
   root.innerHTML = renderApp(state);
+  try { mountMarketCharts(root, state); } catch { /* Chart canvas optional in headless environments. */ }
   try { explainer?.sync(); } catch { disableExplainer(); }
   document.title = `${state.route[0].toUpperCase() + state.route.slice(1)} / CAS Forex`;
   if (focusMain) document.querySelector('#main').focus({ preventScroll: true });
@@ -97,6 +105,7 @@ function updateDialog() {
 
 async function loadSchemas() {
   if (!sharedSchema) sharedSchema = parseUniqueJSON(await readStatic(schemaURL));
+  if (!marketSchema) marketSchema = parseUniqueJSON(await readStatic(marketSchemaURL));
   if (!reviewSchema) {
     rawReviewSchema = await readStatic(reviewSchemaURL);
     reviewSchema = parseUniqueJSON(rawReviewSchema);
@@ -116,11 +125,13 @@ export async function attachTransport(bridge) {
     if (!controller) controller = new ScopedBridge({ cockpitSchema: sharedSchema, onChange: bridgeChanged });
     await controller.attach(bridge);
     await readBridgeReview();
+    await readBridgeMarketStream();
     return { detach: detachTransport, read: readTransport };
   } catch (error) { failLoad(generation, error); throw error; }
 }
 
 export function detachTransport() {
+  stopLoopbackStream();
   loadGeneration += 1; reviewGeneration += 1;
   state.reviewEnvelope = null; state.reviewIssue = 'Transport detached. Prior references are historical.';
   controller?.detach();
@@ -139,10 +150,89 @@ async function readBridgeReview() {
   render();
 }
 
+async function readBridgeMarketStream() {
+  if (!controller?.attached || !marketSchema) return;
+  try {
+    const mstream = await controller.readMarketStream(marketSchema);
+    if (mstream) { state.marketStream = mstream; render(); }
+  } catch { /* Keep prior verified market stream or empty state. */ }
+}
+
+function recordMicroTick(envelope) {
+  const nextMicro = { ...state.chartMicroBars };
+  for (const s of envelope.streams) {
+    const prev = Array.isArray(nextMicro[s.pair]) ? nextMicro[s.pair].slice(-47) : [];
+    const lastClose = prev.length ? prev[prev.length - 1].c : s.mid;
+    const hi = Number(s.mid) >= Number(lastClose) ? s.mid : lastClose;
+    const lo = Number(s.mid) <= Number(lastClose) ? s.mid : lastClose;
+    prev.push(Object.freeze({ t: s.observed_at, o: lastClose, h: hi, l: lo, c: s.mid, v: '1.00', n: 1 }));
+    nextMicro[s.pair] = prev;
+  }
+  state.chartMicroBars = nextMicro;
+}
+
+function stopLoopbackStream() {
+  if (liveEventSource) { liveEventSource.close(); liveEventSource = null; }
+  state.liveStreamConnected = false;
+}
+
+async function connectLoopbackLiveFeed() {
+  if (!marketSchema) marketSchema = parseUniqueJSON(await readStatic(marketSchemaURL));
+  const streamURL = new URL('/api/market-stream', window.location.origin);
+  const initialRaw = await readStatic(streamURL, MAX_MARKET_STREAM_BYTES);
+  const decoded = decodeMarketStream(initialRaw, marketSchema);
+  state.marketStream = decoded;
+  recordMicroTick(decoded);
+  stopLoopbackStream();
+  if (typeof window.EventSource === 'function') {
+    const es = new window.EventSource('/api/market-events');
+    es.addEventListener('market', (ev) => {
+      try {
+        const nextEnv = decodeMarketStream(ev.data, marketSchema);
+        state.marketStream = nextEnv;
+        recordMicroTick(nextEnv);
+        if (controller?.attached) void controller.refresh().catch(() => {});
+        else render();
+      } catch { /* Ignore malformed frame. */ }
+    });
+    es.onerror = () => { stopLoopbackStream(); render(); };
+    liveEventSource = es;
+  }
+  state.liveStreamConnected = true;
+  if (!controller?.attached) {
+    try {
+      const health = parseUniqueJSON(await readStatic(new URL('/api/health', window.location.origin)));
+      if (health.bridge_attached) {
+        const postJSON = async (p, body) => {
+          const r = await fetch(new URL(p, window.location.origin), { method: 'POST', credentials: 'omit', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(10000) });
+          if (!r.ok) throw new Error(`RPC error (${r.status})`);
+          return parseUniqueJSON(await r.text(), MAX_MARKET_STREAM_BYTES);
+        };
+        await attachTransport({
+          readBoot: async () => parseUniqueJSON(await readStatic(new URL('/api/boot', window.location.origin))),
+          readCockpit: async () => parseUniqueJSON(await readStatic(new URL('/api/cockpit', window.location.origin))),
+          readDecisionRead: async () => parseUniqueJSON(await readStatic(new URL('/api/decision-read', window.location.origin)), MAX_REVIEW_BYTES),
+          resolveEvidence: (input) => postJSON('/api/resolve-evidence', input),
+          prepareControl: (input) => postJSON('/api/prepare-control', input),
+          requestControl: (input) => postJSON('/api/request-control', input),
+          readControl: (input) => postJSON('/api/read-control', input),
+          prepareClose: (input) => postJSON('/api/prepare-close', input),
+          requestReviewedClose: (input) => postJSON('/api/request-reviewed-close', input),
+          readCommand: (command_id) => postJSON('/api/read-command', { command_id }),
+          readMarketStream: async () => readStatic(new URL('/api/market-stream', window.location.origin), MAX_MARKET_STREAM_BYTES),
+        });
+      }
+    } catch { /* Operate with verified market stream even if ScopedUIService is absent. */ }
+  }
+  render();
+  announce('Connected to verified loopback multi-currency market stream.');
+}
+
 async function readTransport() {
   if (!controller?.attached) throw new Error('Transport unavailable.');
   await controller.refresh();
   await readBridgeReview();
+  await readBridgeMarketStream();
 }
 
 function report(promise) {
@@ -220,6 +310,11 @@ async function loadFixture() {
     if (generation !== loadGeneration) return;
     acceptSnapshot(generation, raw, 'shared fixture');
     await loadReviewFixture(generation);
+    try {
+      marketSchema = parseUniqueJSON(await readStatic(marketSchemaURL));
+      const mRaw = await readStatic(marketFixtureURL, MAX_MARKET_STREAM_BYTES);
+      if (generation === loadGeneration) { state.marketStream = decodeMarketStream(mRaw, marketSchema); render(); }
+    } catch { /* Market stream fixture optional. */ }
   } catch (error) { failLoad(generation, error); }
 }
 
@@ -258,6 +353,24 @@ root.addEventListener('click', (event) => {
   const target = event.target.closest('button');
   if (!target || target.disabled) return;
   if (transportClick(target)) return;
+  if (target.dataset.connectLoopback) { report(connectLoopbackLiveFeed()); return; }
+  if (target.dataset.disconnectLoopback) { stopLoopbackStream(); render(); announce('Live market stream paused.'); return; }
+  if (target.dataset.chartPair && ALL_CHART_PAIRS.includes(target.dataset.chartPair)) {
+    state.chartPair = target.dataset.chartPair; render();
+    root.querySelector(`[data-chart-pair="${state.chartPair}"]`)?.focus(); return;
+  }
+  if (target.dataset.chartTf && CHART_TIMEFRAMES.includes(target.dataset.chartTf)) {
+    state.chartTimeframe = target.dataset.chartTf; render();
+    root.querySelector(`[data-chart-tf="${state.chartTimeframe}"]`)?.focus(); return;
+  }
+  if (target.dataset.chartLayout && CHART_LAYOUTS.includes(target.dataset.chartLayout)) {
+    state.chartLayout = target.dataset.chartLayout; render();
+    root.querySelector(`[data-chart-layout="${state.chartLayout}"]`)?.focus(); return;
+  }
+  if (target.dataset.chartCat && ['all', 'MAJOR', 'CROSS'].includes(target.dataset.chartCat)) {
+    state.chartCategory = target.dataset.chartCat; render();
+    root.querySelector(`[data-chart-cat="${state.chartCategory}"]`)?.focus(); return;
+  }
   if (target.dataset.route) { window.location.hash = target.dataset.route; return; }
   if (target.dataset.control) { dialogContext = target.dataset.control; openDialog(renderControlDialog(target.dataset.control, state.transport), target); return; }
   if (target.dataset.close && state.projection) {

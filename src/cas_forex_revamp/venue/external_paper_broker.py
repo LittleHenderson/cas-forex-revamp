@@ -72,6 +72,18 @@ from cas_forex_revamp.operator.decisions import OperatorSession
 from .faults import FaultSchedule
 from .fixtures import VenueScenario
 from .sqlite_venue import JournalCheckpoint, PRICE_QUANTUM, SQLiteVenue, VenueStorageError
+from .live_market_stream import (
+    DIRECT_KRAKEN_FX_PAIRS,
+    EXPANDED_FX_PAIRS,
+    EXPANDED_PAIR_SPECS,
+    ExpandedPublicLiveFxFeedClient,
+    LiveCandleAggregator,
+    MarketStreamEnvelope,
+    OhlcCandleBar,
+    PairMarketStream,
+    build_signed_market_stream_envelope,
+    parse_ecb_g10_reference,
+)
 
 KRAKEN_PUBLIC_TICKER_URL = "https://api.kraken.com/0/public/Ticker?pair=EURUSD,GBPUSD,USDJPY"
 FRANKFURTER_ECB_URLS: tuple[str, ...] = (
@@ -121,6 +133,123 @@ _PAIR_METADATA: dict[str, dict[str, Any]] = {
         "max_price": Decimal("350.0"),
         "kraken_keys": ("USDJPY", "ZUSDZJPY", "USD/JPY", "ZUSDJPY"),
         "oanda_instrument": "USD_JPY",
+    },
+    "USDCHF": {
+        "base": "USD",
+        "quote": "CHF",
+        "tick": Decimal("0.00001"),
+        "min_price": Decimal("0.40"),
+        "max_price": Decimal("2.20"),
+        "kraken_keys": ("USDCHF", "USD/CHF"),
+        "oanda_instrument": "USD_CHF",
+    },
+    "AUDUSD": {
+        "base": "AUD",
+        "quote": "USD",
+        "tick": Decimal("0.00001"),
+        "min_price": Decimal("0.30"),
+        "max_price": Decimal("1.80"),
+        "kraken_keys": ("AUDUSD", "AUD/USD"),
+        "oanda_instrument": "AUD_USD",
+    },
+    "USDCAD": {
+        "base": "USD",
+        "quote": "CAD",
+        "tick": Decimal("0.00001"),
+        "min_price": Decimal("0.70"),
+        "max_price": Decimal("2.50"),
+        "kraken_keys": ("USDCAD", "ZUSDZCAD", "USD/CAD", "ZUSDCAD"),
+        "oanda_instrument": "USD_CAD",
+    },
+    "NZDUSD": {
+        "base": "NZD",
+        "quote": "USD",
+        "tick": Decimal("0.00001"),
+        "min_price": Decimal("0.30"),
+        "max_price": Decimal("1.60"),
+        "kraken_keys": ("NZDUSD", "NZD/USD"),
+        "oanda_instrument": "NZD_USD",
+    },
+    "EURGBP": {
+        "base": "EUR",
+        "quote": "GBP",
+        "tick": Decimal("0.00001"),
+        "min_price": Decimal("0.40"),
+        "max_price": Decimal("1.60"),
+        "kraken_keys": ("EURGBP", "EUR/GBP"),
+        "oanda_instrument": "EUR_GBP",
+    },
+    "EURJPY": {
+        "base": "EUR",
+        "quote": "JPY",
+        "tick": Decimal("0.001"),
+        "min_price": Decimal("70.0"),
+        "max_price": Decimal("350.0"),
+        "kraken_keys": ("EURJPY", "EUR/JPY"),
+        "oanda_instrument": "EUR_JPY",
+    },
+    "GBPJPY": {
+        "base": "GBP",
+        "quote": "JPY",
+        "tick": Decimal("0.001"),
+        "min_price": Decimal("90.0"),
+        "max_price": Decimal("400.0"),
+        "kraken_keys": ("GBPJPY", "GBP/JPY"),
+        "oanda_instrument": "GBP_JPY",
+    },
+    "EURCHF": {
+        "base": "EUR",
+        "quote": "CHF",
+        "tick": Decimal("0.00001"),
+        "min_price": Decimal("0.50"),
+        "max_price": Decimal("2.20"),
+        "kraken_keys": ("EURCHF", "EUR/CHF"),
+        "oanda_instrument": "EUR_CHF",
+    },
+    "EURAUD": {
+        "base": "EUR",
+        "quote": "AUD",
+        "tick": Decimal("0.00001"),
+        "min_price": Decimal("0.90"),
+        "max_price": Decimal("3.20"),
+        "kraken_keys": ("EURAUD", "EUR/AUD"),
+        "oanda_instrument": "EUR_AUD",
+    },
+    "EURCAD": {
+        "base": "EUR",
+        "quote": "CAD",
+        "tick": Decimal("0.00001"),
+        "min_price": Decimal("0.90"),
+        "max_price": Decimal("3.00"),
+        "kraken_keys": ("EURCAD", "EUR/CAD"),
+        "oanda_instrument": "EUR_CAD",
+    },
+    "AUDJPY": {
+        "base": "AUD",
+        "quote": "JPY",
+        "tick": Decimal("0.001"),
+        "min_price": Decimal("40.0"),
+        "max_price": Decimal("250.0"),
+        "kraken_keys": ("AUDJPY", "AUD/JPY"),
+        "oanda_instrument": "AUD_JPY",
+    },
+    "CHFJPY": {
+        "base": "CHF",
+        "quote": "JPY",
+        "tick": Decimal("0.001"),
+        "min_price": Decimal("60.0"),
+        "max_price": Decimal("380.0"),
+        "kraken_keys": ("CHFJPY", "CHF/JPY"),
+        "oanda_instrument": "CHF_JPY",
+    },
+    "CADJPY": {
+        "base": "CAD",
+        "quote": "JPY",
+        "tick": Decimal("0.001"),
+        "min_price": Decimal("40.0"),
+        "max_price": Decimal("250.0"),
+        "kraken_keys": ("CADJPY", "CAD/JPY"),
+        "oanda_instrument": "CAD_JPY",
     },
 }
 
@@ -1944,6 +2073,64 @@ class SealedLiveFeedPaperVenue:
             live_snap, key=key, symbols=symbols, now=now, align_to_tick=align_to_tick
         )
         return live_snap, venue_snap
+
+    def ingest_market_stream(
+        self,
+        envelope: MarketStreamEnvelope,
+        *,
+        key: AccountRunKey,
+        symbols: tuple[str, ...] | None = None,
+        now: datetime | None = None,
+    ) -> VenueSnapshot:
+        """Ingest a verified 16-pair MarketStreamEnvelope into registered venue instruments and retain read-only stream."""
+        if not isinstance(envelope, MarketStreamEnvelope):
+            raise ContractError("ingest_market_stream requires MarketStreamEnvelope")
+        self._retained_market_stream = envelope
+        obs_time = utc_time(now, "now") if now is not None else envelope.observed_at
+        registered = self._registered_instruments()
+        by_symbol = {inst.symbol: inst for inst in registered}
+        wanted = set(symbols) if symbols is not None else set(by_symbol.keys())
+        latest_snap: VenueSnapshot | None = None
+        pmap = envelope.pair_map()
+        for sym in sorted(wanted):
+            if sym not in by_symbol or sym not in pmap:
+                continue
+            inst = by_symbol[sym]
+            pstream = pmap[sym]
+            cur_snap = self._venue.snapshot(key, now=obs_time)
+            next_seq = cur_snap.sequence + 1
+            bid_q = pstream.bid.quantize(inst.tick_size, rounding=ROUND_FLOOR)
+            ask_q = pstream.ask.quantize(inst.tick_size, rounding=ROUND_CEILING)
+            if ask_q <= bid_q:
+                ask_q = bid_q + inst.tick_size
+            obs = MarketObservation(
+                key,
+                f"mstream-{envelope.sequence}-{sym.lower()}-{next_seq}",
+                inst.instrument_id,
+                next_seq,
+                obs_time,
+                obs_time,
+                bid_q,
+                ask_q,
+            )
+            latest_snap = self.advance_market(obs)
+        self._append_audit(
+            "MARKET_STREAM_INGESTED",
+            obs_time,
+            {
+                "stream_id": envelope.stream_id,
+                "sequence": envelope.sequence,
+                "pair_count": len(envelope.streams),
+                "raw_wire_sha256": envelope.raw_wire_sha256,
+                "canonical_payload_sha256": envelope.canonical_payload_sha256,
+            },
+        )
+        return latest_snap if latest_snap is not None else self._venue.snapshot(key, now=obs_time)
+
+    def read_market_stream(self) -> dict[str, Any] | None:
+        """Read-only market stream accessor; never mutates SQLite core or venue state."""
+        env = getattr(self, "_retained_market_stream", None)
+        return env.to_wire_dict() if isinstance(env, MarketStreamEnvelope) else None
 
 
 def assemble_live_feed_paper_simulation(

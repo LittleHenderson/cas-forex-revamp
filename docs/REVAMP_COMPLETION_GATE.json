@@ -10,7 +10,7 @@
     "phase_3_forex_meta_valve_gate": "VALIDATED",
     "phase_4_airgapped_aws_pilot": "VALIDATED",
     "phase_5_external_broker_and_stageb_custody": "ENGINEERED-NOT-VALIDATED",
-    "phase_6_16pair_live_chart_and_lantern_hardening": "IN_PROGRESS"
+    "phase_6_16pair_live_chart_and_lantern_hardening": "ENGINEERED-NOT-VALIDATED"
   },
   "stop_condition": "Keep merging passing AI-agent PRs continuously while revamp_completed is false. Set revamp_completed to true only after Lantern ameliorations and Phase 5+6 AWS end-to-end pilot validation pass."
 }

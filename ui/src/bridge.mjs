@@ -3,6 +3,7 @@ import { decodeCockpit, assertSchema, freeze, decimalCoefficient, isUTCTimestamp
 import { canonicalJSON, decodeDecisionRead } from './decision-read.mjs';
 import { compareFenceReadback } from './control-observation.mjs';
 import { resolveCatalog } from './catalog.mjs';
+import { decodeMarketStream, verifyMarketStreamDigest } from './chart.mjs';
 
 const METHODS = ['readBoot', 'readCockpit', 'readDecisionRead', 'prepareControl', 'requestControl', 'readControl', 'prepareClose', 'requestReviewedClose', 'readCommand'];
 const CAPABILITY = { PAUSE_NEW_RISK: 'pause', STOP_AUTOMATION: 'stop', RESUME_NEW_RISK: 'resume_new_risk', RESUME_MANAGEMENT: 'resume_management' };
@@ -254,5 +255,15 @@ export class ScopedBridge {
     }
     this.boot = current; this.#observeClock(current, receivedAt); this.#emit();
     return copy({ envelope: read.envelope, local: { ...read.local, source_binding: 'BRIDGE_ANCHOR_MATCHED', reference_resolution: catalog.status, semantic_verification: 'NOT_ESTABLISHED', reason: catalog.reason }, anchor, catalog });
+  }
+  async readMarketStream(marketSchema) {
+    require(this.attached && this.boot, 'Bound MarketStream source unavailable.');
+    const generation = this.#generation; const bridge = this.#bridge;
+    if (typeof bridge.readMarketStream !== 'function') return null;
+    const rawPayload = await bridge.readMarketStream(); this.#active(generation);
+    if (rawPayload === null || rawPayload === undefined) return null;
+    const decoded = decodeMarketStream(typeof rawPayload === 'string' ? rawPayload : JSON.stringify(rawPayload), marketSchema);
+    await verifyMarketStreamDigest(decoded, sha256Bytes); this.#active(generation);
+    return copy(decoded);
   }
 }

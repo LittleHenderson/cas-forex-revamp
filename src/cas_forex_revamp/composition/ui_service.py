@@ -25,7 +25,7 @@ def exact(value, fields):
 
 
 class ScopedUIService:
-    def __init__(self, *, app, owner, journal, reader, clock):
+    def __init__(self, *, app, owner, journal, reader, clock, market_stream_provider=None):
         if app.config.scope != owner.scope or app.config.scope != reader.scope:
             raise ContractError('trusted bootstrap scope mismatch')
         self.app, self.owner, self.journal, self.reader, self.clock = app, owner, journal, reader, clock
@@ -33,6 +33,7 @@ class ScopedUIService:
         self._prepared_controls = {}
         self._prepared_close = {}
         self._lock = RLock()
+        self._market_stream_provider = market_stream_provider
 
     def _scope(self, value):
         if value != wire(self.scope):
@@ -228,3 +229,12 @@ class ScopedUIService:
             state=record.state.value, last_venue_receipt_id=record.receipt.receipt_id if record.receipt else None,
             reservation_held=record.reservation_held, reason_code=record.reason_code)
         return dict(command=command, venue_lookup=wire(self.app.venue.lookup(self.scope.key, command_id)))
+
+    def readMarketStream(self):
+        """Read-only multi-currency market stream accessor; never reconciles or mutates durable state."""
+        if callable(self._market_stream_provider):
+            return self._market_stream_provider()
+        reader_fn = getattr(self.app.venue, 'read_market_stream', None)
+        if callable(reader_fn):
+            return reader_fn()
+        return None

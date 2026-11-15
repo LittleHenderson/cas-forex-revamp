@@ -1,0 +1,363 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:market-stream:1.0",
+  "title": "MarketStreamEnvelope",
+  "description": "Read-only multi-currency FX quote, OHLCV candle, and ForexMetaValveGate telemetry envelope.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "stream_id",
+    "sequence",
+    "observed_at",
+    "observed_at_ns",
+    "source_mode",
+    "raw_wire_sha256",
+    "ecb_reference_date",
+    "valve_status",
+    "streams",
+    "canonical_payload_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "stream_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "sequence": {
+      "$ref": "#/$defs/nonNegativeInt"
+    },
+    "observed_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "observed_at_ns": {
+      "$ref": "#/$defs/nsDigits"
+    },
+    "source_mode": {
+      "enum": [
+        "LIVE_EXTERNAL_PUBLIC_FEED",
+        "SEALED_CAPTURED_LIVE_FEED",
+        "REHEARSAL_VENUE_FEED"
+      ]
+    },
+    "raw_wire_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "ecb_reference_date": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "minLength": 10,
+          "maxLength": 10
+        }
+      ]
+    },
+    "valve_status": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/valveStatus"
+        }
+      ]
+    },
+    "streams": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/pairStream"
+      }
+    },
+    "canonical_payload_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+    },
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nsDigits": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 30,
+      "pattern": "^[0-9]{1,30}$"
+    },
+    "decimal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 31,
+      "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+    },
+    "nonNegativeInt": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 32,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$"
+    },
+    "valveStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gate_active",
+        "status",
+        "weights_sha256",
+        "parameter_count",
+        "threshold",
+        "last_score",
+        "last_reason"
+      ],
+      "properties": {
+        "gate_active": {
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "ALLOW",
+            "REFUSE",
+            "STANDBY",
+            "UNCONFIGURED"
+          ]
+        },
+        "weights_sha256": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha256"
+            }
+          ]
+        },
+        "parameter_count": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/nonNegativeInt"
+            }
+          ]
+        },
+        "threshold": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/decimal"
+            }
+          ]
+        },
+        "last_score": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/decimal"
+            }
+          ]
+        },
+        "last_reason": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 240
+            }
+          ]
+        }
+      }
+    },
+    "candleBar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "t",
+        "o",
+        "h",
+        "l",
+        "c",
+        "v",
+        "n"
+      ],
+      "properties": {
+        "t": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "o": {
+          "$ref": "#/$defs/decimal"
+        },
+        "h": {
+          "$ref": "#/$defs/decimal"
+        },
+        "l": {
+          "$ref": "#/$defs/decimal"
+        },
+        "c": {
+          "$ref": "#/$defs/decimal"
+        },
+        "v": {
+          "$ref": "#/$defs/decimal"
+        },
+        "n": {
+          "$ref": "#/$defs/nonNegativeInt"
+        }
+      }
+    },
+    "pairStream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pair",
+        "display_pair",
+        "category",
+        "base_currency",
+        "quote_currency",
+        "tick_size",
+        "feed_mode",
+        "bid",
+        "ask",
+        "mid",
+        "spread_pips",
+        "change_24h_pct",
+        "ecb_reference_mid",
+        "ecb_deviation_bps",
+        "observed_at",
+        "candles_m1",
+        "candles_m5",
+        "candles_h1"
+      ],
+      "properties": {
+        "pair": {
+          "type": "string",
+          "pattern": "^[A-Z]{6}$",
+          "minLength": 6,
+          "maxLength": 6
+        },
+        "display_pair": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}/[A-Z]{3}$",
+          "minLength": 7,
+          "maxLength": 7
+        },
+        "category": {
+          "enum": [
+            "MAJOR",
+            "CROSS"
+          ]
+        },
+        "base_currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$",
+          "minLength": 3,
+          "maxLength": 3
+        },
+        "quote_currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$",
+          "minLength": 3,
+          "maxLength": 3
+        },
+        "tick_size": {
+          "$ref": "#/$defs/decimal"
+        },
+        "feed_mode": {
+          "enum": [
+            "DIRECT_KRAKEN_ORDERBOOK",
+            "SYNTHETIC_KRAKEN_CROSS_BOOK",
+            "INTERBANK_YAHOO_ECB_VERIFIED",
+            "REHEARSAL_SIMULATOR_VENUE"
+          ]
+        },
+        "bid": {
+          "$ref": "#/$defs/decimal"
+        },
+        "ask": {
+          "$ref": "#/$defs/decimal"
+        },
+        "mid": {
+          "$ref": "#/$defs/decimal"
+        },
+        "spread_pips": {
+          "$ref": "#/$defs/decimal"
+        },
+        "change_24h_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "ecb_reference_mid": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/decimal"
+            }
+          ]
+        },
+        "ecb_deviation_bps": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/decimal"
+            }
+          ]
+        },
+        "observed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "candles_m1": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 96,
+          "items": {
+            "$ref": "#/$defs/candleBar"
+          }
+        },
+        "candles_m5": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 96,
+          "items": {
+            "$ref": "#/$defs/candleBar"
+          }
+        },
+        "candles_h1": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 96,
+          "items": {
+            "$ref": "#/$defs/candleBar"
+          }
+        }
+      }
+    }
+  }
+}
