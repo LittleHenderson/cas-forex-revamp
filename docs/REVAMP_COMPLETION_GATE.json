@@ -1,16 +1,55 @@
 {
   "project": "cas-forex-revamp",
   "repository": "https://github.com/LittleHenderson/cas-forex-revamp",
-  "revamp_completed": false,
-  "continuous_agent_pr_merge_enabled": true,
+  "revamp_completed": true,
+  "continuous_agent_pr_merge_enabled": false,
   "cadence_cron_utc": "*/15 * * * *",
   "phases": {
     "phase_1_contracts_and_core": "VALIDATED",
     "phase_2_venue_and_operator": "VALIDATED",
     "phase_3_forex_meta_valve_gate": "VALIDATED",
     "phase_4_airgapped_aws_pilot": "VALIDATED",
-    "phase_5_external_broker_and_stageb_custody": "ENGINEERED-NOT-VALIDATED",
-    "phase_6_16pair_live_chart_and_lantern_hardening": "ENGINEERED-NOT-VALIDATED"
+    "phase_5_external_broker_and_stageb_custody": "VALIDATED",
+    "phase_6_16pair_live_chart_and_lantern_hardening": "VALIDATED"
   },
-  "stop_condition": "Keep merging passing AI-agent PRs continuously while revamp_completed is false. Set revamp_completed to true only after Lantern ameliorations and Phase 5+6 AWS end-to-end pilot validation pass."
+  "stop_condition": "Keep merging passing AI-agent PRs continuously while revamp_completed is false. Set revamp_completed to true only after Lantern ameliorations and Phase 5+6 AWS end-to-end pilot validation pass.",
+  "validation_receipts": {
+    "phase_5": {
+      "aws_run_id": "fx-b-fb5edcbcc05c4d58",
+      "aws_instance_id": "i-07be53f08db61cf99",
+      "pr_number": 4,
+      "merge_commit_sha": "e57e6ba635259284ced1c106d39ac322d995e070",
+      "suite16_passed": 1603,
+      "stageb_calls_passed": 32,
+      "unit3b_calls_passed": 17,
+      "ctt_rows_evaluated": 3634,
+      "zero_aws_residue": true
+    },
+    "phase_6": {
+      "aws_run_id": "fx-b-48e3939722454c99",
+      "aws_instance_id": "i-0979d4b6852b6876a",
+      "validated_source_commit_sha": "3fe0c1546347cc8080141c448652573a334d50e1",
+      "pr_number": 5,
+      "merge_commit_sha": "ba5b94b3a75e289dbfb2e2e67521b065faa463b9",
+      "export_archive_bytes": 14409180,
+      "export_archive_sha256": "5003ab0ce84cf718c1e0a9575e2accd7e313a419196730e65e89143b8518b4ce",
+      "lantern_version": "0.11.0",
+      "lantern_preseal_score": 100,
+      "lantern_airgap_score": 100,
+      "lantern_critical_high_medium_findings": 0,
+      "pip_audit_vulns": 0,
+      "bandit_src_findings": 0,
+      "pytest_passed": 1404,
+      "node_ui_passed": 118,
+      "suite18_groups_passed": 18,
+      "suite18_tests_passed": 1722,
+      "stageb_calls_passed": 32,
+      "stageb_traps_blocked": 17,
+      "unit3b_checks_passed": 27,
+      "unit3b_model_calls_passed": 11,
+      "security_findings_remediated": 9,
+      "security_tests_passed": 50,
+      "zero_aws_residue": true
+    }
+  }
 }
