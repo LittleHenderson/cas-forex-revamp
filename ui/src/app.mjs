@@ -6,6 +6,7 @@ import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose,
 import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decision-read.mjs';
 import { ScopedBridge } from './bridge.mjs';
 import { ALL_CHART_PAIRS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts } from './chart.mjs';
+import { MAX_BROKER_ROUTING_BYTES, normalizeBrokerRouting } from './broker-routing.mjs';
 
 // Fixed same-origin assets. Only explicit trusted bootstrap may inject a scoped bridge.
 const schemaURL = new URL('../docs/contracts/cockpit.schema.json', document.baseURI);
@@ -35,7 +36,7 @@ let state = {
   reviewView: 'list', reviewFilter: 'all', explainerIssue: null, inspection: resetInspection(),
   reviewEnvelope: null, reviewIssue: null, reviewSchemaReady: false, lastLoaded: null, transport: null,
   marketStream: null, chartPair: 'EURUSD', chartTimeframe: 'M5', chartLayout: 'single', chartCategory: 'all',
-  liveStreamConnected: false, chartMicroBars: {},
+  liveStreamConnected: false, chartMicroBars: {}, brokerRouting: null,
 };
 
 function routeFromHash() {
@@ -224,8 +225,19 @@ async function connectLoopbackLiveFeed() {
       }
     } catch { /* Operate with verified market stream even if ScopedUIService is absent. */ }
   }
+  await readBrokerRouting();
   render();
   announce('Connected to verified loopback multi-currency market stream.');
+}
+
+// Optional loopback-only broker routing summary. Any failure keeps the static Setup preview.
+async function readBrokerRouting() {
+  try {
+    const raw = await readStatic(new URL('/api/broker-routing', window.location.origin), MAX_BROKER_ROUTING_BYTES);
+    state.brokerRouting = normalizeBrokerRouting(parseUniqueJSON(raw, MAX_BROKER_ROUTING_BYTES));
+  } catch {
+    state.brokerRouting = null; // Static/offline mode: no routing endpoint, nothing changes.
+  }
 }
 
 async function readTransport() {

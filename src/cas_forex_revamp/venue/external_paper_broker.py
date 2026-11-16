@@ -2182,10 +2182,10 @@ class SealedLiveFeedPaperVenue:
             pstream = pmap[sym]
             cur_snap = self._venue.snapshot(key, now=obs_time)
             next_seq = cur_snap.sequence + 1
-            bid_q = pstream.bid.quantize(inst.tick_size, rounding=ROUND_FLOOR)
-            ask_q = pstream.ask.quantize(inst.tick_size, rounding=ROUND_CEILING)
+            bid_q = pstream.bid.quantize(inst.price_tick, rounding=ROUND_FLOOR)
+            ask_q = pstream.ask.quantize(inst.price_tick, rounding=ROUND_CEILING)
             if ask_q <= bid_q:
-                ask_q = bid_q + inst.tick_size
+                ask_q = bid_q + inst.price_tick
             obs = MarketObservation(
                 key,
                 f"mstream-{envelope.sequence}-{sym.lower()}-{next_seq}",

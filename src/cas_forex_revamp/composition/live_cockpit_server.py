@@ -6,6 +6,10 @@ Security & Honesty Invariants:
 - Emits strict Content-Security-Policy (default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self').
 - Exposes read-only market-stream JSON (/api/market-stream) + Server-Sent Events (/api/market-events) and
   optional ScopedUIService JSON RPC endpoints with bounded 256 KiB request payloads.
+- Exposes an optional read-only, secret-free broker routing summary (/api/broker-routing) for the
+  MetaTrader 5 Hugo's Way / LHFX / OANDA practice dual-shield hierarchy, served only to loopback
+  clients and refused (HTTP 500, generic message) if the payload ever carries credential-like keys
+  or non-safe JSON numbers.
 - Importing and constructing LoopbackCockpitServer is strictly inert until .start() is called.
 """
 from __future__ import annotations
@@ -23,6 +27,8 @@ import urllib.parse
 from cas_forex_revamp.contracts import ContractError
 
 MAX_HTTP_RPC_BYTES = 262_144
+MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
+_FORBIDDEN_ROUTING_KEY_TOKENS: tuple[str, ...] = ("password", "passwd", "token", "secret", "login", "credential", "api_key")
 STRICT_CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; "
     "connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
@@ -36,6 +42,29 @@ _CONTENT_TYPES: dict[str, str] = {
     ".json": "application/json; charset=utf-8",
     ".svg": "image/svg+xml",
 }
+
+
+def safe_broker_routing_payload(payload: Any, *, path: str = "$") -> Any:
+    """Validate that a broker routing payload is secret-free, float-free, safe-integer JSON."""
+    if payload is None or type(payload) in (str, bool):
+        return payload
+    if type(payload) is int:
+        if not (-MAX_SAFE_JSON_INTEGER <= payload <= MAX_SAFE_JSON_INTEGER):
+            raise ContractError(f"{path}: integer exceeds Number.MAX_SAFE_INTEGER")
+        return payload
+    if type(payload) in (list, tuple):
+        return [safe_broker_routing_payload(item, path=f"{path}[{idx}]") for idx, item in enumerate(payload)]
+    if type(payload) is dict:
+        out: dict[str, Any] = {}
+        for key, value in payload.items():
+            if type(key) is not str:
+                raise ContractError(f"{path}: object keys must be strings")
+            lowered = key.lower()
+            if any(tok in lowered for tok in _FORBIDDEN_ROUTING_KEY_TOKENS):
+                raise ContractError(f"{path}: credential-like key {key!r} is forbidden in broker routing payloads")
+            out[key] = safe_broker_routing_payload(value, path=f"{path}.{key}")
+        return out
+    raise ContractError(f"{path}: unsupported broker routing value type {type(payload).__name__}")
 
 
 def validate_loopback_host(host: str) -> str:
@@ -62,6 +91,7 @@ class LoopbackCockpitServer:
         port: int = 0,
         ui_service: Any | None = None,
         market_stream_reader: Callable[[], dict[str, Any] | None] | None = None,
+        broker_router_reader: Callable[[], dict[str, Any] | None] | None = None,
     ) -> None:
         self._host = validate_loopback_host(host)
         if type(port) is not int or not (0 <= port <= 65535):
@@ -72,11 +102,15 @@ class LoopbackCockpitServer:
         self._contracts_dir = (self._repo_root / "docs" / "contracts").resolve()
         self._ui_service = ui_service
         self._market_stream_reader = market_stream_reader
+        if broker_router_reader is not None and not callable(broker_router_reader):
+            raise ContractError("broker_router_reader must be callable")
+        self._broker_router_reader = broker_router_reader
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._sse_cond = threading.Condition()
         self._sse_version = 0
+        self._last_routing_error: str | None = None
 
     @property
     def bound_port(self) -> int:
@@ -99,6 +133,16 @@ class LoopbackCockpitServer:
         if self._ui_service is not None and hasattr(self._ui_service, "readMarketStream"):
             return self._ui_service.readMarketStream()
         return None
+
+    def _read_broker_routing(self) -> dict[str, Any] | None:
+        if self._broker_router_reader is None:
+            return None
+        payload = self._broker_router_reader()
+        if payload is None:
+            return None
+        if type(payload) is not dict:
+            raise ContractError("broker routing payload must be a JSON object")
+        return safe_broker_routing_payload(payload)
 
     def _resolve_static_path(self, raw_path: str) -> Path | None:
         clean = urllib.parse.unquote(raw_path.split("?", 1)[0].split("#", 1)[0])
@@ -173,6 +217,25 @@ class LoopbackCockpitServer:
                         self._write_json(HTTPStatus.NOT_FOUND, {"error": "Market stream not configured"})
                     else:
                         self._write_json(HTTPStatus.OK, stream)
+                    return
+                if route == "/api/broker-routing":
+                    try:
+                        client_ip = ipaddress.ip_address(str(self.client_address[0]))
+                    except ValueError:
+                        client_ip = None
+                    if client_ip is None or not client_ip.is_loopback:
+                        self._write_json(HTTPStatus.FORBIDDEN, {"error": "Loopback clients only"})
+                        return
+                    try:
+                        routing = outer._read_broker_routing()
+                    except Exception as exc:  # never echo reader internals; report a generic refusal
+                        outer._last_routing_error = type(exc).__name__
+                        self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Broker routing unavailable"})
+                        return
+                    if routing is None:
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "Broker routing not configured"})
+                    else:
+                        self._write_json(HTTPStatus.OK, routing)
                     return
                 if route == "/api/market-events":
                     self.send_response(int(HTTPStatus.OK))

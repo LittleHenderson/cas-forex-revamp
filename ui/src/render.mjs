@@ -2,6 +2,7 @@ import { CONTROL_COPY, moneyLabel, formatDecimal, positionSummary, pendingEffect
 import { envelopeRecords, canonicalJSON } from './decision-read.mjs';
 import { displayFreshness } from './freshness.mjs';
 import { renderMarketChartSection } from './chart.mjs';
+import { STATIC_BROKER_ROUTING } from './broker-routing.mjs';
 
 export function escapeHTML(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
@@ -170,11 +171,27 @@ function setup(projection, state) {
     <fieldset class="theme-options"><legend>Theme</legend>${['system', 'light', 'dark'].map((theme) => `<label><input type="radio" name="theme" value="${theme}" ${state.theme === theme ? 'checked' : ''}>${theme[0].toUpperCase() + theme.slice(1)}</label>`).join('')}</fieldset><p class="quiet-note">Theme is held in this tab. No credentials or permissions are stored.</p>
     <dl class="metadata">${meta('Default view', 'Operate')}${meta('Decision presentation', state.reviewView === 'atlas' ? 'Atlas' : 'List')}${meta('Control requests', state.transport?.attached ? 'Explicit scoped requests' : 'Unavailable')}</dl>
   </section><section class="panel">${heading('EXPLICIT OWNER REQUEST', 'Resume permissions')}<p class="panel-copy">Resume is separate from Pause, Stop and Close. Core checks recovery before granting permission.</p><div class="direct-controls">${action('Resume new risk', 'RESUME_NEW_RISK', state.transport)}${action('Resume management', 'RESUME_MANAGEMENT', state.transport)}</div></section><section class="panel scope-panel">${heading('SOURCE IDENTITY', 'Account & run')}${projection ? `<dl class="metadata">${Object.entries(projection.scope).map(([key, value]) => meta(key.replaceAll('_', ' '), value)).join('')}</dl>` : '<p class="panel-copy">No valid source loaded.</p>'}</section>
-  <section class="panel">${heading('READINESS', 'Rehearsal stages')}
+  ${renderBrokerRoutingPanel(state.brokerRouting)}<section class="panel">${heading('READINESS', 'Rehearsal stages')}
     <div class="stage-row"><div><span class="stage-letter">A</span><h3>Scripted rehearsal</h3><p>Continuous operational management.</p></div>${tag('NOT_RUN')}</div>
     <div class="stage-row"><div><span class="stage-letter">B</span><h3>Actual-model simulator</h3><p>Real decisions and continuing management.</p></div>${tag('NOT_RUN')}</div>
     <p class="quiet-note">These are build validation states. Neither stage establishes trading profit or strategy edge.</p>
   </section></div>`;
+}
+
+const pct = (share) => { const n = Number(share); return Number.isFinite(n) ? `${Math.round(n * 10000) / 100}%` : 'Unknown'; };
+
+/** 03 Setup card: Broker & MetaTrader 5 routing (demo only). Static preview when no loopback routing is attached. */
+export function renderBrokerRoutingPanel(routing) {
+  const r = routing && typeof routing === 'object' && Array.isArray(routing.chain) ? routing : STATIC_BROKER_ROUTING;
+  const s = r.shield ?? STATIC_BROKER_ROUTING.shield;
+  const chain = r.chain.map((item) => `<div class="stage-row broker-row" data-broker-id="${e(item.brokerId)}"><div><span class="stage-letter">${e(item.priority)}</span><h3>${e(item.brokerId)} · ${e(item.label)}</h3><p>${e(item.role)} · ${e(item.platform)} · ${e(item.server)} · ${e(item.leverage)} ${e(item.accountType)}</p></div>${tag(item.status, item.status !== 'ACTIVE')}</div>`).join('');
+  return `<section class="panel broker-routing-panel" aria-labelledby="broker-routing-title"><div class="section-heading"><div><p class="eyebrow">DEMO ACCOUNTS ONLY</p><h2 id="broker-routing-title">Broker &amp; MetaTrader 5 Routing</h2></div>${tag('Demo only · live trading locked')}</div>
+    <p class="panel-copy">Active platform ${e(r.platform)}. Hugo&#39;s Way is the primary main venue, LHFX is the secondary MetaTrader 5 venue, and the OANDA practice account is the regulated safe harbor. Every trade still needs ForexMetaValveGate clearance first.</p>
+    <dl class="metadata">${meta('Active platform', r.platform)}${meta('Routing source', r.connected ? 'Loopback broker routing (read only)' : 'Static preview (not connected)')}${meta('Primary broker', r.primaryBroker)}${meta('Active broker', r.activeBroker)}${meta('MT5 transport', r.transportMode)}${meta('Safety valve', `${r.valve.controller} · ${r.valve.parameters} params · threshold ${r.valve.threshold}`)}</dl>
+    <div class="broker-chain" aria-label="Broker priority chain">${chain}</div>
+    <dl class="metadata" aria-label="Dual-shield barbell">${meta('Quote-truth shield', `${s.majorBps} bps majors / ${s.crossBps} bps crosses vs ${s.reference} · spread ≤ ${s.spreadMultiple}x`)}${meta('Barbell allocation', `${pct(s.reserveShare)} OANDA reserve · ${pct(s.hugoswayShare)} Hugo's Way · ${pct(s.lhfxShare)} LHFX`)}${meta('Stop-loss risk cap', `${s.maxStopRiskPct}% of total equity`)}${meta('Safe harbor', `${s.safeHarbor} ${s.safeHarborLeverage} · ${s.degradations} recent degradations`)}${meta('Protective offsets', s.offsetPlanner ? 'Delta-neutral OANDA hedge plan if an MT5 terminal freezes' : 'Unavailable')}</dl>
+    <p class="quiet-note">Demo-only lock: live servers (Hugo PRO5, LHFXSA-Live, api-fxtrade.oanda.com) are refused in code. No credentials are shown or stored in this page.</p>
+  </section>`;
 }
 
 export function renderApp(state, now = Date.now(), monotonicNow = globalThis.performance?.now?.() ?? null) {
