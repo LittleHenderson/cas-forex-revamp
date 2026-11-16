@@ -97,7 +97,7 @@ def expected_state_checks(expected, a, *, before, disposition, previous):
     return checks
 
 
-def row_checks(key, a, history, semantic):
+def row_checks(key, a, history, semantic, *, semantic_supplied=False):
     required = ('actual_before','actual_after','observed_before','observed_after','observed_before_after_events',
         'core_before','core_after','new_core_commands','selected_action_ref','policy_before','context_before',
         'binding_before','binding_after','result','request','current_view','effect','receipt','position_id',
@@ -121,7 +121,6 @@ def row_checks(key, a, history, semantic):
     disposition = semantic['disposition'] if semantic is not None else None
     reason_ok = semantic['reason_supported_by_current_evidence'] if semantic is not None else None
     model_choice = selected in key['permissible_action_refs']
-    a_disposition = 'STALE_REJECTED' if a['stale_rejected'] else disposition
     previous = history[-1] if history else None
     current_options = {o['action_ref']: o for o in a['request']['options']}
     entry = bool(kind == 'OPEN' and filled and Decimal(after['open_quantity']) > 0)
@@ -161,6 +160,7 @@ def row_checks(key, a, history, semantic):
     ledger_advances = after['venue_sequence'] > before['venue_sequence'] if a['decision_venue_changed'] else True
     semantic_none = (semantic.get('none_eligible_from_current_policy_and_facts') if semantic is not None else None)
     checks = {'verified_actual_first_attempt': a['actual_receipt_verified'] is True,
+        'semantic_review_authenticated': (True if semantic is not None else False if semantic_supplied else None),
         'permissible_selection': model_choice,
         'required_evidence': set(key['required_evidence_ids']) <= set(a['evidence_ids']),
         'reason_supported': reason_ok,
@@ -215,12 +215,23 @@ def row_checks(key, a, history, semantic):
     return checks, {name: predicates[name] for name in key['mandatory_assertions']}
 
 
-def score_suite(suite, keys, attempts, *, verify_attempt, semantic_reviews=None, trusted_reviewer_id=None):
+def score_suite(
+    suite,
+    keys,
+    attempts,
+    *,
+    verify_attempt,
+    semantic_reviews=None,
+    pinned_reviewer_public_key=None,
+    trusted_reviewer_id=None,
+):
     """Caller supplies a trusted resolver of persisted attempt/inference evidence.
 
-    Pure shape/source tests may inject fakes, which never become runtime evidence.
-    The production driver verifies each row against separate durable ledgers.
+    Semantic reviews must carry a valid Ed25519 signature over the complete
+    canonical review object verified against an out-of-band pinned_reviewer_public_key.
+    Caller/driver-claimed trusted_reviewer_id is ignored.
     """
+    _ = trusted_reviewer_id
     if suite.get('schema') != 'forex.model-suite/2' or not callable(verify_attempt):
         raise ContractError('v2 suite and independent persisted-evidence resolver required')
     if set(keys['global_assertions']) != GLOBALS:
@@ -247,8 +258,19 @@ def score_suite(suite, keys, attempts, *, verify_attempt, semantic_reviews=None,
             if bound is not True and bound is not False and bound is not None:
                 raise ContractError('evidence resolver must return bool or None')
             binding_results.append(bound)
-            semantic = semantic_result(attempt, semantic_reviews.get(key['step_id']), trusted_reviewer_id=trusted_reviewer_id)
-            checks, named = row_checks(key, attempt, history, semantic)
+            raw_review = semantic_reviews.get(key['step_id'])
+            semantic = semantic_result(
+                attempt,
+                raw_review,
+                pinned_reviewer_public_key=pinned_reviewer_public_key,
+            )
+            checks, named = row_checks(
+                key,
+                attempt,
+                history,
+                semantic,
+                semantic_supplied=(raw_review is not None),
+            )
             checks['persisted_independent_evidence_bound'] = bound
             if 'stale_proof' in key:
                 nxt = first.get((case['case_id'], case['steps'][index+1]['step_id'])) if index+1 < len(case['steps']) else None

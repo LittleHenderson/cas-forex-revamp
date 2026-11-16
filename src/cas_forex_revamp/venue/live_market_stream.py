@@ -8,6 +8,8 @@ Phase 6 live market stream module:
   derives exact two-sided synthetic cross orderbooks (GBPJPY, CHFJPY, CADJPY),
   fetches verified interbank NZDUSD OHLC + spot, and cross-checks all 16 pairs
   against official ECB / Frankfurter G10 reference rates (USD, GBP, JPY, CHF, AUD, CAD, NZD).
+- Fails closed when independent reference rates are unavailable, stale beyond
+  max_reference_age_days, or breached on pair-specific deviation or spread ceilings.
 - Aggregates real-time incoming ticks into live forming OHLCV candles (LiveCandleAggregator).
 - Emits canonical MarketStreamEnvelope payloads conforming strictly to
   docs/contracts/market-stream.schema.json (urn:cas-forex:market-stream:1.0),
@@ -21,11 +23,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from decimal import Context, Decimal, ROUND_CEILING, ROUND_FLOOR, localcontext
+from datetime import date, datetime, timezone
+from decimal import Context, Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, localcontext
 from hashlib import sha256
+import http.client
+import ipaddress
 import json
 import re
+import socket
 import ssl
 import time
 from typing import Any
@@ -34,10 +39,11 @@ import urllib.parse
 import urllib.request
 
 from cas_forex_revamp.contracts import ContractError, canonical_bytes, decimal_text, parse_decimal
-from cas_forex_revamp.contracts.primitives import digest, identifier, integer, utc_time
+from cas_forex_revamp.contracts.primitives import decimal_value, digest, identifier, integer, utc_time
 
 MAX_SAFE_JS_INTEGER = (1 << 53) - 1
 MAX_STREAM_WIRE_BYTES = 1_048_576
+DEFAULT_MAX_REFERENCE_AGE_DAYS = 5
 
 DIRECT_KRAKEN_FX_PAIRS: tuple[str, ...] = (
     "EURUSD",
@@ -73,23 +79,61 @@ EXPANDED_FX_PAIRS: tuple[str, ...] = (
     "CADJPY",
 )
 
+PAIR_MAX_REFERENCE_DEVIATION_BPS: dict[str, Decimal] = {
+    "EURUSD": Decimal("250"),
+    "GBPUSD": Decimal("250"),
+    "USDJPY": Decimal("300"),
+    "USDCHF": Decimal("300"),
+    "AUDUSD": Decimal("300"),
+    "USDCAD": Decimal("250"),
+    "NZDUSD": Decimal("300"),
+    "EURGBP": Decimal("250"),
+    "EURJPY": Decimal("350"),
+    "GBPJPY": Decimal("350"),
+    "EURCHF": Decimal("250"),
+    "EURAUD": Decimal("350"),
+    "EURCAD": Decimal("350"),
+    "AUDJPY": Decimal("350"),
+    "CHFJPY": Decimal("350"),
+    "CADJPY": Decimal("350"),
+}
+
+PAIR_MAX_SPREAD_BPS: dict[str, Decimal] = {
+    "EURUSD": Decimal("100"),
+    "GBPUSD": Decimal("100"),
+    "USDJPY": Decimal("300"),
+    "USDCHF": Decimal("100"),
+    "AUDUSD": Decimal("100"),
+    "USDCAD": Decimal("100"),
+    "NZDUSD": Decimal("100"),
+    "EURGBP": Decimal("100"),
+    "EURJPY": Decimal("300"),
+    "GBPJPY": Decimal("350"),
+    "EURCHF": Decimal("100"),
+    "EURAUD": Decimal("200"),
+    "EURCAD": Decimal("200"),
+    "AUDJPY": Decimal("300"),
+    "CHFJPY": Decimal("350"),
+    "CADJPY": Decimal("350"),
+}
+
 EXPANDED_PAIR_SPECS: dict[str, dict[str, Any]] = {
-    "EURUSD": {"display": "EUR/USD", "category": "MAJOR", "base": "EUR", "quote": "USD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.50"), "max": Decimal("2.50"), "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("ZEURZUSD", "EURUSD", "EUR/USD"), "oanda": "EUR_USD"},
-    "GBPUSD": {"display": "GBP/USD", "category": "MAJOR", "base": "GBP", "quote": "USD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.50"), "max": Decimal("3.00"), "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("ZGBPZUSD", "GBPUSD", "GBP/USD"), "oanda": "GBP_USD"},
-    "USDJPY": {"display": "USD/JPY", "category": "MAJOR", "base": "USD", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("50.0"), "max": Decimal("350.0"), "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("ZUSDZJPY", "USDJPY", "USD/JPY"), "oanda": "USD_JPY"},
-    "USDCHF": {"display": "USD/CHF", "category": "MAJOR", "base": "USD", "quote": "CHF", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.40"), "max": Decimal("2.20"), "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("USDCHF", "USD/CHF"), "oanda": "USD_CHF"},
-    "AUDUSD": {"display": "AUD/USD", "category": "MAJOR", "base": "AUD", "quote": "USD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.30"), "max": Decimal("1.80"), "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("AUDUSD", "AUD/USD"), "oanda": "AUD_USD"},
-    "USDCAD": {"display": "USD/CAD", "category": "MAJOR", "base": "USD", "quote": "CAD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.70"), "max": Decimal("2.50"), "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("ZUSDZCAD", "USDCAD", "USD/CAD"), "oanda": "USD_CAD"},
-    "NZDUSD": {"display": "NZD/USD", "category": "MAJOR", "base": "NZD", "quote": "USD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.30"), "max": Decimal("1.60"), "mode": "INTERBANK_YAHOO_ECB_VERIFIED", "kraken_keys": (), "yahoo": "NZDUSD=X", "oanda": "NZD_USD"},
-    "EURGBP": {"display": "EUR/GBP", "category": "CROSS", "base": "EUR", "quote": "GBP", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.40"), "max": Decimal("1.60"), "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("EURGBP", "EUR/GBP"), "oanda": "EUR_GBP"},
-    "EURJPY": {"display": "EUR/JPY", "category": "CROSS", "base": "EUR", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("70.0"), "max": Decimal("350.0"), "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("EURJPY", "EUR/JPY"), "oanda": "EUR_JPY"},
-    "GBPJPY": {"display": "GBP/JPY", "category": "CROSS", "base": "GBP", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("90.0"), "max": Decimal("400.0"), "mode": "SYNTHETIC_KRAKEN_CROSS_BOOK", "kraken_keys": (), "legs": ("MUL", "GBPUSD", "USDJPY"), "oanda": "GBP_JPY"},
-    "EURCHF": {"display": "EUR/CHF", "category": "CROSS", "base": "EUR", "quote": "CHF", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.50"), "max": Decimal("2.20"), "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("EURCHF", "EUR/CHF"), "oanda": "EUR_CHF"},
-    "EURAUD": {"display": "EUR/AUD", "category": "CROSS", "base": "EUR", "quote": "AUD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.90"), "max": Decimal("3.20"), "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("EURAUD", "EUR/AUD"), "oanda": "EUR_AUD"},
-    "EURCAD": {"display": "EUR/CAD", "category": "CROSS", "base": "EUR", "quote": "CAD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.90"), "max": Decimal("3.00"), "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("EURCAD", "EUR/CAD"), "oanda": "EUR_CAD"},
-    "AUDJPY": {"display": "AUD/JPY", "category": "CROSS", "base": "AUD", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("40.0"), "max": Decimal("250.0"), "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("AUDJPY", "AUD/JPY"), "oanda": "AUD_JPY"},
-    "CHFJPY": {"display": "CHF/JPY", "category": "CROSS", "base": "CHF", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("60.0"), "max": Decimal("380.0"), "mode": "SYNTHETIC_KRAKEN_CROSS_BOOK", "kraken_keys": (), "legs": ("DIV", "USDJPY", "USDCHF"), "oanda": "CHF_JPY"},
-    "CADJPY": {"display": "CAD/JPY", "category": "CROSS", "base": "CAD", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("40.0"), "max": Decimal("250.0"), "mode": "SYNTHETIC_KRAKEN_CROSS_BOOK", "kraken_keys": (), "legs": ("DIV", "USDJPY", "USDCAD"), "oanda": "CAD_JPY"},
+    "EURUSD": {"display": "EUR/USD", "category": "MAJOR", "base": "EUR", "quote": "USD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.50"), "max": Decimal("2.50"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["EURUSD"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["EURUSD"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("ZEURZUSD", "EURUSD", "EUR/USD"), "oanda": "EUR_USD"},
+    "GBPUSD": {"display": "GBP/USD", "category": "MAJOR", "base": "GBP", "quote": "USD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.50"), "max": Decimal("3.00"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["GBPUSD"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["GBPUSD"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("ZGBPZUSD", "GBPUSD", "GBP/USD"), "oanda": "GBP_USD"},
+    "USDJPY": {"display": "USD/JPY", "category": "MAJOR", "base": "USD", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("50.0"), "max": Decimal("350.0"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["USDJPY"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["USDJPY"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("ZUSDZJPY", "USDJPY", "USD/JPY"), "oanda": "USD_JPY"},
+    "USDCHF": {"display": "USD/CHF", "category": "MAJOR", "base": "USD", "quote": "CHF", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.40"), "max": Decimal("2.20"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["USDCHF"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["USDCHF"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("USDCHF", "USD/CHF"), "oanda": "USD_CHF"},
+    "AUDUSD": {"display": "AUD/USD", "category": "MAJOR", "base": "AUD", "quote": "USD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.30"), "max": Decimal("1.80"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["AUDUSD"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["AUDUSD"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("AUDUSD", "AUD/USD"), "oanda": "AUD_USD"},
+    "USDCAD": {"display": "USD/CAD", "category": "MAJOR", "base": "USD", "quote": "CAD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.70"), "max": Decimal("2.50"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["USDCAD"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["USDCAD"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("ZUSDZCAD", "USDCAD", "USD/CAD"), "oanda": "USD_CAD"},
+    "NZDUSD": {"display": "NZD/USD", "category": "MAJOR", "base": "NZD", "quote": "USD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.30"), "max": Decimal("1.60"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["NZDUSD"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["NZDUSD"], "mode": "INTERBANK_YAHOO_ECB_VERIFIED", "kraken_keys": (), "yahoo": "NZDUSD=X", "oanda": "NZD_USD"},
+    "EURGBP": {"display": "EUR/GBP", "category": "CROSS", "base": "EUR", "quote": "GBP", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.40"), "max": Decimal("1.60"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["EURGBP"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["EURGBP"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("EURGBP", "EUR/GBP"), "oanda": "EUR_GBP"},
+    "EURJPY": {"display": "EUR/JPY", "category": "CROSS", "base": "EUR", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("70.0"), "max": Decimal("350.0"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["EURJPY"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["EURJPY"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("EURJPY", "EUR/JPY"), "oanda": "EUR_JPY"},
+    "GBPJPY": {"display": "GBP/JPY", "category": "CROSS", "base": "GBP", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("90.0"), "max": Decimal("400.0"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["GBPJPY"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["GBPJPY"], "mode": "SYNTHETIC_KRAKEN_CROSS_BOOK", "kraken_keys": (), "legs": ("MUL", "GBPUSD", "USDJPY"), "oanda": "GBP_JPY"},
+    "EURCHF": {"display": "EUR/CHF", "category": "CROSS", "base": "EUR", "quote": "CHF", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.50"), "max": Decimal("2.20"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["EURCHF"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["EURCHF"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("EURCHF", "EUR/CHF"), "oanda": "EUR_CHF"},
+    "EURAUD": {"display": "EUR/AUD", "category": "CROSS", "base": "EUR", "quote": "AUD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.90"), "max": Decimal("3.20"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["EURAUD"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["EURAUD"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("EURAUD", "EUR/AUD"), "oanda": "EUR_AUD"},
+    "EURCAD": {"display": "EUR/CAD", "category": "CROSS", "base": "EUR", "quote": "CAD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.90"), "max": Decimal("3.00"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["EURCAD"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["EURCAD"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("EURCAD", "EUR/CAD"), "oanda": "EUR_CAD"},
+    "AUDJPY": {"display": "AUD/JPY", "category": "CROSS", "base": "AUD", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("40.0"), "max": Decimal("250.0"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["AUDJPY"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["AUDJPY"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("AUDJPY", "AUD/JPY"), "oanda": "AUD_JPY"},
+    "CHFJPY": {"display": "CHF/JPY", "category": "CROSS", "base": "CHF", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("60.0"), "max": Decimal("380.0"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["CHFJPY"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["CHFJPY"], "mode": "SYNTHETIC_KRAKEN_CROSS_BOOK", "kraken_keys": (), "legs": ("DIV", "USDJPY", "USDCHF"), "oanda": "CHF_JPY"},
+    "CADJPY": {"display": "CAD/JPY", "category": "CROSS", "base": "CAD", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("40.0"), "max": Decimal("250.0"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["CADJPY"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["CADJPY"], "mode": "SYNTHETIC_KRAKEN_CROSS_BOOK", "kraken_keys": (), "legs": ("DIV", "USDJPY", "USDCAD"), "oanda": "CAD_JPY"},
 }
 
 KRAKEN_EXPANDED_TICKER_URL = (
@@ -100,24 +144,298 @@ FRANKFURTER_G10_URLS: tuple[str, ...] = (
     "https://api.frankfurter.dev/v1/latest?base=EUR&symbols=USD,GBP,JPY,CHF,AUD,CAD,NZD",
     "https://api.frankfurter.app/latest?from=EUR&to=USD,GBP,JPY,CHF,AUD,CAD,NZD",
 )
+ECB_DAILY_XML_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
 YAHOO_FX_CHART_URL_TEMPLATE = (
     "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={range}"
 )
 
-_ALLOWED_PUBLIC_HOSTS = frozenset({
-    "api.kraken.com",
-    "api.frankfurter.dev",
-    "api.frankfurter.app",
-    "www.ecb.europa.eu",
-    "query1.finance.yahoo.com",
-})
+PINNED_PUBLIC_FEED_HOST_PATHS: dict[str, frozenset[str]] = {
+    "api.kraken.com": frozenset({"/0/public/Ticker", "/0/public/OHLC"}),
+    "www.ecb.europa.eu": frozenset({"/stats/eurofxref/eurofxref-daily.xml"}),
+    "data-api.ecb.europa.eu": frozenset({"/service/data/EXR"}),
+    "api.frankfurter.dev": frozenset({"/v1/latest"}),
+    "api.frankfurter.app": frozenset({"/latest"}),
+}
+ALLOWED_PUBLIC_FEED_HOSTS: frozenset[str] = frozenset(PINNED_PUBLIC_FEED_HOST_PATHS.keys())
+_YAHOO_ALLOWED_CHART_PATHS: frozenset[str] = frozenset({"/v8/finance/chart/NZDUSD=X"})
+_ALLOWED_PUBLIC_HOSTS: frozenset[str] = ALLOWED_PUBLIC_FEED_HOSTS | frozenset({"query1.finance.yahoo.com"})
+
+_FORBIDDEN_LIVE_HOST_TOKENS: tuple[str, ...] = (
+    "api-fxtrade.oanda.com",
+    "stream-fxtrade.oanda.com",
+    "fxtrade",
+)
+_ECB_DATA_API_EXR_PATH_RE = re.compile(r"^/service/data/EXR(?:/D\.[A-Z+]{0,64}\.EUR\.SP00\.A)?$")
+_SAFE_QUERY_RE = re.compile(r"^[A-Za-z0-9_,=&.+:%-]*$")
+_FORBIDDEN_PERCENT_ESCAPES = ("%2f", "%2e", "%5c", "%00", "%0d", "%0a", "%40", "%23")
+_NUMERIC_HOST_RE = re.compile(r"^[0-9xXa-fA-F.]+$")
 _NS_DIGITS_RE = re.compile(r"^[0-9]{1,30}$")
 _DATE_ISO_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+_XML_FORBIDDEN_DECL_RE = re.compile(r"<!\s*(?:DOCTYPE|ENTITY|ELEMENT|ATTLIST|NOTATION|\[CDATA\[)", re.IGNORECASE)
+_XML_CUSTOM_ENTITY_RE = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)")
+_XML_ATTR_RE = re.compile(r"""\s+([A-Za-z_][A-Za-z0-9_.:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Hard-refuses every HTTP 3xx status and never follows redirects."""
+
+    def __init__(self, error_cls: type[ContractError] = ContractError) -> None:
+        super().__init__()
+        self._error_cls = error_cls
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ContractError(f"HTTP redirect ({code}) refused on public FX stream transport")
+        raise self._error_cls(f"HTTP redirect ({code}) refused on pinned public FX transport")
+
+    def http_response(self, request, response):
+        code = getattr(response, "status", None)
+        if code is None:
+            code = getattr(response, "code", 200)
+        if 300 <= int(code) < 400:
+            response.close()
+            raise self._error_cls(f"HTTP redirect ({code}) refused on pinned public FX transport")
+        return response
+
+    https_response = http_response
+
+    def _reject_3xx(self, req, fp, code, msg, headers):
+        if fp is not None:
+            fp.close()
+        raise self._error_cls(f"HTTP redirect ({code}) refused on pinned public FX transport")
+
+    http_error_300 = _reject_3xx
+    http_error_301 = _reject_3xx
+    http_error_302 = _reject_3xx
+    http_error_303 = _reject_3xx
+    http_error_304 = _reject_3xx
+    http_error_305 = _reject_3xx
+    http_error_306 = _reject_3xx
+    http_error_307 = _reject_3xx
+    http_error_308 = _reject_3xx
+
+
+_NoRedirectHandler = NoRedirectHandler
+
+
+def verify_public_ip_address(
+    ip_text: str,
+    *,
+    label: str = "feed_host",
+    error_cls: type[ContractError] = ContractError,
+) -> None:
+    """Reject loopback, private, link-local, multicast, unspecified, reserved, or non-global IPs."""
+    if not isinstance(ip_text, str) or not ip_text or "%" in ip_text:
+        raise error_cls(f"{label}: invalid or link-local scoped IP destination {ip_text!r}")
+    stripped = ip_text.strip("[]")
+    try:
+        addr = ipaddress.ip_address(stripped)
+    except ValueError as exc:
+        raise error_cls(f"{label}: malformed IP destination {ip_text!r}") from exc
+
+    candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [addr]
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        candidates.append(mapped)
+    sixtofour = getattr(addr, "sixtofour", None)
+    if sixtofour is not None:
+        candidates.append(sixtofour)
+    teredo = getattr(addr, "teredo", None)
+    if teredo is not None:
+        candidates.extend(teredo)
+
+    for cand in candidates:
+        if (
+            cand.is_private
+            or cand.is_loopback
+            or cand.is_link_local
+            or cand.is_multicast
+            or cand.is_reserved
+            or cand.is_unspecified
+            or not cand.is_global
+        ):
+            raise error_cls(f"{label}: non-public IP destination {ip_text!r} is forbidden")
+
+
+def _is_ip_literal_or_numeric_host(host: str) -> bool:
+    stripped = host.strip("[]")
+    if ":" in stripped:
+        return True
+    try:
+        ipaddress.ip_address(stripped)
+    except ValueError:
+        labels = stripped.split(".")
+        if labels and labels[-1].isdigit():
+            return True
+        if _NUMERIC_HOST_RE.fullmatch(stripped) and any(ch.isdigit() for ch in stripped):
+            return True
+        return False
+    return True
+
+
+def validate_pinned_public_feed_url(
+    url: str,
+    *,
+    label: str = "feed_url",
+    allowed_hosts: frozenset[str] | None = None,
+    allowed_paths_override: Mapping[str, frozenset[str]] | None = None,
+    allow_yahoo_chart: bool = False,
+    live_host_error_cls: type[ContractError] = ContractError,
+) -> str:
+    """Validate an HTTPS public FX feed URL against exact scheme, port 443, host, and path pinning."""
+    if not isinstance(url, str) or not url.strip():
+        raise ContractError(f"{label} must be a non-empty pinned HTTPS URL")
+    cleaned = url.strip()
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch == "\\" for ch in cleaned):
+        raise ContractError(f"{label} contains forbidden whitespace, backslash, or control characters")
+
+    parsed = urllib.parse.urlsplit(cleaned)
+    raw_netloc_lower = parsed.netloc.lower()
+    host_lower = (parsed.hostname or "").lower()
+    if any(tok in host_lower or tok in raw_netloc_lower for tok in _FORBIDDEN_LIVE_HOST_TOKENS):
+        raise live_host_error_cls(f"live trading endpoint host {host_lower!r} is strictly forbidden")
+
+    if not cleaned.startswith("https://") or parsed.scheme != "https":
+        raise ContractError(f"{label} requires an explicit canonical https:// URL")
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        raise ContractError(f"{label} must not embed credentials or userinfo")
+    if parsed.fragment or "#" in cleaned:
+        raise ContractError(f"{label} must not contain URL fragments")
+
+    raw_hostname = parsed.hostname
+    if not raw_hostname or raw_hostname != raw_hostname.lower():
+        raise ContractError(f"{label} requires a canonical lowercase hostname")
+    host = raw_hostname
+    if "[" in parsed.netloc or "]" in parsed.netloc or _is_ip_literal_or_numeric_host(host):
+        raise ContractError(f"{label} forbids IP literals and numeric hostnames ({host!r})")
+
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ContractError(f"{label} specifies an invalid port") from exc
+    if port not in (None, 443) or parsed.netloc not in (host, f"{host}:443"):
+        raise ContractError(f"{label} must use canonical port 443 without nonstandard netloc formatting")
+
+    permitted_hosts = (
+        allowed_hosts
+        if allowed_hosts is not None
+        else (_ALLOWED_PUBLIC_HOSTS if allow_yahoo_chart else ALLOWED_PUBLIC_FEED_HOSTS)
+    )
+    if host not in permitted_hosts:
+        raise ContractError(f"{label}: unpinned public FX feed host {host!r}")
+
+    path = parsed.path
+    if (
+        not path.startswith("/")
+        or "//" in path
+        or "%" in path
+        or any(seg in (".", "..") for seg in path.split("/"))
+    ):
+        raise ContractError(f"{label}: non-canonical or traversal URL path {path!r}")
+
+    if allowed_paths_override is not None and host in allowed_paths_override:
+        if path not in allowed_paths_override[host]:
+            raise ContractError(f"{label}: path {path!r} is not allowlisted for {host!r}")
+    elif host == "data-api.ecb.europa.eu":
+        if not _ECB_DATA_API_EXR_PATH_RE.fullmatch(path):
+            raise ContractError(f"{label}: path {path!r} is not allowlisted for {host!r}")
+    elif host == "query1.finance.yahoo.com":
+        if not allow_yahoo_chart or path not in _YAHOO_ALLOWED_CHART_PATHS:
+            raise ContractError(f"{label}: path {path!r} is not allowlisted for {host!r}")
+    else:
+        allowed_paths = PINNED_PUBLIC_FEED_HOST_PATHS.get(host, frozenset())
+        if path not in allowed_paths:
+            raise ContractError(f"{label}: path {path!r} is not allowlisted for {host!r}")
+
+    if parsed.query:
+        q_lower = parsed.query.lower()
+        if any(esc in q_lower for esc in _FORBIDDEN_PERCENT_ESCAPES) or not _SAFE_QUERY_RE.fullmatch(parsed.query):
+            raise ContractError(f"{label}: query string contains forbidden characters or percent-escapes")
+
+    return cleaned
+
+
+class _PinnedPublicHTTPSConnection(http.client.HTTPSConnection):
+    """Resolves DNS once, rejects any non-global IP, and connects directly with pinned TLS SNI."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        *,
+        context: ssl.SSLContext,
+        ip_error_cls: type[ContractError] = ContractError,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(host, port=port, context=context, **kwargs)
+        self._tls_context = context
+        self._ip_error_cls = ip_error_cls
+
+    def connect(self) -> None:
+        target_host = self.host
+        target_port = self.port or 443
+        try:
+            infos = socket.getaddrinfo(target_host, target_port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise urllib.error.URLError(exc) from exc
+        if not infos:
+            raise urllib.error.URLError(f"no DNS records resolved for {target_host!r}")
+        for _family, _socktype, _proto, _canon, sockaddr in infos:
+            verify_public_ip_address(str(sockaddr[0]), label=target_host, error_cls=self._ip_error_cls)
+
+        family, socktype, proto, _canon, sockaddr = infos[0]
+        raw_sock = socket.socket(family, socktype, proto)
+        try:
+            if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                raw_sock.settimeout(self.timeout)
+            raw_sock.connect(sockaddr)
+            self.sock = self._tls_context.wrap_socket(raw_sock, server_hostname=target_host)
+        except Exception:
+            raw_sock.close()
+            raise
+
+
+class PinnedPublicHTTPSHandler(urllib.request.HTTPSHandler):
+    """HTTPSHandler binding TLS 1.2+, verified global-unicast DNS resolution, and SNI."""
+
+    def __init__(
+        self,
+        *,
+        context: ssl.SSLContext | None = None,
+        ip_error_cls: type[ContractError] = ContractError,
+    ) -> None:
+        if context is None:
+            context = ssl.create_default_context()
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+        super().__init__(context=context)
+        self._pinned_context = context
+        self._ip_error_cls = ip_error_cls
+
+    def https_open(self, req: urllib.request.Request):
+        def _conn_factory(host: str, **kwargs: Any) -> _PinnedPublicHTTPSConnection:
+            kwargs.pop("context", None)
+            return _PinnedPublicHTTPSConnection(
+                host,
+                context=self._pinned_context,
+                ip_error_cls=self._ip_error_cls,
+                **kwargs,
+            )
+
+        return self.do_open(_conn_factory, req)
+
+
+def build_pinned_public_opener(
+    *,
+    error_cls: type[ContractError] = ContractError,
+) -> urllib.request.OpenerDirector:
+    """Build a redirect-refusing, TLS 1.2+, public-IP-verified opener with no default redirect handler."""
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.UnknownHandler())
+    opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    opener.add_handler(NoRedirectHandler(error_cls=error_cls))
+    opener.add_handler(PinnedPublicHTTPSHandler(context=ctx, ip_error_cls=error_cls))
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    return opener
 
 
 def _format_utc(dt: datetime) -> str:
@@ -140,6 +458,56 @@ def _quantize_price(value: Decimal, tick: Decimal, *, rounding: str = ROUND_FLOO
         return value.quantize(tick, rounding=rounding)
 
 
+def _resolve_pair_limits(
+    override: Decimal | Mapping[str, Decimal] | None,
+    defaults: Mapping[str, Decimal],
+    *,
+    label: str,
+) -> dict[str, Decimal]:
+    resolved = dict(defaults)
+    if override is None:
+        return resolved
+    if isinstance(override, Decimal):
+        checked = decimal_value(override, label, positive=True)
+        return {pair: checked for pair in resolved}
+    if isinstance(override, Mapping):
+        for pair, val in override.items():
+            if pair not in EXPANDED_PAIR_SPECS:
+                raise ContractError(f"{label}: unsupported FX pair {pair!r}")
+            resolved[pair] = decimal_value(val, f"{label}[{pair}]", positive=True)
+        return resolved
+    raise ContractError(f"{label} must be a positive Decimal, pair Mapping, or None")
+
+
+def validate_reference_date_freshness(
+    ecb_reference_date: str | None,
+    *,
+    observed_at: datetime,
+    max_reference_age_days: int = DEFAULT_MAX_REFERENCE_AGE_DAYS,
+) -> date:
+    """Fail closed with ContractError if ECB reference date is missing, invalid, future, or stale."""
+    integer(max_reference_age_days, "max_reference_age_days", minimum=0)
+    checked_obs = utc_time(observed_at, "observed_at")
+    if not isinstance(ecb_reference_date, str) or not _DATE_ISO_RE.fullmatch(ecb_reference_date):
+        raise ContractError("missing or invalid ecb_reference_date; venue-driving stream fails closed")
+    try:
+        ref_date = datetime.strptime(ecb_reference_date, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ContractError(f"invalid calendar ecb_reference_date {ecb_reference_date!r}") from exc
+
+    age_days = (checked_obs.date() - ref_date).days
+    if age_days < -1:
+        raise ContractError(
+            f"ECB reference date {ecb_reference_date} is in the future relative to {checked_obs.date().isoformat()}"
+        )
+    if age_days > max_reference_age_days:
+        raise ContractError(
+            f"ECB reference date {ecb_reference_date} exceeds max_reference_age_days={max_reference_age_days} "
+            f"(age={age_days} days)"
+        )
+    return ref_date
+
+
 def _https_get_pinned_host(
     url: str,
     *,
@@ -147,16 +515,15 @@ def _https_get_pinned_host(
     max_bytes: int = MAX_STREAM_WIRE_BYTES,
     retries: int = 2,
 ) -> bytes:
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_PUBLIC_HOSTS:
-        raise ContractError(f"forbidden or unpinned FX stream URL host: {parsed.hostname!r}")
-    if parsed.username or parsed.password:
-        raise ContractError("URL userinfo is forbidden")
-    ctx = ssl.create_default_context()
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    opener = urllib.request.build_opener(_NoRedirectHandler(), urllib.request.HTTPSHandler(context=ctx))
-    req = urllib.request.Request(
+    validated_url = validate_pinned_public_feed_url(
         url,
+        label="fx_stream_url",
+        allow_yahoo_chart=True,
+    )
+    parsed = urllib.parse.urlsplit(validated_url)
+    opener = build_pinned_public_opener(error_cls=ContractError)
+    req = urllib.request.Request(
+        validated_url,
         method="GET",
         headers={
             "Accept": "application/json, text/xml;q=0.8",
@@ -167,6 +534,9 @@ def _https_get_pinned_host(
     for attempt in range(max_attempts):
         try:
             with opener.open(req, timeout=timeout_seconds) as resp:
+                status = getattr(resp, "status", 200)
+                if status != 200:
+                    raise ContractError(f"FX stream unexpected HTTP status {status} from {parsed.hostname}")
                 chunks: list[bytes] = []
                 total = 0
                 while True:
@@ -177,12 +547,19 @@ def _https_get_pinned_host(
                     if total > max_bytes:
                         raise ContractError(f"FX stream response exceeded {max_bytes} bytes")
                     chunks.append(block)
-                return b"".join(chunks)
+                body = b"".join(chunks)
+                if not body:
+                    raise ContractError(f"empty response body from {parsed.hostname}")
+                return body
+        except ContractError:
+            raise
         except urllib.error.HTTPError as exc:
             raise ContractError(f"FX stream HTTPS transport error for {parsed.hostname}: HTTP {exc.code}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+            if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, ContractError):
+                raise exc.reason from exc
             if attempt + 1 >= max_attempts:
-                reason = exc.reason if isinstance(exc, urllib.error.URLError) else str(exc)
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else type(exc).__name__
                 raise ContractError(f"FX stream HTTPS transport error for {parsed.hostname}: {reason}") from exc
             time.sleep(0.2 * (2 ** attempt))
     raise ContractError(f"FX stream HTTPS transport error for {parsed.hostname}: exhausted retries")
@@ -365,11 +742,10 @@ class MarketStreamEnvelope:
                 raise ContractError(f"duplicate pair in MarketStreamEnvelope: {item.pair}")
             seen.add(item.pair)
         digest(self.canonical_payload_sha256, "canonical_payload_sha256")
-        expected = sha256(canonical_bytes(self._unsigned_dict())).hexdigest()
-        if self.canonical_payload_sha256 != expected:
-            raise ContractError("MarketStreamEnvelope canonical_payload_sha256 mismatch")
+        self.verify_digest()
 
-    def _unsigned_dict(self) -> dict[str, Any]:
+    def _payload_without_digest_dict(self) -> dict[str, Any]:
+        """Return the canonical envelope fields hashed by self-computed canonical_payload_sha256."""
         return {
             "schema_version": self.schema_version,
             "stream_id": self.stream_id,
@@ -383,8 +759,14 @@ class MarketStreamEnvelope:
             "streams": [s.to_wire_dict() for s in self.streams],
         }
 
+    def verify_digest(self) -> None:
+        """Verify the self-computed SHA-256 content digest (integrity checksum, not a cryptographic signature)."""
+        expected = sha256(canonical_bytes(self._payload_without_digest_dict())).hexdigest()
+        if self.canonical_payload_sha256 != expected:
+            raise ContractError("MarketStreamEnvelope canonical_payload_sha256 mismatch")
+
     def to_wire_dict(self) -> dict[str, Any]:
-        body = self._unsigned_dict()
+        body = self._payload_without_digest_dict()
         body["canonical_payload_sha256"] = self.canonical_payload_sha256
         return body
 
@@ -413,7 +795,7 @@ class MarketStreamEnvelope:
         return {s.pair: s for s in self.streams}
 
 
-def build_signed_market_stream_envelope(
+def build_market_stream_envelope(
     *,
     stream_id: str,
     sequence: int,
@@ -425,7 +807,8 @@ def build_signed_market_stream_envelope(
     valve_status: dict[str, Any] | None,
     streams: Sequence[PairMarketStream],
 ) -> MarketStreamEnvelope:
-    unsigned = {
+    """Assemble a MarketStreamEnvelope with a self-computed canonical_payload_sha256 integrity digest."""
+    body_without_digest = {
         "schema_version": "1.0",
         "stream_id": stream_id,
         "sequence": sequence,
@@ -437,7 +820,7 @@ def build_signed_market_stream_envelope(
         "valve_status": valve_status,
         "streams": [s.to_wire_dict() for s in streams],
     }
-    payload_sha = sha256(canonical_bytes(unsigned)).hexdigest()
+    payload_sha = sha256(canonical_bytes(body_without_digest)).hexdigest()
     return MarketStreamEnvelope(
         schema_version="1.0",
         stream_id=stream_id,
@@ -453,19 +836,227 @@ def build_signed_market_stream_envelope(
     )
 
 
-def parse_ecb_g10_reference(raw_bytes: bytes) -> tuple[str, dict[str, Decimal]]:
-    doc = json.loads(raw_bytes.decode("utf-8"))
-    if not isinstance(doc, dict) or not isinstance(doc.get("date"), str) or not isinstance(doc.get("rates"), dict):
-        raise ContractError("invalid ECB G10 JSON payload")
-    ref_date = doc["date"]
-    rates_raw = doc["rates"]
+build_digest_market_stream_envelope = build_market_stream_envelope
+
+
+def validate_market_stream_for_venue(
+    envelope: MarketStreamEnvelope,
+    *,
+    now: datetime | None = None,
+    max_reference_age_days: int = DEFAULT_MAX_REFERENCE_AGE_DAYS,
+    max_reference_deviation_bps: Decimal | Mapping[str, Decimal] | None = None,
+    max_spread_bps: Decimal | Mapping[str, Decimal] | None = None,
+) -> None:
+    """Enforce fail-closed reference presence, freshness, deviation ceilings, and spread limits."""
+    if not isinstance(envelope, MarketStreamEnvelope):
+        raise ContractError("validate_market_stream_for_venue requires MarketStreamEnvelope")
+    envelope.verify_digest()
+
+    validate_reference_date_freshness(
+        envelope.ecb_reference_date,
+        observed_at=envelope.observed_at,
+        max_reference_age_days=max_reference_age_days,
+    )
+    if now is not None:
+        validate_reference_date_freshness(
+            envelope.ecb_reference_date,
+            observed_at=utc_time(now, "now"),
+            max_reference_age_days=max_reference_age_days,
+        )
+
+    dev_limits = _resolve_pair_limits(
+        max_reference_deviation_bps,
+        PAIR_MAX_REFERENCE_DEVIATION_BPS,
+        label="max_reference_deviation_bps",
+    )
+    spread_limits = _resolve_pair_limits(
+        max_spread_bps,
+        PAIR_MAX_SPREAD_BPS,
+        label="max_spread_bps",
+    )
+
+    with localcontext(Context(prec=50)):
+        for ps in envelope.streams:
+            if ps.bid <= Decimal("0") or ps.ask <= ps.bid:
+                raise ContractError(f"{ps.pair}: non-positive or inverted spread (bid={ps.bid}, ask={ps.ask})")
+            calc_mid = (ps.bid + ps.ask) / Decimal("2")
+            if abs(ps.mid - calc_mid) > ps.tick_size:
+                raise ContractError(f"{ps.pair}: mid {ps.mid} inconsistent with bid={ps.bid}, ask={ps.ask}")
+
+            actual_spread_bps = ((ps.ask - ps.bid) / calc_mid) * Decimal("10000")
+            pair_spread_cap = spread_limits[ps.pair]
+            if actual_spread_bps <= Decimal("0") or actual_spread_bps > pair_spread_cap:
+                raise ContractError(
+                    f"{ps.pair}: spread {actual_spread_bps:.4f} bps exceeds pair max_spread_bps={pair_spread_cap}"
+                )
+
+            pip = EXPANDED_PAIR_SPECS[ps.pair]["pip"]
+            expected_spread_pips = ((ps.ask - ps.bid) / pip).quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
+            if abs(ps.spread_pips - expected_spread_pips) > Decimal("0.2"):
+                raise ContractError(
+                    f"{ps.pair}: spread_pips {ps.spread_pips} inconsistent with bid/ask ({expected_spread_pips})"
+                )
+
+            if ps.ecb_reference_mid is None or ps.ecb_reference_mid <= Decimal("0"):
+                raise ContractError(f"{ps.pair}: missing independent ECB reference mid; failing closed")
+            if ps.ecb_deviation_bps is None or ps.ecb_deviation_bps < Decimal("0"):
+                raise ContractError(f"{ps.pair}: missing or negative ecb_deviation_bps; failing closed")
+
+            actual_dev_bps = (abs(ps.mid - ps.ecb_reference_mid) / ps.ecb_reference_mid) * Decimal("10000")
+            calc_mid_dev_bps = (abs(calc_mid - ps.ecb_reference_mid) / ps.ecb_reference_mid) * Decimal("10000")
+            if abs(ps.ecb_deviation_bps - actual_dev_bps) > Decimal("1.0"):
+                raise ContractError(
+                    f"{ps.pair}: reported ecb_deviation_bps={ps.ecb_deviation_bps} inconsistent with "
+                    f"actual deviation {actual_dev_bps:.4f} bps"
+                )
+            pair_dev_cap = dev_limits[ps.pair]
+            if (
+                actual_dev_bps > pair_dev_cap
+                or calc_mid_dev_bps > pair_dev_cap
+                or ps.ecb_deviation_bps > pair_dev_cap
+            ):
+                raise ContractError(
+                    f"{ps.pair}: reference deviation {actual_dev_bps:.4f} bps exceeds "
+                    f"pair max_reference_deviation_bps={pair_dev_cap}"
+                )
+
+
+def _parse_ecb_g10_xml(raw_bytes: bytes) -> tuple[str, dict[str, Decimal]]:
+    """Entity-free parser for official ECB eurofxref daily XML across G10 currencies."""
+    try:
+        xml_text = raw_bytes.decode("utf-8").lstrip("\ufeff")
+    except UnicodeDecodeError as exc:
+        raise ContractError("malformed ECB G10 XML payload") from exc
+    if _XML_FORBIDDEN_DECL_RE.search(xml_text) or _XML_CUSTOM_ENTITY_RE.search(xml_text):
+        raise ContractError("forbidden DTD or entity declaration in ECB XML payload")
+
+    ref_date: str | None = None
     eur_rates: dict[str, Decimal] = {"EUR": Decimal("1")}
-    for ccy in ("USD", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD"):
-        if ccy in rates_raw:
-            val = Decimal(str(rates_raw[ccy]))
-            if val <= 0:
-                raise ContractError(f"nonpositive ECB rate for {ccy}")
-            eur_rates[ccy] = val
+    wanted_ccys = ("USD", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD")
+    stack: list[str] = []
+    saw_root = False
+    root_closed = False
+    pos = 0
+    n = len(xml_text)
+    while pos < n:
+        lt = xml_text.find("<", pos)
+        if lt == -1:
+            if ">" in xml_text[pos:] or xml_text[pos:].strip():
+                raise ContractError("malformed ECB G10 XML payload")
+            break
+        between = xml_text[pos:lt]
+        if ">" in between or (not stack and between.strip()):
+            raise ContractError("malformed ECB G10 XML payload")
+        if xml_text.startswith("<!--", lt):
+            end = xml_text.find("-->", lt + 4)
+            if end == -1:
+                raise ContractError("malformed ECB G10 XML payload")
+            pos = end + 3
+            continue
+        if xml_text.startswith("<?", lt):
+            end = xml_text.find("?>", lt + 2)
+            if end == -1:
+                raise ContractError("malformed ECB G10 XML payload")
+            pos = end + 2
+            continue
+        gt = xml_text.find(">", lt + 1)
+        if gt == -1:
+            raise ContractError("malformed ECB G10 XML payload")
+        inner = xml_text[lt + 1:gt].strip()
+        if not inner or "<" in inner:
+            raise ContractError("malformed ECB G10 XML payload")
+        if inner.startswith("/"):
+            close_name = inner[1:].strip()
+            if not stack or stack[-1] != close_name:
+                raise ContractError("malformed ECB G10 XML payload")
+            stack.pop()
+            if not stack:
+                root_closed = True
+            pos = gt + 1
+            continue
+        if root_closed:
+            raise ContractError("malformed ECB G10 XML payload")
+        self_closing = inner.endswith("/")
+        if self_closing:
+            inner = inner[:-1].rstrip()
+        name_m = re.match(r"^([A-Za-z_][A-Za-z0-9_.:-]*)", inner)
+        if not name_m:
+            raise ContractError("malformed ECB G10 XML payload")
+        tag_name = name_m.group(1)
+        attr_str = inner[name_m.end():]
+        attrs: dict[str, str] = {}
+        cursor = 0
+        while cursor < len(attr_str):
+            am = _XML_ATTR_RE.match(attr_str, cursor)
+            if not am:
+                if attr_str[cursor:].strip():
+                    raise ContractError("malformed ECB G10 XML payload")
+                break
+            attrs[am.group(1)] = am.group(2) if am.group(2) is not None else am.group(3)
+            cursor = am.end()
+        if self_closing:
+            if not stack:
+                root_closed = True
+        else:
+            stack.append(tag_name)
+        saw_root = True
+        if tag_name.rsplit(":", 1)[-1] == "Cube":
+            if attrs.get("time") and ref_date is None:
+                ref_date = attrs["time"]
+            ccy = attrs.get("currency")
+            rate_txt = attrs.get("rate")
+            if ccy in wanted_ccys and rate_txt is not None:
+                val = parse_decimal(rate_txt, f"ECB.{ccy}")
+                if val <= 0:
+                    raise ContractError(f"nonpositive ECB rate for {ccy}")
+                eur_rates[ccy] = val
+        pos = gt + 1
+
+    if not saw_root or stack or ref_date is None:
+        raise ContractError("incomplete ECB G10 XML payload")
+    return ref_date, eur_rates
+
+
+def parse_ecb_g10_reference(raw_bytes: bytes) -> tuple[str, dict[str, Decimal]]:
+    if not isinstance(raw_bytes, bytes) or not raw_bytes.strip():
+        raise ContractError("empty ECB G10 reference payload")
+
+    if raw_bytes.lstrip().startswith(b"<"):
+        ref_date, eur_rates = _parse_ecb_g10_xml(raw_bytes)
+    else:
+        try:
+            text = raw_bytes.decode("utf-8")
+            doc = json.loads(
+                text,
+                parse_float=Decimal,
+                parse_constant=lambda tok: (_ for _ in ()).throw(ContractError(f"nonfinite JSON constant {tok!r}")),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, InvalidOperation, RecursionError) as exc:
+            raise ContractError("invalid ECB G10 JSON payload") from exc
+        if not isinstance(doc, dict) or not isinstance(doc.get("date"), str) or not isinstance(doc.get("rates"), dict):
+            raise ContractError("invalid ECB G10 JSON payload")
+        if doc.get("base", "EUR") != "EUR":
+            raise ContractError(f"unsupported ECB G10 base currency {doc.get('base')!r}")
+        ref_date = doc["date"]
+        rates_raw = doc["rates"]
+        eur_rates = {"EUR": Decimal("1")}
+        for ccy in ("USD", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD"):
+            if ccy in rates_raw:
+                try:
+                    val = Decimal(str(rates_raw[ccy]))
+                except InvalidOperation as exc:
+                    raise ContractError(f"invalid ECB rate for {ccy}") from exc
+                if not val.is_finite() or val <= 0:
+                    raise ContractError(f"nonpositive ECB rate for {ccy}")
+                eur_rates[ccy] = val
+
+    if not _DATE_ISO_RE.fullmatch(ref_date):
+        raise ContractError(f"invalid ECB reference date {ref_date!r}")
+    try:
+        datetime.strptime(ref_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ContractError(f"invalid ECB calendar date {ref_date!r}") from exc
+
     pair_refs: dict[str, Decimal] = {}
     with localcontext(Context(prec=60)):
         for pair, spec in EXPANDED_PAIR_SPECS.items():
@@ -473,6 +1064,8 @@ def parse_ecb_g10_reference(raw_bytes: bytes) -> tuple[str, dict[str, Decimal]]:
             if b_ccy in eur_rates and q_ccy in eur_rates:
                 mid = (eur_rates[q_ccy] / eur_rates[b_ccy]).quantize(Decimal("0.00000001"), rounding=ROUND_FLOOR)
                 pair_refs[pair] = mid
+    if not pair_refs:
+        raise ContractError("ECB G10 payload contained no usable FX reference rates")
     return ref_date, pair_refs
 
 
@@ -581,7 +1174,26 @@ def _anchor_last_bar_to_mid(bars: list[OhlcCandleBar], mid: Decimal, tick: Decim
 class LiveCandleAggregator:
     """Maintains multi-currency M1/M5/H1 candle series and updates forming bars on every incoming tick."""
 
-    def __init__(self, initial_envelope: MarketStreamEnvelope) -> None:
+    def __init__(
+        self,
+        initial_envelope: MarketStreamEnvelope,
+        *,
+        max_reference_age_days: int = DEFAULT_MAX_REFERENCE_AGE_DAYS,
+        max_reference_deviation_bps: Decimal | Mapping[str, Decimal] | None = None,
+        max_spread_bps: Decimal | Mapping[str, Decimal] | None = None,
+    ) -> None:
+        integer(max_reference_age_days, "max_reference_age_days", minimum=0)
+        self._max_reference_age_days = max_reference_age_days
+        self._dev_limits = _resolve_pair_limits(
+            max_reference_deviation_bps,
+            PAIR_MAX_REFERENCE_DEVIATION_BPS,
+            label="max_reference_deviation_bps",
+        )
+        self._spread_limits = _resolve_pair_limits(
+            max_spread_bps,
+            PAIR_MAX_SPREAD_BPS,
+            label="max_spread_bps",
+        )
         self._sequence = initial_envelope.sequence
         self._source_mode = initial_envelope.source_mode
         self._ecb_date = initial_envelope.ecb_reference_date
@@ -645,35 +1257,60 @@ class LiveCandleAggregator:
         valve_status: dict[str, Any] | None = None,
     ) -> MarketStreamEnvelope:
         checked_now = utc_time(observed_at, "observed_at")
-        self._sequence += 1
+        next_raw_sha = self._raw_wire_sha256
         if raw_wire_sha256 is not None:
             digest(raw_wire_sha256, "raw_wire_sha256")
-            self._raw_wire_sha256 = raw_wire_sha256
-        if valve_status is not None:
-            self._valve_status = valve_status
+            next_raw_sha = raw_wire_sha256
+        next_valve = self._valve_status if valve_status is None else valve_status
 
+        enforce_ref = self._source_mode != "REHEARSAL_VENUE_FEED"
+        if enforce_ref:
+            validate_reference_date_freshness(
+                self._ecb_date,
+                observed_at=checked_now,
+                max_reference_age_days=self._max_reference_age_days,
+            )
+
+        staged_streams = dict(self._streams)
         with localcontext(Context(prec=50)):
             for pair, (raw_bid, raw_ask) in quotes_by_pair.items():
-                if pair not in self._streams:
+                if pair not in staged_streams:
                     continue
-                cur = self._streams[pair]
+                decimal_value(raw_bid, f"{pair}.bid", positive=True)
+                decimal_value(raw_ask, f"{pair}.ask", positive=True)
+                if raw_ask <= raw_bid:
+                    raise ContractError(f"{pair}: non-positive spread in ingest_quotes (bid={raw_bid}, ask={raw_ask})")
+                cur = staged_streams[pair]
                 spec = EXPANDED_PAIR_SPECS[pair]
                 tick = spec["tick"]
                 pip = spec["pip"]
                 bid = _quantize_price(raw_bid, tick, rounding=ROUND_FLOOR)
                 ask = _quantize_price(raw_ask, tick, rounding=ROUND_CEILING)
                 if ask <= bid:
-                    ask = bid + tick
+                    raise ContractError(f"{pair}: quantized ask <= bid ({bid}/{ask})")
                 mid = _quantize_price((bid + ask) / Decimal("2"), tick)
+                calc_mid = (bid + ask) / Decimal("2")
+                spread_bps = ((ask - bid) / calc_mid) * Decimal("10000")
+                if spread_bps <= Decimal("0") or spread_bps > self._spread_limits[pair]:
+                    raise ContractError(
+                        f"{pair}: spread {spread_bps:.4f} bps exceeds pair max_spread_bps={self._spread_limits[pair]}"
+                    )
                 spread_pips = ((ask - bid) / pip).quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
                 first_h1 = cur.candles_h1[0].open_price if cur.candles_h1 else mid
                 chg_pct = (((mid - first_h1) / first_h1) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
                 dev_bps = None
                 if cur.ecb_reference_mid is not None and cur.ecb_reference_mid > 0:
-                    dev_bps = ((abs(mid - cur.ecb_reference_mid) / cur.ecb_reference_mid) * Decimal("10000")).quantize(
-                        Decimal("0.1"), rounding=ROUND_FLOOR
-                    )
-                self._streams[pair] = PairMarketStream(
+                    exact_dev_bps = (abs(mid - cur.ecb_reference_mid) / cur.ecb_reference_mid) * Decimal("10000")
+                    if enforce_ref and exact_dev_bps > self._dev_limits[pair]:
+                        raise ContractError(
+                            f"{pair}: reference deviation {exact_dev_bps:.4f} bps exceeds "
+                            f"pair max_reference_deviation_bps={self._dev_limits[pair]}"
+                        )
+                    dev_bps = exact_dev_bps.quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
+                elif enforce_ref:
+                    raise ContractError(f"{pair}: missing ECB reference mid for live stream aggregation")
+
+                staged_streams[pair] = PairMarketStream(
                     pair=pair,
                     display_pair=cur.display_pair,
                     category=cur.category,
@@ -694,36 +1331,78 @@ class LiveCandleAggregator:
                     candles_h1=self._update_series(cur.candles_h1, minutes=60, mid=mid, tick=tick, now=checked_now, max_len=24),
                 )
 
+        next_seq = self._sequence + 1
         epoch_ns = str(int(checked_now.timestamp() * 1_000_000_000))
-        return build_signed_market_stream_envelope(
-            stream_id=f"fxstream-{self._sequence}",
-            sequence=self._sequence,
+        envelope = build_market_stream_envelope(
+            stream_id=f"fxstream-{next_seq}",
+            sequence=next_seq,
             observed_at=checked_now,
             observed_at_ns=epoch_ns,
             source_mode=self._source_mode,
-            raw_wire_sha256=self._raw_wire_sha256,
+            raw_wire_sha256=next_raw_sha,
             ecb_reference_date=self._ecb_date,
-            valve_status=self._valve_status,
-            streams=[self._streams[p] for p in self._order],
+            valve_status=next_valve,
+            streams=[staged_streams[p] for p in self._order],
         )
+        if enforce_ref:
+            validate_market_stream_for_venue(
+                envelope,
+                now=checked_now,
+                max_reference_age_days=self._max_reference_age_days,
+                max_reference_deviation_bps=self._dev_limits,
+                max_spread_bps=self._spread_limits,
+            )
+        self._sequence = next_seq
+        self._raw_wire_sha256 = next_raw_sha
+        self._valve_status = next_valve
+        self._streams = staged_streams
+        return envelope
 
 
 class ExpandedPublicLiveFxFeedClient:
-    """Fetches all 16 G10 major & cross FX pairs + live M1/M5/H1 candlestick series."""
+    """Fetches all 16 G10 major & cross FX pairs + live M1/M5/H1 candlestick series with fail-closed reference checks."""
 
     def __init__(
         self,
         *,
         http_get: Callable[[str, float, int], bytes] | None = None,
         timeout_seconds: float = 15.0,
+        reference_urls: tuple[str, ...] = FRANKFURTER_G10_URLS,
+        max_reference_age_days: int = DEFAULT_MAX_REFERENCE_AGE_DAYS,
+        max_reference_deviation_bps: Decimal | Mapping[str, Decimal] | None = None,
+        max_spread_bps: Decimal | Mapping[str, Decimal] | None = None,
     ) -> None:
         if timeout_seconds <= 0 or timeout_seconds > 60:
             raise ContractError("timeout_seconds must be in (0, 60]")
+        if type(reference_urls) is not tuple or not reference_urls:
+            raise ContractError("reference_urls must be a non-empty tuple of pinned ECB/Frankfurter HTTPS URLs")
+        ref_hosts = frozenset({"www.ecb.europa.eu", "data-api.ecb.europa.eu", "api.frankfurter.dev", "api.frankfurter.app"})
+        validated_refs = tuple(
+            validate_pinned_public_feed_url(u, label="reference_url", allowed_hosts=ref_hosts)
+            for u in reference_urls
+        )
+        integer(max_reference_age_days, "max_reference_age_days", minimum=0)
         self._timeout = float(timeout_seconds)
+        self.reference_urls = validated_refs
+        self.max_reference_age_days = max_reference_age_days
+        self.pair_max_reference_deviation_bps = _resolve_pair_limits(
+            max_reference_deviation_bps,
+            PAIR_MAX_REFERENCE_DEVIATION_BPS,
+            label="max_reference_deviation_bps",
+        )
+        self.pair_max_spread_bps = _resolve_pair_limits(
+            max_spread_bps,
+            PAIR_MAX_SPREAD_BPS,
+            label="max_spread_bps",
+        )
         self._http_get = http_get or (lambda url, t, m: _https_get_pinned_host(url, timeout_seconds=t, max_bytes=m))
 
     def _get(self, url: str) -> bytes:
-        return self._http_get(url, self._timeout, MAX_STREAM_WIRE_BYTES)
+        validated = validate_pinned_public_feed_url(url, label="expanded_feed_url", allow_yahoo_chart=True)
+        raw = self._http_get(validated, self._timeout, MAX_STREAM_WIRE_BYTES)
+        if not isinstance(raw, bytes) or len(raw) == 0 or len(raw) > MAX_STREAM_WIRE_BYTES:
+            raise ContractError("expanded FX feed transport returned empty or oversized wire bytes")
+        return raw
 
     def fetch_live_ohlc_candles(
         self,
@@ -761,45 +1440,78 @@ class ExpandedPublicLiveFxFeedClient:
         m1_bars: int = 24,
         m5_bars: int = 36,
         h1_bars: int = 24,
+        max_reference_age_days: int | None = None,
+        max_reference_deviation_bps: Decimal | Mapping[str, Decimal] | None = None,
+        max_spread_bps: Decimal | Mapping[str, Decimal] | None = None,
     ) -> MarketStreamEnvelope:
+        if not pairs or any(p not in EXPANDED_PAIR_SPECS for p in pairs):
+            raise ContractError("pairs must be a non-empty sequence of supported EXPANDED_FX_PAIRS")
         observed = utc_time(now, "now") if now is not None else datetime.now(timezone.utc)
         observed_ns = str(time.time_ns() if now is None else int(observed.timestamp() * 1_000_000_000))
+
+        effective_max_age = self.max_reference_age_days if max_reference_age_days is None else max_reference_age_days
+        integer(effective_max_age, "max_reference_age_days", minimum=0)
+        dev_limits = (
+            self.pair_max_reference_deviation_bps
+            if max_reference_deviation_bps is None
+            else _resolve_pair_limits(
+                max_reference_deviation_bps,
+                self.pair_max_reference_deviation_bps,
+                label="max_reference_deviation_bps",
+            )
+        )
+        spread_limits = (
+            self.pair_max_spread_bps
+            if max_spread_bps is None
+            else _resolve_pair_limits(
+                max_spread_bps,
+                self.pair_max_spread_bps,
+                label="max_spread_bps",
+            )
+        )
 
         ecb_date: str | None = None
         ecb_refs: dict[str, Decimal] = {}
         raw_blobs: list[bytes] = []
-        for ecb_url in FRANKFURTER_G10_URLS:
+        last_ref_error: Exception | None = None
+        for ecb_url in self.reference_urls:
             try:
                 ecb_raw = self._get(ecb_url)
-                ecb_date, ecb_refs = parse_ecb_g10_reference(ecb_raw)
+                cand_date, cand_refs = parse_ecb_g10_reference(ecb_raw)
+                validate_reference_date_freshness(
+                    cand_date,
+                    observed_at=observed,
+                    max_reference_age_days=effective_max_age,
+                )
+                if any(p not in cand_refs or cand_refs[p] <= Decimal("0") for p in pairs):
+                    missing = [p for p in pairs if p not in cand_refs or cand_refs[p] <= Decimal("0")]
+                    raise ContractError(f"ECB reference feed missing rates for {missing}")
+                ecb_date = cand_date
+                ecb_refs = cand_refs
                 raw_blobs.append(ecb_raw)
                 break
-            except (ContractError, ValueError, KeyError):
-                continue
+            except Exception as exc:
+                last_ref_error = exc
+
+        if ecb_date is None or not ecb_refs:
+            detail = type(last_ref_error).__name__ if last_ref_error is not None else "no_reference_urls"
+            if isinstance(last_ref_error, ContractError):
+                raise ContractError(
+                    f"all independent ECB/Frankfurter reference feeds failed or were stale ({last_ref_error})"
+                ) from last_ref_error
+            raise ContractError(
+                f"all independent ECB/Frankfurter reference feeds failed ({detail}); failing closed"
+            ) from last_ref_error
 
         ticker_raw = self._get(KRAKEN_EXPANDED_TICKER_URL)
         raw_blobs.append(ticker_raw)
-        ticker_doc = json.loads(ticker_raw.decode("utf-8"))
-        if ticker_doc.get("error"):
-            raise ContractError(f"Kraken expanded Ticker error: {ticker_doc['error']}")
+        try:
+            ticker_doc = json.loads(ticker_raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ContractError("malformed Kraken expanded Ticker JSON") from exc
+        if not isinstance(ticker_doc, dict) or ticker_doc.get("error"):
+            raise ContractError(f"Kraken expanded Ticker error: {ticker_doc.get('error') if isinstance(ticker_doc, dict) else 'non-object'}")
         result_map = ticker_doc.get("result") or {}
-
-        direct_quotes: dict[str, tuple[Decimal, Decimal]] = {}
-        for dpair in DIRECT_KRAKEN_FX_PAIRS:
-            spec = EXPANDED_PAIR_SPECS[dpair]
-            entry = None
-            for alias in spec["kraken_keys"]:
-                if alias in result_map:
-                    entry = result_map[alias]
-                    break
-            if entry is None:
-                raise ContractError(f"Kraken Ticker missing direct pair {dpair}")
-            tick = spec["tick"]
-            bid = _quantize_price(Decimal(str(entry["b"][0])), tick, rounding=ROUND_FLOOR)
-            ask = _quantize_price(Decimal(str(entry["a"][0])), tick, rounding=ROUND_CEILING)
-            if ask <= bid:
-                ask = bid + tick
-            direct_quotes[dpair] = (bid, ask)
 
         needed_direct: set[str] = set()
         for p in pairs:
@@ -810,6 +1522,27 @@ class ExpandedPublicLiveFxFeedClient:
                 _, leg_a, leg_b = spec["legs"]
                 needed_direct.add(leg_a)
                 needed_direct.add(leg_b)
+
+        direct_quotes: dict[str, tuple[Decimal, Decimal]] = {}
+        for dpair in sorted(needed_direct):
+            spec = EXPANDED_PAIR_SPECS[dpair]
+            entry = None
+            for alias in spec["kraken_keys"]:
+                if alias in result_map:
+                    entry = result_map[alias]
+                    break
+            if entry is None:
+                raise ContractError(f"Kraken Ticker missing direct pair {dpair}")
+            tick = spec["tick"]
+            raw_bid = parse_decimal(str(entry["b"][0]), f"{dpair}.bid")
+            raw_ask = parse_decimal(str(entry["a"][0]), f"{dpair}.ask")
+            if raw_bid <= Decimal("0") or raw_ask <= raw_bid:
+                raise ContractError(f"Kraken Ticker {dpair} has non-positive spread (bid={raw_bid}, ask={raw_ask})")
+            bid = _quantize_price(raw_bid, tick, rounding=ROUND_FLOOR)
+            ask = _quantize_price(raw_ask, tick, rounding=ROUND_CEILING)
+            if ask <= bid:
+                raise ContractError(f"Kraken Ticker {dpair} quantized spread collapsed ({bid}/{ask})")
+            direct_quotes[dpair] = (bid, ask)
 
         direct_candles: dict[str, dict[str, list[OhlcCandleBar]]] = {}
         for dpair in sorted(needed_direct):
@@ -848,7 +1581,7 @@ class ExpandedPublicLiveFxFeedClient:
                         bid = _quantize_price(bid_a / ask_b, tick, rounding=ROUND_FLOOR)
                         ask = _quantize_price(ask_a / bid_b, tick, rounding=ROUND_CEILING)
                     if ask <= bid:
-                        ask = bid + tick
+                        raise ContractError(f"{pair}: synthetic cross book spread collapsed ({bid}/{ask})")
                     c_m1 = _synthesize_cross_candles(direct_candles[leg_a]["m1"], direct_candles[leg_b]["m1"], op=op, tick=tick, max_bars=m1_bars)
                     c_m5 = _synthesize_cross_candles(direct_candles[leg_a]["m5"], direct_candles[leg_b]["m5"], op=op, tick=tick, max_bars=m5_bars)
                     c_h1 = _synthesize_cross_candles(direct_candles[leg_a]["h1"], direct_candles[leg_b]["h1"], op=op, tick=tick, max_bars=h1_bars)
@@ -861,12 +1594,33 @@ class ExpandedPublicLiveFxFeedClient:
                     _, c_h1 = _parse_yahoo_fx_candles(y_h1_raw, tick=tick, max_bars=h1_bars)
                     c_m1 = c_m5[-m1_bars:]
                     half_spread = pip * Decimal("1.2")
+                    if spot <= half_spread:
+                        raise ContractError(f"{pair}: invalid spot price {spot}")
                     bid = _quantize_price(spot - half_spread, tick, rounding=ROUND_FLOOR)
                     ask = _quantize_price(spot + half_spread, tick, rounding=ROUND_CEILING)
                     if ask <= bid:
-                        ask = bid + tick
+                        raise ContractError(f"{pair}: interbank spread collapsed ({bid}/{ask})")
 
                 mid = _quantize_price((bid + ask) / Decimal("2"), tick)
+                calc_mid = (bid + ask) / Decimal("2")
+                actual_spread_bps = ((ask - bid) / calc_mid) * Decimal("10000")
+                if actual_spread_bps <= Decimal("0") or actual_spread_bps > spread_limits[pair]:
+                    raise ContractError(
+                        f"{pair}: spread {actual_spread_bps:.4f} bps exceeds pair max_spread_bps={spread_limits[pair]}"
+                    )
+
+                ref_mid = ecb_refs.get(pair)
+                if ref_mid is None or ref_mid <= Decimal("0"):
+                    raise ContractError(f"{pair}: missing independent ECB reference rate; failing closed")
+                exact_dev_bps = (abs(mid - ref_mid) / ref_mid) * Decimal("10000")
+                calc_mid_dev_bps = (abs(calc_mid - ref_mid) / ref_mid) * Decimal("10000")
+                if exact_dev_bps > dev_limits[pair] or calc_mid_dev_bps > dev_limits[pair]:
+                    raise ContractError(
+                        f"{pair}: mid {mid} deviates {exact_dev_bps:.4f} bps from ECB reference {ref_mid} "
+                        f"(pair max_reference_deviation_bps={dev_limits[pair]})"
+                    )
+                dev_bps = exact_dev_bps.quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
+
                 c_m1 = _anchor_last_bar_to_mid(c_m1, mid, tick)
                 c_m5 = _anchor_last_bar_to_mid(c_m5, mid, tick)
                 c_h1 = _anchor_last_bar_to_mid(c_h1, mid, tick)
@@ -874,11 +1628,6 @@ class ExpandedPublicLiveFxFeedClient:
                 spread_pips = ((ask - bid) / pip).quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
                 first_open = c_h1[0].open_price if c_h1 else mid
                 chg_pct = (((mid - first_open) / first_open) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
-
-                ref_mid = ecb_refs.get(pair)
-                dev_bps = None
-                if ref_mid is not None and ref_mid > 0:
-                    dev_bps = ((abs(mid - ref_mid) / ref_mid) * Decimal("10000")).quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
 
                 pair_streams.append(
                     PairMarketStream(
@@ -904,7 +1653,7 @@ class ExpandedPublicLiveFxFeedClient:
                 )
 
         combined_wire_sha = sha256(b"\n--WIRE-BOUNDARY--\n".join(raw_blobs)).hexdigest()
-        return build_signed_market_stream_envelope(
+        envelope = build_market_stream_envelope(
             stream_id=f"fxstream-{sequence}",
             sequence=sequence,
             observed_at=observed,
@@ -915,6 +1664,14 @@ class ExpandedPublicLiveFxFeedClient:
             valve_status=valve_status,
             streams=pair_streams,
         )
+        validate_market_stream_for_venue(
+            envelope,
+            now=observed,
+            max_reference_age_days=effective_max_age,
+            max_reference_deviation_bps=dev_limits,
+            max_spread_bps=spread_limits,
+        )
+        return envelope
 
     def fetch_live_spot_tick_map(self) -> tuple[dict[str, tuple[Decimal, Decimal]], str]:
         raw = self._get(KRAKEN_EXPANDED_TICKER_URL)
@@ -930,10 +1687,21 @@ class ExpandedPublicLiveFxFeedClient:
                 if alias in result_map:
                     entry = result_map[alias]
                     tick = spec["tick"]
-                    b = _quantize_price(Decimal(str(entry["b"][0])), tick, rounding=ROUND_FLOOR)
-                    a = _quantize_price(Decimal(str(entry["a"][0])), tick, rounding=ROUND_CEILING)
+                    raw_bid = parse_decimal(str(entry["b"][0]), f"{dpair}.bid")
+                    raw_ask = parse_decimal(str(entry["a"][0]), f"{dpair}.ask")
+                    if raw_bid <= Decimal("0") or raw_ask <= raw_bid:
+                        raise ContractError(f"Kraken live tick {dpair} has non-positive spread")
+                    b = _quantize_price(raw_bid, tick, rounding=ROUND_FLOOR)
+                    a = _quantize_price(raw_ask, tick, rounding=ROUND_CEILING)
                     if a <= b:
-                        a = b + tick
+                        raise ContractError(f"Kraken live tick {dpair} quantized spread collapsed")
+                    calc_mid = (b + a) / Decimal("2")
+                    spread_bps = ((a - b) / calc_mid) * Decimal("10000")
+                    if spread_bps > self.pair_max_spread_bps[dpair]:
+                        raise ContractError(
+                            f"Kraken live tick {dpair} spread {spread_bps:.4f} bps exceeds "
+                            f"pair max_spread_bps={self.pair_max_spread_bps[dpair]}"
+                        )
                     out[dpair] = (b, a)
                     break
         with localcontext(Context(prec=50)):
@@ -951,6 +1719,13 @@ class ExpandedPublicLiveFxFeedClient:
                         b = _quantize_price(ba / ab, tick, rounding=ROUND_FLOOR)
                         a = _quantize_price(aa / bb, tick, rounding=ROUND_CEILING)
                     if a <= b:
-                        a = b + tick
+                        raise ContractError(f"Kraken synthetic live tick {spair} spread collapsed")
+                    calc_mid = (b + a) / Decimal("2")
+                    spread_bps = ((a - b) / calc_mid) * Decimal("10000")
+                    if spread_bps > self.pair_max_spread_bps[spair]:
+                        raise ContractError(
+                            f"Kraken synthetic live tick {spair} spread {spread_bps:.4f} bps exceeds "
+                            f"pair max_spread_bps={self.pair_max_spread_bps[spair]}"
+                        )
                     out[spair] = (b, a)
         return out, wire_sha

@@ -1,11 +1,17 @@
-"""TKS Meta-Valve Controller for CAS Forex Revamp (Phase 3).
+"""TKS Meta-Valve Controller for CAS Forex Revamp (Phase 3 + Phase 6 Drawdown Hardening).
 
 Provides:
 1. TKSMetaValveController: 8 -> 16 (tanh) -> 1 (sigmoid) deterministic MLP controller
    (161 trainable parameters) for cognitive trajectory & Forex decision gating.
-2. ForexMetaValveGate: Dual-layer Forex trade-proposal safety valve combining:
+2. PeakEquityStore: Durable high-water peak-equity tracker (SQLite WAL or scoped memory)
+   that auto-seeds new scopes at max(opening_balance, current_equity), monotonically
+   ratchets upward, never resets on restart/rollback, and requires authenticated owner
+   recovery to re-arm after a drawdown event.
+3. ForexMetaValveGate: Dual-layer Forex trade-proposal safety valve combining:
    - Trained 8-D -> 16 -> 1 neural MLP admission probability (threshold = 0.55)
    - Constitutional Hard-Floor Invariant vetoing missing accounting (G-ABSENT),
+     missing or exceeded peak-equity drawdown (MISSING_DRAWDOWN_ACCOUNTING /
+     MAX_DRAWDOWN_EXCEEDED on OPEN/ADD while preserving WAIT/REDUCE/CLOSE),
      disallowed risk/management permissions, oversized quantity, unbacked evidence,
      missing/inverted protective stop on entries, prompt-injection override pressure,
      or expired market state.
@@ -16,16 +22,21 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, localcontext
 from hashlib import sha256
 import json
 import math
 from pathlib import Path
+import sqlite3
+from threading import RLock
 from typing import Any
 
-from cas_forex_revamp.contracts import ActionKind, ContractError, canonical_bytes
+from cas_forex_revamp.contracts import ActionKind, ContractError, ControlKind, canonical_bytes, decimal_text
 
+
+DEFAULT_MAX_DRAWDOWN_PCT = Decimal("0.10")
+_GENESIS_SHA256 = "0" * 64
 
 FOREX_FEATURE_NAMES: tuple[str, ...] = (
     "missing_accounting_ratio",
@@ -124,14 +135,368 @@ def _sigmoid(z: float) -> float:
 
 
 def _safe_decimal(value: Any) -> Decimal | None:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, Decimal):
-        return value
+        return value if value.is_finite() else None
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
         return None
+    return parsed if parsed.is_finite() else None
+
+
+def _extract_money_decimal(value: Any) -> Decimal | None:
+    """Extract a finite Decimal from a plain scalar/string or typed Money wire dict."""
+    if value is None or value == "UNAVAILABLE":
+        return None
+    if isinstance(value, dict):
+        if "amount" not in value:
+            return None
+        return _safe_decimal(value.get("amount"))
+    if hasattr(value, "amount"):
+        return _safe_decimal(getattr(value, "amount"))
+    return _safe_decimal(value)
+
+
+def compute_drawdown_pct(current_equity: Decimal, peak_equity: Decimal) -> Decimal:
+    """Exact Decimal drawdown fraction in [0, +inf): max(0, (peak - current) / peak)."""
+    cur = _safe_decimal(current_equity)
+    peak = _safe_decimal(peak_equity)
+    if cur is None or peak is None or peak <= Decimal("0"):
+        raise ContractError("compute_drawdown_pct requires finite current_equity and positive peak_equity")
+    if cur >= peak:
+        return Decimal("0")
+    with localcontext() as ctx:
+        ctx.prec = 40
+        return (peak - cur) / peak
+
+
+def _iso_utc(ts: datetime | None) -> str:
+    val = ts if isinstance(ts, datetime) and ts.tzinfo is not None else datetime.now(timezone.utc)
+    return val.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class PeakEquityStore:
+    """Durable high-water peak-equity tracker (SQLite WAL when path supplied, scoped memory otherwise).
+
+    Invariants:
+    - Inert on construction (no file or SQLite connection opened in __init__).
+    - Auto-initializes an unseen scope to max(opening_balance, current_equity).
+    - Monotonically ratchets upward on subsequent observations; restart or lower opening_balance
+      never clears or lowers an existing high-water mark.
+    - Lowering/resetting a high-water mark requires `rearm_after_drawdown` with an authenticated
+      owner verifier (`OwnerRequestBook` with a registered `RESUME_NEW_RISK` fence request or an
+      explicit `verify_drawdown_rearm` authority).
+    """
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        self._path = Path(path) if path is not None else None
+        self._lock = RLock()
+        self._memory: dict[str, Decimal] = {}
+        self._initialized = False
+
+    @property
+    def path(self) -> Path | None:
+        return self._path
+
+    def _connect(self) -> sqlite3.Connection:
+        if self._path is None:
+            raise ContractError("in-memory PeakEquityStore has no SQLite path")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self._path), timeout=10.0, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        if not self._initialized:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS peak_equity_marks (
+                    scope_id TEXT PRIMARY KEY,
+                    peak_equity TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_event_sha256 TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS peak_equity_events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope_id TEXT NOT NULL,
+                    event_kind TEXT NOT NULL,
+                    peak_equity TEXT NOT NULL,
+                    observed_equity TEXT NOT NULL,
+                    owner_request_id TEXT,
+                    observed_at TEXT NOT NULL,
+                    prev_sha256 TEXT NOT NULL,
+                    event_sha256 TEXT NOT NULL
+                )
+                """
+            )
+            self._initialized = True
+        return conn
+
+    def read_peak(self, scope_id: str) -> Decimal | None:
+        if not isinstance(scope_id, str) or not scope_id.strip():
+            raise ContractError("scope_id must be a non-empty string")
+        key = scope_id.strip()
+        with self._lock:
+            if self._path is None:
+                return self._memory.get(key)
+            if not self._path.exists():
+                return None
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT peak_equity FROM peak_equity_marks WHERE scope_id = ?",
+                    (key,),
+                ).fetchone()
+            finally:
+                conn.close()
+            return _safe_decimal(row[0]) if row is not None else None
+
+    def _append_sqlite(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        scope_id: str,
+        event_kind: str,
+        peak: Decimal,
+        observed: Decimal,
+        owner_request_id: str | None,
+        ts_str: str,
+    ) -> None:
+        last_row = conn.execute(
+            "SELECT event_sha256 FROM peak_equity_events ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        prev_sha = str(last_row[0]) if last_row is not None else _GENESIS_SHA256
+        peak_txt = decimal_text(peak)
+        obs_txt = decimal_text(observed)
+        payload = {
+            "scope_id": scope_id,
+            "event_kind": event_kind,
+            "peak_equity": peak_txt,
+            "observed_equity": obs_txt,
+            "owner_request_id": owner_request_id,
+            "observed_at": ts_str,
+            "prev_sha256": prev_sha,
+        }
+        ev_sha = sha256(canonical_bytes(payload)).hexdigest()
+        conn.execute(
+            """
+            INSERT INTO peak_equity_events (
+                scope_id, event_kind, peak_equity, observed_equity,
+                owner_request_id, observed_at, prev_sha256, event_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (scope_id, event_kind, peak_txt, obs_txt, owner_request_id, ts_str, prev_sha, ev_sha),
+        )
+        conn.execute(
+            """
+            INSERT INTO peak_equity_marks (scope_id, peak_equity, updated_at, last_event_sha256)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(scope_id) DO UPDATE SET
+                peak_equity = excluded.peak_equity,
+                updated_at = excluded.updated_at,
+                last_event_sha256 = excluded.last_event_sha256
+            """,
+            (scope_id, peak_txt, ts_str, ev_sha),
+        )
+
+    def observe_equity(
+        self,
+        scope_id: str,
+        *,
+        current_equity: Decimal,
+        opening_balance: Decimal | None = None,
+        now: datetime | None = None,
+    ) -> Decimal:
+        if not isinstance(scope_id, str) or not scope_id.strip():
+            raise ContractError("scope_id must be a non-empty string")
+        cur = _safe_decimal(current_equity)
+        if cur is None:
+            raise ContractError("current_equity must be a finite Decimal")
+        open_bal = _safe_decimal(opening_balance) if opening_balance is not None else None
+        key = scope_id.strip()
+        ts_str = _iso_utc(now)
+
+        with self._lock:
+            if self._path is None:
+                existing = self._memory.get(key)
+                if existing is not None:
+                    nxt = max(existing, cur)
+                else:
+                    seed = max(cur, open_bal) if open_bal is not None else cur
+                    if seed <= Decimal("0"):
+                        raise ContractError("initial peak_equity seed must be positive")
+                    nxt = seed
+                self._memory[key] = nxt
+                return nxt
+
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT peak_equity FROM peak_equity_marks WHERE scope_id = ?",
+                    (key,),
+                ).fetchone()
+                if row is not None:
+                    stored = _safe_decimal(row[0])
+                    if stored is None or stored <= Decimal("0"):
+                        raise ContractError("corrupted peak_equity mark in durable store")
+                    nxt = max(stored, cur)
+                    if nxt > stored:
+                        self._append_sqlite(
+                            conn,
+                            scope_id=key,
+                            event_kind="PEAK_RATCHET",
+                            peak=nxt,
+                            observed=cur,
+                            owner_request_id=None,
+                            ts_str=ts_str,
+                        )
+                else:
+                    seed = max(cur, open_bal) if open_bal is not None else cur
+                    if seed <= Decimal("0"):
+                        raise ContractError("initial peak_equity seed must be positive")
+                    nxt = seed
+                    self._append_sqlite(
+                        conn,
+                        scope_id=key,
+                        event_kind="PEAK_INIT",
+                        peak=nxt,
+                        observed=cur,
+                        owner_request_id=None,
+                        ts_str=ts_str,
+                    )
+                conn.execute("COMMIT")
+                return nxt
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+
+    def rearm_after_drawdown(
+        self,
+        scope_id: str,
+        *,
+        new_peak_equity: Decimal,
+        owner_verifier: Any,
+        owner_request_id: str,
+        fence_request: Any | None = None,
+        now: datetime | None = None,
+    ) -> Decimal:
+        """Reset high-water peak_equity ONLY after authenticated owner recovery verification."""
+        if not isinstance(scope_id, str) or not scope_id.strip():
+            raise ContractError("scope_id must be a non-empty string")
+        if not isinstance(owner_request_id, str) or not owner_request_id.strip():
+            raise ContractError("owner_request_id must be a non-empty string")
+        new_peak = _safe_decimal(new_peak_equity)
+        if new_peak is None or new_peak <= Decimal("0"):
+            raise ContractError("new_peak_equity must be a positive finite Decimal")
+        if owner_verifier is None:
+            raise ContractError("authenticated owner recovery verifier required to re-arm peak_equity")
+
+        check_time = now if isinstance(now, datetime) and now.tzinfo is not None else datetime.now(timezone.utc)
+        verified = False
+        verify_rearm = getattr(owner_verifier, "verify_drawdown_rearm", None)
+        if callable(verify_rearm):
+            verified = bool(
+                verify_rearm(
+                    scope_id=scope_id.strip(),
+                    request_id=owner_request_id.strip(),
+                    new_peak_equity=new_peak,
+                    now=check_time,
+                )
+            )
+        elif fence_request is not None and callable(getattr(owner_verifier, "verify", None)):
+            if getattr(fence_request, "control", None) is ControlKind.RESUME_NEW_RISK and getattr(
+                fence_request, "owner_request_id", None
+            ) == owner_request_id.strip():
+                approval = owner_verifier.verify(fence_request, now=check_time)
+                verified = approval is not None and getattr(approval, "request_id", None) == owner_request_id.strip()
+        if not verified:
+            raise ContractError("owner drawdown re-arm verification failed; peak_equity unchanged")
+
+        key = scope_id.strip()
+        ts_str = _iso_utc(check_time)
+        with self._lock:
+            if self._path is None:
+                self._memory[key] = new_peak
+                return new_peak
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._append_sqlite(
+                    conn,
+                    scope_id=key,
+                    event_kind="OWNER_DRAWDOWN_REARM",
+                    peak=new_peak,
+                    observed=new_peak,
+                    owner_request_id=owner_request_id.strip(),
+                    ts_str=ts_str,
+                )
+                conn.execute("COMMIT")
+                return new_peak
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+
+
+def _proposal_scope_id(proposal: Any, current_view: dict[str, Any] | None) -> str:
+    req = getattr(proposal, "request", None)
+    state = getattr(req, "state", None)
+    scope = getattr(state, "scope", None)
+    acct = getattr(scope, "account_id", None)
+    run = getattr(scope, "run_id", None)
+    if isinstance(acct, str) and acct and isinstance(run, str) and run:
+        return f"{acct}:{run}"
+    if isinstance(current_view, dict):
+        va = current_view.get("account_id")
+        vp = current_view.get("plan_id")
+        if isinstance(va, str) and va:
+            return f"{va}:{vp or 'default'}"
+        bal = _extract_money_decimal(current_view.get("balance"))
+        if bal is not None:
+            return f"view-scope:{decimal_text(bal)}"
+    return "default-valve-scope"
+
+
+def _extract_fact_accounting(request: Any) -> tuple[Decimal | None, Decimal | None, Decimal | None, bool]:
+    """Extract (current_equity, balance, peak_equity, explicit_peak_present) from DecisionRequest facts."""
+    cur_eq: Decimal | None = None
+    bal_eq: Decimal | None = None
+    peak_eq: Decimal | None = None
+    explicit_peak = False
+    for f in getattr(request, "facts", ()):
+        label = getattr(f, "label", "")
+        raw_val = getattr(f, "value", "")
+        fid = getattr(f, "fact_id", "")
+        parsed_json: Any = raw_val
+        if isinstance(raw_val, str) and (raw_val.startswith("{") or raw_val.startswith('"') or raw_val in ("null",)):
+            try:
+                parsed_json = json.loads(raw_val)
+            except (ValueError, TypeError):
+                parsed_json = raw_val
+        if label == "equity" or fid.startswith("observed-equity"):
+            cur_eq = _extract_money_decimal(parsed_json)
+        elif label == "balance" or fid.startswith("observed-balance"):
+            bal_eq = _extract_money_decimal(parsed_json)
+        elif label == "peak_equity" or fid.startswith("observed-peak_equity"):
+            explicit_peak = True
+            peak_eq = _extract_money_decimal(parsed_json)
+        elif fid.startswith("observed-") and isinstance(parsed_json, dict):
+            if "equity" in parsed_json and cur_eq is None:
+                cur_eq = _extract_money_decimal(parsed_json.get("equity"))
+            if "balance" in parsed_json and bal_eq is None:
+                bal_eq = _extract_money_decimal(parsed_json.get("balance"))
+            if "peak_equity" in parsed_json:
+                explicit_peak = True
+                peak_eq = _extract_money_decimal(parsed_json.get("peak_equity"))
+    return cur_eq, bal_eq, peak_eq, explicit_peak
 
 
 def _text_drift_and_injection(texts: list[str]) -> tuple[float, float]:
@@ -191,6 +556,8 @@ def extract_forex_valve_features(
     current_view: dict[str, Any] | None = None,
     policy: dict[str, Any] | None = None,
     now: datetime | None = None,
+    max_drawdown_pct: Decimal | str | None = DEFAULT_MAX_DRAWDOWN_PCT,
+    peak_equity_store: PeakEquityStore | None = None,
 ) -> tuple[list[float], list[str]]:
     """Extract 8-D safety feature vector and deterministic hard-veto reasons."""
     request = proposal.request
@@ -209,7 +576,6 @@ def extract_forex_valve_features(
             if val is None or val == "UNAVAILABLE":
                 missing_count += 1
     else:
-        # Inspect DecisionRequest facts when called from RehearsalWiring without CaseRuntime view
         fact_map = {f.label: f.value for f in request.facts}
         for k in req_fields:
             if k in fact_map and (fact_map[k] in ("null", '"UNAVAILABLE"', "UNAVAILABLE")):
@@ -220,7 +586,7 @@ def extract_forex_valve_features(
             if f.fact_id.startswith("observed-") and f.value.startswith("{"):
                 try:
                     obs_obj = json.loads(f.value)
-                except Exception:
+                except (ValueError, TypeError):
                     obs_obj = {}
                 if isinstance(obs_obj, dict):
                     if "available_margin" in obs_obj and (obs_obj["available_margin"] is None or obs_obj["available_margin"] == "UNAVAILABLE"):
@@ -228,6 +594,73 @@ def extract_forex_valve_features(
     missing_ratio = _clamp01(missing_count / max(1, len(req_fields)))
     if intent is not None and missing_count > 0:
         vetoes.append("MISSING_REQUIRED_ACCOUNTING")
+
+    # 1b. Peak-equity / maximum drawdown hard-floor gate on new-risk entries (OPEN / ADD).
+    # WAIT (intent is None) and risk-reducing/protective management (REDUCE, CLOSE, AMEND_STOP, CANCEL_ORDER)
+    # remain available during drawdown.
+    if intent is not None and intent.kind in (ActionKind.OPEN, ActionKind.ADD):
+        pol_dict = policy if isinstance(policy, dict) else {}
+        dd_threshold: Decimal | None
+        dd_invalid = False
+        if "max_drawdown_pct" in pol_dict:
+            dd_threshold = _safe_decimal(pol_dict.get("max_drawdown_pct"))
+            if dd_threshold is None or dd_threshold <= Decimal("0") or dd_threshold >= Decimal("1"):
+                dd_invalid = True
+        elif max_drawdown_pct is not None:
+            dd_threshold = _safe_decimal(max_drawdown_pct)
+            if dd_threshold is None or dd_threshold <= Decimal("0") or dd_threshold >= Decimal("1"):
+                dd_invalid = True
+        else:
+            dd_threshold = None
+
+        if dd_invalid:
+            missing_ratio = max(missing_ratio, 0.25)
+            vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
+        elif dd_threshold is not None:
+            require_explicit_peak = bool(pol_dict.get("require_peak_equity", False))
+            if current_view is not None:
+                cur_eq = _extract_money_decimal(current_view.get("equity"))
+                bal_eq = _extract_money_decimal(current_view.get("balance"))
+                explicit_peak = "peak_equity" in current_view
+                peak_eq = _extract_money_decimal(current_view.get("peak_equity")) if explicit_peak else None
+            else:
+                cur_eq, bal_eq, peak_eq, explicit_peak = _extract_fact_accounting(request)
+
+            if cur_eq is None or (explicit_peak and (peak_eq is None or peak_eq <= Decimal("0"))):
+                missing_ratio = max(missing_ratio, 0.25)
+                vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
+            elif not explicit_peak and require_explicit_peak:
+                missing_ratio = max(missing_ratio, 0.25)
+                vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
+            else:
+                resolved_peak = peak_eq
+                scope_id = _proposal_scope_id(proposal, current_view)
+                if resolved_peak is None:
+                    if bal_eq is None or max(cur_eq, bal_eq) <= Decimal("0"):
+                        missing_ratio = max(missing_ratio, 0.25)
+                        vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
+                    elif peak_equity_store is not None:
+                        resolved_peak = peak_equity_store.observe_equity(
+                            scope_id,
+                            current_equity=cur_eq,
+                            opening_balance=bal_eq,
+                            now=now,
+                        )
+                    else:
+                        resolved_peak = max(cur_eq, bal_eq)
+                elif peak_equity_store is not None:
+                    stored_peak = peak_equity_store.observe_equity(
+                        scope_id,
+                        current_equity=cur_eq,
+                        opening_balance=resolved_peak,
+                        now=now,
+                    )
+                    resolved_peak = max(resolved_peak, stored_peak)
+
+                if resolved_peak is not None and "MISSING_DRAWDOWN_ACCOUNTING" not in vetoes:
+                    dd_pct = compute_drawdown_pct(cur_eq, resolved_peak)
+                    if dd_pct >= dd_threshold:
+                        vetoes.append("MAX_DRAWDOWN_EXCEEDED")
 
     # 2. Policy permission violation (from explicit policy OR observed-* JSON fact)
     perm_violation = 0.0
@@ -246,7 +679,7 @@ def extract_forex_valve_features(
                 if f.fact_id.startswith("observed-") and f.value.startswith("{"):
                     try:
                         obs_obj = json.loads(f.value)
-                    except Exception:
+                    except (ValueError, TypeError):
                         obs_obj = {}
                     if isinstance(obs_obj, dict):
                         if intent.kind in (ActionKind.OPEN, ActionKind.ADD) and obs_obj.get("new_risk") is False:
@@ -430,11 +863,26 @@ class TKSMetaValveController:
 class ForexMetaValveGate:
     """Runtime admission valve wired into RehearsalWiring, CaseRuntime, and trajectory driver."""
 
-    def __init__(self, controller: TKSMetaValveController, *, default_policy: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        controller: TKSMetaValveController,
+        *,
+        default_policy: dict[str, Any] | None = None,
+        max_drawdown_pct: Decimal | str | None = DEFAULT_MAX_DRAWDOWN_PCT,
+        peak_equity_store: PeakEquityStore | None = None,
+    ) -> None:
         if not isinstance(controller, TKSMetaValveController):
             raise ContractError("ForexMetaValveGate requires a typed TKSMetaValveController")
         self.controller = controller
         self.default_policy = deepcopy(default_policy) if default_policy is not None else None
+        if max_drawdown_pct is None:
+            self.max_drawdown_pct: Decimal | None = None
+        else:
+            parsed_dd = _safe_decimal(max_drawdown_pct)
+            if parsed_dd is None or parsed_dd <= Decimal("0") or parsed_dd >= Decimal("1"):
+                raise ContractError("max_drawdown_pct must be a finite Decimal in (0, 1)")
+            self.max_drawdown_pct = parsed_dd
+        self.peak_equity_store = peak_equity_store if peak_equity_store is not None else PeakEquityStore()
         self._weights_sha256 = controller.weights_sha256()
 
     @property
@@ -451,7 +899,12 @@ class ForexMetaValveGate:
     ) -> ValveDecision:
         eff_policy = policy if policy is not None else self.default_policy
         vec, vetoes = extract_forex_valve_features(
-            proposal, current_view=current_view, policy=eff_policy, now=now
+            proposal,
+            current_view=current_view,
+            policy=eff_policy,
+            now=now,
+            max_drawdown_pct=self.max_drawdown_pct,
+            peak_equity_store=self.peak_equity_store,
         )
         feature_map = {name: val for name, val in zip(FOREX_FEATURE_NAMES, vec)}
         score = self.controller.forward(vec)
@@ -506,6 +959,15 @@ class ForexMetaValveGate:
         return dec
 
 
-def load_default_forex_valve_gate(weights_path: Path | None = None) -> ForexMetaValveGate:
+def load_default_forex_valve_gate(
+    weights_path: Path | None = None,
+    *,
+    max_drawdown_pct: Decimal | str | None = DEFAULT_MAX_DRAWDOWN_PCT,
+    peak_equity_store: PeakEquityStore | None = None,
+) -> ForexMetaValveGate:
     target = Path(weights_path) if weights_path is not None else (Path(__file__).resolve().parent / "tks_meta_valve_forex_weights_v1.json")
-    return ForexMetaValveGate(TKSMetaValveController.load_weights(target))
+    return ForexMetaValveGate(
+        TKSMetaValveController.load_weights(target),
+        max_drawdown_pct=max_drawdown_pct,
+        peak_equity_store=peak_equity_store,
+    )

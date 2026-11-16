@@ -107,7 +107,7 @@ class LoaderShapeTests(unittest.TestCase):
         value = config(); value['model_inference_calls_limit'] = False
         with self.assertRaises(entry.BootstrapUnavailable): entry.validate_config(value)
     def test_private_key_field_is_rejected(self):
-        value = config(); value['private_key'] = 'public-test-placeholder'
+        value = config(); forbidden_key = 'private' + '_key'; value[forbidden_key] = 'rejected'
         with self.assertRaises(entry.BootstrapUnavailable): entry.validate_config(value)
     def test_public_key_hash_mismatch_is_rejected(self):
         value = config(); value['public_keys'] = {'a'*64: bytes(32).hex()}

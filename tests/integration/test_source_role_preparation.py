@@ -56,7 +56,7 @@ class RolePreparationTests(unittest.TestCase):
     def test_root_prepares_objects_for_actual_observed_owner(self):
         published,objects=self.fixture()
         def identity(path):return {'path':path}
-        with patch.object(os,'geteuid',return_value=0),patch.object(os,'chown') as chown,patch.object(os,'chmod') as chmod,patch.object(controller,'make_dir') as make,patch.object(s,'directory_identity',side_effect=identity):
+        with patch.object(os,'geteuid',return_value=0),patch.object(os,'lstat',return_value=SimpleNamespace(st_mode=stat.S_IFDIR|0o750)),patch.object(os,'chown') as chown,patch.object(os,'chmod') as chmod,patch.object(controller,'make_dir') as make,patch.object(s,'directory_identity',side_effect=identity):
             answer=controller.prepare_role_directories('observer',{'uid':60001},60000,c,s)
             make.assert_called_once_with(s.IPC+'/observer-records/objects',60001,60000,0o2750,c)
             self.assertEqual(chown.call_count,2);self.assertEqual(chmod.call_count,2)

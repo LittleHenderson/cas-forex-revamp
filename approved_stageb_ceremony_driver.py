@@ -3,20 +3,20 @@
 Preserves approved_model_driver.py and authority_component/release_gate.py untouched
 so all 1,575 Phase 1-4 non-release tests remain 100% green, while executing the
 cryptographically verified Owner Stage B Custody Ceremony end-to-end:
-  - AuthorityProvider + PinnedEd25519Verifier (cryptography==50.0.2)
+  - AuthorityProvider + PinnedEd25519Verifier (cryptography==50.0.2) anchored to
+    out-of-band trust_roots.json outside bundle_dir
   - Hardened Linux isolation + IsolatedController (DECISION_RUNNER & MODEL_SERVICE)
   - External root observer/issuer release consumption + ReleaseLedger
   - validate_recovered_design + adapt_custody across all 5 sealed custody docs
   - ForexMetaValveGate live enforcement + deterministic counterpart-trap audit
   - 2 availability probes + 16 R6 trajectories (30 mandatory steps = 32 calls)
-  - AttemptReader + Ed25519 semantic_reviews + score_suite + public_aggregate
+  - AttemptReader + externally signed Ed25519 semantic_reviews + score_suite
 """
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from hashlib import sha256
-import json
 import logging
 import os
 from pathlib import Path
@@ -43,21 +43,66 @@ from model_guest_boundary import (
     verify_sources,
 )
 from approved_model_driver import (
-    bounded_child,
     child_environment,
     probe_request,
-    runtime_libraries,
     source_tests,
     stop_group,
     write_new,
 )
 
 
+def _await_external_semantic_reviews(
+    *,
+    request_path: Path,
+    reviews_path: Path,
+    base: Path,
+    run_id: str,
+    attempts: list[dict],
+    window,
+    clock,
+) -> tuple[dict[str, dict], list[dict], str]:
+    """Publish retained first-attempt payload for independent semantic review and await signed bundle."""
+    from cas_forex_revamp.contracts import canonical_bytes
+
+    write_new(
+        request_path,
+        {
+            "format": "forex.stageb-semantic-review-request/1",
+            "run_id": run_id,
+            "attempts": load(canonical_bytes(attempts)),
+        },
+    )
+    wait_until = min(
+        time.monotonic() + 180.0,
+        time.monotonic() + (window.end - clock()).total_seconds(),
+    )
+    while not reviews_path.is_file():
+        window.require_remaining(0)
+        need(time.monotonic() < wait_until, "independent external semantic review bundle unavailable")
+        time.sleep(0.1)
+
+    verified_path = regular(reviews_path, base, readonly=True, root_owned=True)
+    raw = verified_path.read_bytes()
+    need(0 < len(raw) <= 4194304, "bounded external semantic review bundle required")
+    doc = load(raw)
+    need(
+        type(doc) is dict
+        and doc.get("format") == "forex.stageb-signed-semantic-reviews/1"
+        and doc.get("run_id") == run_id
+        and type(doc.get("reviews")) is dict,
+        "external semantic review bundle format or run_id differs",
+    )
+    envelopes = doc.get("envelopes") if type(doc.get("envelopes")) is list else list(doc["reviews"].values())
+    return doc["reviews"], envelopes, sha256(raw).hexdigest()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--guest-config", type=Path, required=True)
     parser.add_argument("--config-sha256", required=True)
-    parser.add_argument("--ceremony-seed", default="cas-forex-phase5-owner-stageb-ceremony-20261115-v1")
+    parser.add_argument("--trust-roots", type=Path, default=None)
+    parser.add_argument("--semantic-reviews-path", type=Path, default=None)
+    parser.add_argument("--ceremony-seed", default=None)
     parser.add_argument("--skip-inner-source-tests", action="store_true")
     args = parser.parse_args(argv)
 
@@ -72,11 +117,38 @@ def main(argv: list[str] | None = None) -> int:
     src_dir = Path(cfg["source_directory"])
     need(Path(__file__).resolve() == src_dir / "approved_stageb_ceremony_driver.py", "ceremony driver source path differs")
 
+    bundle_dir = (base / "ceremony") if (base / "ceremony").is_dir() else (base / "ceremony_bundle")
+    raw_trust_roots = args.trust_roots or cfg.get("trust_roots_path") or f"/etc/cas-forex-stageb-trust/{cfg['run_id']}/trust_roots.json"
+    trust_roots_path = Path(raw_trust_roots)
+    need(
+        trust_roots_path.is_absolute() and not trust_roots_path.is_relative_to(bundle_dir),
+        "out-of-band trust_roots_path outside ceremony bundle required",
+    )
+    regular(trust_roots_path, trust_roots_path.parent, readonly=True, root_owned=True)
+    trust_roots_doc = load(trust_roots_path.read_bytes())
+    need(
+        type(trust_roots_doc) is dict
+        and trust_roots_doc.get("format") == "forex.stageb-pinned-trust-roots/1"
+        and trust_roots_doc.get("run_id") == cfg["run_id"],
+        "pinned trust roots format or run_id differs",
+    )
+    pinned_reviewer_pub_hex = (
+        ((trust_roots_doc.get("roles") or {}).get("semantic_reviewer") or {}).get("public_key_hex")
+    )
+    need(
+        type(pinned_reviewer_pub_hex) is str and len(pinned_reviewer_pub_hex) == 64,
+        "pinned semantic_reviewer public key missing",
+    )
+    pinned_reviewer_pub = bytes.fromhex(pinned_reviewer_pub_hex)
+
     # Verify Ed25519 Owner Stage B Custody Ceremony authority bundle via PinnedEd25519Verifier (cryptography==50.0.2)
     from authority_component.ceremony_release_gate import require_ceremony_release_enabled
     ceremony_gate_receipt = require_ceremony_release_enabled(
-        bundle_dir=(base / "ceremony") if (base / "ceremony").is_dir() else (base / "ceremony_bundle"),
+        bundle_dir=bundle_dir,
         source_root=src_dir,
+        trust_roots_path=trust_roots_path,
+        expected_selection_sha256=trust_roots_doc.get("selection_content_sha256"),
+        expected_config_sha256=args.config_sha256,
         now=clock(),
         require_pinned_cryptography=True,
     )
@@ -123,12 +195,12 @@ def main(argv: list[str] | None = None) -> int:
     from cas_forex_revamp.composition.r6_runtime import packet_json
     from cas_forex_revamp.composition.r6_design import validate_recovered_design
     from cas_forex_revamp.composition.continuous_model_driver_v2 import run_trajectory
-    from cas_forex_revamp.valve.tks_meta_valve_controller import load_default_forex_valve_gate
-    from ceremony_generator import (
-        audit_counterpart_traps_with_valve_gate,
-        build_public_aggregate_bundle,
-        build_semantic_reviews_for_attempts,
+    from cas_forex_revamp.valve.tks_meta_valve_controller import (
+        DEFAULT_MAX_DRAWDOWN_PCT,
+        PeakEquityStore,
+        load_default_forex_valve_gate,
     )
+    from ceremony_generator import audit_counterpart_traps_with_valve_gate
 
     evidence = cfg["evidence"]
     window = ModelWindow(absolute_deadline=deadline, clock=clock)
@@ -286,7 +358,11 @@ def main(argv: list[str] | None = None) -> int:
             now=clock(),
         )
 
-        valve_gate = load_default_forex_valve_gate()
+        drawdown_store = PeakEquityStore(out / "stageb-drawdown.sqlite3")
+        valve_gate = load_default_forex_valve_gate(
+            max_drawdown_pct=DEFAULT_MAX_DRAWDOWN_PCT,
+            peak_equity_store=drawdown_store,
+        )
         valve_audit = audit_counterpart_traps_with_valve_gate(suite, documents, valve_gate=valve_gate, work_dir=out / "valve-audit-work")
         write_new(out / "valve-trap-interception-audit.json", valve_audit)
 
@@ -398,19 +474,31 @@ def main(argv: list[str] | None = None) -> int:
                 break
 
         reader = AttemptReader(root=out.resolve(), controller_journal=journal, model_reader=readers["acceptance"])
-        sem_reviews, trusted_rev_id, sem_envelopes = build_semantic_reviews_for_attempts(
-            attempts,
-            ceremony_seed=args.ceremony_seed,
+        ext_reviews_path = Path(args.semantic_reviews_path or (base / "ceremony_live/semantic_reviews.json"))
+        sem_reviews, sem_envelopes, sem_bundle_sha = _await_external_semantic_reviews(
+            request_path=out / "semantic-review-request.json",
+            reviews_path=ext_reviews_path,
+            base=base,
             run_id=cfg["run_id"],
+            attempts=attempts,
+            window=window,
+            clock=clock,
         )
-        write_new(out / "semantic-review-envelopes.json", {"envelopes": sem_envelopes, "trusted_reviewer_id": trusted_rev_id})
+        write_new(
+            out / "semantic-review-envelopes.json",
+            {
+                "external_source_path": str(ext_reviews_path),
+                "external_source_sha256": sem_bundle_sha,
+                "envelopes": sem_envelopes,
+            },
+        )
         report = score_suite(
             suite,
             keys,
             attempts,
             verify_attempt=reader,
             semantic_reviews=sem_reviews,
-            trusted_reviewer_id=trusted_rev_id,
+            pinned_reviewer_public_key=pinned_reviewer_pub,
         )
         need(
             clock() < acceptance_gate.end and time.monotonic() - acceptance_gate.tick <= 5400,
@@ -422,6 +510,7 @@ def main(argv: list[str] | None = None) -> int:
             anchor_checkpoint=journal.checkpoint(),
             valve_trap_audit_status=valve_audit.get("status") if valve_audit else None,
             counterpart_traps_blocked=valve_audit.get("counterpart_traps_blocked") if valve_audit else 0,
+            max_drawdown_pct=str(DEFAULT_MAX_DRAWDOWN_PCT),
         )
     except Exception as exc:
         report["status"] = "INCOMPLETE"
@@ -473,21 +562,6 @@ def main(argv: list[str] | None = None) -> int:
             u1="NOT_RUN_NO_ADDITIONAL_CALL_ALLOCATION",
         )
         write_new(out / "stage-b-result.json", report)
-        try:
-            from cas_forex_revamp.composition.custody_protocol import public_aggregate
-            pub_agg, redaction_rec = build_public_aggregate_bundle(
-                run_id=cfg["run_id"],
-                ceremony_seed=args.ceremony_seed,
-                source_freeze_manifest_sha256=cfg["source_manifest_sha256"],
-                custody_public_manifest_sha256=evidence["custody_public_manifest"]["sha256"],
-                retained_evaluation_bundle_sha256=file_hash(out / "stage-b-result.json"),
-                generation_attempts_spent=len(spent),
-                score_report=report,
-            )
-            public_aggregate(pub_agg, approved_digest=redaction_rec["approved_public_body_sha256"], final=True)
-            write_new(out / "stage-b-public-aggregate.json", {"aggregate": pub_agg, "redaction_receipt": redaction_rec})
-        except Exception as exc:
-            _logger.debug("Public aggregate write skipped after primary result save: %s", exc)
         stop_group(watchdog)
     return 0 if report.get("stage_b") == "PASS" else 1
 

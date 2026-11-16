@@ -3,7 +3,8 @@
 Preserves authority_component/release_gate.py (RELEASE_ENABLED = False) and
 authority_provider.py (RELEASE_ENABLED = False) untouched for Phase 1-4 non-release
 denial guarantees, while gating the dedicated Stage B ceremony driver behind
-cryptographic Ed25519 verification via AuthorityProvider + PinnedEd25519Verifier.
+cryptographic Ed25519 verification via AuthorityProvider + PinnedEd25519Verifier
+anchored strictly to an out-of-band pinned trust_roots.json outside bundle_dir.
 """
 from __future__ import annotations
 
@@ -19,6 +20,9 @@ def require_ceremony_release_enabled(
     *,
     bundle_dir: Path,
     source_root: Path,
+    trust_roots_path: Path | str | None = None,
+    expected_selection_sha256: str | None = None,
+    expected_config_sha256: str | None = None,
     now: datetime | None = None,
     require_pinned_cryptography: bool = True,
 ) -> dict[str, Any]:
@@ -37,6 +41,9 @@ def require_ceremony_release_enabled(
     result = verify_ceremony_authority_bundle(
         bdir,
         source_root=src_root,
+        trust_roots_path=trust_roots_path,
+        expected_selection_sha256=expected_selection_sha256,
+        expected_config_sha256=expected_config_sha256,
         now=check_now,
         require_pinned_cryptography=require_pinned_cryptography,
     )

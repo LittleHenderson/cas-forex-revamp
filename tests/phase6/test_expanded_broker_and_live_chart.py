@@ -18,7 +18,7 @@ from cas_forex_revamp.composition.owner_requests import OwnerRequestBook
 from cas_forex_revamp.composition.read_service import DecisionReadService
 from cas_forex_revamp.composition.ui_service import ScopedUIService
 from cas_forex_revamp.contracts import ControlKind, DecisionOrigin, Money, RunScope
-from cas_forex_revamp.contracts.errors import ContractError
+from cas_forex_revamp.contracts import ContractError
 from cas_forex_revamp.core import InstrumentPolicy, RiskPolicy
 from cas_forex_revamp.venue import VenueScenario
 from cas_forex_revamp.venue.external_paper_broker import (
@@ -132,7 +132,8 @@ class ExpandedBrokerAndChartTests(unittest.TestCase):
             env = MarketStreamEnvelope.from_json_bytes(INITIAL_STREAM_PATH.read_bytes())
             clk = _Clock(env.observed_at)
             scope = RunScope("acct-p6", "run-p6", 1, "build-p6", "pol-p6", "scen-p6", "venue-p6")
-            instruments = tuple(default_spot_fx_instrument(sym) for sym in ("EURUSD", "GBPUSD", "USDJPY", "GBPJPY", "NZDUSD"))
+            # v1 CoreCoordinator requires quote currency == account currency (USD), so use the 4 USD-quoted pairs.
+            instruments = tuple(default_spot_fx_instrument(sym) for sym in ("EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"))
             policies = tuple(InstrumentPolicy(inst, Decimal("50")) for inst in instruments)
             owner = OwnerRequestBook(scope, controls=frozenset(ControlKind), reviewed_close=True)
             sim = assemble_live_feed_paper_simulation(
@@ -144,12 +145,12 @@ class ExpandedBrokerAndChartTests(unittest.TestCase):
                 owner_verifier=owner,
                 expected_origin=DecisionOrigin.ACTUAL_MODEL,
             )
-            journal = EvidenceJournal(root / "evidence.sqlite3", scope.key)
+            journal = EvidenceJournal(root / "phase6.evidence.sqlite3", scope.key)
             journal.initialize(create=True)
             sim.venue.initialize(scope.key, opening_balance=Money(Decimal("10000"), "USD"), instruments=instruments, now=clk(), scenario=VenueScenario(scope.scenario_id))
             sim.core.initialize(create=True)
             snap = sim.venue.ingest_market_stream(env, key=scope.key, now=clk())
-            self.assertEqual(len(snap.quotes), 5)
+            self.assertEqual(len(snap.market), 4)
 
             schema_bytes = (REPO_ROOT / "docs" / "contracts" / "decision-read.schema.json").read_bytes()
             reader = DecisionReadService(
@@ -193,7 +194,13 @@ class ExpandedBrokerAndChartTests(unittest.TestCase):
                 body_html = r_html.read().decode("utf-8")
                 self.assertIn("CAS Forex", body_html)
 
-            with urllib.request.urlopen(base_url + "/api/market-stream", timeout=5) as r_ms:
+            with self.assertRaises(urllib.error.HTTPError) as unauth_ms:
+                urllib.request.urlopen(base_url + "/api/market-stream", timeout=5)
+            self.assertEqual(unauth_ms.exception.code, 401)
+            unauth_ms.exception.close()
+
+            req_ms = urllib.request.Request(base_url + "/api/market-stream", headers=srv.auth_headers(), method="GET")
+            with urllib.request.urlopen(req_ms, timeout=5) as r_ms:
                 self.assertEqual(r_ms.status, 200)
                 doc = json.loads(r_ms.read().decode("utf-8"))
                 self.assertEqual(len(doc["streams"]), 16)

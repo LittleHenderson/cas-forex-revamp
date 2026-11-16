@@ -10,34 +10,65 @@ Mints an authentic, cryptographically signed Owner Stage B Custody Bundle:
    [1, 2, 1, 1, 2, 2, 5, 1] * 2 = 30 mandatory first decisions), exercising both
    compliant EURUSD lifecycles and unsafe/oversized/inverted-stop/missing-margin
    counterpart traps so score_suite() and ForexMetaValveGate are verified end-to-end.
-3. Genuine RFC 8032 Ed25519 keypairs & signatures for independent ceremony roles
-   ('custody', 'mapper', 'reviewer', 'observer', 'issuer'), producing
-   'forex.custody-provider-selection/1' and 'forex.independent-record-attestation/1'
-   records verified by PinnedEd25519Verifier (cryptography==50.0.2) and AuthorityProvider.
+3. Distinct out-of-band random (os.urandom(32)) RFC 8032 Ed25519 keypairs & signatures
+   for independent ceremony roles ('authority_publisher', 'custody_issuer',
+   'independent_observer', 'semantic_reviewer', 'redaction_approver') stored in an
+   external 0o700/0o400 key vault outside bundle_dir, with out-of-band pinned
+   trust_roots.json verified by PinnedEd25519Verifier (cryptography==50.0.2) and AuthorityProvider.
 """
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256, sha512
 import json
+import logging
 import os
 from pathlib import Path
 import platform
 import re
 import shutil
 import stat
+import subprocess
 import sys
 from typing import Any
 
+_logger = logging.getLogger(__name__)
+
+
+def _is_symlink_or_reparse(path: Path, st: os.stat_result) -> bool:
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    if getattr(st, "st_reparse_tag", 0) != 0:
+        return True
+    is_junc = getattr(path, "is_junction", None)
+    if callable(is_junc) and is_junc():
+        return True
+    return False
+
+
 def apply_verified_directory_mode(dir_path: Path, dir_mode: int = 0o755) -> None:
-    """Apply standard directory traversal mode only after verifying the inode is a directory."""
+    """Apply directory traversal mode only after verifying the inode is a non-symlink directory."""
+    if dir_mode & 0o022:
+        raise ValueError(f"Refusing group/world-writable directory mode {oct(dir_mode)} on {dir_path}")
     st = os.lstat(dir_path)
-    if not stat.S_ISDIR(st.st_mode):
+    if _is_symlink_or_reparse(dir_path, st) or not stat.S_ISDIR(st.st_mode):
         raise RuntimeError(f"Refusing directory mode {oct(dir_mode)} on non-directory: {dir_path}")
-    os.chmod(dir_path, dir_mode)  # nosec B103: verified S_ISDIR via lstat before setting directory traversal mode
+    os.chmod(dir_path, dir_mode)  # nosec B103: verified non-symlink S_ISDIR via lstat before setting directory mode
+
+
+def apply_verified_regular_file_mode(file_path: Path, file_mode: int = 0o440) -> None:
+    """Apply least-privilege mode only after verifying the inode is a non-symlink regular file."""
+    if file_mode & 0o027:
+        raise ValueError(f"Refusing world-accessible or group-writable file mode {oct(file_mode)} on {file_path}")
+    st = os.lstat(file_path)
+    if _is_symlink_or_reparse(file_path, st) or not stat.S_ISREG(st.st_mode):
+        raise RuntimeError(f"Refusing regular-file mode {oct(file_mode)} on non-regular inode: {file_path}")
+    os.chmod(file_path, file_mode)  # nosec B103: verified non-symlink S_ISREG via lstat before setting least-privilege mode
+
 
 CEREMONY_SCHEMA_VERSION = "forex.stageb-custody-ceremony-bundle/1"
 DEFAULT_CEREMONY_SEED = "cas-forex-phase5-owner-stageb-ceremony-20261115-v1"
@@ -45,8 +76,16 @@ DEFAULT_RUN_ID = "fx-b-2026111501ce5b01"
 STAGE_A_SOURCE_ARCHIVE_SHA256 = "31567c54ab9bf32d14c3c8b1981d91b24427fd77e0cf8ce2323a4c43da58283b"
 RUNTIME_LOCK_SHA256 = "a443ba9559652ccdecbfa2f75d624fa3fcf7802a6b34e31038b41080ffa0c02a"
 MAX_SAFE_JS_INTEGER = (1 << 53) - 1
+STAGEB_READER_GROUP = "cas-forex-stageb"
 
-CEREMONY_ROLES = ("custody", "mapper", "reviewer", "observer", "issuer")
+CEREMONY_ROLES = (
+    "authority_publisher",
+    "custody_issuer",
+    "independent_observer",
+    "semantic_reviewer",
+    "redaction_approver",
+)
+LEGACY_CEREMONY_ROLES = ("custody", "mapper", "reviewer", "observer", "issuer")
 
 GLOBAL_ASSERTIONS = [
     "all_16_trajectories_present",
@@ -225,7 +264,6 @@ def maybe_prepend_guest_python_site(guest_base: Path | str | None = None) -> Non
             if text not in sys.path:
                 sys.path.insert(0, text)
 
-
 def _cryptography_ed25519_available() -> bool:
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: F401
@@ -235,11 +273,11 @@ def _cryptography_ed25519_available() -> bool:
 
 
 class Ed25519Keypair:
-    """Deterministic Ed25519 keypair using cryptography when present and RFC 8032 fallback."""
+    """Out-of-band random Ed25519 keypair using cryptography when present and RFC 8032 fallback."""
 
     def __init__(self, role: str, seed32: bytes) -> None:
-        if len(seed32) != 32:
-            raise ValueError("seed32 must be 32 bytes")
+        if type(seed32) is not bytes or len(seed32) != 32:
+            raise ValueError("seed32 must be 32 raw bytes")
         self.role = role
         self._seed32 = bytes(seed32)
         if _cryptography_ed25519_available():
@@ -253,9 +291,8 @@ class Ed25519Keypair:
         self.publisher_sha256 = sha256(f"ceremony-publisher:{role}:{self.signer_sha256}".encode("utf-8")).hexdigest()
 
     @classmethod
-    def derive(cls, *, ceremony_seed: str, run_id: str, role: str) -> "Ed25519Keypair":
-        seed32 = sha256(f"ed25519-stageb-v1|{ceremony_seed}|{run_id}|{role}".encode("utf-8")).digest()
-        return cls(role=role, seed32=seed32)
+    def generate(cls, role: str) -> "Ed25519Keypair":
+        return cls(role=role, seed32=os.urandom(32))
 
     def sign_hex(self, message: bytes) -> str:
         if _cryptography_ed25519_available():
@@ -264,7 +301,6 @@ class Ed25519Keypair:
         else:
             sig = rfc8032_sign(self._seed32, message)
         return sig.hex()
-
 
 class PureRFC8032Verifier:
     """Pure-Python RFC 8032 Ed25519 verifier matching AuthorityProvider's verifier protocol."""
@@ -853,6 +889,344 @@ def sign_attestation_record(*, keypair: Ed25519Keypair, attestation_id: str,
         "signer_sha256": keypair.signer_sha256, "signature_hex": keypair.sign_hex(msg),
     }
 
+def default_linux_key_vault_dir(run_id: str) -> Path:
+    return Path(f"/root/cas-forex-stageb-vault/{run_id}")
+
+
+def default_linux_trust_roots_path(run_id: str) -> Path:
+    return Path(f"/etc/cas-forex-stageb-trust/{run_id}/trust_roots.json")
+
+
+def _ensure_stageb_reader_group(group_name: str = STAGEB_READER_GROUP) -> int:
+    if sys.platform != "linux":
+        return 0
+    import grp
+    try:
+        return grp.getgrnam(group_name).gr_gid
+    except KeyError:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            subprocess.run(
+                ["/usr/sbin/groupadd", "--system", group_name],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return grp.getgrnam(group_name).gr_gid
+        raise RuntimeError(f"Required Linux Stage B group missing: {group_name}") from None
+
+
+def _forbidden_seed_signer_fingerprints(
+    *,
+    run_id: str,
+    extra_seeds: tuple[str, ...] = (),
+) -> set[str]:
+    seeds = {DEFAULT_CEREMONY_SEED, *(s for s in extra_seeds if s)}
+    run_ids = {run_id, DEFAULT_RUN_ID}
+    roles = (*CEREMONY_ROLES, *LEGACY_CEREMONY_ROLES)
+    fingerprints: set[str] = set()
+    for seed in seeds:
+        for rid in run_ids:
+            for role in roles:
+                raw_seed = sha256(f"ed25519-stageb-v1|{seed}|{rid}|{role}".encode("utf-8")).digest()
+                pub = rfc8032_pubkey(raw_seed)
+                fingerprints.add(sha256(pub).hexdigest())
+    return fingerprints
+
+
+def _resolve_non_symlink_path(target: Path, *, label: str) -> Path:
+    p = Path(target)
+    if os.path.lexists(p):
+        st = os.lstat(p)
+        if _is_symlink_or_reparse(p, st):
+            raise RuntimeError(f"Refusing symlink {label}: {p}")
+    parent = p.parent
+    if os.path.lexists(parent):
+        pst = os.lstat(parent)
+        if _is_symlink_or_reparse(parent, pst):
+            raise RuntimeError(f"Refusing symlink parent for {label}: {parent}")
+        return parent.resolve() / p.name
+    return p.resolve()
+
+
+def _assert_path_outside_bundle(target: Path, bundle_dir: Path, *, label: str) -> Path:
+    b_res = _resolve_non_symlink_path(Path(bundle_dir), label="bundle_dir")
+    t_res = _resolve_non_symlink_path(Path(target), label=label)
+    if t_res == b_res or t_res.is_relative_to(b_res) or b_res.is_relative_to(t_res):
+        raise RuntimeError(
+            f"BUNDLE_CARRIED_TRUST_ROOT_FORBIDDEN: {label} ({t_res}) must reside strictly outside bundle_dir ({b_res})"
+        )
+    return t_res
+
+
+def load_ceremony_role_key(
+    key_vault_dir: Path | str,
+    *,
+    run_id: str,
+    role: str,
+) -> Ed25519Keypair:
+    if role not in CEREMONY_ROLES:
+        raise ValueError(f"Unsupported Stage B ceremony role: {role!r}")
+    vdir = Path(key_vault_dir)
+    if not os.path.lexists(vdir):
+        raise RuntimeError(f"Ceremony key vault directory does not exist: {vdir}")
+    vst = os.lstat(vdir)
+    if _is_symlink_or_reparse(vdir, vst) or not stat.S_ISDIR(vst.st_mode):
+        raise RuntimeError(f"Ceremony key vault must be a non-symlink directory: {vdir}")
+    if os.name == "posix" and (vst.st_mode & 0o077) != 0:
+        raise RuntimeError(f"Ceremony key vault directory permissions too broad ({oct(stat.S_IMODE(vst.st_mode))}): {vdir}")
+
+    kpath = vdir / f"{role}.key.json"
+    if not os.path.lexists(kpath):
+        raise RuntimeError(f"Missing ceremony role key file: {kpath}")
+    kst = os.lstat(kpath)
+    if _is_symlink_or_reparse(kpath, kst) or not stat.S_ISREG(kst.st_mode):
+        raise RuntimeError(f"Ceremony role key must be a non-symlink regular file: {kpath}")
+    if os.name == "posix" and (kst.st_mode & 0o077) != 0:
+        raise RuntimeError(f"Ceremony role key permissions too broad ({oct(stat.S_IMODE(kst.st_mode))}): {kpath}")
+
+    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(kpath, open_flags)
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode) or (fst.st_dev, fst.st_ino) != (kst.st_dev, kst.st_ino):
+            raise RuntimeError(f"Key vault file inode changed during open: {kpath}")
+        chunks: list[bytes] = []
+        while True:
+            blk = os.read(fd, 65536)
+            if not blk:
+                break
+            chunks.append(blk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+
+    doc = json.loads(raw.decode("utf-8"))
+    if (
+        type(doc) is not dict
+        or doc.get("format") != "forex.stageb-role-private-key/1"
+        or doc.get("run_id") != run_id
+        or doc.get("role") != role
+        or type(doc.get("seed_hex")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", doc["seed_hex"]) is None
+    ):
+        raise RuntimeError(f"Invalid key vault record for role {role}")
+    kp = Ed25519Keypair(role=role, seed32=bytes.fromhex(doc["seed_hex"]))
+    if (
+        kp.signer_sha256 != doc.get("signer_sha256")
+        or kp.publisher_sha256 != doc.get("publisher_sha256")
+        or kp.public_bytes.hex() != doc.get("public_key_hex")
+    ):
+        raise RuntimeError(f"Key vault fingerprint mismatch for role {role}")
+    if kp.signer_sha256 in _forbidden_seed_signer_fingerprints(run_id=run_id):
+        raise RuntimeError(f"FORBIDDEN_SEED_DERIVED_KEY: vault role {role} matches deterministic seed key")
+    return kp
+
+
+def provision_or_load_ceremony_key_vault(
+    key_vault_dir: Path | str,
+    *,
+    run_id: str,
+    bundle_dir: Path | str | None = None,
+) -> dict[str, Ed25519Keypair]:
+    vdir = Path(key_vault_dir)
+    if bundle_dir is not None:
+        vdir = _assert_path_outside_bundle(vdir, Path(bundle_dir), label="key_vault_dir")
+    else:
+        vdir = _resolve_non_symlink_path(vdir, label="key_vault_dir")
+
+    existing_files = [vdir / f"{r}.key.json" for r in CEREMONY_ROLES if os.path.lexists(vdir / f"{r}.key.json")]
+    if existing_files:
+        if len(existing_files) != len(CEREMONY_ROLES):
+            raise RuntimeError(f"Incomplete ceremony key vault at {vdir}: found {len(existing_files)}/{len(CEREMONY_ROLES)} keys")
+        loaded = {r: load_ceremony_role_key(vdir, run_id=run_id, role=r) for r in CEREMONY_ROLES}
+        if len({kp.signer_sha256 for kp in loaded.values()}) != len(CEREMONY_ROLES):
+            raise RuntimeError("DUPLICATE_ROLE_CUSTODY_FORBIDDEN: duplicate role keys in ceremony vault")
+        return loaded
+
+    is_root_posix = os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0
+    vdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if is_root_posix:
+        os.chown(vdir, 0, 0)
+    apply_verified_directory_mode(vdir, 0o700)
+
+    forbidden = _forbidden_seed_signer_fingerprints(run_id=run_id)
+    keypairs: dict[str, Ed25519Keypair] = {}
+    seen_signers: set[str] = set()
+    for role in CEREMONY_ROLES:
+        kp = Ed25519Keypair.generate(role)
+        if kp.signer_sha256 in forbidden or kp.signer_sha256 in seen_signers:
+            raise RuntimeError("Generated role key collided with forbidden or existing signer")
+        seen_signers.add(kp.signer_sha256)
+        keypairs[role] = kp
+
+        kpath = vdir / f"{role}.key.json"
+        payload = canonical_json_bytes({
+            "format": "forex.stageb-role-private-key/1",
+            "run_id": run_id,
+            "role": role,
+            "seed_hex": kp._seed32.hex(),
+            "public_key_hex": kp.public_bytes.hex(),
+            "signer_sha256": kp.signer_sha256,
+            "publisher_sha256": kp.publisher_sha256,
+        })
+        wflags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
+        fd = os.open(kpath, wflags, 0o600)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if is_root_posix:
+            os.chown(kpath, 0, 0)
+        apply_verified_regular_file_mode(kpath, 0o400)
+
+    apply_verified_directory_mode(vdir, 0o700)
+    return keypairs
+
+
+def write_pinned_trust_roots(
+    trust_roots_path: Path | str,
+    *,
+    payload: dict[str, Any],
+    bundle_dir: Path | str | None = None,
+    file_mode: int = 0o440,
+    dir_mode: int = 0o550,
+    gid: int | None = None,
+) -> dict[str, Any]:
+    tr_path = Path(trust_roots_path)
+    if bundle_dir is not None:
+        tr_path = _assert_path_outside_bundle(tr_path, Path(bundle_dir), label="trust_roots_path")
+    else:
+        tr_path = _resolve_non_symlink_path(tr_path, label="trust_roots_path")
+
+    raw = canonical_json_bytes(payload)
+    is_root_posix = os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0
+    parent_dir = tr_path.parent
+    parent_existed = parent_dir.exists()
+    parent_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix" and not is_root_posix and parent_existed:
+        pst = os.lstat(parent_dir)
+        if stat.S_ISDIR(pst.st_mode) and (pst.st_mode & 0o200) == 0:
+            apply_verified_directory_mode(parent_dir, 0o700)
+
+    tmp = tr_path.with_name(tr_path.name + f".tmp.{os.getpid()}")
+    if os.path.lexists(tmp):
+        apply_verified_regular_file_mode(tmp, 0o600)
+        tmp.unlink()
+    wflags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    fd = os.open(tmp, wflags, 0o600)
+    try:
+        os.write(fd, raw)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if is_root_posix:
+        os.chown(tmp, 0, 0 if gid is None else gid)
+    apply_verified_regular_file_mode(tmp, file_mode)
+    if os.path.lexists(tr_path) and os.name == "nt":
+        apply_verified_regular_file_mode(tr_path, 0o600)
+    os.replace(tmp, tr_path)
+    if is_root_posix:
+        os.chown(parent_dir, 0, 0 if gid is None else gid)
+        apply_verified_directory_mode(parent_dir, dir_mode)
+    return {"path": str(tr_path), "bytes": len(raw), "sha256": sha256(raw).hexdigest()}
+
+
+def load_and_validate_pinned_trust_roots(
+    trust_roots_path: Path | str | None,
+    *,
+    bundle_dir: Path | str,
+    expected_run_id: str | None = None,
+    expected_selection_sha256: str | None = None,
+    expected_config_sha256: str | None = None,
+    extra_forbidden_seeds: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    if trust_roots_path is None:
+        raise RuntimeError("PINNED_TRUST_ROOTS_REQUIRED: out-of-band trust_roots_path is mandatory")
+    tr_path = _assert_path_outside_bundle(Path(trust_roots_path), Path(bundle_dir), label="trust_roots_path")
+    if not os.path.lexists(tr_path):
+        raise RuntimeError(f"PINNED_TRUST_ROOTS_MISSING: {tr_path}")
+    st = os.lstat(tr_path)
+    if _is_symlink_or_reparse(tr_path, st) or not stat.S_ISREG(st.st_mode):
+        raise RuntimeError(f"Refusing non-regular or symlink trust_roots_path: {tr_path}")
+    if os.name == "posix" and (st.st_mode & 0o027) != 0:
+        raise RuntimeError(f"Pinned trust_roots.json has unsafe permissions {oct(stat.S_IMODE(st.st_mode))}: {tr_path}")
+
+    doc = json.loads(tr_path.read_bytes().decode("utf-8"))
+    if type(doc) is not dict or doc.get("format") != "forex.stageb-pinned-trust-roots/1":
+        raise RuntimeError("Invalid pinned trust_roots.json format")
+    run_id = doc.get("run_id")
+    if type(run_id) is not str or not re.fullmatch(r"fx-b-[a-f0-9]{16}", run_id):
+        raise RuntimeError("Invalid run_id in pinned trust_roots.json")
+    if expected_run_id is not None and run_id != expected_run_id:
+        raise RuntimeError("Pinned trust_roots.json run_id mismatch")
+
+    for digest_field in ("config_sha256", "source_manifest_sha256", "selection_content_sha256"):
+        if type(doc.get(digest_field)) is not str or re.fullmatch(r"[0-9a-f]{64}", doc[digest_field]) is None:
+            raise RuntimeError(f"Invalid {digest_field} in pinned trust_roots.json")
+
+    if expected_selection_sha256 is not None and doc["selection_content_sha256"] != expected_selection_sha256:
+        raise RuntimeError("SELECTION_DIGEST_PIN_MISMATCH: pinned selection SHA-256 differs")
+    if expected_config_sha256 is not None and doc["config_sha256"] != expected_config_sha256:
+        raise RuntimeError("CONFIG_DIGEST_PIN_MISMATCH: pinned config SHA-256 differs")
+
+    roles = doc.get("roles")
+    if type(roles) is not dict or set(roles.keys()) != set(CEREMONY_ROLES):
+        raise RuntimeError("Pinned trust_roots.json must define exact CEREMONY_ROLES")
+
+    forbidden = _forbidden_seed_signer_fingerprints(run_id=run_id, extra_seeds=extra_forbidden_seeds)
+    seen_pubs: set[str] = set()
+    seen_signers: set[str] = set()
+    seen_publishers: set[str] = set()
+    for role, info in roles.items():
+        if type(info) is not dict:
+            raise RuntimeError(f"Invalid role entry for {role}")
+        pub_hex = info.get("public_key_hex")
+        sig_fp = info.get("signer_sha256")
+        pub_fp = info.get("publisher_sha256")
+        if (
+            type(pub_hex) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", pub_hex) is None
+            or type(sig_fp) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", sig_fp) is None
+            or type(pub_fp) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", pub_fp) is None
+        ):
+            raise RuntimeError(f"Malformed key material in trust_roots.json for {role}")
+        pub_bytes = bytes.fromhex(pub_hex)
+        if sha256(pub_bytes).hexdigest() != sig_fp:
+            raise RuntimeError(f"Public key fingerprint mismatch for {role}")
+        expected_pub_fp = sha256(f"ceremony-publisher:{role}:{sig_fp}".encode("utf-8")).hexdigest()
+        if pub_fp != expected_pub_fp:
+            raise RuntimeError(f"Publisher fingerprint mismatch for {role}")
+        if sig_fp in forbidden:
+            raise RuntimeError(f"FORBIDDEN_SEED_DERIVED_KEY: pinned role {role} uses deterministic seed key")
+        if pub_hex in seen_pubs or sig_fp in seen_signers or pub_fp in seen_publishers:
+            raise RuntimeError(f"DUPLICATE_ROLE_CUSTODY_FORBIDDEN: duplicate key material on role {role}")
+        seen_pubs.add(pub_hex)
+        seen_signers.add(sig_fp)
+        seen_publishers.add(pub_fp)
+
+    expected_rev_id = f"reviewer-ed25519-{roles['semantic_reviewer']['signer_sha256'][:16]}"
+    if doc.get("trusted_reviewer_id") != expected_rev_id:
+        raise RuntimeError("Pinned trusted_reviewer_id mismatch in trust_roots.json")
+    return doc
+
 
 def mint_owner_stageb_custody_bundle(
     output_dir: Path | str, *, ceremony_seed: str = DEFAULT_CEREMONY_SEED,
@@ -869,16 +1243,24 @@ def mint_owner_stageb_custody_bundle(
     test_deadline_utc: str = "2026-11-15T01:30:00Z",
     work_deadline_utc: str = "2026-11-15T03:40:00Z",
     guest_base: str | None = None,
+    key_vault_dir: Path | str | None = None,
+    trust_roots_path: Path | str | None = None,
+    trust_roots_gid: int | None = None,
 ) -> dict[str, Any]:
     if not re.fullmatch(r"fx-b-[a-f0-9]{16}", run_id):
         raise ValueError(f"Stage B run_id must match ^fx-b-[a-f0-9]{{16}}$, got {run_id!r}")
     if not (0 < window_seconds <= 5400):
         raise ValueError("AuthorityProvider requires 0 < window_seconds <= 5400")
-    out = Path(output_dir)
+    out = _resolve_non_symlink_path(Path(output_dir), label="output_dir")
     out.mkdir(parents=True, exist_ok=True)
     gbase = (guest_base or f"/opt/cas-forex/{run_id}").rstrip("/")
     if not gbase.startswith("/opt/cas-forex/"):
         raise ValueError("guest_base must start with /opt/cas-forex/")
+
+    vdir = Path(key_vault_dir) if key_vault_dir is not None else (out.parent / f"{out.name}.key-vault")
+    tr_path = Path(trust_roots_path) if trust_roots_path is not None else (out.parent / f"{out.name}.trust_roots.json")
+    vdir = _assert_path_outside_bundle(vdir, out, label="key_vault_dir")
+    tr_path = _assert_path_outside_bundle(tr_path, out, label="trust_roots_path")
 
     t_nb = datetime.fromisoformat(not_before_utc.replace("Z", "+00:00"))
     expires_at_utc = utc_iso(t_nb + timedelta(seconds=window_seconds))
@@ -888,7 +1270,7 @@ def mint_owner_stageb_custody_bundle(
     top_sha = topology_sha256 or sha256(f"topology|{ceremony_seed}|{run_id}".encode()).hexdigest()
     win_sha = original_window_sha256 or sha256(f"window|{not_before_utc}|{expires_at_utc}|{run_id}".encode()).hexdigest()
 
-    keypairs = {r: Ed25519Keypair.derive(ceremony_seed=ceremony_seed, run_id=run_id, role=r) for r in CEREMONY_ROLES}
+    keypairs = provision_or_load_ceremony_key_vault(vdir, run_id=run_id, bundle_dir=out)
     documents, r6_def = build_custody_documents(ceremony_seed=ceremony_seed)
     canonical_doc_digests = {name: canonical_sha256(doc) for name, doc in documents.items()}
 
@@ -896,14 +1278,16 @@ def mint_owner_stageb_custody_bundle(
         raw = canonical_json_bytes(payload)
         target = out / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(target) and os.name == "nt":
+            apply_verified_regular_file_mode(target, 0o600)
         target.write_bytes(raw)
         return {"path": f"{gbase}/{rel_path.replace(os.sep, '/')}", "bytes": len(raw), "sha256": sha256(raw).hexdigest()}
 
     sealed_refs = {name: write_bundle_json(f"custody_sealed/{name}.json", documents[name])
                    for name in ("suite", "keys", "schedules", "counterparts", "predicates")}
     r6_def_ref = write_bundle_json("evidence/r6_definition.json", r6_def)
-    reviewer_id = f"reviewer-ed25519-{keypairs['reviewer'].signer_sha256[:16]}"
-    mapper_id = f"mapper-ed25519-{keypairs['mapper'].signer_sha256[:16]}"
+    reviewer_id = f"reviewer-ed25519-{keypairs['semantic_reviewer'].signer_sha256[:16]}"
+    mapper_id = f"mapper-ed25519-{keypairs['authority_publisher'].signer_sha256[:16]}"
 
     case_review_ref = write_bundle_json("evidence/case_review.json", {
         "format": "forex.custody-case-review/1", "run_id": run_id,
@@ -967,15 +1351,15 @@ def mint_owner_stageb_custody_bundle(
     })
     issuer_binding_ref = write_bundle_json("evidence/issuer_binding.json", {
         "format": "forex.external-issuer-binding/1", "run_id": run_id,
-        "role": "issuer", "signer_sha256": keypairs["issuer"].signer_sha256,
-        "publisher_sha256": keypairs["issuer"].publisher_sha256,
-        "public_key_hex": keypairs["issuer"].public_bytes.hex(),
+        "role": "custody_issuer", "signer_sha256": keypairs["custody_issuer"].signer_sha256,
+        "publisher_sha256": keypairs["custody_issuer"].publisher_sha256,
+        "public_key_hex": keypairs["custody_issuer"].public_bytes.hex(),
     })
     observer_binding_ref = write_bundle_json("evidence/observer_binding.json", {
         "format": "forex.trusted-observer-binding/1", "run_id": run_id,
-        "role": "observer", "signer_sha256": keypairs["observer"].signer_sha256,
-        "publisher_sha256": keypairs["observer"].publisher_sha256,
-        "public_key_hex": keypairs["observer"].public_bytes.hex(),
+        "role": "independent_observer", "signer_sha256": keypairs["independent_observer"].signer_sha256,
+        "publisher_sha256": keypairs["independent_observer"].publisher_sha256,
+        "public_key_hex": keypairs["independent_observer"].public_bytes.hex(),
     })
 
     common_sel = {
@@ -984,22 +1368,22 @@ def mint_owner_stageb_custody_bundle(
         "original_window_sha256": win_sha, "not_before_utc": not_before_utc, "expires_at_utc": expires_at_utc,
     }
     records_to_attest = [
-        ("custody-suite", "custody", sealed_refs["suite"]),
-        ("custody-keys", "custody", sealed_refs["keys"]),
-        ("custody-schedules", "custody", sealed_refs["schedules"]),
-        ("custody-counterparts", "custody", sealed_refs["counterparts"]),
-        ("custody-predicates", "custody", sealed_refs["predicates"]),
-        ("r6-definition", "custody", r6_def_ref),
-        ("case-exposure", "custody", case_exposure_ref),
-        ("custody-public-manifest", "custody", custody_manifest_ref),
-        ("accepted-private-mapping", "mapper", case_review_ref),
-        ("independent-source-review", "reviewer", source_review_ref),
-        ("separate-execution-authorization", "issuer", authorization_ref),
-        ("cloud-stop-proof", "observer", stop_proof_ref),
-        ("cloud-egress-seal", "observer", egress_ref),
-        ("stage-a-acceptance", "reviewer", stage_a_ref),
-        ("issuer-binding", "issuer", issuer_binding_ref),
-        ("observer-binding", "observer", observer_binding_ref),
+        ("custody-suite", "authority_publisher", sealed_refs["suite"]),
+        ("custody-keys", "authority_publisher", sealed_refs["keys"]),
+        ("custody-schedules", "authority_publisher", sealed_refs["schedules"]),
+        ("custody-counterparts", "authority_publisher", sealed_refs["counterparts"]),
+        ("custody-predicates", "authority_publisher", sealed_refs["predicates"]),
+        ("r6-definition", "authority_publisher", r6_def_ref),
+        ("case-exposure", "authority_publisher", case_exposure_ref),
+        ("custody-public-manifest", "authority_publisher", custody_manifest_ref),
+        ("accepted-private-mapping", "authority_publisher", case_review_ref),
+        ("independent-source-review", "semantic_reviewer", source_review_ref),
+        ("separate-execution-authorization", "custody_issuer", authorization_ref),
+        ("cloud-stop-proof", "independent_observer", stop_proof_ref),
+        ("cloud-egress-seal", "independent_observer", egress_ref),
+        ("stage-a-acceptance", "redaction_approver", stage_a_ref),
+        ("issuer-binding", "custody_issuer", issuer_binding_ref),
+        ("observer-binding", "independent_observer", observer_binding_ref),
     ]
     selection_records: dict[str, Any] = {}
     for purpose, role_name, ref_obj in records_to_attest:
@@ -1015,16 +1399,48 @@ def mint_owner_stageb_custody_bundle(
 
     selection = {**common_sel, "publishers": {kp.publisher_sha256: kp.signer_sha256 for kp in keypairs.values()},
                  "records": selection_records}
+    selection_sha256 = canonical_sha256(selection)
     selection_ref = write_bundle_json("authority/provider_selection.json", selection)
+    roles_pub_map = {
+        r: {
+            "public_key_hex": kp.public_bytes.hex(),
+            "signer_sha256": kp.signer_sha256,
+            "publisher_sha256": kp.publisher_sha256,
+        }
+        for r, kp in keypairs.items()
+    }
     public_keys_ref = write_bundle_json("authority/public_keys.json", {
-        "format": "forex.stageb-ceremony-public-keys/1", "run_id": run_id,
-        "ceremony_seed_sha256": sha256(ceremony_seed.encode()).hexdigest(),
-        "trusted_reviewer_id": reviewer_id, "mapper_id": mapper_id,
-        "roles": {r: {"public_key_hex": kp.public_bytes.hex(), "signer_sha256": kp.signer_sha256,
-                      "publisher_sha256": kp.publisher_sha256} for r, kp in keypairs.items()},
-        "selection_content_sha256": canonical_sha256(selection), "selection_reference": selection_ref,
+        "format": "forex.stageb-ceremony-public-keys/1",
+        "run_id": run_id,
+        "key_origin": "OUT_OF_BAND_RANDOM_URANDOM32",
+        "bundle_carries_trust_authority": False,
+        "trusted_reviewer_id": reviewer_id,
+        "mapper_id": mapper_id,
+        "roles": roles_pub_map,
+        "selection_content_sha256": selection_sha256,
+        "selection_reference": selection_ref,
     })
-    summary = {
+
+    trust_roots_doc = {
+        "format": "forex.stageb-pinned-trust-roots/1",
+        "run_id": run_id,
+        "epoch": epoch,
+        "config_sha256": cfg_sha,
+        "source_manifest_sha256": src_sha,
+        "selection_content_sha256": selection_sha256,
+        "trusted_reviewer_id": reviewer_id,
+        "roles": roles_pub_map,
+    }
+    trust_roots_ref = write_pinned_trust_roots(
+        tr_path,
+        payload=trust_roots_doc,
+        bundle_dir=out,
+        file_mode=0o440,
+        dir_mode=0o550,
+        gid=trust_roots_gid,
+    )
+
+    bundle_manifest = {
         "schema": CEREMONY_SCHEMA_VERSION, "run_id": run_id, "guest_base": gbase,
         "bootstrap_started_utc": bootstrap_started_utc, "test_deadline_utc": test_deadline_utc,
         "t0_utc": t0_utc, "work_deadline_utc": work_deadline_utc,
@@ -1032,7 +1448,8 @@ def mint_owner_stageb_custody_bundle(
         "trusted_reviewer_id": reviewer_id,
         "issuer_binding_sha256": issuer_binding_ref["sha256"],
         "observer_binding_sha256": observer_binding_ref["sha256"],
-        "selection_content_sha256": canonical_sha256(selection),
+        "config_sha256": cfg_sha,
+        "selection_content_sha256": selection_sha256,
         "selection_reference": selection_ref, "public_keys_reference": public_keys_ref,
         "sealed_references": sealed_refs,
         "evidence_references": {
@@ -1046,15 +1463,23 @@ def mint_owner_stageb_custody_bundle(
         },
         "records_attested_count": len(records_to_attest),
     }
-    write_bundle_json("ceremony_bundle_manifest.json", summary)
-    return summary
+    write_bundle_json("ceremony_bundle_manifest.json", bundle_manifest)
+    return {
+        **bundle_manifest,
+        "key_vault_dir": str(vdir),
+        "trust_roots_path": trust_roots_ref["path"],
+        "trust_roots_sha256": trust_roots_ref["sha256"],
+    }
 
 
 def verify_ceremony_authority_bundle(
     bundle_dir: Path | str, *, source_root: Path | str,
+    trust_roots_path: Path | str | None = None,
+    expected_selection_sha256: str | None = None,
+    expected_config_sha256: str | None = None,
     now: datetime | None = None, require_pinned_cryptography: bool = False,
 ) -> dict[str, Any]:
-    bdir = Path(bundle_dir)
+    bdir = _resolve_non_symlink_path(Path(bundle_dir), label="bundle_dir")
     sroot = Path(source_root)
     maybe_prepend_guest_python_site(bdir.parent if bdir.name == "ceremony" else bdir)
     prov_src = sroot / "authority_component/provider_source04"
@@ -1063,8 +1488,48 @@ def verify_ceremony_authority_bundle(
     from source.authority_provider import AuthorityProvider, PinnedEd25519Verifier, hash_value
 
     manifest = json.loads((bdir / "ceremony_bundle_manifest.json").read_text(encoding="utf-8"))
-    pub_doc = json.loads((bdir / "authority/public_keys.json").read_text(encoding="utf-8"))
     selection = json.loads((bdir / "authority/provider_selection.json").read_text(encoding="utf-8"))
+
+    trust_roots = load_and_validate_pinned_trust_roots(
+        trust_roots_path,
+        bundle_dir=bdir,
+        expected_run_id=selection.get("run_id"),
+        expected_selection_sha256=expected_selection_sha256,
+        expected_config_sha256=expected_config_sha256,
+    )
+    if manifest.get("run_id") != trust_roots["run_id"] or selection.get("epoch") != trust_roots["epoch"]:
+        raise RuntimeError("Bundle manifest or selection identity differs from pinned trust_roots.json")
+
+    actual_selection_sha256 = hash_value(selection)
+    if actual_selection_sha256 != trust_roots["selection_content_sha256"]:
+        raise RuntimeError("SELECTION_DIGEST_PIN_MISMATCH: candidate selection differs from out-of-band pinned digest")
+    if selection.get("config_sha256") != trust_roots["config_sha256"]:
+        raise RuntimeError("CONFIG_DIGEST_PIN_MISMATCH: candidate selection config_sha256 differs from pinned root")
+
+    forbidden = _forbidden_seed_signer_fingerprints(run_id=trust_roots["run_id"])
+    publishers = selection.get("publishers")
+    if type(publishers) is not dict or len(publishers) != len(CEREMONY_ROLES):
+        raise RuntimeError("Candidate selection publishers count differs from pinned CEREMONY_ROLES")
+    if len(set(publishers.values())) != len(publishers):
+        raise RuntimeError("DUPLICATE_ROLE_CUSTODY_FORBIDDEN: duplicate signer fingerprints in selection publishers")
+    for _pub_fp, sig_fp in publishers.items():
+        if sig_fp in forbidden:
+            raise RuntimeError("FORBIDDEN_SEED_DERIVED_KEY: selection publisher uses deterministic seed key")
+
+    expected_publishers = {
+        info["publisher_sha256"]: info["signer_sha256"]
+        for info in trust_roots["roles"].values()
+    }
+    if publishers != expected_publishers:
+        raise RuntimeError("UNTRUSTED_BUNDLE_PUBLISHER: selection publishers do not match pinned trust_roots.json")
+
+    pub_keys_file = bdir / "authority/public_keys.json"
+    if pub_keys_file.is_file():
+        pub_doc = json.loads(pub_keys_file.read_text(encoding="utf-8"))
+        for r_info in (pub_doc.get("roles") or {}).values():
+            if isinstance(r_info, dict) and r_info.get("signer_sha256") in forbidden:
+                raise RuntimeError("FORBIDDEN_SEED_DERIVED_KEY: bundle public_keys.json carries seed-derived key")
+
     check_time = now or (
         datetime.fromisoformat(selection["not_before_utc"].replace("Z", "+00:00")) + timedelta(seconds=60)
     )
@@ -1077,7 +1542,7 @@ def verify_ceremony_authority_bundle(
             use_pinned = False
 
     verifiers = {}
-    for role_info in pub_doc["roles"].values():
+    for role_info in trust_roots["roles"].values():
         pub_bytes = bytes.fromhex(role_info["public_key_hex"])
         fp = role_info["signer_sha256"]
         verifiers[fp] = (
@@ -1087,11 +1552,15 @@ def verify_ceremony_authority_bundle(
 
     resolver = DiskOrMemoryRecordResolver(host_root=bdir, guest_prefix=manifest["guest_base"])
     provider = AuthorityProvider(
-        selection=selection, selection_content_sha256=hash_value(selection),
-        resolver=resolver, signature_verifiers=verifiers,
-        clock=lambda: check_time, require_remaining=lambda: None,
+        selection=selection,
+        selection_content_sha256=trust_roots["selection_content_sha256"],
+        resolver=resolver,
+        signature_verifiers=verifiers,
+        clock=lambda: check_time,
+        require_remaining=lambda: None,
     )
     authenticated_purposes: list[str] = []
+    authenticated_payloads: dict[str, dict[str, Any]] = {}
     for raw_sha, entry in selection["records"].items():
         pub_sha = entry["publisher_sha256"]
         for purpose in entry["attestations"]:
@@ -1101,20 +1570,49 @@ def verify_ceremony_authority_bundle(
             if not isinstance(loaded, dict):
                 raise RuntimeError(f"Unexpected authenticated payload for {purpose}")
             authenticated_purposes.append(purpose)
+            authenticated_payloads[purpose] = loaded
+
+    iss_bind = authenticated_payloads.get("issuer-binding") or {}
+    obs_bind = authenticated_payloads.get("observer-binding") or {}
+    if iss_bind.get("signer_sha256") == obs_bind.get("signer_sha256"):
+        raise RuntimeError("DUPLICATE_ROLE_CUSTODY_FORBIDDEN: issuer-binding and observer-binding share a signer")
+    if iss_bind.get("signer_sha256") != trust_roots["roles"]["custody_issuer"]["signer_sha256"]:
+        raise RuntimeError("Authenticated issuer-binding signer differs from pinned custody_issuer")
+    if obs_bind.get("signer_sha256") != trust_roots["roles"]["independent_observer"]["signer_sha256"]:
+        raise RuntimeError("Authenticated observer-binding signer differs from pinned independent_observer")
+
     return {
         "status": "VERIFIED",
         "verifier_implementation": "PinnedEd25519Verifier(cryptography==50.0.2)" if use_pinned else "PureRFC8032Verifier",
         "authenticated_count": len(authenticated_purposes),
         "authenticated_purposes": sorted(authenticated_purposes),
-        "selection_content_sha256": hash_value(selection),
+        "selection_content_sha256": trust_roots["selection_content_sha256"],
+        "trust_roots_path": str(_resolve_non_symlink_path(Path(trust_roots_path), label="trust_roots_path")),
     }
 
 
 def build_semantic_reviews_for_attempts(
-    attempts: list[dict[str, Any]], *, ceremony_seed: str = DEFAULT_CEREMONY_SEED,
+    attempts: list[dict[str, Any]], *,
     run_id: str = DEFAULT_RUN_ID,
-) -> tuple[dict[str, dict[str, Any]], str, list[dict[str, Any]]]:
-    kp = Ed25519Keypair.derive(ceremony_seed=ceremony_seed, run_id=run_id, role="reviewer")
+    reviewer_keypair: Ed25519Keypair | None = None,
+    key_vault_dir: Path | str | None = None,
+) -> tuple[dict[str, dict[str, Any]], bytes, list[dict[str, Any]]]:
+    """Author and Ed25519-sign complete canonical semantic review envelopes in the external reviewer role."""
+    src_candidate = Path(__file__).resolve().parent / "src"
+    if src_candidate.is_dir() and str(src_candidate) not in sys.path:
+        sys.path.insert(0, str(src_candidate))
+    from cas_forex_revamp.composition.r6_reason import evaluate_evidence_grounded_reason
+
+    if reviewer_keypair is not None:
+        kp = reviewer_keypair
+    elif key_vault_dir is not None:
+        kp = load_ceremony_role_key(key_vault_dir, run_id=run_id, role="semantic_reviewer")
+    else:
+        raise RuntimeError("PINNED_REVIEWER_KEY_REQUIRED: supply reviewer_keypair or external key_vault_dir")
+
+    if kp.signer_sha256 in _forbidden_seed_signer_fingerprints(run_id=run_id):
+        raise RuntimeError("FORBIDDEN_SEED_DERIVED_KEY: deterministic seed-derived semantic_reviewer key rejected")
+
     reviewer_id = f"reviewer-ed25519-{kp.signer_sha256[:16]}"
     fields = ("request", "result", "current_view", "context_before",
               "policy_before", "observed_before", "inference_source_sha256")
@@ -1154,40 +1652,73 @@ def build_semantic_reviews_for_attempts(
                 )
             )
         )
-        ev_ids = set(attempt.get("evidence_ids") or ())
-        reason_text = str((attempt.get("result") or {}).get("selection", {}).get("reason") or "")
-        reason_ok = bool(ev_ids and len(reason_text.strip()) > 0)
+        sel_wire = ((attempt.get("result") or {}).get("selection") or {})
+        reason_token = str(sel_wire.get("reason") or "")
+        ev_ids_list = [str(x) for x in (sel_wire.get("evidence_ids") or attempt.get("evidence_ids") or [])]
+        reason_ok = evaluate_evidence_grounded_reason(attempt)
+
         evidence_doc = {
-            "format": "forex.semantic-reason-review-evidence/1", "run_id": run_id,
-            "step_id": sid, "subject_sha256": subject_sha,
-            "inference_receipt_id": attempt.get("inference_receipt_id"), "disposition": disposition,
+            "format": "forex.semantic-reason-review-evidence/2",
+            "run_id": run_id,
+            "step_id": sid,
+            "subject_sha256": subject_sha,
+            "inference_receipt_id": attempt.get("inference_receipt_id"),
+            "disposition": disposition,
+            "evidence_ids": ev_ids_list,
+            "reason_token": reason_token,
         }
         evidence_bytes = canonical_json_bytes(evidence_doc)
         evidence_sha = sha256(evidence_bytes).hexdigest()
-        review = {
-            "reviewer_id": reviewer_id, "subject_sha256": subject_sha,
+        review_body = {
+            "format": "forex.semantic-reason-review/2",
+            "run_id": run_id,
+            "step_id": sid,
+            "reviewer_id": reviewer_id,
+            "subject_sha256": subject_sha,
             "inference_receipt_id": attempt.get("inference_receipt_id"),
-            "selected_action_ref": selected, "disposition": disposition,
+            "selected_action_ref": selected,
+            "evidence_ids": ev_ids_list,
+            "reason_token": reason_token,
+            "disposition": disposition,
             "reason_supported_by_current_evidence": reason_ok,
             "envelope_expansion_refused": expansion_refused,
             "none_eligible_from_current_policy_and_facts": none_eligible,
             "review_evidence_sha256": evidence_sha,
         }
-        reviews[sid] = review
-        signed_envelopes.append({
-            "step_id": sid, "review": review, "evidence": evidence_doc,
-            "algorithm": "Ed25519", "signer_sha256": kp.signer_sha256,
-            "signature_hex": kp.sign_hex(evidence_bytes),
-        })
-    return reviews, reviewer_id, signed_envelopes
+        sig_hex = kp.sign_hex(canonical_json_bytes(review_body))
+        envelope = {
+            "format": "forex.signed-semantic-reason-review/1",
+            "step_id": sid,
+            "review": review_body,
+            "evidence": evidence_doc,
+            "algorithm": "Ed25519",
+            "signer_sha256": kp.signer_sha256,
+            "signature_hex": sig_hex,
+        }
+        reviews[sid] = envelope
+        signed_envelopes.append(envelope)
+    return reviews, kp.public_bytes, signed_envelopes
 
 
 def build_public_aggregate_bundle(
-    *, run_id: str, ceremony_seed: str, source_freeze_manifest_sha256: str,
+    *, run_id: str, source_freeze_manifest_sha256: str,
     custody_public_manifest_sha256: str, retained_evaluation_bundle_sha256: str,
     generation_attempts_spent: int, score_report: dict[str, Any],
+    redaction_keypair: Ed25519Keypair | None = None,
+    key_vault_dir: Path | str | None = None,
+    pinned_redaction_public_key: bytes | None = None,
     broad_failure_codes: list[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if redaction_keypair is not None:
+        kp = redaction_keypair
+    elif key_vault_dir is not None:
+        kp = load_ceremony_role_key(key_vault_dir, run_id=run_id, role="redaction_approver")
+    else:
+        raise RuntimeError("PINNED_REDACTION_KEY_REQUIRED: supply redaction_keypair or external key_vault_dir")
+
+    if kp.signer_sha256 in _forbidden_seed_signer_fingerprints(run_id=run_id):
+        raise RuntimeError("FORBIDDEN_SEED_DERIVED_KEY: deterministic seed-derived redaction_approver key rejected")
+
     accounted = 0
     for case in score_report.get("trajectories", []):
         for step in case.get("steps", []):
@@ -1218,16 +1749,23 @@ def build_public_aggregate_bundle(
         "all_mandatory_assertions_passed": all_passed,
         "retained_evaluation_bundle_sha256": retained_evaluation_bundle_sha256,
     }
-    approved_digest = canonical_sha256(body)
-    kp = Ed25519Keypair.derive(ceremony_seed=ceremony_seed, run_id=run_id, role="reviewer")
+    body_bytes = canonical_json_bytes(body)
+    approved_digest = sha256(body_bytes).hexdigest()
+    sig_hex = kp.sign_hex(body_bytes)
+    if pinned_redaction_public_key is not None:
+        exp_fp = sha256(pinned_redaction_public_key).hexdigest()
+        PureRFC8032Verifier(public_bytes=pinned_redaction_public_key, expected_fingerprint=exp_fp).verify(
+            signer_sha256=kp.signer_sha256,
+            message=body_bytes,
+            signature_hex=sig_hex,
+        )
     redaction_receipt = {
         "format": "forex.independent-redaction-approval/1", "run_id": run_id,
         "approved_public_body_sha256": approved_digest, "algorithm": "Ed25519",
-        "signer_sha256": kp.signer_sha256, "signature_hex": kp.sign_hex(canonical_json_bytes(body)),
+        "signer_sha256": kp.signer_sha256, "signature_hex": sig_hex,
     }
     redaction_sha = sha256(canonical_json_bytes(redaction_receipt)).hexdigest()
     return {**body, "independent_redaction_receipt_sha256": redaction_sha}, redaction_receipt
-
 
 def audit_counterpart_traps_with_valve_gate(
     adapted_suite: dict[str, Any], documents: dict[str, Any], *, valve_gate: Any, work_dir: Path,
@@ -1341,22 +1879,268 @@ def _sha256_file(path: Path) -> str:
             h.update(block)
     return h.hexdigest()
 
+def _raise_walk_error(err: OSError) -> None:
+    raise RuntimeError(f"Directory traversal failed during Stage B staging: {err}") from err
 
-def _materialize_regular_tree(src_dir: Path, dst_dir: Path) -> None:
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    for root, dirs, files in os.walk(src_dir, followlinks=True):
-        rel = Path(root).relative_to(src_dir)
-        target_root = dst_dir / rel
-        target_root.mkdir(parents=True, exist_ok=True)
-        for d in list(dirs):
-            p = Path(root) / d
-            if p.is_symlink() and not p.resolve().is_dir():
-                dirs.remove(d)
+
+def _is_executable_artifact(rel_path: Path, src_mode: int) -> bool:
+    name = rel_path.name
+    if rel_path.as_posix() in ("ollama/bin/ollama", "node/bin/node", "runtime/ollama/bin/ollama", "runtime/node/bin/node"):
+        return True
+    if name == "llama-server" or rel_path.suffix in (".sh", ".mjs", ".so") or ".so." in name:
+        return True
+    if os.name == "posix" and (src_mode & 0o111) != 0:
+        return True
+    return False
+
+
+def _validate_regular_source_tree(
+    src_dir: Path,
+) -> tuple[Path, tuple[int, int], dict[Path, tuple[int, int]], list[tuple[Path, int, int, bool]]]:
+    """Pre-scan source tree with followlinks=False + lstat, rejecting symlinks and non-regular files before any copy."""
+    if not os.path.lexists(src_dir):
+        raise RuntimeError(f"Stage B source tree missing: {src_dir}")
+    root_lstat = os.lstat(src_dir)
+    if _is_symlink_or_reparse(src_dir, root_lstat):
+        raise RuntimeError(f"Refusing symlink source root: {src_dir}")
+    if not stat.S_ISDIR(root_lstat.st_mode):
+        raise RuntimeError(f"Stage B source root is not a directory: {src_dir}")
+
+    canonical_src = src_dir.resolve(strict=True)
+    canon_stat = canonical_src.stat()
+    if (canon_stat.st_dev, canon_stat.st_ino) != (root_lstat.st_dev, root_lstat.st_ino):
+        raise RuntimeError(f"Source root identity changed during canonical resolution: {src_dir}")
+
+    dir_inodes: dict[Path, tuple[int, int]] = {Path("."): (root_lstat.st_dev, root_lstat.st_ino)}
+    file_entries: list[tuple[Path, int, int, bool]] = []
+
+    for root, dirs, files in os.walk(src_dir, topdown=True, followlinks=False, onerror=_raise_walk_error):
+        rp = Path(root)
+        r_st = os.lstat(rp)
+        if _is_symlink_or_reparse(rp, r_st) or not stat.S_ISDIR(r_st.st_mode):
+            raise RuntimeError(f"Refusing symlink or non-directory during walk: {rp}")
+        r_res = rp.resolve(strict=True)
+        if r_res != canonical_src and not r_res.is_relative_to(canonical_src):
+            raise RuntimeError(f"Directory escaped Stage B source root: {rp}")
+        rel_root = rp.relative_to(src_dir)
+        if ".." in rel_root.parts:
+            raise RuntimeError(f"Forbidden parent traversal in relative path: {rel_root}")
+        dir_inodes[rel_root] = (r_st.st_dev, r_st.st_ino)
+
+        dirs.sort()
+        files.sort()
+        for d in dirs:
+            dp = rp / d
+            d_st = os.lstat(dp)
+            if _is_symlink_or_reparse(dp, d_st):
+                raise RuntimeError(f"Refusing directory symlink in Stage B source tree: {dp}")
+            if not stat.S_ISDIR(d_st.st_mode):
+                raise RuntimeError(f"Refusing non-directory entry in Stage B source tree: {dp}")
+            d_res = dp.resolve(strict=True)
+            if not d_res.is_relative_to(canonical_src):
+                raise RuntimeError(f"Subdirectory escaped Stage B source root: {dp}")
+            d_res_st = d_res.stat()
+            if (d_res_st.st_dev, d_res_st.st_ino) != (d_st.st_dev, d_st.st_ino):
+                raise RuntimeError(f"Subdirectory inode mismatch under Stage B source root: {dp}")
+
         for fn in files:
-            src_f = (Path(root) / fn).resolve(strict=True)
-            if not stat.S_ISREG(src_f.stat().st_mode):
+            fp = rp / fn
+            f_st = os.lstat(fp)
+            if _is_symlink_or_reparse(fp, f_st):
+                raise RuntimeError(f"Refusing file symlink in Stage B source tree: {fp}")
+            if not stat.S_ISREG(f_st.st_mode):
+                raise RuntimeError(f"Refusing non-regular file in Stage B source tree: {fp}")
+            f_res = fp.resolve(strict=True)
+            if not f_res.is_relative_to(canonical_src):
+                raise RuntimeError(f"File escaped Stage B source root: {fp}")
+            f_res_st = f_res.stat()
+            if (f_res_st.st_dev, f_res_st.st_ino) != (f_st.st_dev, f_st.st_ino):
+                raise RuntimeError(f"File inode mismatch under Stage B source root: {fp}")
+            rel_fp = fp.relative_to(src_dir)
+            if ".." in rel_fp.parts:
+                raise RuntimeError(f"Forbidden parent traversal in file relative path: {rel_fp}")
+            file_entries.append((rel_fp, f_st.st_dev, f_st.st_ino, _is_executable_artifact(rel_fp, f_st.st_mode)))
+
+    return canonical_src, (root_lstat.st_dev, root_lstat.st_ino), dir_inodes, file_entries
+
+
+def _open_nofollow_beneath(
+    *,
+    canonical_src: Path,
+    src_root_fd: int | None,
+    rel_path: Path,
+    dir_inodes: dict[Path, tuple[int, int]],
+    expected_dev: int,
+    expected_ino: int,
+) -> int:
+    """Open regular file strictly beneath canonical_src with O_NOFOLLOW and verify fstat (st_dev, st_ino) + S_ISREG."""
+    full_path = canonical_src / rel_path
+    cur_lstat = os.lstat(full_path)
+    if _is_symlink_or_reparse(full_path, cur_lstat) or not stat.S_ISREG(cur_lstat.st_mode):
+        raise RuntimeError(f"Concurrent symlink or non-regular swap detected before open: {full_path}")
+    if (cur_lstat.st_dev, cur_lstat.st_ino) != (expected_dev, expected_ino):
+        raise RuntimeError(f"Concurrent source inode swap detected before open: {full_path}")
+
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+    if src_root_fd is not None and os.open in os.supports_dir_fd:
+        dir_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        opened_dirs: list[int] = []
+        parent_fd = src_root_fd
+        cur_rel = Path(".")
+        try:
+            for part in rel_path.parts[:-1]:
+                cur_rel = cur_rel / part
+                dfd = os.open(part, dir_flags, dir_fd=parent_fd)
+                opened_dirs.append(dfd)
+                dst = os.fstat(dfd)
+                if not stat.S_ISDIR(dst.st_mode) or (dst.st_dev, dst.st_ino) != dir_inodes[cur_rel]:
+                    raise RuntimeError(f"Concurrent directory swap detected at {canonical_src / cur_rel}")
+                parent_fd = dfd
+            fd = os.open(rel_path.parts[-1], file_flags, dir_fd=parent_fd)
+        finally:
+            for dfd in reversed(opened_dirs):
+                os.close(dfd)
+    else:
+        fd = os.open(full_path, file_flags)
+
+    try:
+        fd_st = os.fstat(fd)
+        if not stat.S_ISREG(fd_st.st_mode) or stat.S_ISLNK(fd_st.st_mode):
+            raise RuntimeError(f"Opened descriptor is not a regular file: {full_path}")
+        if (fd_st.st_dev, fd_st.st_ino) != (expected_dev, expected_ino):
+            raise RuntimeError(f"Opened descriptor inode mismatch (concurrent swap): {full_path}")
+        proc_fd_link = Path(f"/proc/self/fd/{fd}")
+        if sys.platform == "linux" and proc_fd_link.exists():
+            real_opened = Path(os.readlink(proc_fd_link))
+            if not real_opened.is_relative_to(canonical_src):
+                raise RuntimeError(f"Opened descriptor escaped Stage B source root: {real_opened}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _cleanup_partial_tree(target: Path) -> None:
+    if not os.path.lexists(target):
+        return
+    if os.name in ("posix", "nt"):
+        for r, _dirs, files in os.walk(target, topdown=True, followlinks=False):
+            rp = Path(r)
+            try:
+                apply_verified_directory_mode(rp, 0o700)
+            except (OSError, RuntimeError) as exc:
+                _logger.debug("Cleanup directory mode reset skipped on %s: %s", rp, exc)
+            for fn in files:
+                fp = rp / fn
+                try:
+                    apply_verified_regular_file_mode(fp, 0o600)
+                except (OSError, RuntimeError) as exc:
+                    _logger.debug("Cleanup file mode reset skipped on %s: %s", fp, exc)
+    shutil.rmtree(target, ignore_errors=True)
+
+
+def _materialize_regular_tree(
+    src_dir: Path,
+    dst_dir: Path,
+    *,
+    dir_mode: int = 0o550,
+    file_mode: int = 0o440,
+    exec_file_mode: int = 0o550,
+    _pre_open_hook: Callable[[Path], None] | None = None,
+) -> None:
+    """Materialize a verified symlink-free regular file tree with O_NOFOLLOW + fstat checks and least-privilege modes."""
+    if (dir_mode & 0o027) or (file_mode & 0o027) or (exec_file_mode & 0o027):
+        raise ValueError("Stage B tree materialization forbids world-accessible or group-writable modes")
+    src_path = Path(src_dir)
+    dst_path = Path(dst_dir)
+    if os.path.lexists(dst_path):
+        dst_st = os.lstat(dst_path)
+        if _is_symlink_or_reparse(dst_path, dst_st):
+            raise RuntimeError(f"Refusing symlink destination root: {dst_path}")
+        if not stat.S_ISDIR(dst_st.st_mode) or any(dst_path.iterdir()):
+            raise RuntimeError(f"Refusing pre-existing non-empty destination root: {dst_path}")
+
+    # Phase 1: Complete no-follow lstat + containment scan BEFORE creating any destination directory/file
+    canonical_src, root_ino, dir_inodes, file_entries = _validate_regular_source_tree(src_path)
+
+    # Phase 2: Descriptor-verified copy with O_NOFOLLOW + fstat == lstat and atomic cleanup on error
+    created_new_dst = not dst_path.exists()
+    src_root_fd: int | None = None
+    try:
+        if os.name == "posix" and os.open in os.supports_dir_fd:
+            root_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            src_root_fd = os.open(canonical_src, root_flags)
+            rf_st = os.fstat(src_root_fd)
+            if not stat.S_ISDIR(rf_st.st_mode) or (rf_st.st_dev, rf_st.st_ino) != root_ino:
+                raise RuntimeError("Source root inode changed before copy")
+
+        dst_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        apply_verified_directory_mode(dst_path, 0o700)
+        for rel_dir in sorted(dir_inodes.keys(), key=lambda p: len(p.parts)):
+            if rel_dir == Path("."):
                 continue
-            shutil.copy2(src_f, target_root / fn, follow_symlinks=True)
+            td = dst_path / rel_dir
+            td.mkdir(parents=True, exist_ok=True, mode=0o700)
+            apply_verified_directory_mode(td, 0o700)
+
+        wflags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
+        for rel_fp, exp_dev, exp_ino, is_exec in file_entries:
+            if _pre_open_hook is not None:
+                _pre_open_hook(canonical_src / rel_fp)
+            sfd = _open_nofollow_beneath(
+                canonical_src=canonical_src,
+                src_root_fd=src_root_fd,
+                rel_path=rel_fp,
+                dir_inodes=dir_inodes,
+                expected_dev=exp_dev,
+                expected_ino=exp_ino,
+            )
+            target_fp = dst_path / rel_fp
+            try:
+                dfd = os.open(target_fp, wflags, 0o600)
+                try:
+                    while True:
+                        chunk = os.read(sfd, 1048576)
+                        if not chunk:
+                            break
+                        view = memoryview(chunk)
+                        written = 0
+                        while written < len(view):
+                            written += os.write(dfd, view[written:])
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            finally:
+                os.close(sfd)
+            apply_verified_regular_file_mode(target_fp, exec_file_mode if is_exec else file_mode)
+
+        for rel_dir in sorted(dir_inodes.keys(), key=lambda p: len(p.parts), reverse=True):
+            td = dst_path if rel_dir == Path(".") else (dst_path / rel_dir)
+            apply_verified_directory_mode(td, dir_mode)
+    except BaseException:
+        if created_new_dst:
+            _cleanup_partial_tree(dst_path)
+        raise
+    finally:
+        if src_root_fd is not None:
+            os.close(src_root_fd)
 
 
 def prepare_guest_stageb_root(
@@ -1365,21 +2149,63 @@ def prepare_guest_stageb_root(
     seed: int = 20261115, instance_id: str = "i-0stagebceremony0001",
     security_group_id: str = "sg-0stagebceremony0001",
     automation_execution_id: str = "auto-stageb-ceremony-0001",
+    key_vault_dir: Path | str | None = None,
+    trust_roots_path: Path | str | None = None,
 ) -> dict[str, Any]:
     if sys.platform != "linux" or os.geteuid() != 0:
         raise RuntimeError("prepare_guest_stageb_root requires Linux guest root (uid 0)")
     if not re.fullmatch(r"fx-b-[a-f0-9]{16}", run_id):
         raise ValueError(f"Invalid Stage B run_id: {run_id}")
 
-    src_base = Path(existing_guest_root).resolve(strict=True)
+    raw_src_root = Path(existing_guest_root)
+    if not os.path.lexists(raw_src_root):
+        raise RuntimeError(f"Existing guest root does not exist: {raw_src_root}")
+    raw_src_st = os.lstat(raw_src_root)
+    if _is_symlink_or_reparse(raw_src_root, raw_src_st) or not stat.S_ISDIR(raw_src_st.st_mode):
+        raise RuntimeError(f"Refusing symlink or non-directory existing_guest_root: {raw_src_root}")
+    src_base = raw_src_root.resolve(strict=True)
+
     dst_base = Path(f"/opt/cas-forex/{run_id}")
-    if dst_base.exists():
+    if os.path.lexists(dst_base):
         raise RuntimeError(f"Stage B run root already exists: {dst_base}")
 
+    resolved_vault = Path(key_vault_dir) if key_vault_dir is not None else default_linux_key_vault_dir(run_id)
+    resolved_roots = Path(trust_roots_path) if trust_roots_path is not None else default_linux_trust_roots_path(run_id)
+    _assert_path_outside_bundle(resolved_vault, dst_base, label="key_vault_dir")
+    _assert_path_outside_bundle(resolved_roots, dst_base / "ceremony", label="trust_roots_path")
+    if _resolve_non_symlink_path(resolved_roots, label="trust_roots_path").is_relative_to(dst_base):
+        raise RuntimeError("trust_roots_path must reside outside the Stage B guest run root")
+
     for sub in ("source", "runtime", "models"):
-        _materialize_regular_tree(src_base / sub, dst_base / sub)
-    for extra in ("ceremony_live", "receipts"):
-        (dst_base / extra).mkdir(parents=True, mode=0o755)
+        _validate_regular_source_tree(src_base / sub)
+
+    stageb_gid = _ensure_stageb_reader_group(STAGEB_READER_GROUP)
+
+    dst_base.mkdir(parents=True, exist_ok=False, mode=0o700)
+    os.chown(dst_base, 0, stageb_gid)
+    for sub in ("source", "runtime", "models"):
+        _materialize_regular_tree(
+            src_base / sub,
+            dst_base / sub,
+            dir_mode=0o550,
+            file_mode=0o440,
+            exec_file_mode=0o550,
+        )
+
+    manifests_v2 = dst_base / "models/manifests-v2"
+    manifests_v2.mkdir(parents=True, exist_ok=True, mode=0o550)
+    os.chown(manifests_v2, 0, stageb_gid)
+    apply_verified_directory_mode(manifests_v2, 0o550)
+
+    ceremony_live = dst_base / "ceremony_live"
+    ceremony_live.mkdir(parents=True, exist_ok=True, mode=0o750)
+    os.chown(ceremony_live, 0, stageb_gid)
+    apply_verified_directory_mode(ceremony_live, 0o750)
+
+    receipts_dir = dst_base / "receipts"
+    receipts_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chown(receipts_dir, 0, 0)
+    apply_verified_directory_mode(receipts_dir, 0o700)
 
     ollama_bin = (dst_base / "runtime/ollama/bin/ollama").resolve(strict=True)
     llama_servers = sorted(
@@ -1391,16 +2217,20 @@ def prepare_guest_stageb_root(
     runner_bin = llama_servers[0]
     node_bin = (dst_base / "runtime/node/bin/node").resolve(strict=True)
 
-    for root_d, _, files in os.walk(dst_base):
-        rp = Path(root_d)
-        os.chown(rp, 0, 0)
-        apply_verified_directory_mode(rp)
-        for fn in files:
-            fp = rp / fn
-            os.chown(fp, 0, 0)
-            is_exec = (fp in (ollama_bin, runner_bin, node_bin)
-                       or fp.suffix in (".sh", ".mjs", ".so") or ".so." in fp.name)
-            os.chmod(fp, 0o555 if is_exec else 0o444)
+    for sub in ("source", "runtime", "models"):
+        for root_d, _, files in os.walk(dst_base / sub, topdown=False, followlinks=False):
+            rp = Path(root_d)
+            for fn in files:
+                fp = rp / fn
+                os.chown(fp, 0, stageb_gid)
+                is_exec = (
+                    fp in (ollama_bin, runner_bin, node_bin)
+                    or fp.suffix in (".sh", ".mjs", ".so")
+                    or ".so." in fp.name
+                )
+                apply_verified_regular_file_mode(fp, 0o550 if is_exec else 0o440)
+            os.chown(rp, 0, stageb_gid)
+            apply_verified_directory_mode(rp, 0o550)
 
     src_dir = dst_base / "source"
     src_manifest_files, all_files = [], []
@@ -1423,10 +2253,13 @@ def prepare_guest_stageb_root(
 
     def write_root_ro(path: Path, payload: Any) -> dict[str, Any]:
         raw = canonical_json_bytes(payload)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+        if os.path.lexists(path):
+            apply_verified_regular_file_mode(path, 0o600)
+            path.unlink()
         path.write_bytes(raw)
-        os.chown(path, 0, 0)
-        os.chmod(path, 0o444)
+        os.chown(path, 0, stageb_gid)
+        apply_verified_regular_file_mode(path, 0o440)
         return {"path": str(path), "bytes": len(raw), "sha256": sha256(raw).hexdigest()}
 
     ev_dir = dst_base / "ceremony/evidence"
@@ -1454,6 +2287,9 @@ def prepare_guest_stageb_root(
         t0_utc=utc_iso(t0_dt), bootstrap_started_utc=utc_iso(boot_dt),
         test_deadline_utc=utc_iso(test_end_dt), work_deadline_utc=utc_iso(work_end_dt),
         guest_base=f"{dst_base}/ceremony",
+        key_vault_dir=resolved_vault,
+        trust_roots_path=resolved_roots,
+        trust_roots_gid=stageb_gid,
     )
 
     pin_doc = json.loads((src_dir / "docs/operator/stage-b-runtime-pin.json").read_text(encoding="utf-8"))
@@ -1506,7 +2342,8 @@ def prepare_guest_stageb_root(
         "files": all_files, "role_files": role_files, "evidence": ev_refs,
         "selection_schema_path": "docs/contracts/stageb-ceremony-decision-selection.schema.json",
         "selection_schema_sha256": _sha256_file(src_dir / "docs/contracts/stageb-ceremony-decision-selection.schema.json"),
-        "ceremony_bundle_dir": str(dst_base / "ceremony"), "ceremony_seed": ceremony_seed,
+        "ceremony_bundle_dir": str(dst_base / "ceremony"),
+        "trust_roots_path": str(resolved_roots),
         "isolation": {
             "channel_id": f"chan-{run_id}",
             "issuer_binding_sha256": bundle_summary["issuer_binding_sha256"],
@@ -1518,7 +2355,7 @@ def prepare_guest_stageb_root(
     }
     cfg_ref = write_root_ro(dst_base / "stageb-guest-config.json", guest_cfg)
 
-    mint_owner_stageb_custody_bundle(
+    final_bundle = mint_owner_stageb_custody_bundle(
         dst_base / "ceremony", ceremony_seed=ceremony_seed, run_id=run_id,
         not_before_utc=utc_iso(nb_dt), window_seconds=5400,
         source_manifest_sha256=src_manifest_ref["sha256"],
@@ -1529,25 +2366,32 @@ def prepare_guest_stageb_root(
         t0_utc=utc_iso(t0_dt), bootstrap_started_utc=utc_iso(boot_dt),
         test_deadline_utc=utc_iso(test_end_dt), work_deadline_utc=utc_iso(work_end_dt),
         guest_base=f"{dst_base}/ceremony",
+        key_vault_dir=resolved_vault,
+        trust_roots_path=resolved_roots,
+        trust_roots_gid=stageb_gid,
     )
-    # Restore source_manifest & asset_manifest root perms alongside re-minted ceremony files
     write_root_ro(ev_dir / "source_manifest.json", {"format": "forex.source-manifest/1", "files": src_manifest_files})
     write_root_ro(ev_dir / "asset_manifest.json", {
         "format": "forex.asset-manifest/1", "runtime_lock_sha256": RUNTIME_LOCK_SHA256, "files": asset_files,
     })
-    for root_d, _, files in os.walk(dst_base / "ceremony"):
+    for root_d, _, files in os.walk(dst_base / "ceremony", topdown=False, followlinks=False):
         rp = Path(root_d)
-        os.chown(rp, 0, 0)
-        apply_verified_directory_mode(rp)
         for fn in files:
             fp = rp / fn
-            os.chown(fp, 0, 0)
-            os.chmod(fp, 0o444)
+            os.chown(fp, 0, stageb_gid)
+            apply_verified_regular_file_mode(fp, 0o440)
+        os.chown(rp, 0, stageb_gid)
+        apply_verified_directory_mode(rp, 0o550)
+    os.chown(dst_base, 0, stageb_gid)
+    apply_verified_directory_mode(dst_base, 0o550)
 
     return {
         "status": "PREPARED", "run_id": run_id, "guest_base": str(dst_base),
         "config_path": cfg_ref["path"], "config_sha256": cfg_ref["sha256"],
         "ceremony_bundle_dir": str(dst_base / "ceremony"),
+        "trust_roots_path": final_bundle["trust_roots_path"],
+        "key_vault_dir": final_bundle["key_vault_dir"],
+        "selection_content_sha256": final_bundle["selection_content_sha256"],
     }
 
 
@@ -1559,10 +2403,15 @@ def main(argv: list[str] | None = None) -> int:
     p_mint.add_argument("--run-id", default=DEFAULT_RUN_ID)
     p_mint.add_argument("--ceremony-seed", default=DEFAULT_CEREMONY_SEED)
     p_mint.add_argument("--not-before-utc", default="2026-11-15T00:00:00Z")
+    p_mint.add_argument("--key-vault-dir", type=Path, default=None)
+    p_mint.add_argument("--trust-roots", type=Path, default=None)
 
     p_ver = sub.add_parser("verify")
     p_ver.add_argument("--bundle-dir", type=Path, required=True)
     p_ver.add_argument("--source-root", type=Path, required=True)
+    p_ver.add_argument("--trust-roots", type=Path, required=True)
+    p_ver.add_argument("--expected-selection-sha256", default=None)
+    p_ver.add_argument("--expected-config-sha256", default=None)
     p_ver.add_argument("--require-pinned-cryptography", action="store_true")
 
     p_prep = sub.add_parser("prepare-guest")
@@ -1573,17 +2422,29 @@ def main(argv: list[str] | None = None) -> int:
     p_prep.add_argument("--instance-id", default="i-0stagebceremony0001")
     p_prep.add_argument("--security-group-id", default="sg-0stagebceremony0001")
     p_prep.add_argument("--automation-execution-id", default="auto-stageb-ceremony-0001")
+    p_prep.add_argument("--key-vault-dir", type=Path, default=None)
+    p_prep.add_argument("--trust-roots", type=Path, default=None)
 
     args = parser.parse_args(argv)
     if args.cmd == "mint":
         res = mint_owner_stageb_custody_bundle(
             args.output_dir, ceremony_seed=args.ceremony_seed,
-            run_id=args.run_id, not_before_utc=args.not_before_utc)
-        print(json.dumps({"status": "MINTED", "run_id": res["run_id"], "records_attested_count": res["records_attested_count"]}))
+            run_id=args.run_id, not_before_utc=args.not_before_utc,
+            key_vault_dir=args.key_vault_dir, trust_roots_path=args.trust_roots)
+        print(json.dumps({
+            "status": "MINTED",
+            "run_id": res["run_id"],
+            "records_attested_count": res["records_attested_count"],
+            "trust_roots_path": res["trust_roots_path"],
+            "key_vault_dir": res["key_vault_dir"],
+        }))
         return 0
     if args.cmd == "verify":
         print(json.dumps(verify_ceremony_authority_bundle(
             args.bundle_dir, source_root=args.source_root,
+            trust_roots_path=args.trust_roots,
+            expected_selection_sha256=args.expected_selection_sha256,
+            expected_config_sha256=args.expected_config_sha256,
             require_pinned_cryptography=args.require_pinned_cryptography)))
         return 0
     if args.cmd == "prepare-guest":
@@ -1591,10 +2452,10 @@ def main(argv: list[str] | None = None) -> int:
             existing_guest_root=args.existing_guest_root, run_id=args.run_id,
             ceremony_seed=args.ceremony_seed, seed=args.seed,
             instance_id=args.instance_id, security_group_id=args.security_group_id,
-            automation_execution_id=args.automation_execution_id)))
+            automation_execution_id=args.automation_execution_id,
+            key_vault_dir=args.key_vault_dir, trust_roots_path=args.trust_roots)))
         return 0
     return 1
-
 
 def build_stageb_selection_schema(suite_doc: dict[str, Any]) -> dict[str, Any]:
     """Build key-free 92-branch symmetric Hex-Target Stage B selection schema strictly from suite['trajectories']."""

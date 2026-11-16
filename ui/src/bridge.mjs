@@ -1,5 +1,5 @@
 /** Consumer of steward-owned docs/contracts/UI_TRANSPORT_V1.md. No HTTP adapter or auto-attachment. */
-import { decodeCockpit, assertSchema, freeze, decimalCoefficient, isUTCTimestamp, utcMicroseconds } from './wire.mjs';
+import { decodeCockpit, assertSchema, freeze, decimalCoefficient, isUTCTimestamp, utcMicroseconds, parseUniqueJSON } from './wire.mjs';
 import { canonicalJSON, decodeDecisionRead } from './decision-read.mjs';
 import { compareFenceReadback } from './control-observation.mjs';
 import { resolveCatalog } from './catalog.mjs';
@@ -43,6 +43,7 @@ function validateBoot(boot, schema) {
   require(boot.fence_generation === null || (Number.isSafeInteger(boot.fence_generation) && boot.fence_generation >= 0), 'Invalid transport generation.');
   require(boot.capabilities && ['pause', 'stop', 'resume_new_risk', 'resume_management', 'reviewed_close'].every((field) => typeof boot.capabilities[field] === 'boolean'), 'Invalid trusted capabilities.');
   require(hash(boot.decision_schema_sha256), 'Missing pinned decision schema hash.');
+  require(boot.session_epoch === undefined || boot.session_epoch === null || id(boot.session_epoch), 'Invalid bridge session epoch.');
   if (boot.fence_receipt !== null) {
     validateFence(boot.fence_receipt, boot.scope);
     require(boot.fence_receipt.applied && boot.fence_receipt.generation === boot.fence_generation, 'Boot fence/generation mismatch.');
@@ -95,7 +96,7 @@ export function inspectCommandRead(result, preview, schema) {
 }
 
 export class ScopedBridge {
-  #bridge = null; #generation = 0; #readGeneration = 0; #boundScope = null; #schema; #onChange; #newId; #monotonicNow;
+  #bridge = null; #generation = 0; #readGeneration = 0; #boundScope = null; #boundSessionEpoch = null; #schema; #onChange; #newId; #monotonicNow;
   boot = null; clock = null; projection = null; controls = []; close = null; closeHistory = []; issue = null;
   constructor({ cockpitSchema, onChange = () => {}, newId = () => `ui-${globalThis.crypto.randomUUID()}`, monotonicNow = () => globalThis.performance?.now?.() ?? null }) {
     this.#schema = cockpitSchema; this.#onChange = onChange; this.#newId = newId; this.#monotonicNow = monotonicNow;
@@ -112,12 +113,12 @@ export class ScopedBridge {
   async attach(bridge) {
     require(!this.attached, 'Detach the previous bridge before changing scope.');
     require(bridge && METHODS.every((method) => typeof bridge[method] === 'function'), 'Explicit scoped bridge methods are required.');
-    this.#bridge = bridge; this.#boundScope = null; this.#generation += 1;
+    this.#bridge = bridge; this.#boundScope = null; this.#boundSessionEpoch = null; this.#generation += 1;
     try { await this.refresh(); } catch (error) { this.detach(); throw error; }
     return this.snapshot();
   }
   detach() {
-    this.#generation += 1; this.#bridge = null; this.boot = null; this.clock = null; this.projection = null;
+    this.#generation += 1; this.#bridge = null; this.#boundSessionEpoch = null; this.boot = null; this.clock = null; this.projection = null;
     this.controls = this.controls.map((item) => ({ ...item, status: 'UNCONFIRMED', reason: 'Transport detached. Historical request identity retained; effect not re-observed.' }));
     if (this.close) this.close = { ...this.close, status: 'UNCONFIRMED', reason: 'Transport detached; no automatic resubmission.' };
     this.issue = 'Transport unavailable. Backend state is unobserved.'; this.#emit();
@@ -130,6 +131,10 @@ export class ScopedBridge {
       const receivedAt = this.#monotonicNow();
       if (this.#boundScope) require(equal(boot.scope, this.#boundScope), 'Bridge scope cannot change after attachment.');
       else this.#boundScope = boot.scope;
+      if (boot.session_epoch !== undefined && boot.session_epoch !== null) {
+        if (this.#boundSessionEpoch) require(boot.session_epoch === this.#boundSessionEpoch, 'Bridge session epoch rotated; prior prepared operations are invalid.');
+        else this.#boundSessionEpoch = boot.session_epoch;
+      }
       const projection = decodeCockpit(JSON.stringify(await bridge.readCockpit()), this.#schema); this.#active(generation);
       require(equal(projection.scope, boot.scope), 'Cockpit differs from attached scope.');
       if (readGeneration !== this.#readGeneration) return this.snapshot();
@@ -208,6 +213,7 @@ export class ScopedBridge {
     this.close = { ...this.close, status: 'CHECKING', reason: 'Checking current owner clock before submission.' }; this.#emit();
     try {
       const boot = validateBoot(await bridge.readBoot(), this.#schema); this.#active(generation);
+      if (this.#boundSessionEpoch !== null) require(boot.session_epoch === this.#boundSessionEpoch, 'Bridge session epoch rotated; review a fresh target.');
       require(equal(boot.scope, preview.scope) && boot.capabilities.reviewed_close && boot.request_time !== null && utcMicroseconds(boot.request_time) < utcMicroseconds(preview.expires_at), 'Close preview expired or owner scope changed. Review a fresh target.');
       this.close = { ...this.close, status: 'REQUESTING', reason: 'Close requested; no fill established.', submitted: true }; this.#emit();
       try {
@@ -240,7 +246,7 @@ export class ScopedBridge {
     require(anchor && Object.keys(anchor).length === fields.length && fields.every((field) => Object.hasOwn(anchor, field)) && id(anchor.anchor_id) && id(anchor.producer_id) && isUTCTimestamp(anchor.issued_at) && isUTCTimestamp(anchor.expires_at) && typeof anchor.reconciliation_confirmed === 'boolean', 'Trusted bridge anchor unavailable.');
     let current = validateBoot(await bridge.readBoot(), this.#schema); this.#active(generation);
     let receivedAt = this.#monotonicNow();
-    require(equal(current.scope, boot.scope) && current.decision_schema_sha256 === boot.decision_schema_sha256, 'Bridge identity changed during Review read.');
+    require(equal(current.scope, boot.scope) && current.decision_schema_sha256 === boot.decision_schema_sha256 && (boot.session_epoch ?? null) === (current.session_epoch ?? null), 'Bridge identity changed during Review read.');
     require(current.request_time !== null && utcMicroseconds(anchor.issued_at) <= utcMicroseconds(current.request_time) && utcMicroseconds(current.request_time) < utcMicroseconds(anchor.expires_at), 'Read anchor is not valid at the selected authoritative clock.');
     require(anchor.schema_sha256 === boot.decision_schema_sha256 && anchor.domain_sha256 === read.envelope.domain_digest, 'Read anchor schema/domain mismatch.');
     require(anchor.scope_sha256 === await sha256Bytes(new TextEncoder().encode(canonicalJSON(read.envelope.scope))) && anchor.cursor_sha256 === await sha256Bytes(new TextEncoder().encode(canonicalJSON(read.envelope.cursor))), 'Read anchor scope/cursor mismatch.'); this.#active(generation);
@@ -250,7 +256,7 @@ export class ScopedBridge {
     checkActive();
     if (catalog.requested_count && typeof bridge.resolveEvidence === 'function') {
       current = validateBoot(await bridge.readBoot(), this.#schema); receivedAt = this.#monotonicNow(); checkActive();
-      require(equal(current.scope, boot.scope) && current.decision_schema_sha256 === boot.decision_schema_sha256, 'Bridge identity changed during catalog inspection.');
+      require(equal(current.scope, boot.scope) && current.decision_schema_sha256 === boot.decision_schema_sha256 && (boot.session_epoch ?? null) === (current.session_epoch ?? null), 'Bridge identity changed during catalog inspection.');
       require(current.request_time !== null && utcMicroseconds(anchor.issued_at) <= utcMicroseconds(current.request_time) && utcMicroseconds(current.request_time) < utcMicroseconds(anchor.expires_at), 'Read anchor expired during catalog inspection.');
     }
     this.boot = current; this.#observeClock(current, receivedAt); this.#emit();
@@ -266,4 +272,45 @@ export class ScopedBridge {
     await verifyMarketStreamDigest(decoded, sha256Bytes); this.#active(generation);
     return copy(decoded);
   }
+}
+
+const LOOPBACK_HOSTS = Object.freeze(['127.0.0.1', '[::1]', '::1']);
+
+/** Create an authenticated loopback RPC adapter (Bearer header + same-origin cookie fallback). */
+export function createAuthenticatedLoopbackBridge({ baseUrl, authToken = null, fetchImpl = globalThis.fetch, maxBytes = 524288, maxReviewBytes = 1048576 }) {
+  const rootUrl = new URL(baseUrl);
+  require(['http:', 'https:'].includes(rootUrl.protocol) && LOOPBACK_HOSTS.includes(rootUrl.hostname), 'Loopback bridge requires a literal loopback origin.');
+  require(authToken === null || (typeof authToken === 'string' && authToken.trim().length >= 16 && !/[\r\n\0]/.test(authToken)), 'Invalid loopback auth token.');
+  const cleanToken = typeof authToken === 'string' ? authToken.trim() : null;
+  const authHeaders = (extra = {}) => (cleanToken ? { ...extra, Authorization: `Bearer ${cleanToken}` } : { ...extra });
+  const getText = async (path, limit = maxBytes) => {
+    const target = new URL(path, rootUrl.origin);
+    require(target.origin === rootUrl.origin, 'Cross-origin loopback RPC forbidden.');
+    const r = await fetchImpl(target, { method: 'GET', credentials: 'same-origin', cache: 'no-store', redirect: 'error', headers: authHeaders(), signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw new Error(`Loopback GET ${path} failed (${r.status}).`);
+    const raw = await r.text();
+    require(new TextEncoder().encode(raw).byteLength <= limit, 'Loopback response exceeds byte cap.');
+    return raw;
+  };
+  const postJSON = async (path, body, limit = maxBytes) => {
+    const target = new URL(path, rootUrl.origin);
+    require(target.origin === rootUrl.origin, 'Cross-origin loopback RPC forbidden.');
+    const r = await fetchImpl(target, { method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(body), signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw new Error(`Loopback RPC ${path} failed (${r.status}).`);
+    const raw = await r.text();
+    return parseUniqueJSON(raw, limit);
+  };
+  return Object.freeze({
+    readBoot: async () => parseUniqueJSON(await getText('/api/boot'), maxBytes),
+    readCockpit: async () => parseUniqueJSON(await getText('/api/cockpit'), maxBytes),
+    readDecisionRead: async () => parseUniqueJSON(await getText('/api/decision-read', maxReviewBytes), maxReviewBytes),
+    resolveEvidence: (input) => postJSON('/api/resolve-evidence', input),
+    prepareControl: (input) => postJSON('/api/prepare-control', input),
+    requestControl: (input) => postJSON('/api/request-control', input),
+    readControl: (input) => postJSON('/api/read-control', input),
+    prepareClose: (input) => postJSON('/api/prepare-close', input),
+    requestReviewedClose: (input) => postJSON('/api/request-reviewed-close', input),
+    readCommand: (command_id) => postJSON('/api/read-command', { command_id }),
+    readMarketStream: async () => getText('/api/market-stream', maxBytes),
+  });
 }

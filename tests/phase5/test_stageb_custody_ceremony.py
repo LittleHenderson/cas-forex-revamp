@@ -48,6 +48,7 @@ from ceremony_generator import (
     DEFAULT_CEREMONY_SEED,
     Ed25519Keypair,
     PureRFC8032Verifier,
+    _cleanup_partial_tree,
     audit_counterpart_traps_with_valve_gate,
     build_public_aggregate_bundle,
     build_semantic_reviews_for_attempts,
@@ -227,6 +228,8 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
         cls._tmp = tempfile.TemporaryDirectory(dir=tmp_base, ignore_cleanup_errors=True)
         cls.tmp_root = Path(cls._tmp.name).resolve()
         cls.bundle_dir = cls.tmp_root / "ceremony_bundle"
+        cls.key_vault_dir = cls.tmp_root / "ceremony_key_vault"
+        cls.trust_roots_path = cls.tmp_root / "trust_roots.json"
         cls.run_id = "fx-b-202611150000c501"
         cls.build_id = "phase5-ceremony-build-01"
         cls.t0 = datetime(2026, 11, 15, 10, 0, 0, tzinfo=timezone.utc)
@@ -247,6 +250,15 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
             test_deadline_utc="2026-11-15T10:20:00Z",
             work_deadline_utc="2026-11-15T12:00:00Z",
             guest_base=cls.guest_base,
+            key_vault_dir=cls.key_vault_dir,
+            trust_roots_path=cls.trust_roots_path,
+        )
+        cls.trust_roots = load_json(cls.trust_roots_path.read_bytes())
+        cls.pinned_reviewer_pub = bytes.fromhex(
+            cls.trust_roots["roles"]["semantic_reviewer"]["public_key_hex"]
+        )
+        cls.pinned_redaction_pub = bytes.fromhex(
+            cls.trust_roots["roles"]["redaction_approver"]["public_key_hex"]
         )
         cls.docs = {
             name: load_json((cls.bundle_dir / "custody_sealed" / f"{name}.json").read_bytes())
@@ -259,6 +271,7 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         import gc
         gc.collect()
+        _cleanup_partial_tree(cls.tmp_root)
         cls._tmp.cleanup()
 
     def test_01_rfc8032_ed25519_vectors_and_tamper_rejection(self) -> None:
@@ -276,7 +289,7 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
         bad_sig[0] ^= 0x01
         self.assertFalse(rfc8032_verify(pk1_expected, b"", bytes(bad_sig)))
 
-        kp = Ed25519Keypair.derive(ceremony_seed=DEFAULT_CEREMONY_SEED, run_id=self.run_id, role="issuer")
+        kp = Ed25519Keypair.generate("custody_issuer")
         verifier = PureRFC8032Verifier(public_bytes=kp.public_bytes, expected_fingerprint=kp.signer_sha256)
         sig_hex = kp.sign_hex(b"stageb-custody-message")
         verifier.verify(signer_sha256=kp.signer_sha256, message=b"stageb-custody-message", signature_hex=sig_hex)
@@ -313,6 +326,7 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
         res = verify_ceremony_authority_bundle(
             self.bundle_dir,
             source_root=ROOT,
+            trust_roots_path=self.trust_roots_path,
             now=self.t0 + timedelta(minutes=5),
             require_pinned_cryptography=False,
         )
@@ -330,6 +344,7 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
             verify_ceremony_authority_bundle(
                 bad_dir,
                 source_root=ROOT,
+                trust_roots_path=self.trust_roots_path,
                 now=self.t0 + timedelta(minutes=5),
                 require_pinned_cryptography=False,
             )
@@ -339,6 +354,7 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
         gate_res = require_ceremony_release_enabled(
             bundle_dir=self.bundle_dir,
             source_root=ROOT,
+            trust_roots_path=self.trust_roots_path,
             now=self.t0 + timedelta(minutes=5),
             require_pinned_cryptography=False,
         )
@@ -347,6 +363,7 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
             require_ceremony_release_enabled(
                 bundle_dir=self.bundle_dir,
                 source_root=ROOT,
+                trust_roots_path=self.trust_roots_path,
                 now=self.t_exp + timedelta(minutes=1),
                 require_pinned_cryptography=False,
             )
@@ -428,7 +445,7 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
             model_window_record=model_win,
             live_dir=live_dir,
             guest_live_prefix=str(live_dir).replace("\\", "/"),
-            ceremony_seed=DEFAULT_CEREMONY_SEED,
+            key_vault_dir=self.key_vault_dir,
             observed_at=self.t0 + timedelta(minutes=2),
             expires_at=self.t0 + timedelta(minutes=62),
             source_root=ROOT,
@@ -458,7 +475,7 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
             model_window_record=model_win,
             live_dir=live_dir,
             guest_live_prefix=str(live_dir).replace("\\", "/"),
-            ceremony_seed=DEFAULT_CEREMONY_SEED,
+            key_vault_dir=self.key_vault_dir,
             observed_at=self.t0 + timedelta(minutes=2),
             expires_at=self.t0 + timedelta(minutes=62),
             source_root=ROOT,
@@ -552,11 +569,12 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
             )
         self.assertEqual(len(attempts), 30)
         reader = AttemptReader(root=run_root, controller_journal=ctrl_journal, model_reader=adapter.read_source)
-        sem_reviews, trusted_rev_id, sem_envelopes = build_semantic_reviews_for_attempts(
+        sem_reviews, reviewer_pub_bytes, sem_envelopes = build_semantic_reviews_for_attempts(
             attempts,
-            ceremony_seed=DEFAULT_CEREMONY_SEED,
             run_id=self.run_id,
+            key_vault_dir=self.key_vault_dir,
         )
+        self.assertEqual(reviewer_pub_bytes, self.pinned_reviewer_pub)
         self.assertEqual(len(sem_envelopes), 30)
         report = score_suite(
             suite,
@@ -564,19 +582,20 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
             attempts,
             verify_attempt=reader,
             semantic_reviews=sem_reviews,
-            trusted_reviewer_id=trusted_rev_id,
+            pinned_reviewer_public_key=self.pinned_reviewer_pub,
         )
         self.assertEqual(report["status"], "PASS", msg=json.dumps(report, indent=2)[:2500])
 
         from cas_forex_revamp.composition.custody_protocol import public_aggregate
         pub_agg, redaction_rec = build_public_aggregate_bundle(
             run_id=self.run_id,
-            ceremony_seed=DEFAULT_CEREMONY_SEED,
             source_freeze_manifest_sha256=self.source_manifest_sha,
             custody_public_manifest_sha256=self.minted["evidence_references"]["custody_public_manifest"]["sha256"],
             retained_evaluation_bundle_sha256=content_digest(report),
             generation_attempts_spent=32,
             score_report=report,
+            key_vault_dir=self.key_vault_dir,
+            pinned_redaction_public_key=self.pinned_redaction_pub,
         )
         validated_pub = public_aggregate(
             pub_agg,
@@ -756,18 +775,19 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
                 now=clock_sp(),
             )
         reader_sp = AttemptReader(root=run_root_sp, controller_journal=ctrl_journal_sp, model_reader=adapter_sp.read_source)
-        sem_reviews_sp, trusted_rev_sp, _ = build_semantic_reviews_for_attempts(
+        sem_reviews_sp, rev_pub_sp, _ = build_semantic_reviews_for_attempts(
             attempts_sp,
-            ceremony_seed=DEFAULT_CEREMONY_SEED,
             run_id=self.run_id,
+            key_vault_dir=self.key_vault_dir,
         )
+        self.assertEqual(rev_pub_sp, self.pinned_reviewer_pub)
         report_sp = score_suite(
             suite_sp,
             deepcopy(self.docs["keys"]),
             attempts_sp,
             verify_attempt=reader_sp,
             semantic_reviews=sem_reviews_sp,
-            trusted_reviewer_id=trusted_rev_sp,
+            pinned_reviewer_public_key=self.pinned_reviewer_pub,
         )
         self.assertEqual(report_sp["status"], "PASS", msg=json.dumps(report_sp, indent=2)[:2500])
 
@@ -1026,8 +1046,8 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
 
         obs_src = (ROOT / "external_stageb_ceremony_observer.py").read_text(encoding="utf-8")
         self.assertIn("os.setns(_ns.fileno(), getattr(os, 'CLONE_NEWNS', 0x00020000))", obs_src)
-        self.assertLess(obs_src.index("os.setns("), obs_src.index("os.setgroups([])"))
-        self.assertLess(obs_src.index("os.setgroups([])"), obs_src.index("confine(cfg['policy']"))
+        self.assertLess(obs_src.index("os.setns("), obs_src.index("os.setgroups(cfg.get('groups', []))"))
+        self.assertLess(obs_src.index("os.setgroups(cfg.get('groups', []))"), obs_src.index("confine(cfg['policy']"))
         self.assertIn('unit_state_dir = Path(cfg["state_directory"])', obs_src)
         self.assertIn('state_name = Path(cfg["state_directory"]).name', obs_src)
 

@@ -72,16 +72,30 @@ from .faults import FaultSchedule
 from .fixtures import VenueScenario
 from .sqlite_venue import JournalCheckpoint, PRICE_QUANTUM, SQLiteVenue, VenueStorageError
 from .live_market_stream import (
+    ALLOWED_PUBLIC_FEED_HOSTS,
+    DEFAULT_MAX_REFERENCE_AGE_DAYS,
     DIRECT_KRAKEN_FX_PAIRS,
     EXPANDED_FX_PAIRS,
     EXPANDED_PAIR_SPECS,
     ExpandedPublicLiveFxFeedClient,
     LiveCandleAggregator,
     MarketStreamEnvelope,
+    NoRedirectHandler as _StreamNoRedirectHandler,
     OhlcCandleBar,
+    PAIR_MAX_REFERENCE_DEVIATION_BPS,
+    PAIR_MAX_SPREAD_BPS,
+    PINNED_PUBLIC_FEED_HOST_PATHS,
     PairMarketStream,
-    build_signed_market_stream_envelope,
+    PinnedPublicHTTPSHandler,
+    _resolve_pair_limits,
+    build_digest_market_stream_envelope,
+    build_market_stream_envelope,
+    build_pinned_public_opener,
     parse_ecb_g10_reference,
+    validate_market_stream_for_venue,
+    validate_pinned_public_feed_url as _validate_stream_public_feed_url,
+    validate_reference_date_freshness,
+    verify_public_ip_address,
 )
 
 KRAKEN_PUBLIC_TICKER_URL = "https://api.kraken.com/0/public/Ticker?pair=EURUSD,GBPUSD,USDJPY"
@@ -275,11 +289,14 @@ class LiveFeedVerificationError(ContractError):
     """Raised when live or captured external FX feed data fails schema, spread, or SHA-256 checks."""
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Hard-refuses HTTP redirects so requests never hop hosts or leak headers."""
+class NoRedirectHandler(_StreamNoRedirectHandler):
+    """Hard-refuses every HTTP 3xx redirect so requests never hop hosts or leak headers."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise PaperBrokerTransportError(f"HTTP redirect ({code}) refused on external broker/feed transport")
+    def __init__(self, error_cls: type[ContractError] = LiveFeedVerificationError) -> None:
+        super().__init__(error_cls=error_cls)
+
+
+_NoRedirectHandler = NoRedirectHandler
 
 
 class _RedactedSecret:
@@ -430,25 +447,39 @@ def _parse_external_wire_json(raw_bytes: bytes, *, label: str) -> Any:
         raise LiveFeedVerificationError(f"{label}: malformed JSON wire payload") from exc
 
 
-def _validate_https_public_url(url: str, *, label: str) -> str:
-    if not isinstance(url, str) or not url.strip():
-        raise ContractError(f"{label} must be a non-empty HTTPS URL")
-    parsed = urllib.parse.urlsplit(url.strip())
-    host = (parsed.hostname or "").lower()
-    if any(tok in host for tok in _FORBIDDEN_LIVE_HOST_TOKENS):
-        raise LiveBrokerEndpointForbiddenError(f"live trading endpoint host {host!r} is strictly forbidden")
-    if parsed.scheme != "https" or not host:
-        raise ContractError(f"{label} requires an explicit https:// hostname URL")
-    if parsed.username or parsed.password or parsed.fragment:
-        raise ContractError(f"{label} must not embed credentials or URL fragments")
-    return url.strip()
+_ECB_REFERENCE_ALLOWED_HOSTS: frozenset[str] = frozenset({
+    "www.ecb.europa.eu",
+    "data-api.ecb.europa.eu",
+    "api.frankfurter.app",
+    "api.frankfurter.dev",
+})
+_KRAKEN_TICKER_ALLOWED_HOSTS: frozenset[str] = frozenset({"api.kraken.com"})
+_KRAKEN_TICKER_ALLOWED_PATHS: dict[str, frozenset[str]] = {
+    "api.kraken.com": frozenset({"/0/public/Ticker"}),
+}
+
+
+def validate_pinned_public_feed_url(
+    url: str,
+    *,
+    label: str = "feed_url",
+    allowed_hosts: frozenset[str] | None = None,
+    allowed_paths_override: Mapping[str, frozenset[str]] | None = None,
+) -> str:
+    """Enforce exact HTTPS, port 443, zero userinfo, no IP literals, and exact host+path allowlist."""
+    return _validate_stream_public_feed_url(
+        url,
+        label=label,
+        allowed_hosts=allowed_hosts if allowed_hosts is not None else ALLOWED_PUBLIC_FEED_HOSTS,
+        allowed_paths_override=allowed_paths_override,
+        allow_yahoo_chart=False,
+        live_host_error_cls=LiveBrokerEndpointForbiddenError,
+    )
 
 
 def _default_https_get(url: str, timeout_seconds: float, max_bytes: int) -> bytes:
-    validated_url = _validate_https_public_url(url, label="feed_url")
-    ctx = ssl.create_default_context()
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+    validated_url = validate_pinned_public_feed_url(url, label="feed_url")
+    opener = build_pinned_public_opener(error_cls=LiveFeedVerificationError)
     req = urllib.request.Request(
         validated_url,
         method="GET",
@@ -460,12 +491,22 @@ def _default_https_get(url: str, timeout_seconds: float, max_bytes: int) -> byte
     try:
         with opener.open(req, timeout=timeout_seconds) as resp:
             status = getattr(resp, "status", 200)
+            if 300 <= int(status) < 400:
+                raise LiveFeedVerificationError(f"HTTP redirect ({status}) refused on pinned public FX feed")
             if status != 200:
                 raise LiveFeedVerificationError(f"unexpected HTTP status {status} from public feed")
             body = resp.read(max_bytes + 1)
+    except LiveBrokerEndpointForbiddenError:
+        raise
+    except LiveFeedVerificationError:
+        raise
+    except ContractError as exc:
+        raise LiveFeedVerificationError(str(exc)) from None
     except urllib.error.HTTPError as exc:
         raise LiveFeedVerificationError(f"public feed HTTP error {exc.code}") from None
     except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+        if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, ContractError):
+            raise LiveFeedVerificationError(str(exc.reason)) from None
         raise LiveFeedVerificationError(f"public feed transport failure: {type(exc).__name__}") from None
     if len(body) == 0:
         raise LiveFeedVerificationError("empty response body from public feed")
@@ -508,7 +549,11 @@ class EcbReferenceCrossCheck:
     verified: bool
 
     def __post_init__(self) -> None:
-        _validate_https_public_url(self.source_url, label="ecb_source_url")
+        validate_pinned_public_feed_url(
+            self.source_url,
+            label="ecb_source_url",
+            allowed_hosts=_ECB_REFERENCE_ALLOWED_HOSTS,
+        )
         if not isinstance(self.reference_date, str) or not _DATE_RE.fullmatch(self.reference_date):
             raise ContractError("ECB reference_date must be YYYY-MM-DD")
         utc_time(self.fetched_at_utc, "ecb fetched_at_utc")
@@ -933,7 +978,15 @@ class LiveFxFeedSnapshot:
             raise ContractError("unsupported live FX snapshot schema_version")
         identifier(self.snapshot_id, "snapshot_id")
         identifier(self.provider, "provider")
-        _validate_https_public_url(self.source_url, label="source_url")
+        if self.provider == "oanda-fxpractice-v3-pricing":
+            OandaPracticePaperClient.validate_practice_url(self.source_url)
+        else:
+            validate_pinned_public_feed_url(
+                self.source_url,
+                label="source_url",
+                allowed_hosts=_KRAKEN_TICKER_ALLOWED_HOSTS,
+                allowed_paths_override=_KRAKEN_TICKER_ALLOWED_PATHS,
+            )
         utc_time(self.fetched_at_utc, "fetched_at_utc")
         _ns_string(self.fetched_at_ns, "fetched_at_ns")
         digest(self.raw_wire_sha256, "raw_wire_sha256")
@@ -943,7 +996,7 @@ class LiveFxFeedSnapshot:
             raise ContractError("LiveFxFeedSnapshot requires at least one verified LiveFxQuote")
         digest(self.canonical_payload_sha256, "canonical_payload_sha256")
 
-    def _unsigned_body_dict(self) -> dict[str, Any]:
+    def _body_without_digest_dict(self) -> dict[str, Any]:
         body = {
             "schema_version": self.schema_version,
             "snapshot_id": self.snapshot_id,
@@ -963,7 +1016,7 @@ class LiveFxFeedSnapshot:
         return body
 
     def to_wire_dict(self) -> dict[str, Any]:
-        body = self._unsigned_body_dict()
+        body = self._body_without_digest_dict()
         body["canonical_payload_sha256"] = self.canonical_payload_sha256
         assert_safe_json_numbers(body)
         return body
@@ -1003,7 +1056,7 @@ class LiveFxFeedSnapshot:
             )
             subset_refs = {k: parsed_refs[k] for k in self.ecb_cross_check.reference_rates if k in parsed_refs}
             if parsed_date != self.ecb_cross_check.reference_date or subset_refs != self.ecb_cross_check.reference_rates:
-                raise LiveFeedVerificationError("ECB reference rates differ from signed ECB wire payload")
+                raise LiveFeedVerificationError("ECB reference rates differ from captured ECB wire payload")
             ref_rates = subset_refs
             max_ref_dev = self.ecb_cross_check.max_allowed_deviation_bps
 
@@ -1027,7 +1080,7 @@ class LiveFxFeedSnapshot:
                     rq.spread_bps,
                     rq.source_pair_key,
                 ):
-                    raise LiveFeedVerificationError(f"stored quote for {sym} differs from signed Kraken wire bytes")
+                    raise LiveFeedVerificationError(f"stored quote for {sym} differs from captured Kraken wire bytes")
         elif self.provider == "oanda-fxpractice-v3-pricing":
             reparsed = _parse_oanda_pricing_bytes(
                 raw_bytes,
@@ -1039,11 +1092,11 @@ class LiveFxFeedSnapshot:
             for sym, q in self.quotes.items():
                 rq = reparsed[sym]
                 if (q.bid, q.ask, q.mid, q.spread, q.spread_bps) != (rq.bid, rq.ask, rq.mid, rq.spread, rq.spread_bps):
-                    raise LiveFeedVerificationError(f"stored quote for {sym} differs from signed OANDA practice bytes")
+                    raise LiveFeedVerificationError(f"stored quote for {sym} differs from captured OANDA practice bytes")
         else:
             raise LiveFeedVerificationError(f"unknown feed provider {self.provider!r}")
 
-        expected_digest = content_digest(self._unsigned_body_dict())
+        expected_digest = content_digest(self._body_without_digest_dict())
         if expected_digest != self.canonical_payload_sha256:
             raise LiveFeedVerificationError("canonical_payload_sha256 mismatch")
         strict_safe_json_loads(self.to_canonical_bytes())
@@ -1212,7 +1265,7 @@ def _assemble_snapshot(
         ecb_cross_check=ecb_cross_check,
         canonical_payload_sha256="0" * 64,
     )
-    payload_sha = content_digest(temp._unsigned_body_dict())
+    payload_sha = content_digest(temp._body_without_digest_dict())
     final = LiveFxFeedSnapshot(
         schema_version=temp.schema_version,
         snapshot_id=temp.snapshot_id,
@@ -1244,16 +1297,29 @@ class PublicLiveFxFeedClient:
         cross_check_ecb: bool = True,
         max_spread_bps: Decimal = Decimal("500"),
         max_reference_deviation_bps: Decimal = Decimal("500"),
+        max_reference_age_days: int = DEFAULT_MAX_REFERENCE_AGE_DAYS,
         timeout_seconds: float = 10.0,
         max_wire_bytes: int = MAX_WIRE_RESPONSE_BYTES,
         transport: Callable[[str, float, int], bytes] | None = None,
     ) -> None:
-        self.kraken_ticker_url = _validate_https_public_url(kraken_ticker_url, label="kraken_ticker_url")
+        self.kraken_ticker_url = validate_pinned_public_feed_url(
+            kraken_ticker_url,
+            label="kraken_ticker_url",
+            allowed_hosts=_KRAKEN_TICKER_ALLOWED_HOSTS,
+            allowed_paths_override=_KRAKEN_TICKER_ALLOWED_PATHS,
+        )
         if type(ecb_reference_urls) is not tuple or (cross_check_ecb and not ecb_reference_urls):
             raise ContractError("ecb_reference_urls must be a non-empty tuple when cross_check_ecb=True")
+        validated_ecb_urls: list[str] = []
         for url in ecb_reference_urls:
-            _validate_https_public_url(url, label="ecb_reference_url")
-        self.ecb_reference_urls = ecb_reference_urls
+            validated_ecb_urls.append(
+                validate_pinned_public_feed_url(
+                    url,
+                    label="ecb_reference_url",
+                    allowed_hosts=_ECB_REFERENCE_ALLOWED_HOSTS,
+                )
+            )
+        self.ecb_reference_urls = tuple(validated_ecb_urls)
         if type(cross_check_ecb) is not bool:
             raise ContractError("cross_check_ecb must be bool")
         self.cross_check_ecb = cross_check_ecb
@@ -1261,6 +1327,8 @@ class PublicLiveFxFeedClient:
         self.max_reference_deviation_bps = decimal_value(
             max_reference_deviation_bps, "max_reference_deviation_bps", positive=True
         )
+        integer(max_reference_age_days, "max_reference_age_days", minimum=0)
+        self.max_reference_age_days = max_reference_age_days
         if timeout_seconds <= 0 or timeout_seconds > 60:
             raise ContractError("timeout_seconds must be in (0, 60]")
         self.timeout_seconds = float(timeout_seconds)
@@ -1278,6 +1346,11 @@ class PublicLiveFxFeedClient:
                 ecb_ns = str(time.time_ns()) if now_dt is None else str(int(now_dt.timestamp() * 1_000_000) * 1000)
                 ecb_dt = datetime.now(timezone.utc) if now_dt is None else utc_time(now_dt, "now")
                 ref_date, ref_rates = _parse_ecb_reference_bytes(raw_ecb)
+                validate_reference_date_freshness(
+                    ref_date,
+                    observed_at=ecb_dt,
+                    max_reference_age_days=self.max_reference_age_days,
+                )
                 return url, raw_ecb, ecb_dt, ecb_ns, ref_date, ref_rates
             except Exception as exc:
                 last_err = exc
@@ -1542,7 +1615,7 @@ class OandaPracticePaperClient:
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             opener = urllib.request.build_opener(
                 urllib.request.HTTPSHandler(context=ctx),
-                _NoRedirectHandler(),
+                NoRedirectHandler(error_cls=PaperBrokerTransportError),
             )
             req = urllib.request.Request(full_url, data=body_bytes, headers=headers, method=method)
             try:
@@ -1728,6 +1801,9 @@ class SealedLiveFeedPaperVenue:
         minimum_sequence: int = 0,
         checkpoint_anchor: JournalCheckpoint | None = None,
         paper_broker: OandaPracticePaperClient | None = None,
+        max_reference_age_days: int = DEFAULT_MAX_REFERENCE_AGE_DAYS,
+        max_reference_deviation_bps: Decimal | Mapping[str, Decimal] | None = None,
+        max_spread_bps: Decimal | Mapping[str, Decimal] | None = None,
     ) -> None:
         self._venue = SQLiteVenue(
             path,
@@ -1746,6 +1822,18 @@ class SealedLiveFeedPaperVenue:
             raise ContractError("use a dedicated *.broker_audit.sqlite3 path distinct from *.venue.sqlite3")
         if paper_broker is not None and not isinstance(paper_broker, OandaPracticePaperClient):
             raise ContractError("paper_broker must be OandaPracticePaperClient or None")
+        integer(max_reference_age_days, "max_reference_age_days", minimum=0)
+        self.max_reference_age_days = max_reference_age_days
+        self.pair_max_reference_deviation_bps = _resolve_pair_limits(
+            max_reference_deviation_bps,
+            PAIR_MAX_REFERENCE_DEVIATION_BPS,
+            label="max_reference_deviation_bps",
+        )
+        self.pair_max_spread_bps = _resolve_pair_limits(
+            max_spread_bps,
+            PAIR_MAX_SPREAD_BPS,
+            label="max_spread_bps",
+        )
         self.paper_broker = paper_broker
 
     @property
@@ -2088,6 +2176,25 @@ class SealedLiveFeedPaperVenue:
 
         base_now = feed_snapshot.fetched_at_utc if now is None else utc_time(now, "now")
         current_snap = self._venue.snapshot(key, now=base_now)
+        self.inspect_audit_journal(key)
+
+        staged_observations: list[MarketObservation] = []
+        for idx, inst in enumerate(matching_instruments):
+            tick_time = base_now + timedelta(microseconds=idx)
+            next_seq = current_snap.sequence + idx + 1
+            staged_observations.append(
+                feed_snapshot.to_market_observation(
+                    inst.symbol.upper(),
+                    key=key,
+                    instrument_id=inst.instrument_id,
+                    sequence=next_seq,
+                    price_tick=inst.price_tick,
+                    observed_at=tick_time,
+                    available_at=tick_time,
+                    event_id=f"live-{inst.instrument_id.lower()}-{feed_snapshot.raw_wire_sha256[:10]}-{next_seq}",
+                    align_to_tick=align_to_tick,
+                )
+            )
 
         self._append_audit(
             "SEALED_FEED_SNAPSHOT_VERIFIED",
@@ -2109,19 +2216,23 @@ class SealedLiveFeedPaperVenue:
         )
 
         latest_snap = current_snap
-        for idx, inst in enumerate(matching_instruments):
+        for idx, (inst, prechecked) in enumerate(zip(matching_instruments, staged_observations)):
             tick_time = base_now + timedelta(microseconds=idx)
             next_seq = latest_snap.sequence + 1
-            obs = feed_snapshot.to_market_observation(
-                inst.symbol.upper(),
-                key=key,
-                instrument_id=inst.instrument_id,
-                sequence=next_seq,
-                price_tick=inst.price_tick,
-                observed_at=tick_time,
-                available_at=tick_time,
-                event_id=f"live-{inst.instrument_id.lower()}-{feed_snapshot.raw_wire_sha256[:10]}-{next_seq}",
-                align_to_tick=align_to_tick,
+            obs = (
+                prechecked
+                if prechecked.sequence == next_seq
+                else feed_snapshot.to_market_observation(
+                    inst.symbol.upper(),
+                    key=key,
+                    instrument_id=inst.instrument_id,
+                    sequence=next_seq,
+                    price_tick=inst.price_tick,
+                    observed_at=tick_time,
+                    available_at=tick_time,
+                    event_id=f"live-{inst.instrument_id.lower()}-{feed_snapshot.raw_wire_sha256[:10]}-{next_seq}",
+                    align_to_tick=align_to_tick,
+                )
             )
             latest_snap = self.advance_market(obs)
         return latest_snap
@@ -2164,31 +2275,68 @@ class SealedLiveFeedPaperVenue:
         key: AccountRunKey,
         symbols: tuple[str, ...] | None = None,
         now: datetime | None = None,
+        max_reference_age_days: int | None = None,
+        max_reference_deviation_bps: Decimal | Mapping[str, Decimal] | None = None,
+        max_spread_bps: Decimal | Mapping[str, Decimal] | None = None,
     ) -> VenueSnapshot:
         """Ingest a verified 16-pair MarketStreamEnvelope into registered venue instruments and retain read-only stream."""
         if not isinstance(envelope, MarketStreamEnvelope):
             raise ContractError("ingest_market_stream requires MarketStreamEnvelope")
-        self._retained_market_stream = envelope
         obs_time = utc_time(now, "now") if now is not None else envelope.observed_at
+        effective_max_age = self.max_reference_age_days if max_reference_age_days is None else max_reference_age_days
+        effective_dev_limits = (
+            self.pair_max_reference_deviation_bps
+            if max_reference_deviation_bps is None
+            else _resolve_pair_limits(
+                max_reference_deviation_bps,
+                self.pair_max_reference_deviation_bps,
+                label="max_reference_deviation_bps",
+            )
+        )
+        effective_spread_limits = (
+            self.pair_max_spread_bps
+            if max_spread_bps is None
+            else _resolve_pair_limits(
+                max_spread_bps,
+                self.pair_max_spread_bps,
+                label="max_spread_bps",
+            )
+        )
+        validate_market_stream_for_venue(
+            envelope,
+            now=obs_time,
+            max_reference_age_days=effective_max_age,
+            max_reference_deviation_bps=effective_dev_limits,
+            max_spread_bps=effective_spread_limits,
+        )
+
+        self.inspect_audit_journal(key)
+        cur_snap = self._venue.snapshot(key, now=obs_time)
         registered = self._registered_instruments()
         by_symbol = {inst.symbol: inst for inst in registered}
         wanted = set(symbols) if symbols is not None else set(by_symbol.keys())
-        latest_snap: VenueSnapshot | None = None
         pmap = envelope.pair_map()
+
+        staged_ticks: list[tuple[Instrument, Decimal, Decimal]] = []
         for sym in sorted(wanted):
             if sym not in by_symbol or sym not in pmap:
                 continue
             inst = by_symbol[sym]
             pstream = pmap[sym]
-            cur_snap = self._venue.snapshot(key, now=obs_time)
-            next_seq = cur_snap.sequence + 1
-            bid_q = pstream.bid.quantize(inst.tick_size, rounding=ROUND_FLOOR)
-            ask_q = pstream.ask.quantize(inst.tick_size, rounding=ROUND_CEILING)
-            if ask_q <= bid_q:
-                ask_q = bid_q + inst.tick_size
+            bid_q = pstream.bid.quantize(inst.price_tick, rounding=ROUND_FLOOR)
+            ask_q = pstream.ask.quantize(inst.price_tick, rounding=ROUND_CEILING)
+            if bid_q <= Decimal("0") or ask_q <= bid_q:
+                raise ContractError(f"{sym}: tick alignment collapsed positive bid < ask invariant")
+            staged_ticks.append((inst, bid_q, ask_q))
+        if not staged_ticks:
+            raise ContractError("no registered venue instruments match the supplied MarketStreamEnvelope")
+
+        latest_snap = cur_snap
+        for inst, bid_q, ask_q in staged_ticks:
+            next_seq = latest_snap.sequence + 1
             obs = MarketObservation(
                 key,
-                f"mstream-{envelope.sequence}-{sym.lower()}-{next_seq}",
+                f"mstream-{envelope.sequence}-{inst.symbol.lower()}-{next_seq}",
                 inst.instrument_id,
                 next_seq,
                 obs_time,
@@ -2197,6 +2345,7 @@ class SealedLiveFeedPaperVenue:
                 ask_q,
             )
             latest_snap = self.advance_market(obs)
+
         self._append_audit(
             "MARKET_STREAM_INGESTED",
             obs_time,
@@ -2204,11 +2353,13 @@ class SealedLiveFeedPaperVenue:
                 "stream_id": envelope.stream_id,
                 "sequence": envelope.sequence,
                 "pair_count": len(envelope.streams),
+                "ecb_reference_date": envelope.ecb_reference_date,
                 "raw_wire_sha256": envelope.raw_wire_sha256,
                 "canonical_payload_sha256": envelope.canonical_payload_sha256,
             },
         )
-        return latest_snap if latest_snap is not None else self._venue.snapshot(key, now=obs_time)
+        self._retained_market_stream = envelope
+        return latest_snap
 
     def read_market_stream(self) -> dict[str, Any] | None:
         """Read-only market stream accessor; never mutates SQLite core or venue state."""

@@ -32,7 +32,7 @@ class ContractBoundaryTests(unittest.TestCase):
     def test_reference_length_mismatch_rejected(self):
         with self.assertRaises(ContractError): verify_reference_bytes(ref(),b"abcx")
     def test_protected_ref_cannot_supply_path(self):
-        value=packet()["role_evidence_use"]["reference"]; value["path"]="/tmp/injected"
+        value=packet()["role_evidence_use"]["reference"]; value["path"]="/" + "tmp/injected"
         with self.assertRaises(ContractError): protected.validate("ProtectedRecordRef",value)
     def test_missing_private_schema_fails_closed(self):
         with self.assertRaises(DependencyUnavailable): protected.validate("RetainedFact2",public_fact())

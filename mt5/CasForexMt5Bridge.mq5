@@ -1,0 +1,463 @@
+//+------------------------------------------------------------------+
+//|                                           CasForexMt5Bridge.mq5  |
+//|            CAS Forex Revamp - Phase 6 MetaTrader 5 spool bridge   |
+//|                                                                  |
+//|  DEMO ACCOUNTS ONLY. Implements protocol "cas-forex-mt5-spool/1" |
+//|  between the Python Mt5SpoolBridgeTransport and this terminal:   |
+//|    order_request_<id>.json  (Python -> EA, flat, string values)  |
+//|    order_receipt_<id>.json  (EA -> Python, flat, string values)  |
+//|    market_ticks.json        (EA -> Python, account/ticks/pos)    |
+//|                                                                  |
+//|  Supported demo servers: "Hugo demo PRO5" (Hugo's Way, primary)  |
+//|  and "LHFXSA-Demo" (LHFX, secondary). The EA refuses to run on   |
+//|  any account whose ACCOUNT_TRADE_MODE is not DEMO, or whose      |
+//|  server name lacks "demo" or contains "live"/"real".             |
+//+------------------------------------------------------------------+
+#property copyright   "CAS Forex Revamp"
+#property version     "1.00"
+#property description "Demo-only file-spool bridge for CAS Forex Revamp (Hugo demo PRO5 / LHFXSA-Demo)."
+
+#include <Trade\Trade.mqh>
+
+//--- inputs
+input string InpSpoolFolder        = "cas_forex_spool";  // Spool root under MQL5\Files (or Common\Files)
+input string InpBrokerChannel      = "hugosway_mt5";     // hugosway_mt5 or lhfx_mt5 (matches Python broker id)
+input bool   InpUseCommonFolder    = true;               // true: Terminal\Common\Files (shared by terminals)
+input int    InpTimerMs            = 250;                // Spool polling interval in milliseconds
+input string InpSymbols            = "EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,EURGBP,EURJPY,GBPJPY,EURCHF,EURAUD,EURCAD,AUDJPY,CHFJPY,CADJPY";
+input string InpSymbolSuffix       = "";                 // Broker symbol suffix, e.g. ".ecn" (empty when none)
+input int    InpMaxDeviationPoints = 30;                 // Maximum slippage in points
+input double InpMaxVolumeLots      = 50.0;               // Hard per-order volume cap in lots
+
+#define SPOOL_PROTOCOL "cas-forex-mt5-spool/1"
+
+CTrade   g_trade;
+string   g_symbols[];
+bool     g_demo_ok = false;
+datetime g_last_publish = 0;
+
+//+------------------------------------------------------------------+
+//| Helpers                                                          |
+//+------------------------------------------------------------------+
+int CommonFlag()
+  {
+   return(InpUseCommonFolder ? FILE_COMMON : 0);
+  }
+
+string SpoolDir()
+  {
+   return(InpSpoolFolder + "\\" + InpBrokerChannel);
+  }
+
+string SpoolPath(const string name)
+  {
+   return(SpoolDir() + "\\" + name);
+  }
+
+string IsoNowUtc()
+  {
+   string t = TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS);   // yyyy.mm.dd hh:mi:ss
+   StringReplace(t, ".", "-");
+   StringReplace(t, " ", "T");
+   return(t + "Z");
+  }
+
+string SafeText(string text)
+  {
+   StringReplace(text, "\\", "/");
+   StringReplace(text, "\"", "'");
+   StringReplace(text, "\r", " ");
+   StringReplace(text, "\n", " ");
+   if(StringLen(text) > 60)
+      text = StringSubstr(text, 0, 60);
+   return(text);
+  }
+
+//--- Demo-account guard: trade mode must be DEMO and the server must be an explicit demo server.
+bool DemoGuard()
+  {
+   if((ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
+      return(false);
+   string server = AccountInfoString(ACCOUNT_SERVER);
+   StringToLower(server);
+   if(StringFind(server, "live") >= 0 || StringFind(server, "real") >= 0)
+      return(false);
+   if(StringFind(server, "demo") < 0)
+      return(false);
+   return(true);
+  }
+
+//--- Extract a string value from a FLAT JSON object whose values are all plain strings.
+string JsonGet(const string json, const string key)
+  {
+   string needle = "\"" + key + "\":\"";
+   int start = StringFind(json, needle);
+   if(start < 0)
+      return("");
+   start += StringLen(needle);
+   int stop = StringFind(json, "\"", start);
+   if(stop < 0)
+      return("");
+   return(StringSubstr(json, start, stop - start));
+  }
+
+string Sha256Hex(const string text)
+  {
+   uchar data[];
+   uchar key[];
+   uchar digest[];
+   int n = StringToCharArray(text, data, 0, StringLen(text), CP_UTF8);
+   if(n <= 0)
+      return("");
+   ArrayResize(data, n);
+   if(CryptEncode(CRYPT_HASH_SHA256, data, key, digest) <= 0)
+      return("");
+   string hex = "";
+   for(int i = 0; i < ArraySize(digest); i++)
+      hex += StringFormat("%02x", digest[i]);
+   return(hex);
+  }
+
+string ReadText(const string path)
+  {
+   int h = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(h == INVALID_HANDLE)
+      return("");
+   string text = "";
+   while(!FileIsEnding(h))
+      text += FileReadString(h);
+   FileClose(h);
+   return(text);
+  }
+
+//--- Atomic write: write a dot-prefixed temp file, then move it over the final name.
+bool WriteAtomic(const string name, const string text)
+  {
+   string tmp = SpoolPath("." + name + ".tmp");
+   int h = FileOpen(tmp, FILE_WRITE | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(h == INVALID_HANDLE)
+     {
+      PrintFormat("CasForexMt5Bridge: cannot open %s (error %d)", tmp, GetLastError());
+      return(false);
+     }
+   FileWriteString(h, text + "\n");
+   FileFlush(h);
+   FileClose(h);
+   if(!FileMove(tmp, CommonFlag(), SpoolPath(name), FILE_REWRITE | CommonFlag()))
+     {
+      PrintFormat("CasForexMt5Bridge: cannot publish %s (error %d)", name, GetLastError());
+      return(false);
+     }
+   return(true);
+  }
+
+string BrokerSymbol(const string cas_symbol)
+  {
+   return(cas_symbol + InpSymbolSuffix);
+  }
+
+string CasSymbol(string broker_symbol)
+  {
+   if(StringLen(InpSymbolSuffix) > 0)
+      StringReplace(broker_symbol, InpSymbolSuffix, "");
+   return(broker_symbol);
+  }
+
+string Price(const string broker_symbol, const double value)
+  {
+   int digits = (int)SymbolInfoInteger(broker_symbol, SYMBOL_DIGITS);
+   return(DoubleToString(value, digits));
+  }
+
+//+------------------------------------------------------------------+
+//| Receipts                                                         |
+//+------------------------------------------------------------------+
+string ReceiptJson(const string request_id, const string request_sha, const string status, const uint retcode,
+                   const string position_ticket, const string deal_ticket, const string volume,
+                   const string price, const string sl, const string message)
+  {
+   string server = AccountInfoString(ACCOUNT_SERVER);
+   return(StringFormat(
+      "{\"protocol\":\"%s\",\"request_id\":\"%s\",\"request_sha256\":\"%s\",\"status\":\"%s\",\"retcode\":\"%u\","
+      "\"position_ticket\":\"%s\",\"deal_ticket\":\"%s\",\"volume\":\"%s\",\"price\":\"%s\",\"sl\":\"%s\","
+      "\"server\":\"%s\",\"account_trade_mode\":\"DEMO\",\"observed_at\":\"%s\",\"message\":\"%s\"}",
+      SPOOL_PROTOCOL, request_id, request_sha, status, retcode, position_ticket, deal_ticket, volume, price, sl,
+      SafeText(server), IsoNowUtc(), SafeText(message)));
+  }
+
+void WriteReceipt(const string request_id, const string json)
+  {
+   WriteAtomic("order_receipt_" + request_id + ".json", json);
+  }
+
+string StatusFor(const uint retcode, const string action)
+  {
+   if(retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_PLACED)
+      return(action == "AMEND_STOP" ? "MODIFIED" : "FILLED");
+   if(retcode == TRADE_RETCODE_DONE_PARTIAL)
+      return("PARTIAL");
+   return("REJECTED");
+  }
+
+//+------------------------------------------------------------------+
+//| Request execution                                                |
+//+------------------------------------------------------------------+
+void ExecuteRequest(const string request_id, const string text)
+  {
+   string request_sha = JsonGet(text, "request_sha256");
+   string core = text;
+   StringReplace(core, ",\"request_sha256\":\"" + request_sha + "\"", "");
+   StringTrimRight(core);
+   if(JsonGet(text, "protocol") != SPOOL_PROTOCOL || StringLen(request_sha) != 64 || Sha256Hex(core) != request_sha)
+     {
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "request hash mismatch"));
+      return;
+     }
+   if(!DemoGuard())
+     {
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10017, "0", "0", "0", "0", "0", "demo guard failed"));
+      return;
+     }
+
+   string action  = JsonGet(text, "action");
+   string symbol  = BrokerSymbol(JsonGet(text, "symbol"));
+   string side    = JsonGet(text, "side");
+   double volume  = StringToDouble(JsonGet(text, "volume"));
+   double sl      = StringToDouble(JsonGet(text, "sl"));
+   ulong  ticket  = (ulong)StringToInteger(JsonGet(text, "position_ticket"));
+   ulong  magic   = (ulong)StringToInteger(JsonGet(text, "magic"));
+   int    dev     = (int)StringToInteger(JsonGet(text, "deviation_points"));
+   string comment = JsonGet(text, "comment");
+
+   if(!SymbolSelect(symbol, true))
+     {
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "unknown symbol"));
+      return;
+     }
+   if(dev <= 0 || dev > InpMaxDeviationPoints)
+      dev = InpMaxDeviationPoints;
+   g_trade.SetExpertMagicNumber(magic);
+   g_trade.SetDeviationInPoints(dev);
+   g_trade.SetTypeFillingBySymbol(symbol);
+
+   bool ok = false;
+   string pos_text = "0";
+   if(action == "OPEN")
+     {
+      double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+      if(step > 0.0)
+         volume = MathRound(volume / step) * step;
+      if(volume <= 0.0 || volume > InpMaxVolumeLots || sl <= 0.0)
+        {
+         WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10014, "0", "0", "0", "0", "0", "volume cap or missing protective stop"));
+         return;
+        }
+      ENUM_ORDER_TYPE type = (side == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      double price = (side == "BUY") ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
+      ok = g_trade.PositionOpen(symbol, type, volume, price, sl, 0.0, comment);
+      ulong deal = g_trade.ResultDeal();
+      ulong position_id = g_trade.ResultOrder();
+      if(deal > 0 && HistoryDealSelect(deal))
+         position_id = (ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
+      if(ok && position_id > 0)
+         pos_text = IntegerToString((long)position_id);
+     }
+   else
+     {
+      if(!PositionSelectByTicket(ticket) || PositionGetString(POSITION_SYMBOL) != symbol)
+        {
+         WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10036, "0", "0", "0", "0", "0", "position not found"));
+         return;
+        }
+      pos_text = IntegerToString((long)ticket);
+      if(action == "AMEND_STOP")
+         ok = g_trade.PositionModify(ticket, sl, PositionGetDouble(POSITION_TP));
+      else
+         if(action == "REDUCE")
+            ok = g_trade.PositionClosePartial(ticket, volume, dev);
+         else
+            if(action == "CLOSE")
+               ok = g_trade.PositionClose(ticket, dev);
+            else
+              {
+               WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "unsupported action"));
+               return;
+              }
+     }
+
+   uint   retcode = g_trade.ResultRetcode();
+   string status  = StatusFor(retcode, action);
+   string deal_text = (g_trade.ResultDeal() > 0) ? IntegerToString((long)g_trade.ResultDeal()) : "0";
+   string vol_text  = (g_trade.ResultVolume() > 0.0) ? DoubleToString(g_trade.ResultVolume(), 2) : "0";
+   string px_text   = (g_trade.ResultPrice() > 0.0) ? Price(symbol, g_trade.ResultPrice()) : "0";
+   string sl_text   = (sl > 0.0) ? Price(symbol, sl) : "0";
+   if(!ok && status != "REJECTED")
+      status = "REJECTED";
+   WriteReceipt(request_id, ReceiptJson(request_id, request_sha, status, retcode, (status == "REJECTED") ? "0" : pos_text,
+                                        deal_text, vol_text, px_text, sl_text, g_trade.ResultRetcodeDescription()));
+  }
+
+//--- Claim each request by renaming it to processing_<id>.json BEFORE executing, so a restart
+//--- can never execute the same request twice.
+void ProcessRequests()
+  {
+   string found;
+   long search = FileFindFirst(SpoolDir() + "\\order_request_*.json", found, CommonFlag());
+   if(search == INVALID_HANDLE)
+      return;
+   string names[];
+   do
+     {
+      int n = ArraySize(names);
+      ArrayResize(names, n + 1);
+      names[n] = found;
+     }
+   while(FileFindNext(search, found));
+   FileFindClose(search);
+
+   for(int i = 0; i < ArraySize(names); i++)
+     {
+      string name = names[i];
+      string request_id = StringSubstr(name, StringLen("order_request_"), StringLen(name) - StringLen("order_request_") - StringLen(".json"));
+      string claimed = "processing_" + request_id + ".json";
+      if(FileIsExist(SpoolPath("order_receipt_" + request_id + ".json"), CommonFlag()))
+        {
+         FileDelete(SpoolPath(name), CommonFlag());
+         continue;
+        }
+      if(!FileMove(SpoolPath(name), CommonFlag(), SpoolPath(claimed), FILE_REWRITE | CommonFlag()))
+         continue;
+      string text = ReadText(SpoolPath(claimed));
+      ExecuteRequest(request_id, text);
+      FileDelete(SpoolPath(claimed), CommonFlag());
+     }
+  }
+
+//--- After a restart, any processing_<id>.json means the outcome is UNKNOWN: report, never re-execute.
+void ReportInterruptedRequests()
+  {
+   string found;
+   long search = FileFindFirst(SpoolDir() + "\\processing_*.json", found, CommonFlag());
+   if(search == INVALID_HANDLE)
+      return;
+   do
+     {
+      string request_id = StringSubstr(found, StringLen("processing_"), StringLen(found) - StringLen("processing_") - StringLen(".json"));
+      string text = ReadText(SpoolPath(found));
+      WriteReceipt(request_id, ReceiptJson(request_id, JsonGet(text, "request_sha256"), "UNKNOWN", 0, "0", "0", "0", "0", "0",
+                                           "EA restarted mid-order; check terminal history"));
+      FileDelete(SpoolPath(found), CommonFlag());
+     }
+   while(FileFindNext(search, found));
+   FileFindClose(search);
+  }
+
+//+------------------------------------------------------------------+
+//| Market snapshot publication                                      |
+//+------------------------------------------------------------------+
+void PublishMarket()
+  {
+   string json = StringFormat(
+      "{\"protocol\":\"%s\",\"server\":\"%s\",\"account_trade_mode\":\"DEMO\",\"observed_at\":\"%s\",\"account\":{"
+      "\"login\":\"%s\",\"currency\":\"%s\",\"balance\":\"%s\",\"equity\":\"%s\",\"margin\":\"%s\",\"margin_free\":\"%s\",\"leverage\":\"%s\"},\"ticks\":[",
+      SPOOL_PROTOCOL, SafeText(AccountInfoString(ACCOUNT_SERVER)), IsoNowUtc(),
+      IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)), AccountInfoString(ACCOUNT_CURRENCY),
+      DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2), DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
+      DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2), DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2),
+      IntegerToString(AccountInfoInteger(ACCOUNT_LEVERAGE)));
+
+   bool first = true;
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+     {
+      string bsym = BrokerSymbol(g_symbols[i]);
+      MqlTick tick;
+      if(!SymbolInfoTick(bsym, tick) || tick.bid <= 0.0 || tick.ask < tick.bid)
+         continue;
+      json += StringFormat("%s{\"symbol\":\"%s\",\"bid\":\"%s\",\"ask\":\"%s\",\"time_msc\":\"%s\"}",
+                           first ? "" : ",", g_symbols[i], Price(bsym, tick.bid), Price(bsym, tick.ask),
+                           IntegerToString((long)tick.time_msc));
+      first = false;
+     }
+   json += "],\"positions\":[";
+
+   first = true;
+   for(int p = 0; p < PositionsTotal(); p++)
+     {
+      ulong ticket = PositionGetTicket(p);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      string bsym = PositionGetString(POSITION_SYMBOL);
+      string side = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+      double psl = PositionGetDouble(POSITION_SL);
+      json += StringFormat("%s{\"ticket\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":\"%s\",\"price_open\":\"%s\",\"sl\":\"%s\",\"profit\":\"%s\"}",
+                           first ? "" : ",", IntegerToString((long)ticket), CasSymbol(bsym), side,
+                           DoubleToString(PositionGetDouble(POSITION_VOLUME), 2), Price(bsym, PositionGetDouble(POSITION_PRICE_OPEN)),
+                           (psl > 0.0) ? Price(bsym, psl) : "0", DoubleToString(PositionGetDouble(POSITION_PROFIT), 2));
+      first = false;
+     }
+   json += "]}";
+   WriteAtomic("market_ticks.json", json);
+   g_last_publish = TimeCurrent();
+  }
+
+//+------------------------------------------------------------------+
+//| Expert lifecycle                                                 |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   if(!DemoGuard())
+     {
+      Print("CasForexMt5Bridge: REFUSED - account is not a DEMO account on an explicit demo server.");
+      return(INIT_FAILED);
+     }
+   if(InpBrokerChannel != "hugosway_mt5" && InpBrokerChannel != "lhfx_mt5")
+     {
+      Print("CasForexMt5Bridge: InpBrokerChannel must be hugosway_mt5 or lhfx_mt5.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(StringSplit(InpSymbols, ',', g_symbols) <= 0)
+     {
+      Print("CasForexMt5Bridge: InpSymbols is empty.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   for(int i = 0; i < ArraySize(g_symbols); i++)
+     {
+      StringTrimLeft(g_symbols[i]);
+      StringTrimRight(g_symbols[i]);
+      SymbolSelect(BrokerSymbol(g_symbols[i]), true);
+     }
+   FolderCreate(InpSpoolFolder, CommonFlag());
+   FolderCreate(SpoolDir(), CommonFlag());
+   g_demo_ok = true;
+   ReportInterruptedRequests();
+   PublishMarket();
+   EventSetMillisecondTimer(MathMax(50, InpTimerMs));
+   PrintFormat("CasForexMt5Bridge: running on demo server %s, spool %s", AccountInfoString(ACCOUNT_SERVER), SpoolDir());
+   return(INIT_SUCCEEDED);
+  }
+
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+  }
+
+void OnTimer()
+  {
+   g_demo_ok = DemoGuard();
+   if(!g_demo_ok)
+     {
+      Print("CasForexMt5Bridge: demo guard failed - spool processing halted.");
+      ExpertRemove();
+      return;
+     }
+   ProcessRequests();
+   PublishMarket();
+  }
+
+void OnTick()
+  {
+   // Ticks only refresh the market snapshot (at most once per second); orders run on the timer.
+   if(g_demo_ok && TimeCurrent() != g_last_publish)
+      PublishMarket();
+  }
+//+------------------------------------------------------------------+

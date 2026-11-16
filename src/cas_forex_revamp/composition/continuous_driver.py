@@ -13,7 +13,7 @@ from decimal import Decimal
 import json
 import os
 from pathlib import Path
-import subprocess
+import subprocess  # nosec B404: deterministic two-process rehearsal invokes pinned sys.executable without a shell
 import sys
 
 from ..contracts import (
@@ -284,7 +284,7 @@ def resume_phase(root: Path) -> dict:
 def run_two_processes(root: Path, *, timeout_seconds=120) -> dict:
     """Explicit parent harness: separate Python processes and persistent stores."""
     for phase in ("prepare", "resume"):
-        subprocess.run([sys.executable, "-m", "cas_forex_revamp.composition.continuous_driver", phase, str(root)], check=True,
+        subprocess.run([sys.executable, "-m", "cas_forex_revamp.composition.continuous_driver", phase, str(root)], check=True,  # nosec B603: fixed argv list invoking current Python interpreter without shell
                        timeout=timeout_seconds, capture_output=True, text=True)
     return json.loads((root / "continuous-a-result.json").read_text(encoding="utf-8"))
 
