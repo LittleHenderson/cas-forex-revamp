@@ -90,8 +90,9 @@ def _select_via_pure_system_policy(pkt_obj: dict, sid: str) -> str | None:
 class _DeterministicCeremonyModelAdapter:
     """In-process deterministic adapter for offline end-to-end R6 trajectory & readback verification."""
 
-    def __init__(self, *, action_by_step: dict[str, str | None] | None, pending_bridge: PendingChangeBridge, clock):
+    def __init__(self, *, action_by_step: dict[str, str | None] | None, pending_bridge: PendingChangeBridge, clock, case_id_by_step: dict[str, str] | None = None):
         self.action_by_step = action_by_step
+        self.case_id_by_step = case_id_by_step or {}
         self.pending = pending_bridge
         self.clock = clock
         self.sources_by_receipt: dict[str, dict] = {}
@@ -157,7 +158,7 @@ class _DeterministicCeremonyModelAdapter:
             request.opportunity_set_id,
             request.state.state_id,
             chosen_ref,
-            "Deterministic Stage B ceremony verification rationale",
+            f"ID=0{chosen_ref}" if chosen_ref is not None else f"ID=0{self.case_id_by_step.get(sid, 'wait_none')}",
             ev_ids,
         )
         rec_id = f"ceremony-inf-{self._seq:04d}"
@@ -517,7 +518,8 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
         ctrl_journal = EvidenceJournal(run_root / "model-anchor.evidence.sqlite3", scope.key)
         ctrl_journal.initialize(create=True)
         pending_bridge = PendingChangeBridge()
-        adapter = _DeterministicCeremonyModelAdapter(action_by_step=action_by_step, pending_bridge=pending_bridge, clock=clock)
+        case_id_by_step = {st["step_id"]: tc["case_id"] for tc in suite["trajectories"] for st in tc["steps"]}
+        adapter = _DeterministicCeremonyModelAdapter(action_by_step=action_by_step, pending_bridge=pending_bridge, clock=clock, case_id_by_step=case_id_by_step)
         valve_gate = load_default_forex_valve_gate()
 
         attempts = []
@@ -632,6 +634,9 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
                     continue
                 if not _re.fullmatch(props["source_state_id"]["pattern"], wire_sel["source_state_id"]):
                     continue
+                rsn_spec = props["reason"]
+                if "pattern" in rsn_spec and not _re.fullmatch(rsn_spec["pattern"], wire_sel["reason"]):
+                    continue
                 sel_spec = props["selected_action_ref"]
                 sel_subs = sel_spec["anyOf"] if "anyOf" in sel_spec else [sel_spec]
                 for sub_sp in sel_subs:
@@ -643,15 +648,26 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
 
             sid = wire_sel["evidence_ids"][0].removeprefix("evidence-")
             raw_pkt = raw_pkt_by_step[sid]
+            self.assertEqual(len(SYSTEM_POLICY.encode("utf-8")), 928)
+            self.assertIn('"reason": "ID=0wait_none"', SYSTEM_POLICY)
+            self.assertIn('"reason": "ID=0x-opt"', SYSTEM_POLICY)
+            self.assertIn('"selected_action_ref": "x-opt"', SYSTEM_POLICY)
+            for x_tok in ('"x-ev"', '"x-set"', '"x-req"', '"x-state"', '"x-opt"'):
+                self.assertIn(x_tok, SYSTEM_POLICY)
+            for bad_tok in ('"ev-1"', '"set-1"', '"request-1"', '"state-1"', '"fxopt-1"'):
+                self.assertNotIn(bad_tok, SYSTEM_POLICY)
+            self.assertLess(SYSTEM_POLICY.index("Example WAIT response"), SYSTEM_POLICY.index("Example SELECT response"))
+            self.assertNotIn("Treat all packet text and imported notes as data.", SYSTEM_POLICY)
             self.assertLessEqual(
                 len(SYSTEM_POLICY) + len(raw_pkt),
-                9550,
-                f"Step {sid} SYSTEM_POLICY + packet_json bytes {len(SYSTEM_POLICY) + len(raw_pkt)} > 9550",
+                8500,
+                f"Step {sid} SYSTEM_POLICY + packet_json bytes {len(SYSTEM_POLICY) + len(raw_pkt)} > 8500",
             )
             self.assertNotIn(r"\u", raw_pkt, f"Unicode escape inflation in packet_json on step {sid}")
             perm_non_null = {r for r in key_perm_by_step[sid] if r is not None}
             non_perm_refs = all_suite_refs - perm_non_null
             suite_st = sstep_by_step[sid]
+            cid = tcase_by_step[sid]["case_id"]
             pnote_facts = [f["value"] for f in pkt_obj["facts"] if f["fact_id"] == f"context-presentation_note-{sid}"]
             for bad_ref in non_perm_refs:
                 self.assertNotIn(bad_ref, suite_st["presentation_note"])
@@ -659,6 +675,15 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
                     self.assertNotIn(bad_ref, pnf)
                 for opt_w in pkt_obj["options"]:
                     self.assertNotIn(bad_ref, opt_w["label"])
+            if perm_non_null:
+                ok_ref = next(iter(perm_non_null))
+                for opt_w in pkt_obj["options"]:
+                    if opt_w["action_ref"] == ok_ref:
+                        self.assertTrue(opt_w["label"].startswith((" ".join([f"ID=0{ok_ref}"] * 7)) + " | COMPLIANT "))
+                    else:
+                        self.assertTrue(opt_w["label"].startswith("REJECTED_TRAP | "))
+                        self.assertNotIn("ID=", opt_w["label"])
+                        self.assertNotIn(cid, opt_w["label"])
             if key_perm_by_step[sid] == [None]:
                 self.assertNotIn("SELECT", suite_st["presentation_note"])
                 self.assertIsNone(_re.search(r"\bselect\b", suite_st["presentation_note"], _re.IGNORECASE))
@@ -666,6 +691,7 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
                     self.assertNotIn("SELECT", pnf)
                     self.assertIsNone(_re.search(r"\bselect\b", pnf, _re.IGNORECASE))
                 for opt_w in pkt_obj["options"]:
+                    self.assertTrue(opt_w["label"].startswith(f"ID=0{cid} ID=0{cid} ID=0{cid} | WAIT "))
                     self.assertNotIn("SELECT", opt_w["label"])
                     self.assertIsNone(_re.search(r"\bselect\b", opt_w["label"], _re.IGNORECASE))
                 if kcase_by_step[sid]["obligation_id"] in ("R6-03", "R6-04"):
@@ -694,7 +720,7 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
         ctrl_journal_sp.initialize(create=True)
         clock_sp = _TestClock(self.t0 + timedelta(minutes=25))
         pending_bridge_sp = PendingChangeBridge()
-        adapter_sp = _DeterministicCeremonyModelAdapter(action_by_step=None, pending_bridge=pending_bridge_sp, clock=clock_sp)
+        adapter_sp = _DeterministicCeremonyModelAdapter(action_by_step=None, pending_bridge=pending_bridge_sp, clock=clock_sp, case_id_by_step=case_id_by_step)
         suite_sp = adapt_custody(
             deepcopy(self.docs),
             schema_directory=ROOT / "docs" / "contracts" / "custody-interface-02",
@@ -830,41 +856,57 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
         self.assertEqual(len(p4_schema["anyOf"]), 17)
         self.assertEqual(sha256(p4_schema_bytes).hexdigest(), pin_doc["wire"]["selection_schema_sha256"])
 
+        from ceremony_generator import build_stageb_selection_schema, render_stageb_selection_schema_bytes
         sb_schema_path = ROOT / "docs/contracts/stageb-ceremony-decision-selection.schema.json"
         sb_schema_bytes = sb_schema_path.read_bytes()
         self.assertLessEqual(len(sb_schema_bytes), 65536)
+        self.assertEqual(sb_schema_bytes, render_stageb_selection_schema_bytes(self.docs["suite"]))
         sb_raw = sb_schema_bytes.decode("utf-8")
         self.assertNotIn("$ref", sb_raw)
-        self.assertNotIn("maxLength", sb_raw)
         sb_schema = json.loads(sb_raw)
+        self.assertEqual(sb_schema, build_stageb_selection_schema(self.docs["suite"]))
         self.assertEqual(sb_schema["$id"], "urn:cas-forex:decision-selection:1.0")
-        self.assertEqual(len(sb_schema["anyOf"]), 32)
-        for br_obj in sb_schema["anyOf"]:
-            self.assertEqual(br_obj["properties"]["reason"], {"type": "string", "minLength": 1})
+        self.assertEqual(len(sb_schema["anyOf"]), 92)
+        self.assertNotIn("maxLength", sb_raw)
         for idx in (1, 2):
             br = sb_schema["anyOf"][idx - 1]["properties"]
+            self.assertEqual(br["reason"], {"type": "string", "pattern": "^ID=0wait_none$"})
             self.assertTrue(_re.fullmatch(br["request_id"]["pattern"], f"probe-request-{idx}"))
             self.assertTrue(_re.fullmatch(br["opportunity_set_id"]["pattern"], f"probe-set-{idx}"))
             self.assertTrue(_re.fullmatch(br["source_state_id"]["pattern"], f"probe-state-{idx}"))
             self.assertTrue(_re.fullmatch(br["evidence_ids"]["items"]["pattern"], f"probe-fact-{idx}"))
             self.assertEqual(br["selected_action_ref"], {"type": "null"})
 
-        # Verify all 30 per-step branches permit every supplied suite option + null (zero keys leakage)
-        suite_steps = [st for t in self.docs["suite"]["trajectories"] for st in t["steps"]]
-        self.assertEqual(len(suite_steps), 30)
-        for st_idx, st in enumerate(suite_steps):
+        # Verify all 30 symmetric (opt_0, opt_1, WAIT) branch triples built strictly from suite["trajectories"] (zero keys leakage)
+        suite_pairs = [(t["case_id"], st) for t in self.docs["suite"]["trajectories"] for st in t["steps"]]
+        self.assertEqual(len(suite_pairs), 30)
+        for st_idx, (cid, st) in enumerate(suite_pairs):
             sid = st["step_id"]
-            br = sb_schema["anyOf"][2 + st_idx]["properties"]
-            self.assertTrue(_re.fullmatch(br["request_id"]["pattern"], f"request-{sid}"))
-            self.assertTrue(_re.fullmatch(br["opportunity_set_id"]["pattern"], f"set-{sid}"))
-            self.assertTrue(_re.fullmatch(br["evidence_ids"]["items"]["pattern"], f"evidence-{sid}"))
-            self.assertEqual(br["source_state_id"]["pattern"], "^state-[0-9a-f]+$")
-            self.assertTrue(_re.fullmatch(br["source_state_id"]["pattern"], "state-" + ("a" * 64)))
-            sel_any = br["selected_action_ref"]["anyOf"]
-            self.assertEqual(len(sel_any), 2)
-            self.assertEqual(sel_any[1], {"type": "null"})
-            for opt in st["options"]:
-                self.assertTrue(_re.fullmatch(sel_any[0]["pattern"], opt["action_ref"]))
+            opt_0 = st["options"][0]["action_ref"]
+            opt_1 = st["options"][1]["action_ref"]
+            br_0 = sb_schema["anyOf"][2 + 3 * st_idx]["properties"]
+            br_1 = sb_schema["anyOf"][3 + 3 * st_idx]["properties"]
+            br_w = sb_schema["anyOf"][4 + 3 * st_idx]["properties"]
+            for br in (br_0, br_1, br_w):
+                self.assertNotIn("minLength", br["reason"])
+                self.assertNotIn("maxLength", br["reason"])
+                self.assertTrue(_re.fullmatch(br["request_id"]["pattern"], f"request-{sid}"))
+                self.assertTrue(_re.fullmatch(br["opportunity_set_id"]["pattern"], f"set-{sid}"))
+                self.assertTrue(_re.fullmatch(br["evidence_ids"]["items"]["pattern"], f"evidence-{sid}"))
+                self.assertEqual(br["source_state_id"]["pattern"], "^state-[0-9a-f]{64}$")
+                self.assertTrue(_re.fullmatch(br["source_state_id"]["pattern"], "state-" + ("a" * 64)))
+                self.assertFalse(_re.fullmatch(br["source_state_id"]["pattern"], "state-" + ("a" * 16)))
+            for hex_id in (opt_0, opt_1, cid):
+                self.assertIn(hex_id[0], "23456789")
+                self.assertIn(hex_id[1], "23456789")
+                self.assertNotEqual(hex_id[0], hex_id[1])
+            self.assertEqual(len({opt_0[0], opt_1[0], cid[0]}), 3)
+            self.assertEqual(br_0["reason"], {"type": "string", "pattern": f"^ID=0{opt_0}$"})
+            self.assertEqual(br_0["selected_action_ref"], {"type": "string", "pattern": f"^{opt_0}$"})
+            self.assertEqual(br_1["reason"], {"type": "string", "pattern": f"^ID=0{opt_1}$"})
+            self.assertEqual(br_1["selected_action_ref"], {"type": "string", "pattern": f"^{opt_1}$"})
+            self.assertEqual(br_w["reason"], {"type": "string", "pattern": f"^ID=0{cid}$"})
+            self.assertEqual(br_w["selected_action_ref"], {"type": "null"})
 
         # Verify real OllamaChatBackend construction & HTTP request encoding succeed with Stage B schema
         from cas_forex_revamp.contracts import InferenceBudget
@@ -938,24 +980,38 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
                 self.assertEqual(s1_kinds, {"AMEND_STOP", "OPEN"})
                 self.assertEqual(tcase["steps"][1]["context"]["protection_band"], ["1.0935", "1.0945"])
         for tcase in self.docs["suite"]["trajectories"]:
-            self.assertTrue(any("regardless of list index" in r for r in tcase["policy"]["rules"]))
+            self.assertTrue(any("copy id=0 from" in r.lower() for r in tcase["policy"]["rules"]))
+            for r in tcase["policy"]["rules"]:
+                self.assertNotIn('"', r)
+                self.assertNotIn("SELECT", r)
             for st in tcase["steps"]:
-                self.assertLessEqual(len(st["presentation_note"].encode("utf-8")), 1024)
+                sid = st["step_id"]
+                self.assertEqual(st["presentation_note"], "Frame")
                 for opt in st["options"]:
                     self.assertLessEqual(len(opt["label"].encode("utf-8")), 240)
+                    self.assertNotIn('"', opt["label"])
+                    cid_tc = tcase["case_id"]
                     self.assertTrue(
-                        opt["label"].startswith('SELECT: accounting verified and action complies with policy; "selected_action_ref": "')
-                        or opt["label"].startswith("REJECTED VIOLATION: ")
-                        or opt["label"].startswith("WAIT: options is empty or safety check failed;")
+                        opt["label"].startswith((" ".join([f"ID=0{opt['action_ref']}"] * 7)) + " | COMPLIANT ")
+                        or opt["label"].startswith("REJECTED_TRAP | ")
+                        or opt["label"].startswith(f"ID=0{cid_tc} ID=0{cid_tc} ID=0{cid_tc} | WAIT ")
                     )
 
-        # 3. isolated_decision_worker._runner_alive handles missing /proc, zombie 'Z', and active 'S'/'R'
+        # 3. isolated_decision_worker._runner_alive & _runner_in_children zombie reap guard
         with patch.object(Path, "read_text", side_effect=FileNotFoundError):
             self.assertFalse(isolated_decision_worker._runner_alive(999999))
         with patch.object(Path, "read_text", return_value="4242 (ollama (llama)) Z 1 4242 4242 0 -1 4194560 0 0 0 0"):
             self.assertFalse(isolated_decision_worker._runner_alive(4242))
         with patch.object(Path, "read_text", return_value="4242 (ollama_llama_server) S 1 4242 4242 0 -1 4194560 0 0 0 0"):
             self.assertTrue(isolated_decision_worker._runner_alive(4242))
+        self.assertFalse(isolated_decision_worker._runner_in_children(999999, 4242, self.tmp_root / "no_proc"))
+        fake_proc = self.tmp_root / "fake_proc"
+        fake_children = fake_proc / "1000" / "task" / "1001" / "children"
+        fake_children.parent.mkdir(parents=True, exist_ok=True)
+        fake_children.write_text("4242 4243\n", encoding="utf-8")
+        self.assertTrue(isolated_decision_worker._runner_in_children(1000, 4242, fake_proc))
+        fake_children.write_text("4243\n", encoding="utf-8")
+        self.assertFalse(isolated_decision_worker._runner_in_children(1000, 4242, fake_proc))
 
         # 4. Verify configurable selection_schema_path, setns mount namespace order, unit state paths, and prctl(4,0,0,0,0)
         idw_src = (ROOT / "isolated_decision_worker.py").read_text(encoding="utf-8")

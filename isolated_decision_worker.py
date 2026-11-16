@@ -36,6 +36,17 @@ def _runner_alive(pid):
     return txt[txt.rfind(')')+2:].split()[0]!='Z'
 
 
+def _runner_in_children(ollama_pid, runner_pid, proc_root=Path('/proc')):
+    try: tasks=list((Path(proc_root)/str(ollama_pid)/'task').iterdir())
+    except (FileNotFoundError,ProcessLookupError,PermissionError,OSError): return False
+    target=str(runner_pid)
+    for task in tasks:
+        try:
+            if target in (task/'children').read_text().split(): return True
+        except (FileNotFoundError,ProcessLookupError,PermissionError,OSError): continue
+    return False
+
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--bootstrap-fd',type=int,required=True)
     parser.add_argument('--channel-fd',type=int,required=True);args=parser.parse_args()
@@ -132,6 +143,9 @@ def main():
                 expiry=min(invocation_deadline,clock()+timedelta(seconds=10))
                 while _runner_alive(previous_runner['pid']) and clock()<expiry:time.sleep(.05)
                 need(not _runner_alive(previous_runner['pid']),'previous model runner not unloaded')
+                reap_expiry=min(invocation_deadline,clock()+timedelta(seconds=2))
+                ollama_pid=getattr(runtime,'ollama_pid',runtime.spec.ollama_pid)
+                while _runner_in_children(ollama_pid,previous_runner['pid'],runtime.proc_root) and clock()<reap_expiry:time.sleep(.02)
             active=ModelInvocation(packet['exact_request_sha256'],model,
                 'session-'+content_digest((cfg['run_id']+'-'+phase,packet['request_id'],counts[phase])),
                 SYSTEM_POLICY,canonical_bytes(packet).decode(),InferenceBudget(*PHASES[phase]),seed=cfg['seed'])
