@@ -8,15 +8,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 from ..contracts import (
     AccountRunKey, CockpitProjection, CommandView, ContractError, ControlKind,
     CorePort, DecisionOrigin, DecisionRequest, FenceReceipt, FenceRequest,
     MarketObservation, RunScope, StateReference, VenuePort, VenueSnapshot,
-    assert_current_request,
+    assert_current_request, decimal_text,
 )
 from ..operator.decisions import DecisionProposal
+from ..valve.tks_meta_valve_controller import PeakEquityStore
 from .application import RuntimeConfig
 
 
@@ -42,6 +43,16 @@ class ReconciledObservation:
 
     venue: VenueSnapshot
     cockpit: CockpitProjection
+
+
+def _request_has_accounting_override(request: DecisionRequest) -> bool:
+    for f in request.facts:
+        low_val = f.value.lower()
+        if ("margin" in f.label.lower() or "equity" in f.label.lower() or f.fact_id.startswith("observed-")) and (
+            "null" in low_val or "unavailable" in low_val
+        ):
+            return True
+    return False
 
 
 class RehearsalWiring:
@@ -70,6 +81,7 @@ class RehearsalWiring:
         self._clock = clock
         self.expected_origin = expected_origin
         self._valve_gate = valve_gate
+        self._peak_equity_store = PeakEquityStore(config.state_directory / "rehearsal.drawdown.sqlite3")
         self.last_valve_decision = None
 
     @property
@@ -79,6 +91,25 @@ class RehearsalWiring:
     def _scope_check(self, scope: RunScope) -> None:
         if scope != self.scope:
             raise ContractError("wrong account/run/epoch/build/policy/scenario/adapter")
+
+    def _build_valve_view(self, proposal: DecisionProposal, now: datetime) -> dict[str, Any] | None:
+        if _request_has_accounting_override(proposal.request):
+            return None
+        snap = self._venue.snapshot(self.scope.key, now=now)
+        peak = self._peak_equity_store.observe_equity(
+            f"{self.scope.account_id}:{self.scope.run_id}",
+            current_equity=snap.equity.amount,
+            opening_balance=snap.balance.amount,
+            now=now,
+        )
+        return {
+            "account_id": self.scope.account_id,
+            "balance": decimal_text(snap.balance.amount),
+            "equity": decimal_text(snap.equity.amount),
+            "peak_equity": decimal_text(peak),
+            "available_margin": decimal_text(snap.equity.amount),
+            "position_inventory": [p.position_id for p in snap.positions],
+        }
 
     def propose(self, request: DecisionRequest) -> DecisionProposal:
         """One explicit operator call. It never admits or dispatches an action."""
@@ -106,7 +137,8 @@ class RehearsalWiring:
         if proposal.intent is None:
             return None
         if self._valve_gate is not None:
-            self.last_valve_decision = self._valve_gate.require_admissible(proposal, now=now)
+            view = self._build_valve_view(proposal, now)
+            self.last_valve_decision = self._valve_gate.require_admissible(proposal, current_view=view, now=now)
         # Core repeats freshness and all authority/risk/target checks atomically.
         return self._core.admit(proposal.intent, command_id=command_id, now=now)
 
@@ -136,6 +168,13 @@ class RehearsalWiring:
         if observation.key != self.scope.key:
             raise ContractError("market observation belongs to another run")
         self._venue.advance_market(observation)
+        snap = self._venue.snapshot(self.scope.key, now=self._clock())
+        self._peak_equity_store.observe_equity(
+            f"{self.scope.account_id}:{self.scope.run_id}",
+            current_equity=snap.equity.amount,
+            opening_balance=snap.balance.amount,
+            now=self._clock(),
+        )
         return self.observe()
 
     def control(self, request: FenceRequest) -> ControlObservation:

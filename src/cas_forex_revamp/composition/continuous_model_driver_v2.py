@@ -109,7 +109,12 @@ def run_trajectory(case, *, directory, execution_id, build_id, adapter, model_st
                     else:
                         raise
             elif valve_gate is not None:
-                dec = valve_gate.evaluate(proposal, current_view=view, policy=runtime.policy, now=runtime.clock())
+                dec = valve_gate.evaluate(
+                    proposal,
+                    current_view=view,
+                    policy=runtime.effective_valve_policy(),
+                    now=runtime.clock(),
+                )
                 row['valve_decision'] = wire(dec.to_dict())
                 row['valve_blocked'] = False
             decision_read = runtime.observe()

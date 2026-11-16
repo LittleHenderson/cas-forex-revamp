@@ -1,7 +1,9 @@
 """Scoped in-process UI service, explicitly attached by a trusted bootstrap.
 
-No HTTP listener or owner authentication is supplied by this class. The caller
-must establish the owner context before handing this object to an adapter.
+No HTTP listener is supplied by this class. Loopback HTTP adapters must
+authenticate callers via per-launch constant-time bearer/cookie credentials,
+enforce exact loopback Host/Origin headers, and rotate `rotate_adapter_session`
+on every launch/restart so prior in-memory prepared requests are invalidated.
 Preparation/read methods grant nothing; request methods retain identities before
 crossing core/venue boundaries and never retry an uncertain attempted request.
 """
@@ -9,12 +11,12 @@ from __future__ import annotations
 
 from datetime import timedelta
 from decimal import Decimal
+import secrets
 from threading import RLock
 
 from ..contracts import (ActionIntent, ActionKind, CommandState, ContractError, ControlKind,
                          DecisionOrigin, FenceRequest, canonical_bytes, content_digest)
 from ..contracts.primitives import identifier
-from ..core import OutcomeUnknown
 from ..core.storage import decode
 from .read_service import wire
 
@@ -34,6 +36,21 @@ class ScopedUIService:
         self._prepared_close = {}
         self._lock = RLock()
         self._market_stream_provider = market_stream_provider
+        self._adapter_session_epoch = 'epoch-' + secrets.token_hex(16)
+
+    @property
+    def session_epoch(self) -> str:
+        with self._lock:
+            return self._adapter_session_epoch
+
+    def rotate_adapter_session(self, session_epoch: str | None = None) -> str:
+        """Rotate adapter session epoch and invalidate all prior prepared control/close objects."""
+        next_epoch = ('epoch-' + secrets.token_hex(16)) if session_epoch is None else identifier(session_epoch, 'session_epoch')
+        with self._lock:
+            self._adapter_session_epoch = next_epoch
+            self._prepared_controls.clear()
+            self._prepared_close.clear()
+            return self._adapter_session_epoch
 
     def _scope(self, value):
         if value != wire(self.scope):
@@ -43,7 +60,10 @@ class ScopedUIService:
         now = self.clock()
         fence = self.app.venue.snapshot(self.scope.key, now=now).fence
         caps = self.owner.controls
+        with self._lock:
+            epoch = self._adapter_session_epoch
         return dict(schema_version='forex.ui-transport/1', scope=wire(self.scope), request_time=wire(now),
+                    session_epoch=epoch,
                     fence_generation=fence.generation, fence_receipt=wire(fence),
                     decision_schema_sha256=self.reader.schema_sha256,
                     capabilities=dict(pause=ControlKind.PAUSE_NEW_RISK in caps,
@@ -71,17 +91,17 @@ class ScopedUIService:
             raise ContractError('selected owner lacks control capability')
         with self._lock:
             previous = self._prepared_controls.get(request['request_id'])
-            if previous is not None:
-                if previous[0] != request:
+            if previous is not None and previous[0] == self._adapter_session_epoch:
+                if previous[1] != request:
                     raise ContractError('control preparation identity conflict')
-                return wire(previous[1])
+                return wire(previous[2])
             now = self.clock()
             fence = self.app.venue.snapshot(self.scope.key, now=now).fence
             if type(request['expected_generation']) is not int or request['expected_generation'] != fence.generation:
                 raise ContractError('control generation changed; refresh independent state')
-            result = FenceRequest(self.scope.key, 'ui-barrier-' + content_digest((self.scope, request)),
+            result = FenceRequest(self.scope.key, 'ui-barrier-' + content_digest((self.scope, self._adapter_session_epoch, request)),
                                   kind, request['request_id'], fence.generation, fence.generation + 1, now)
-            self._prepared_controls[request['request_id']] = (wire(request), result)
+            self._prepared_controls[request['request_id']] = (self._adapter_session_epoch, wire(request), result)
             return wire(result)
 
     def _retained(self, request_id, subject):
@@ -118,7 +138,8 @@ class ScopedUIService:
             if retained is not None:
                 return wire(retained)
             prepared = self._prepared_controls.get(request.owner_request_id)
-            if prepared is None or prepared[1] != request or request.control not in self.owner.controls:
+            if (prepared is None or prepared[0] != self._adapter_session_epoch
+                    or prepared[2] != request or request.control not in self.owner.controls):
                 raise ContractError('request was not prepared in this trusted owner context')
             now = self.clock()
             if not request.requested_at <= now < request.requested_at + timedelta(seconds=30):
@@ -157,10 +178,10 @@ class ScopedUIService:
             raise ContractError('Close requires exact decimal base units')
         with self._lock:
             old = self._prepared_close.get(request['owner_request_id'])
-            if old is not None:
-                if old[0] != request:
+            if old is not None and old[0] == self._adapter_session_epoch:
+                if old[1] != request:
                     raise ContractError('Close preparation identity conflict')
-                return wire(old[2])
+                return wire(old[3])
             now = self.clock()
             state = self.app.core.current_state(self.scope.key, now=now)
             snapshot = self.app.venue.snapshot(self.scope.key, now=now)
@@ -170,16 +191,17 @@ class ScopedUIService:
                     or target is None or type(request['position_version']) is not int
                     or target.version != request['position_version'] or target.quantity != amount):
                 raise ContractError('review target/state/version/quantity changed')
-            intent = ActionIntent('ui-intent-' + content_digest(request), self.scope,
-                'ui-close-decision-' + content_digest(request), 'ui-close-opportunity-' + content_digest(request),
-                'ui-close-action-' + content_digest(request), state, ActionKind.CLOSE, target.instrument_id,
+            bind_seed = (self._adapter_session_epoch, request)
+            intent = ActionIntent('ui-intent-' + content_digest(bind_seed), self.scope,
+                'ui-close-decision-' + content_digest(bind_seed), 'ui-close-opportunity-' + content_digest(bind_seed),
+                'ui-close-action-' + content_digest(bind_seed), state, ActionKind.CLOSE, target.instrument_id,
                 DecisionOrigin.OWNER_REVIEWED, now, min(state.valid_until, now + timedelta(seconds=30)),
                 quantity=amount, target_id=target.position_id, target_version=target.version)
-            preview = dict(preview_id='preview-' + content_digest((request, intent)),
+            preview = dict(preview_id='preview-' + content_digest((self._adapter_session_epoch, request, intent)),
                            owner_request_id=request['owner_request_id'], command_id=request['command_id'],
                            scope=wire(self.scope), intent=wire(intent), intent_sha256=content_digest(intent),
                            expires_at=wire(intent.expires_at))
-            self._prepared_close[request['owner_request_id']] = (wire(request), intent, preview)
+            self._prepared_close[request['owner_request_id']] = (self._adapter_session_epoch, wire(request), intent, preview)
             return wire(preview)
 
     def requestReviewedClose(self, request):
@@ -190,9 +212,9 @@ class ScopedUIService:
             if retained is not None:
                 return {**wire(retained), 'command': retained.get('command')}
             prepared = self._prepared_close.get(request['owner_request_id'])
-            if prepared is None:
+            if prepared is None or prepared[0] != self._adapter_session_epoch:
                 raise ContractError('Close was not reviewed in this owner context')
-            _, intent, preview = prepared
+            _, _, intent, preview = prepared
             if request != {k: preview[k] for k in request}:
                 raise ContractError('Close submission differs from exact reviewed preview')
             now = self.clock()

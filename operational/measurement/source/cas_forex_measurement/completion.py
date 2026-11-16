@@ -1,7 +1,10 @@
 """Actual bounded subprocess/stream/framework observation; never test acceptance."""
 from __future__ import annotations
 from dataclasses import dataclass
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX orchestration host
+    fcntl = None  # type: ignore[assignment]
 import hashlib
 import os
 from pathlib import Path
@@ -10,11 +13,17 @@ import selectors
 import signal
 import select
 import struct
+import subprocess
 import time
 import unittest
 from cas_forex_operational_contracts import completion as co, protected as pr, capture as c, method as m
 from cas_forex_operational_contracts.validation import verify_reference_bytes
-from .inventory import stat_record,require_owned_child_lifecycle,terminate_owned_child
+try:
+    from .inventory import stat_record,require_owned_child_lifecycle,terminate_owned_child
+except ImportError:  # pragma: no cover - non-POSIX orchestration host
+    stat_record = None  # type: ignore[assignment]
+    require_owned_child_lifecycle = None  # type: ignore[assignment]
+    terminate_owned_child = None  # type: ignore[assignment]
 from cas_forex_operational_contracts.common import (canonical_bytes,decode_json,decode_canonical,digest,require,ContractError,
     DependencyUnavailable,ValidationLimits,utc)
 
@@ -184,15 +193,144 @@ class ObservedGroupRun:
     def release_frame_ref(self):return m.decode('ObjectRef',self.release_frame_ref_bytes).payload()
 
 
+MEASUREMENT_SYSTEMD_CGROUP_PROPERTIES={
+    'MemoryHigh':'1536M',
+    'MemoryMax':'2048M',
+    'MemorySwapMax':'0',
+    'CPUQuota':'200%',
+    'TasksMax':'256',
+    'LimitNPROC':'256',
+    'LimitNOFILE':'1024',
+    'OOMPolicy':'kill',
+    'KillMode':'control-group',
+}
+
+SYSTEMCTL_MEASUREMENT_CGROUP_QUERY=(
+    'MemoryHigh,MemoryMax,MemorySwapMax,CPUQuotaPerSecUSec,CPUQuota,'
+    'TasksMax,LimitNPROC,LimitNOFILE,OOMPolicy,KillMode'
+)
+
+_MEASUREMENT_EFFECTIVE_EXACT_VALUES={
+    'MemoryHigh':frozenset({'1610612736','1536M'}),
+    'MemoryMax':frozenset({'2147483648','2048M'}),
+    'MemorySwapMax':frozenset({'0','0B'}),
+    'TasksMax':frozenset({'256'}),
+    'LimitNPROC':frozenset({'256'}),
+    'LimitNOFILE':frozenset({'1024'}),
+    'OOMPolicy':frozenset({'kill'}),
+    'KillMode':frozenset({'control-group'}),
+}
+
+_MEASUREMENT_EFFECTIVE_CPU_QUOTA_USEC=frozenset({'2s','2000ms','2000000','2000000us','200%'})
+_SAFE_UNIT_NAME=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.@-]{0,254}\Z')
+
+
+def _require_unit_name(unit):
+    require(type(unit) is str and _SAFE_UNIT_NAME.fullmatch(unit) is not None,'MEASUREMENT_UNIT_NAME')
+    return unit
+
+
+def measurement_systemd_command(unit,argv,*,runtime_max_sec,extra_properties=None):
+    """Build transient systemd-run command with pinned cgroup and rlimit ceilings."""
+    _require_unit_name(unit)
+    require(type(runtime_max_sec) is int and runtime_max_sec>0,'MEASUREMENT_RUNTIME_MAX_SEC')
+    require(type(argv) in (list,tuple) and len(argv)>=1
+            and all(type(x) is str and '\x00' not in x for x in argv)
+            and argv[0].startswith('/'),'MEASUREMENT_COMMAND_ARGV')
+    properties={
+        'Type':'exec',
+        'Restart':'no',
+        'RuntimeMaxSec':str(runtime_max_sec),
+        'TimeoutStopSec':'1',
+        'KillMode':'control-group',
+        'SendSIGKILL':'yes',
+        'DynamicUser':'yes',
+        'NoNewPrivileges':'yes',
+        'UMask':'0077',
+        'CapabilityBoundingSet':'',
+        'AmbientCapabilities':'',
+        'PrivateNetwork':'yes',
+        'PrivateDevices':'yes',
+        'PrivateTmp':'yes',
+        'ProtectSystem':'strict',
+        'ProtectHome':'yes',
+        'ProtectControlGroups':'yes',
+        'RestrictSUIDSGID':'yes',
+        'RestrictNamespaces':'yes',
+        'LockPersonality':'yes',
+        **MEASUREMENT_SYSTEMD_CGROUP_PROPERTIES,
+    }
+    if extra_properties is not None:
+        require(type(extra_properties) is dict,'MEASUREMENT_EXTRA_PROPERTIES')
+        for key,value in extra_properties.items():
+            require(type(key) is str and bool(key) and '=' not in key and '\x00' not in key
+                    and type(value) is str and '\x00' not in value and '\n' not in value,
+                    'MEASUREMENT_EXTRA_PROPERTIES')
+            if key in properties:
+                require(properties[key]==value,'MEASUREMENT_CGROUP_PROPERTY_OVERRIDE')
+            else:
+                properties[key]=value
+    command=['/usr/bin/systemd-run','--unit='+unit,'--wait','--pipe','--quiet']
+    command.extend('--property='+k+'='+v for k,v in properties.items())
+    command.extend(argv)
+    return command
+
+
+def validate_measurement_unit_ready(unit,*,timeout=3.0,runner=subprocess.run):
+    """Verify effective transient unit cgroup/rlimit ceilings via systemctl show; fail closed."""
+    _require_unit_name(unit)
+    require(type(timeout) in (int,float) and not isinstance(timeout,bool) and timeout>0,'MEASUREMENT_SHOW_TIMEOUT')
+    require(callable(runner),'MEASUREMENT_SHOW_RUNNER')
+    try:
+        completed=runner(
+            ['/usr/bin/systemctl','show',unit,'--property='+SYSTEMCTL_MEASUREMENT_CGROUP_QUERY],
+            check=True,capture_output=True,text=True,timeout=timeout,
+        )
+    except (subprocess.SubprocessError,OSError) as exc:
+        raise ContractError('MEASUREMENT_UNIT_SHOW_UNAVAILABLE') from exc
+    output=getattr(completed,'stdout',None)
+    require(type(output) is str and bool(output.strip()),'MEASUREMENT_UNIT_SHOW_EMPTY')
+    props={}
+    for raw_line in output.splitlines():
+        line=raw_line.strip()
+        if not line:
+            continue
+        require('=' in line,'MEASUREMENT_UNIT_SHOW_MALFORMED')
+        key,value=line.split('=',1)
+        key,value=key.strip(),value.strip()
+        require(bool(key) and key not in props,'MEASUREMENT_UNIT_SHOW_DUPLICATE')
+        props[key]=value
+    for key,allowed in _MEASUREMENT_EFFECTIVE_EXACT_VALUES.items():
+        require(props.get(key) in allowed,'MEASUREMENT_UNIT_CGROUP_CEILING_MISMATCH:'+key)
+    raw_quota=props.get('CPUQuota')
+    raw_usec=props.get('CPUQuotaPerSecUSec')
+    if raw_quota not in (None,'','[not set]'):
+        require(raw_quota=='200%','MEASUREMENT_UNIT_CGROUP_CEILING_MISMATCH:CPUQuota')
+    if raw_usec not in (None,'','[not set]'):
+        require(raw_usec in _MEASUREMENT_EFFECTIVE_CPU_QUOTA_USEC,'MEASUREMENT_UNIT_CGROUP_CEILING_MISMATCH:CPUQuotaPerSecUSec')
+    require(raw_quota=='200%' or raw_usec in _MEASUREMENT_EFFECTIVE_CPU_QUOTA_USEC,
+            'MEASUREMENT_UNIT_CGROUP_CEILING_MISMATCH:CPUQuota')
+    return props
+
+
 class ForkExecCapture:
     """One observed child, with collection publication before execution release.
 
     Exact argv selects child FD numbers. Anonymous pipe sources are remapped in
     the child only; executable/argv/environment pins are never rewritten.
     """
-    def __init__(self,*,inventory,guard,execution_gate,capture_sink):
+    def __init__(self,*,inventory,guard,execution_gate,capture_sink,unit_name=None,systemctl_runner=subprocess.run):
         require(callable(execution_gate),'EXECUTION_GATE_REQUIRED')
+        if unit_name is not None:
+            _require_unit_name(unit_name)
+            require(callable(systemctl_runner),'MEASUREMENT_SHOW_RUNNER')
         self.inventory,self.guard,self.gate,self.sink=inventory,guard,execution_gate,capture_sink
+        self.unit_name,self._systemctl_runner=unit_name,systemctl_runner
+    def validate_ready(self):
+        require(self.gate() is None,'RUNTIME_APPROVAL_ABSENT')
+        if self.unit_name is not None:
+            timeout=min(3.0,self.guard.remaining()) if self.guard is not None else 3.0
+            validate_measurement_unit_ready(self.unit_name,timeout=timeout,runner=self._systemctl_runner)
     def _retain(self,raw):
         ref=self.sink.retain(raw,artifact_kind='NATIVE_CAPTURE_BYTES')
         verify_reference_bytes(ref,raw)
@@ -214,7 +352,8 @@ class ForkExecCapture:
         require(callable(on_discovery) and callable(before_release),'DISCOVERY_CALLBACKS_REQUIRED')
         require(type(maximum_stream_bytes) is int and 0<maximum_stream_bytes<=524_288,'STREAM_BOUND')
         selected_args=selected_driver_arguments(command)
-        require(self.gate() is None,'RUNTIME_APPROVAL_ABSENT');self.guard.now()
+        self.validate_ready();self.guard.now()
+        require(fcntl is not None and stat_record is not None and require_owned_child_lifecycle is not None,'POSIX_CAPTURE_REQUIRED')
         selected=command['executable'];fd=os.open(selected['selected_path'],os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
         pipes=[];pid=None;pidfd=None
         def pipe(*,nonblocking=False):
@@ -296,7 +435,7 @@ class ForkExecCapture:
                         publication=canonical_bytes(publication) # Callback cannot later mutate it.
                         require(before_release(process=notice.process,now=self.guard.now()) is None,'DISCOVERY_RELEASE_AUTHORITY')
                         self._live(pid,pidfd,subject)
-                        require(self.gate() is None,'RUNTIME_APPROVAL_ABSENT')
+                        self.validate_ready()
                         wire=release_frame(command['group_id'],frame.body)
                         execution_started=self.guard.now()
                         self._release(release[1],wire);close_owned(release[1])

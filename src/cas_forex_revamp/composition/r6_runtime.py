@@ -15,15 +15,34 @@ from threading import RLock
 from ..contracts import (ActionIntent, ActionKind, ActionOption, CommandState, ContractError,
     ControlKind, DecisionFact, DecisionOrigin, DecisionRequest, EffectState, EvidenceKind,
     EvidenceReference, FenceRequest, Instrument, MarketObservation, Money, RunScope, Side,
-    canonical_bytes, content_digest, assert_current_request)
+    canonical_bytes, content_digest, assert_current_request, decimal_text)
 from ..core import CoreCoordinator, InstrumentPolicy, RiskPolicy, SQLiteStore
 from ..operator.decisions import OperatorSession
+from ..valve.tks_meta_valve_controller import (
+    DEFAULT_MAX_DRAWDOWN_PCT,
+    PeakEquityStore,
+    _extract_money_decimal,
+    compute_drawdown_pct,
+)
 from ..venue import SQLiteVenue
 from ..venue.fixtures import OrderPlan, VenueScenario
 from .custody_adapter import PROFILE, need, validate_context
 from .evidence_journal import EvidenceJournal
 from .owner_requests import OwnerRequestBook
 from .r6_observation import read_venue_state, wire
+
+_PACKET_VIEW_KEYS = (
+    'account_id',
+    'plan_id',
+    'balance',
+    'equity',
+    'available_margin',
+    'margin_provenance',
+    'position_inventory',
+    'current_market',
+    'policy_revision',
+    'context_version',
+)
 
 
 def packet_json(request):
@@ -49,16 +68,20 @@ def packet_json(request):
 
 
 class CaseRuntime:
-    def __init__(self, case, *, directory, execution_id, build_id, adapter, clock, valve_gate=None):
+    def __init__(self, case, *, directory, execution_id, build_id, adapter, clock, valve_gate=None, peak_equity_store=None):
         self.case = deepcopy(case)
         self.directory, self.adapter, self.clock = directory, adapter, clock
         self.valve_gate = valve_gate
         self.last_valve_decision = None
         self.lock = RLock()
         self.policy = deepcopy(case['policy'])
+        raw_dd = self.policy.get('max_drawdown_pct', DEFAULT_MAX_DRAWDOWN_PCT)
+        self.max_drawdown_pct = Decimal(str(raw_dd)) if raw_dd is not None else None
         self.context, self.context_version = None, 0
         self.scope = RunScope(case['account_id'], execution_id+'-'+case['case_id'], 1,
             build_id, 'policy-'+content_digest(self.policy), case['plan_id'], 'independent-simulator-1')
+        self._drawdown_scope_id = f"{self.scope.account_id}:{self.scope.run_id}"
+        self.drawdown_store = peak_equity_store if peak_equity_store is not None else PeakEquityStore(directory/'account.drawdown.sqlite3')
         self.instrument = Instrument('synthetic-eurusd', 'EURUSD', 'EUR', 'USD',
             Decimal(PROFILE['price_tick']), Decimal(PROFILE['quantity_step']), Decimal(PROFILE['quantity_step']))
         self.core_path, self.venue_path = directory/'account.core.sqlite3', directory/'account.venue.sqlite3'
@@ -72,12 +95,21 @@ class CaseRuntime:
         self.used_step_ids = set()
         self.event_index = 0
 
+    def effective_valve_policy(self):
+        dd_val = self.policy['max_drawdown_pct'] if 'max_drawdown_pct' in self.policy else (
+            decimal_text(self.max_drawdown_pct) if self.max_drawdown_pct is not None else None
+        )
+        return {**self.policy, 'max_drawdown_pct': dd_val, 'require_peak_equity': True}
+
     def append(self, kind, payload):
         self.event_index += 1
         return self.journal.append('r6-event-'+str(self.event_index), kind, self.scope, payload, now=self.clock())
 
-    def initialize(self):
-        self.directory.mkdir(exist_ok=False)
+    def initialize(self, *, allow_existing_drawdown: bool = False):
+        if allow_existing_drawdown:
+            self.directory.mkdir(exist_ok=True)
+        else:
+            self.directory.mkdir(exist_ok=False)
         self.journal.initialize(create=True)
         plans = []
         for step in self.case['steps']:
@@ -91,6 +123,12 @@ class CaseRuntime:
         first = self.venue.snapshot(self.scope.key, now=self.clock())
         need(first.equity.amount == Decimal(self.case['initial_account']['equity']) and not first.positions,
              'initial declaration does not equal independently created venue state')
+        self.drawdown_store.observe_equity(
+            self._drawdown_scope_id,
+            current_equity=first.equity.amount,
+            opening_balance=Decimal(self.case['initial_account']['balance']),
+            now=self.clock(),
+        )
         self.append('R6_INITIAL_OBSERVATION', {'snapshot': first, 'margin_provenance': 'DECLARED_FIXTURE_SAFETY_FACT'})
         self._new_core(create=True)
         self.market(self.case['initial_market'])
@@ -123,6 +161,41 @@ class CaseRuntime:
         self.append('R6_FIXTURE_OWNER_CONTROL', {'request': request, 'returned': returned, 'observed': actual})
         self.core.reconcile(self.scope.key, now=self.clock())
 
+    def rearm_drawdown(self, *, owner_request_id: str) -> Decimal:
+        """Authenticated owner recovery re-arming peak_equity to current venue equity."""
+        with self.lock:
+            now = self.clock()
+            snap = self.venue.snapshot(self.scope.key, now=now)
+            fence = snap.fence
+            request = FenceRequest(
+                self.scope.key,
+                'barrier-' + owner_request_id,
+                ControlKind.RESUME_NEW_RISK,
+                owner_request_id,
+                fence.generation,
+                fence.generation + 1,
+                now,
+            )
+            self.owner.register(request, request_id=owner_request_id, now=now)
+            returned = self.core.control(request, now=now)
+            actual = self.venue.snapshot(self.scope.key, now=self.clock()).fence
+            need(returned == actual and actual.applied, 'owner drawdown re-arm fence failed readback')
+            new_peak = self.drawdown_store.rearm_after_drawdown(
+                self._drawdown_scope_id,
+                new_peak_equity=snap.equity.amount,
+                owner_verifier=self.owner,
+                owner_request_id=owner_request_id,
+                fence_request=request,
+                now=now,
+            )
+            self.core.reconcile(self.scope.key, now=self.clock())
+            self.append('R6_OWNER_DRAWDOWN_REARM', {
+                'owner_request_id': owner_request_id,
+                'new_peak_equity': decimal_text(new_peak),
+                'fence': actual,
+            })
+            return new_peak
+
     def _declared_permissions(self):
         self.control(ControlKind.STOP_AUTOMATION)
         if self.policy['new_risk_permission'] == 'ALLOWED' and Decimal(self.policy['max_entry_quantity']) > 0:
@@ -137,7 +210,12 @@ class CaseRuntime:
             event = MarketObservation(self.scope.key, 'market-'+str(before.sequence+1),
                 self.instrument.instrument_id, before.sequence+1, now, now,
                 Decimal(quote['bid']), Decimal(quote['ask']))
-            self.venue.advance_market(event)
+            after_snap = self.venue.advance_market(event)
+            self.drawdown_store.observe_equity(
+                self._drawdown_scope_id,
+                current_equity=after_snap.equity.amount,
+                now=now,
+            )
             self.core.reconcile(self.scope.key, now=self.clock())
             self.append('R6_MARKET_EVENT', {'event': event, 'observed': self.observe()})
             return event
@@ -157,11 +235,16 @@ class CaseRuntime:
 
     def change_policy(self, patch):
         with self.lock:
-            need(set(patch) == {'policy_revision', 'max_entry_quantity'}
+            allowed_keys = {'policy_revision', 'max_entry_quantity'}
+            if 'max_drawdown_pct' in patch:
+                allowed_keys = {'policy_revision', 'max_entry_quantity', 'max_drawdown_pct'}
+            need(set(patch) == allowed_keys
                  and patch['policy_revision'] == self.policy['policy_revision']+1,
                  'only declared next policy revision/entry-limit patch is supported')
             previous = deepcopy(self.policy)
             self.policy.update(deepcopy(patch))
+            if 'max_drawdown_pct' in patch:
+                self.max_drawdown_pct = Decimal(str(patch['max_drawdown_pct'])) if patch['max_drawdown_pct'] is not None else None
             self.scope = replace(self.scope, epoch=self.scope.epoch+1,
                                  policy_id='policy-'+content_digest(self.policy))
             self._new_core(create=False)
@@ -201,12 +284,27 @@ class CaseRuntime:
                  'declared current quote differs from actual observation')
             self._market_current(snap)
             state = self.current_state()
-            margin = None if 'observed_accounting_override' in step else self.case['initial_account']['available_margin']
+            observed_peak = self.drawdown_store.observe_equity(
+                self._drawdown_scope_id,
+                current_equity=Decimal(snap['equity']['amount']),
+                opening_balance=Decimal(self.case['initial_account']['balance']),
+                now=self.clock(),
+            )
+            has_override = 'observed_accounting_override' in step
+            override = step['observed_accounting_override'] if (has_override and isinstance(step['observed_accounting_override'], dict)) else {}
+            if has_override and ('available_margin' in override or not override):
+                margin = override.get('available_margin', None)
+            else:
+                margin = self.case['initial_account']['available_margin']
+            equity_view = override['equity'] if (has_override and 'equity' in override) else snap['equity']
+            peak_view = override['peak_equity'] if (has_override and 'peak_equity' in override) else decimal_text(observed_peak)
+
             current = {'account_id': self.scope.account_id, 'plan_id': self.case['plan_id'],
-                'balance': snap['balance'], 'equity': snap['equity'],
+                'balance': snap['balance'], 'equity': equity_view,
                 'available_margin': margin, 'margin_provenance': 'DECLARED_FIXTURE_SAFETY_FACT' if margin is not None else 'UNAVAILABLE',
                 'position_inventory': snap['positions'], 'current_market': snap['market'],
-                'policy_revision': self.policy['policy_revision'], 'context_version': self.context_version}
+                'policy_revision': self.policy['policy_revision'], 'context_version': self.context_version,
+                'peak_equity': peak_view}
             context = deepcopy(self.context)
             untrusted = context.pop('imported_note', None)
             source = {'context': context, 'presentation_note': step['presentation_note']}
@@ -220,8 +318,9 @@ class CaseRuntime:
             facts = []
             def fact(name, label, value, source_id):
                 facts.append(DecisionFact(name+'-'+sid, label, canonical_bytes(value).decode(), (source_id,)))
-            # Split current records to preserve exact values inside bounded facts.
-            for name, value in current.items(): fact('observed-'+name, name, value, 'evidence-'+sid)
+            # Preserve exact bounded packet keys so Stage B 4096-token / 8500-byte budget stays invariant.
+            for name in _PACKET_VIEW_KEYS:
+                fact('observed-'+name, name, current[name], 'evidence-'+sid)
             fact('context', 'Current declared context', context, 'case-'+sid)
             fact('presentation', 'Irrelevant presentation note', step['presentation_note'], 'case-'+sid)
             if untrusted is not None:
@@ -262,6 +361,28 @@ class CaseRuntime:
             need(0 <= (self.clock()-original).total_seconds() < PROFILE['observation_ttl_seconds'],
                  'market observation expired; rereading cannot refresh it')
 
+    def _require_drawdown_envelope(self, intent, current_view):
+        if intent.kind not in (ActionKind.OPEN, ActionKind.ADD):
+            return
+        eff_dd = self.policy['max_drawdown_pct'] if 'max_drawdown_pct' in self.policy else self.max_drawdown_pct
+        if eff_dd is None:
+            raise ContractError('MISSING_DRAWDOWN_ACCOUNTING: drawdown threshold missing from bound policy')
+        dd_limit = Decimal(str(eff_dd))
+        need(Decimal('0') < dd_limit < Decimal('1'), 'MISSING_DRAWDOWN_ACCOUNTING: invalid max_drawdown_pct')
+        cur_eq = _extract_money_decimal(current_view.get('equity'))
+        peak_eq = _extract_money_decimal(current_view.get('peak_equity'))
+        need(cur_eq is not None and peak_eq is not None and peak_eq > Decimal('0'),
+             'MISSING_DRAWDOWN_ACCOUNTING: peak_equity or current equity unavailable')
+        stored_peak = self.drawdown_store.observe_equity(
+            self._drawdown_scope_id,
+            current_equity=cur_eq,
+            opening_balance=peak_eq,
+            now=self.clock(),
+        )
+        effective_peak = max(peak_eq, stored_peak)
+        dd_pct = compute_drawdown_pct(cur_eq, effective_peak)
+        need(dd_pct < dd_limit, 'MAX_DRAWDOWN_EXCEEDED: new risk admission halted until owner recovery')
+
     def admit_dispatch(self, proposal, binding, current_view, command_id):
         with self.lock:
             need(binding['context_sha256'] == content_digest(self.context)
@@ -271,15 +392,21 @@ class CaseRuntime:
             intent = proposal.intent
             if intent is None: return None, None
             if self.valve_gate is not None:
-                dec = self.valve_gate.evaluate(proposal, current_view=current_view, policy=self.policy, now=self.clock())
+                dec = self.valve_gate.evaluate(
+                    proposal,
+                    current_view=current_view,
+                    policy=self.effective_valve_policy(),
+                    now=self.clock(),
+                )
                 self.last_valve_decision = wire(dec.to_dict())
                 self.append('R6_VALVE_EVALUATION', self.last_valve_decision)
                 if not dec.admitted:
                     from ..valve import ValveRefusalError
                     raise ValveRefusalError(f'ForexMetaValveGate blocked unsafe proposal ({dec.valve_mode})', decision=dec)
+            self._require_drawdown_envelope(intent, current_view)
             missing = [k for k in self.policy['accounting_required'] if current_view.get(k) is None]
             need(not missing, 'required safety facts are unavailable; no admission')
-            if intent.kind is ActionKind.OPEN:
+            if intent.kind in (ActionKind.OPEN, ActionKind.ADD):
                 need(self.policy['new_risk_permission'] == 'ALLOWED'
                      and intent.quantity <= Decimal(self.policy['max_entry_quantity']), 'entry outside current policy envelope')
             else:

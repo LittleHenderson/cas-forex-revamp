@@ -33,7 +33,13 @@ from typing import Any
 
 from cas_forex_revamp.contracts import ActionKind, ContractError, Side, decimal_text, parse_decimal
 from cas_forex_revamp.contracts.primitives import decimal_value
-from cas_forex_revamp.valve.tks_meta_valve_controller import ForexMetaValveGate, ValveDecision
+from cas_forex_revamp.valve.tks_meta_valve_controller import (
+    DEFAULT_MAX_DRAWDOWN_PCT,
+    ForexMetaValveGate,
+    PeakEquityStore,
+    ValveDecision,
+    compute_drawdown_pct,
+)
 from .external_paper_broker import EXPANDED_FX_PAIRS, OandaPracticePaperClient, assert_safe_json_numbers
 from .mt5_broker_bridge import (
     BROKER_HUGOSWAY_MT5,
@@ -63,6 +69,7 @@ __all__ = [
     "BarbellCapitalPolicy",
     "BarbellPolicyRefusalError",
     "DualShieldBrokerRouter",
+    "ENV_BARBELL_MAX_DRAWDOWN_PCT",
     "DualShieldExecution",
     "MAJOR_FX_PAIRS",
     "OandaProtectiveOffsetPlanner",
@@ -80,6 +87,7 @@ ENV_BARBELL_OANDA_RESERVE_SHARE = "CAS_FOREX_BARBELL_OANDA_RESERVE_SHARE"
 ENV_BARBELL_HUGOSWAY_SHARE = "CAS_FOREX_BARBELL_HUGOSWAY_SHARE"
 ENV_BARBELL_LHFX_SHARE = "CAS_FOREX_BARBELL_LHFX_SHARE"
 ENV_BARBELL_MAX_STOP_RISK_PCT = "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT"
+ENV_BARBELL_MAX_DRAWDOWN_PCT = "CAS_FOREX_MAX_DRAWDOWN_PCT"
 
 OANDA_SAFE_HARBOR_LEVERAGE = 50
 MAJOR_FX_PAIRS: tuple[str, ...] = tuple(p for p in EXPANDED_FX_PAIRS if "USD" in p)
@@ -388,6 +396,7 @@ class BarbellCapitalPolicy:
         hugosway_share: Decimal = Decimal("0.12"),
         lhfx_share: Decimal = Decimal("0.08"),
         max_stop_loss_equity_risk_pct: Decimal = Decimal("1.00"),
+        max_drawdown_pct: Decimal = DEFAULT_MAX_DRAWDOWN_PCT,
         allocation_tolerance_share: Decimal = Decimal("0.02"),
         account_currency: str = "USD",
     ) -> None:
@@ -405,6 +414,9 @@ class BarbellCapitalPolicy:
         )
         if self.max_stop_loss_equity_risk_pct > Decimal("5"):
             raise ContractError("max_stop_loss_equity_risk_pct must not exceed 5%")
+        self.max_drawdown_pct = decimal_value(max_drawdown_pct, "max_drawdown_pct", positive=True)
+        if self.max_drawdown_pct >= Decimal("1"):
+            raise ContractError("max_drawdown_pct must be strictly below 1 (100%)")
         self.tolerance = _share(allocation_tolerance_share, "allocation_tolerance_share")
         self._calc = Mt5MarginCalculator(account_currency=account_currency)
 
@@ -420,6 +432,7 @@ class BarbellCapitalPolicy:
             hugosway_share=pick(ENV_BARBELL_HUGOSWAY_SHARE, "0.12"),
             lhfx_share=pick(ENV_BARBELL_LHFX_SHARE, "0.08"),
             max_stop_loss_equity_risk_pct=pick(ENV_BARBELL_MAX_STOP_RISK_PCT, "1.00"),
+            max_drawdown_pct=pick(ENV_BARBELL_MAX_DRAWDOWN_PCT, "0.10"),
             **kwargs,
         )
 
@@ -467,6 +480,20 @@ class BarbellCapitalPolicy:
             return (total_equity * self.max_stop_loss_equity_risk_pct / Decimal(100)).quantize(
                 Decimal("0.01"), rounding=ROUND_FLOOR
             )
+
+    def require_drawdown(self, *, current_equity: Decimal | None, peak_equity: Decimal | None) -> Decimal:
+        if current_equity is None or peak_equity is None or peak_equity <= Decimal("0"):
+            raise BarbellPolicyRefusalError(
+                "peak_equity and current_equity are required before opening new risk",
+                "MISSING_DRAWDOWN_ACCOUNTING",
+            )
+        dd_pct = compute_drawdown_pct(current_equity, peak_equity)
+        if dd_pct >= self.max_drawdown_pct:
+            raise BarbellPolicyRefusalError(
+                f"barbell drawdown {decimal_text(dd_pct)} >= max_drawdown_pct {decimal_text(self.max_drawdown_pct)}",
+                "MAX_DRAWDOWN_EXCEEDED",
+            )
+        return dd_pct
 
     def require_stop_risk(self, risk: Decimal, equities: Mapping[str, Decimal]) -> Decimal:
         total = self.total_equity(equities)
@@ -534,6 +561,7 @@ class BarbellCapitalPolicy:
             "hugosway_share": decimal_text(self.shares[BROKER_HUGOSWAY_MT5]),
             "lhfx_share": decimal_text(self.shares[BROKER_LHFX_MT5]),
             "max_stop_loss_equity_risk_pct": decimal_text(self.max_stop_loss_equity_risk_pct),
+            "max_drawdown_pct": decimal_text(self.max_drawdown_pct),
             "allocation_tolerance_share": decimal_text(self.tolerance),
         }
 
@@ -765,6 +793,9 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         barbell: BarbellCapitalPolicy | None = None,
         offset_planner: OandaProtectiveOffsetPlanner | None = None,
         equity_attestations: Mapping[str, Decimal] | None = None,
+        peak_equity_store: PeakEquityStore | None = None,
+        initial_peak_equity: Decimal | None = None,
+        drawdown_scope_id: str = "dual-shield-barbell",
         **kwargs: Any,
     ) -> None:
         super().__init__(environ=environ, valve_gate=valve_gate, **kwargs)
@@ -777,6 +808,13 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             if key not in BROKER_SPECS:
                 raise ContractError(f"unknown attested venue {key}")
             decimal_value(value, f"attested equity {key}")
+        if initial_peak_equity is not None:
+            decimal_value(initial_peak_equity, "initial_peak_equity", positive=True)
+        if not isinstance(drawdown_scope_id, str) or not drawdown_scope_id.strip():
+            raise ContractError("drawdown_scope_id must be a non-empty string")
+        self._peak_store = peak_equity_store if peak_equity_store is not None else PeakEquityStore()
+        self._initial_peak_equity = initial_peak_equity
+        self._drawdown_scope_id = drawdown_scope_id.strip()
         self._venues: dict[str, Mt5PaperBrokerVenue | OandaPracticeFallbackVenue] = {}
         self._last_equity: dict[str, Decimal] = {}
         self._degradations: list[dict[str, Any]] = []
@@ -850,7 +888,36 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 value = self._last_equity.get(broker_id, self._attestations.get(broker_id, Decimal("0")))
             self._last_equity[broker_id] = value
             out[broker_id] = value
+        total = self.barbell.total_equity(out)
+        if total > Decimal("0"):
+            self._peak_store.observe_equity(
+                self._drawdown_scope_id,
+                current_equity=total,
+                opening_balance=self._initial_peak_equity if self._initial_peak_equity is not None else total,
+                now=self._clock(),
+            )
         return out
+
+    def peak_equity(self) -> Decimal | None:
+        return self._peak_store.read_peak(self._drawdown_scope_id)
+
+    def rearm_drawdown(
+        self,
+        *,
+        new_peak_equity: Decimal,
+        owner_verifier: Any,
+        owner_request_id: str,
+        fence_request: Any | None = None,
+        now: datetime | None = None,
+    ) -> Decimal:
+        return self._peak_store.rearm_after_drawdown(
+            self._drawdown_scope_id,
+            new_peak_equity=new_peak_equity,
+            owner_verifier=owner_verifier,
+            owner_request_id=owner_request_id,
+            fence_request=fence_request,
+            now=now or self._clock(),
+        )
 
     def _offshore_route(self) -> tuple[str, ...]:
         if self.primary_broker == BROKER_OANDA_PRACTICE:
@@ -878,6 +945,9 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         rbid, rask = reference[order.symbol]
         entry = rask if order.side is Side.BUY else rbid
         equities = self.equities()
+        total_eq = self.barbell.total_equity(equities)
+        peak_eq = self.peak_equity()
+        self.barbell.require_drawdown(current_equity=total_eq, peak_equity=peak_eq)
         risk = self.barbell.stop_loss_risk(
             symbol=order.symbol,
             units=order.quantity_units,  # type: ignore[arg-type]
@@ -1017,10 +1087,20 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             oracle_cfg = OandaQuoteTruthOracle.from_static_quotes({}, reference_name="UNAVAILABLE").config_dict()
         snap["schema"] = "cas-forex.broker-routing/2"
         snap["architecture"] = "DUAL_SHIELD_BARBELL"
+        eq_map = self.equities()
+        alloc = self.barbell.allocation_report(eq_map)
+        total_eq = self.barbell.total_equity(eq_map)
+        peak_eq = self.peak_equity()
+        alloc["peak_equity"] = None if peak_eq is None else decimal_text(peak_eq)
+        alloc["drawdown_pct"] = (
+            "0"
+            if (peak_eq is None or peak_eq <= Decimal("0") or total_eq <= Decimal("0"))
+            else decimal_text(compute_drawdown_pct(total_eq, peak_eq).quantize(Decimal("0.0001")))
+        )
         snap["dual_shield"] = {
             "quote_truth_oracle": oracle_cfg,
             "barbell": self.barbell.config_dict(),
-            "allocation": self.barbell.allocation_report(self.equities()),
+            "allocation": alloc,
             "safe_harbor": {
                 "broker_id": BROKER_OANDA_PRACTICE,
                 "leverage": f"1:{OANDA_SAFE_HARBOR_LEVERAGE}",

@@ -24,6 +24,13 @@ ZERO = Decimal("0")
 PRICE_QUANTUM = Decimal("0.000000000001")
 APPLICATION_ID = 0x56454E55
 STORAGE_VERSION = 1
+RISK_CHANGING_ACTIONS = (
+    ActionKind.OPEN,
+    ActionKind.ADD,
+    ActionKind.AMEND_STOP,
+    ActionKind.REDUCE,
+    ActionKind.CLOSE,
+)
 
 
 class VenueStorageError(RuntimeError):
@@ -54,7 +61,8 @@ class JournalCheckpoint:
 class SQLiteVenue:
     def __init__(self, path: str | Path, *, faults: FaultSchedule | None = None,
                  owner_close_verifier: Callable[[AuthorizedCommand, datetime], bool] | None = None,
-                 minimum_sequence: int = 0, checkpoint_anchor: JournalCheckpoint | None = None) -> None:
+                 minimum_sequence: int = 0, checkpoint_anchor: JournalCheckpoint | None = None,
+                 strict_source_cursor: bool = False) -> None:
         self.path = Path(path)
         if not self.path.name.endswith(".venue.sqlite3"):
             raise ContractError("use a dedicated *.venue.sqlite3 path, never the core store")
@@ -65,6 +73,9 @@ class SQLiteVenue:
         if checkpoint_anchor is not None and not isinstance(checkpoint_anchor, JournalCheckpoint):
             raise ContractError("trusted checkpoint anchor must be JournalCheckpoint")
         self.checkpoint_anchor = checkpoint_anchor
+        if not isinstance(strict_source_cursor, bool):
+            raise ContractError("strict_source_cursor must be bool")
+        self._strict_source_cursor = strict_source_cursor
 
     def initialize(self, key: AccountRunKey, *, opening_balance: Money,
                    instruments: tuple[Instrument, ...], now: datetime,
@@ -360,6 +371,16 @@ class SQLiteVenue:
             return "STALE_OR_FUTURE_INTENT"
         if intent.source_state.venue_sequence > state["sequence"]:
             return "FUTURE_SOURCE_CURSOR"
+        if (
+            intent.kind in RISK_CHANGING_ACTIONS
+            and (
+                intent.source_state.version > 0
+                or intent.source_state.venue_sequence > 0
+                or getattr(self, "_strict_source_cursor", False)
+            )
+            and intent.source_state.venue_sequence != state["sequence"]
+        ):
+            return "STALE_SOURCE_CURSOR"
         new_risk = intent.kind in (ActionKind.OPEN, ActionKind.ADD)
         if new_risk and command.risk_price_ceiling is None:
             return "RISK_PRICE_CEILING_REQUIRED"

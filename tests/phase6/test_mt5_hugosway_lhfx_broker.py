@@ -1006,15 +1006,21 @@ class DualShieldBarbellTests(unittest.TestCase):
 
 
 class CockpitBrokerRoutingEndpointTests(unittest.TestCase):
-    def _get(self, base: str, path: str):
-        return urllib.request.urlopen(base + path, timeout=5)
+    def _get(self, base: str, path: str, headers: dict[str, str] | None = None):
+        req = urllib.request.Request(base + path, headers=headers or {}, method="GET")
+        return urllib.request.urlopen(req, timeout=5)
 
-    def test_broker_routing_endpoint_serves_safe_json_with_csp(self) -> None:
+    def test_broker_routing_endpoint_requires_auth_and_serves_safe_json_with_csp(self) -> None:
         router = DualShieldBrokerRouter(environ={}, valve_gate=GATE)
         srv = LoopbackCockpitServer(repo_root=REPO_ROOT, host="127.0.0.1", port=0, broker_router_reader=router.routing_snapshot)
         base = srv.start()
         try:
-            with self._get(base, "/api/broker-routing") as resp:
+            with self.assertRaises(urllib.error.HTTPError) as unauth:
+                self._get(base, "/api/broker-routing")
+            self.assertEqual(unauth.exception.code, 401)
+            unauth.exception.close()
+
+            with self._get(base, "/api/broker-routing", headers=srv.auth_headers()) as resp:
                 self.assertEqual(resp.status, 200)
                 self.assertIn("default-src 'none'", resp.headers.get("Content-Security-Policy", ""))
                 doc = json.loads(resp.read().decode("utf-8"))
@@ -1022,6 +1028,7 @@ class CockpitBrokerRoutingEndpointTests(unittest.TestCase):
             self.assertEqual(doc["chain"][0]["server"], "Hugo demo PRO5")
             self.assertEqual(doc["platform"], "MetaTrader 5")
             self.assertIn("dual_shield", doc)
+            self.assertEqual(doc["dual_shield"]["barbell"]["max_drawdown_pct"], "0.1")
         finally:
             srv.stop()
 
@@ -1037,7 +1044,7 @@ class CockpitBrokerRoutingEndpointTests(unittest.TestCase):
             base = srv.start()
             try:
                 with self.assertRaises(urllib.error.HTTPError) as ctx:
-                    self._get(base, "/api/broker-routing")
+                    self._get(base, "/api/broker-routing", headers=srv.auth_headers())
                 self.assertEqual(ctx.exception.code, code)
                 body = ctx.exception.read().decode("utf-8")
                 ctx.exception.close()

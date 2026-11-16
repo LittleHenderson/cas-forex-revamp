@@ -194,7 +194,13 @@ class ExpandedBrokerAndChartTests(unittest.TestCase):
                 body_html = r_html.read().decode("utf-8")
                 self.assertIn("CAS Forex", body_html)
 
-            with urllib.request.urlopen(base_url + "/api/market-stream", timeout=5) as r_ms:
+            with self.assertRaises(urllib.error.HTTPError) as unauth_ms:
+                urllib.request.urlopen(base_url + "/api/market-stream", timeout=5)
+            self.assertEqual(unauth_ms.exception.code, 401)
+            unauth_ms.exception.close()
+
+            req_ms = urllib.request.Request(base_url + "/api/market-stream", headers=srv.auth_headers(), method="GET")
+            with urllib.request.urlopen(req_ms, timeout=5) as r_ms:
                 self.assertEqual(r_ms.status, 200)
                 doc = json.loads(r_ms.read().decode("utf-8"))
                 self.assertEqual(len(doc["streams"]), 16)

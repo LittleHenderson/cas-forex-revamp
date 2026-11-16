@@ -4,7 +4,7 @@ import { resetInspection, reviewRecords, inspectRecord } from './model.mjs';
 import { displayFreshness } from './freshness.mjs';
 import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose, replaceSafeHTML } from './render.mjs';
 import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decision-read.mjs';
-import { ScopedBridge } from './bridge.mjs';
+import { ScopedBridge, createAuthenticatedLoopbackBridge } from './bridge.mjs';
 import { ALL_CHART_PAIRS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts } from './chart.mjs';
 import { MAX_BROKER_ROUTING_BYTES, normalizeBrokerRouting } from './broker-routing.mjs';
 
@@ -30,6 +30,25 @@ let loadGeneration = 0;
 let reviewGeneration = 0;
 let dialogTrigger = null;
 let explainer = null;
+let loopbackAuthToken = null;
+try {
+  const bootParams = new URLSearchParams(window.location.search);
+  const tok = bootParams.get('token');
+  if (tok && tok.trim().length >= 16 && !/[\r\n\0]/.test(tok)) {
+    loopbackAuthToken = tok.trim();
+    bootParams.delete('token');
+    const qs = bootParams.toString();
+    const cleanPath = `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`;
+    window.history?.replaceState?.(null, '', cleanPath);
+  }
+} catch { /* Static preview has no token query. */ }
+
+/** Explicitly set or clear the in-memory per-launch loopback bearer token (never stored in Web Storage). */
+export function setLoopbackAuthToken(token) {
+  if (token === null) { loopbackAuthToken = null; return; }
+  if (typeof token !== 'string' || token.trim().length < 16 || /[\r\n\0]/.test(token)) throw new Error('Invalid loopback auth token.');
+  loopbackAuthToken = token.trim();
+}
 let state = {
   projection: null, source: 'none', loadedAt: null, schemaReady: false,
   error: null, loading: false, route: routeFromHash(), theme: 'system',
@@ -204,24 +223,12 @@ async function connectLoopbackLiveFeed() {
     try {
       const health = parseUniqueJSON(await readStatic(new URL('/api/health', window.location.origin)));
       if (health.bridge_attached) {
-        const postJSON = async (p, body) => {
-          const r = await fetch(new URL(p, window.location.origin), { method: 'POST', credentials: 'omit', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(10000) });
-          if (!r.ok) throw new Error(`RPC error (${r.status})`);
-          return parseUniqueJSON(await r.text(), MAX_MARKET_STREAM_BYTES);
-        };
-        await attachTransport({
-          readBoot: async () => parseUniqueJSON(await readStatic(new URL('/api/boot', window.location.origin))),
-          readCockpit: async () => parseUniqueJSON(await readStatic(new URL('/api/cockpit', window.location.origin))),
-          readDecisionRead: async () => parseUniqueJSON(await readStatic(new URL('/api/decision-read', window.location.origin)), MAX_REVIEW_BYTES),
-          resolveEvidence: (input) => postJSON('/api/resolve-evidence', input),
-          prepareControl: (input) => postJSON('/api/prepare-control', input),
-          requestControl: (input) => postJSON('/api/request-control', input),
-          readControl: (input) => postJSON('/api/read-control', input),
-          prepareClose: (input) => postJSON('/api/prepare-close', input),
-          requestReviewedClose: (input) => postJSON('/api/request-reviewed-close', input),
-          readCommand: (command_id) => postJSON('/api/read-command', { command_id }),
-          readMarketStream: async () => readStatic(new URL('/api/market-stream', window.location.origin), MAX_MARKET_STREAM_BYTES),
-        });
+        await attachTransport(createAuthenticatedLoopbackBridge({
+          baseUrl: window.location.origin,
+          authToken: loopbackAuthToken,
+          maxBytes: MAX_MARKET_STREAM_BYTES,
+          maxReviewBytes: MAX_REVIEW_BYTES,
+        }));
       }
     } catch { /* Operate with verified market stream even if ScopedUIService is absent. */ }
   }
@@ -289,7 +296,9 @@ function acceptSnapshot(generation, raw, source) {
 
 async function readStatic(url, maximumBytes = MAX_SNAPSHOT_BYTES) {
   if (url.origin !== window.location.origin || !['http:', 'https:'].includes(url.protocol)) throw new Error('Static assets require an approved same-origin HTTP preview. File-URL loading is unavailable.');
-  const response = await fetch(url, { method: 'GET', credentials: 'omit', cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(10000) });
+  const isApi = url.pathname === '/api' || url.pathname.startsWith('/api/');
+  const headers = isApi && loopbackAuthToken ? { Authorization: `Bearer ${loopbackAuthToken}` } : {};
+  const response = await fetch(url, { method: 'GET', credentials: isApi ? 'same-origin' : 'omit', cache: 'no-store', redirect: 'error', headers, signal: AbortSignal.timeout(10000) });
   if (!response.ok) throw new Error(`Shared static asset unavailable (${response.status}).`);
   if (Number(response.headers.get('content-length')) > maximumBytes) throw new Error('Shared static asset exceeds the display size limit.');
   if (!response.body) throw new Error('Shared static asset has no readable body.');

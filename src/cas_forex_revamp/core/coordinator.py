@@ -30,6 +30,13 @@ from .storage import SQLiteStore, encode
 ZERO = Decimal("0")
 RISK_ACTIONS = (ActionKind.OPEN, ActionKind.ADD)
 QUANTITY_ACTIONS = (ActionKind.OPEN, ActionKind.ADD, ActionKind.REDUCE, ActionKind.CLOSE)
+RISK_CHANGING_ACTIONS = (
+    ActionKind.OPEN,
+    ActionKind.ADD,
+    ActionKind.AMEND_STOP,
+    ActionKind.REDUCE,
+    ActionKind.CLOSE,
+)
 RESUMES = (ControlKind.RESUME_NEW_RISK, ControlKind.RESUME_MANAGEMENT)
 
 
@@ -666,6 +673,10 @@ class CoreCoordinator:
                             record = replace(record, state=CommandState.UNRESOLVED, reason_code="ABSENT_WITHOUT_NEWER_FENCE")
                     elif record.reservation_held and (record.command.writer_id != self.writer_id
                             or record.command.dispatch_generation != snapshot.fence.generation
+                            or (record.command.intent.kind in RISK_CHANGING_ACTIONS
+                                and (record.command.intent.source_state.version > 0
+                                     or record.command.intent.source_state.venue_sequence > 0)
+                                and record.command.intent.source_state.venue_sequence != snapshot.sequence)
                             or now >= record.command.intent.expires_at):
                         record = _retire(record, "UNSENT_STALE_COMMAND")
                     unresolved |= record.state in (CommandState.SUBMITTED, CommandState.UNRESOLVED)
