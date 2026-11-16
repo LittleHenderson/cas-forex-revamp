@@ -10,7 +10,7 @@ import logging
 import os
 from pathlib import Path
 import socket
-import subprocess
+import subprocess  # nosec B404: isolated Stage B worker spawns pinned /usr/bin/python3 with close_fds and zero shell
 
 from ..contracts import canonical_bytes, content_digest, DecisionRequest
 from ..core.storage import decode
@@ -86,7 +86,7 @@ class IsolatedController:
                 'environment':model_env,'cwd':str(model),'probe_paths':self.cfg['isolation']['probe_paths'],
                 'boot_id':self.cfg['isolation']['boot_id']}}
         try:
-            self.child=subprocess.Popen(['/usr/bin/python3','-B',str(source/'isolated_decision_worker.py'),
+            self.child=subprocess.Popen(['/usr/bin/python3','-B',str(source/'isolated_decision_worker.py'),  # nosec B603: pinned absolute /usr/bin/python3 argv with sanitized environment and no shell
                 '--bootstrap-fd',str(read_fd),'--channel-fd',str(right.fileno())],cwd=runner,env=clean,
                 stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
                 close_fds=True,pass_fds=(read_fd,right.fileno()),start_new_session=True)

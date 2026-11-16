@@ -770,19 +770,20 @@ class Phase4PilotReadinessTests(unittest.TestCase):
         gate = load_default_forex_valve_gate()
         scope = RunScope("acct-inert", "run-inert", 1, "b-1", "pol-1", "scen-1", "independent-simulator-1")
         inst = Instrument("synthetic-eurusd", "EURUSD", "EUR", "USD", Decimal("0.0001"), Decimal("1"), Decimal("1"))
-        cfg = RuntimeConfig(scope, Path("/tmp/inert-phase4-check").resolve())
-        sim = assemble_inert_simulation(
-            cfg,
-            policy=RiskPolicy("USD", Decimal("100")),
-            instruments=(InstrumentPolicy(inst, Decimal("2")),),
-            decision_adapter=object(),
-            clock=lambda: datetime.now(timezone.utc),
-            expected_origin=DecisionOrigin.ACTUAL_MODEL,
-            valve_gate=gate,
-        )
-        self.assertIs(sim.wiring._valve_gate, gate)
-        self.assertFalse(sim.core_path.exists())
-        self.assertFalse(sim.venue_path.exists())
+        with tempfile.TemporaryDirectory() as td:
+            cfg = RuntimeConfig(scope, Path(td).resolve() / "inert-phase4-check")
+            sim = assemble_inert_simulation(
+                cfg,
+                policy=RiskPolicy("USD", Decimal("100")),
+                instruments=(InstrumentPolicy(inst, Decimal("2")),),
+                decision_adapter=object(),
+                clock=lambda: datetime.now(timezone.utc),
+                expected_origin=DecisionOrigin.ACTUAL_MODEL,
+                valve_gate=gate,
+            )
+            self.assertIs(sim.wiring._valve_gate, gate)
+            self.assertFalse(sim.core_path.exists())
+            self.assertFalse(sim.venue_path.exists())
 
     def test_12_post_stop_automation_denies_new_actual_model_admission(self) -> None:
         clock = _StepClock(datetime(2026, 11, 15, 0, 50, tzinfo=timezone.utc))
