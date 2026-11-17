@@ -15,7 +15,9 @@ Security & Honesty Invariants:
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+import argparse
+from collections.abc import Callable, Mapping
+import os
 import hmac
 from http import HTTPStatus
 from http import cookies as http_cookies
@@ -567,3 +569,126 @@ class LoopbackCockpitServer:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+
+
+def load_dotenv_file(path: str | Path) -> dict[str, str]:
+    """Parse KEY=VALUE lines from an explicit CLI ``--env-file`` (never called automatically on import)."""
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file() or resolved.is_symlink():
+        raise ContractError(f"env file must be a regular non-symlink file: {resolved}")
+    loaded: dict[str, str] = {}
+    for lineno, raw_line in enumerate(resolved.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ContractError(f"{resolved.name}:{lineno}: expected KEY=VALUE line")
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+            val = val[1:-1]
+        if not key.isascii() or not key.replace("_", "").isalnum():
+            raise ContractError(f"{resolved.name}:{lineno}: invalid env var name {key!r}")
+        loaded[key] = val
+    return loaded
+
+
+def run_cockpit_cli(
+    argv: list[str] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    repo_root: str | Path | None = None,
+) -> int:
+    """Explicit 1-command launcher for LoopbackCockpitServer + DualShieldBrokerRouter (DEMO or two-key LIVE)."""
+    ap = argparse.ArgumentParser(description="CAS Forex Revamp Cockpit & Dual-Shield Broker Launcher")
+    ap.add_argument("--env-file", type=Path, default=None, help="Optional KEY=VALUE file with CAS_FOREX_* settings")
+    ap.add_argument("--host", default="127.0.0.1", help="Loopback bind IP (127.0.0.1 or ::1)")
+    ap.add_argument("--port", type=int, default=8787, help="Loopback port (0 picks an ephemeral port)")
+    ap.add_argument("--poll-seconds", type=int, default=15, help="Live 16-pair FX poll interval in seconds (0=disable)")
+    ap.add_argument("--activate-brokers", action="store_true", help="Attempt live/demo connection to configured brokers")
+    ap.add_argument("--print-check-only", action="store_true", help="Validate config/routing, print JSON, and exit")
+    args = ap.parse_args(argv)
+    if args.poll_seconds < 0 or args.poll_seconds > 3600:
+        raise ContractError("--poll-seconds must be in 0..3600")
+
+    root = Path(repo_root).resolve() if repo_root is not None else Path(__file__).resolve().parents[3]
+    merged: dict[str, str] = dict(os.environ if environ is None else environ)
+    if args.env_file is not None:
+        merged.update(load_dotenv_file(args.env_file))
+
+    from cas_forex_revamp.valve.tks_meta_valve_controller import load_default_forex_valve_gate
+    from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
+    from cas_forex_revamp.venue.live_market_stream import ExpandedPublicLiveFxFeedClient
+
+    gate = load_default_forex_valve_gate()
+    router = DualShieldBrokerRouter(environ=merged, valve_gate=gate)
+    if args.activate_brokers:
+        router.activate_all()
+
+    routing_summary = safe_broker_routing_payload(router.routing_snapshot())
+    if args.print_check_only:
+        print(json.dumps(routing_summary, indent=2))
+        return 0
+
+    fixture_path = root / "docs" / "contracts" / "initial-market-stream.json"
+    stream_lock = threading.Lock()
+    latest_stream: list[dict[str, Any] | None] = [
+        json.loads(fixture_path.read_text(encoding="utf-8")) if fixture_path.is_file() else None
+    ]
+    feed_client = ExpandedPublicLiveFxFeedClient() if args.poll_seconds > 0 else None
+    if feed_client is not None:
+        try:
+            env_stream = feed_client.fetch_market_stream()
+            latest_stream[0] = env_stream.to_wire_dict()
+        except Exception as exc:
+            print(f"[feed] Initial live quote fetch skipped ({type(exc).__name__}); using sealed fixture until next poll.")
+
+    def _read_stream() -> dict[str, Any] | None:
+        with stream_lock:
+            return latest_stream[0]
+
+    srv = LoopbackCockpitServer(
+        repo_root=root,
+        host=args.host,
+        port=args.port,
+        market_stream_reader=_read_stream,
+        broker_router_reader=router.routing_snapshot,
+    )
+    srv.start()
+    stop_flag = threading.Event()
+
+    def _poll_loop() -> None:
+        while not stop_flag.wait(float(args.poll_seconds)):
+            if feed_client is None:
+                break
+            try:
+                env_stream = feed_client.fetch_market_stream()
+                with stream_lock:
+                    latest_stream[0] = env_stream.to_wire_dict()
+                srv.notify_stream_updated()
+            except Exception as exc:
+                print(f"[feed] Poll skipped ({type(exc).__name__}); keeping last verified snapshot.")
+
+    poller = threading.Thread(target=_poll_loop, name="cas-forex-feed-poll", daemon=True)
+    if args.poll_seconds > 0 and feed_client is not None:
+        poller.start()
+
+    print(f"CAS Forex Cockpit Execution Mode : {router.execution_mode} (live_armed={routing_summary['live_trading_armed']})")
+    for row in routing_summary["chain"]:
+        print(f"  [{row['priority']}] {row['broker_id']} ({row['server']}) configured={row['configured']} status={row['status']}")
+    print(f"Open Authenticated UI            : {srv.bootstrap_url}")
+    print("Press Ctrl+C to stop cleanly.")
+    try:
+        while not stop_flag.wait(1.0):
+            continue
+    except KeyboardInterrupt:
+        print("\nShutting down CAS Forex Cockpit...")
+    finally:
+        stop_flag.set()
+        srv.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_cockpit_cli())

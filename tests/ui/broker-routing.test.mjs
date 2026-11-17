@@ -72,3 +72,37 @@ test('unsafe or live routing payloads are refused and hostile text is escaped', 
   assert.equal(html.includes('<img'), false);
   assert.ok(html.includes('&lt;img'));
 });
+test('armed LIVE routing payload normalizes and renders explicit LIVE real-money banner', () => {
+  const liveDoc = sampleRouting();
+  liveDoc.execution_mode = 'LIVE';
+  liveDoc.demo_only = false;
+  liveDoc.live_trading_locked = false;
+  liveDoc.live_trading_armed = true;
+  liveDoc.chain[0].server = 'Hugo PRO5';
+  liveDoc.chain[0].account_type = 'ECN live';
+  liveDoc.chain[1].server = 'LHFXSA-Live';
+  liveDoc.chain[1].account_type = 'STP/ECN live';
+  liveDoc.chain[2].broker_id = 'OANDA_LIVE';
+  liveDoc.chain[2].server = 'https://api-fxtrade.oanda.com/v3';
+  liveDoc.chain[2].account_type = 'fxTrade Live';
+  liveDoc.dual_shield.safe_harbor.broker_id = 'OANDA_LIVE';
+  const routing = normalizeBrokerRouting(liveDoc);
+  assert.equal(routing.executionMode, 'LIVE');
+  assert.equal(routing.liveArmed, true);
+  assert.equal(routing.demoOnly, false);
+  assert.equal(routing.liveLocked, false);
+  const html = renderBrokerRoutingPanel(routing);
+  assert.match(html, /LIVE REAL-MONEY EXECUTION ARMED/);
+  assert.match(html, /LIVE MODE · real money armed/);
+  assert.match(html, /OANDA_LIVE/);
+  assert.match(html, /Hugo PRO5/);
+  assert.equal(/\bstyle\s*=/.test(html), false);
+
+  // Inconsistent live lock flags remain refused.
+  const bad = sampleRouting();
+  bad.execution_mode = 'LIVE';
+  bad.demo_only = false;
+  bad.live_trading_locked = true;
+  bad.live_trading_armed = true;
+  assert.throws(() => normalizeBrokerRouting(bad));
+});

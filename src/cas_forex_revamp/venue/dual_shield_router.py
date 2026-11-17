@@ -40,10 +40,11 @@ from cas_forex_revamp.valve.tks_meta_valve_controller import (
     ValveDecision,
     compute_drawdown_pct,
 )
-from .external_paper_broker import EXPANDED_FX_PAIRS, OandaPracticePaperClient, assert_safe_json_numbers
+from .external_paper_broker import EXECUTION_MODE_LIVE, EXPANDED_FX_PAIRS, OandaPracticePaperClient, assert_safe_json_numbers
 from .mt5_broker_bridge import (
     BROKER_HUGOSWAY_MT5,
     BROKER_LHFX_MT5,
+    BROKER_OANDA_LIVE,
     BROKER_OANDA_PRACTICE,
     BROKER_SPECS,
     BrokerFailoverExhaustedError,
@@ -226,7 +227,8 @@ class OandaQuoteTruthOracle:
             snap = client.fetch_pricing(pairs=tuple(symbols))
             return {sym: (q.bid, q.ask) for sym, q in snap.quotes.items()}
 
-        return cls(reference_source=source, reference_name="OANDA_PRACTICE", **kwargs)
+        ref_name = BROKER_OANDA_LIVE if client.execution_mode == EXECUTION_MODE_LIVE else BROKER_OANDA_PRACTICE
+        return cls(reference_source=source, reference_name=ref_name, **kwargs)
 
     @classmethod
     def from_market_stream(cls, envelope_provider: Callable[[], Any], **kwargs: Any) -> "OandaQuoteTruthOracle":
@@ -437,14 +439,25 @@ class BarbellCapitalPolicy:
         )
 
     def share_for(self, broker_id: str) -> Decimal:
-        if broker_id not in self.shares:
+        key = BROKER_OANDA_PRACTICE if broker_id == BROKER_OANDA_LIVE else broker_id
+        if key not in self.shares:
             raise ContractError(f"unknown barbell venue {broker_id}")
-        return self.shares[broker_id]
+        return self.shares[key]
+
+    @staticmethod
+    def _oanda_equity(equities: Mapping[str, Decimal]) -> Decimal:
+        val = Decimal("0")
+        if BROKER_OANDA_PRACTICE in equities:
+            val += equities[BROKER_OANDA_PRACTICE]
+        if BROKER_OANDA_LIVE in equities:
+            val += equities[BROKER_OANDA_LIVE]
+        decimal_value(val, "equity[OANDA]")
+        return val
 
     @staticmethod
     def total_equity(equities: Mapping[str, Decimal]) -> Decimal:
-        total = Decimal("0")
-        for broker_id in (BROKER_OANDA_PRACTICE, BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
+        total = BarbellCapitalPolicy._oanda_equity(equities)
+        for broker_id in (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
             value = equities.get(broker_id, Decimal("0"))
             decimal_value(value, f"equity[{broker_id}]")
             total += value
@@ -517,9 +530,9 @@ class BarbellCapitalPolicy:
         with localcontext() as ctx:
             ctx.prec = 40
             sleeve_cap = (share * total).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
-            if broker_id != BROKER_OANDA_PRACTICE:
+            if broker_id not in (BROKER_OANDA_PRACTICE, BROKER_OANDA_LIVE):
                 reserve_floor = (self.shares[BROKER_OANDA_PRACTICE] - self.tolerance) * total
-                if equities.get(BROKER_OANDA_PRACTICE, Decimal("0")) < reserve_floor:
+                if self._oanda_equity(equities) < reserve_floor:
                     raise BarbellPolicyRefusalError(
                         "regulated OANDA reserve is below its barbell floor; high-leverage MT5 risk refused",
                         "RESERVE_UNDERFUNDED",
@@ -540,15 +553,16 @@ class BarbellCapitalPolicy:
 
     def allocation_report(self, equities: Mapping[str, Decimal]) -> dict[str, Any]:
         total = self.total_equity(equities)
+        oanda_key = BROKER_OANDA_LIVE if (BROKER_OANDA_LIVE in equities and BROKER_OANDA_PRACTICE not in equities) else BROKER_OANDA_PRACTICE
         rows = []
-        for broker_id in (BROKER_OANDA_PRACTICE, BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
+        for broker_id in (oanda_key, BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
             equity = equities.get(broker_id, Decimal("0"))
             with localcontext() as ctx:
                 ctx.prec = 40
                 actual = Decimal("0") if total <= 0 else (equity / total).quantize(Decimal("0.0001"))
             rows.append({
                 "broker_id": broker_id,
-                "target_share": decimal_text(self.shares[broker_id]),
+                "target_share": decimal_text(self.share_for(broker_id)),
                 "actual_share": decimal_text(actual),
                 "equity": decimal_text(equity),
             })
@@ -657,9 +671,11 @@ class OandaProtectiveOffsetPlanner:
         oanda_leverage: int = OANDA_SAFE_HARBOR_LEVERAGE,
         account_currency: str = "USD",
         default_catastrophe_stop_bps: Decimal = Decimal("100"),
+        venue_id: str = BROKER_OANDA_PRACTICE,
     ) -> None:
         self._calc = Mt5MarginCalculator(leverage=oanda_leverage, account_currency=account_currency)
         self.oanda_leverage = oanda_leverage
+        self.venue_id = venue_id
         self.default_catastrophe_stop_bps = decimal_value(
             default_catastrophe_stop_bps, "default_catastrophe_stop_bps", positive=True
         )
@@ -667,7 +683,7 @@ class OandaProtectiveOffsetPlanner:
     def config_dict(self) -> dict[str, Any]:
         return {
             "name": "OandaProtectiveOffsetPlanner",
-            "venue": BROKER_OANDA_PRACTICE,
+            "venue": self.venue_id,
             "leverage": f"1:{self.oanda_leverage}",
             "default_catastrophe_stop_bps": decimal_text(self.default_catastrophe_stop_bps),
             "requires_valve_clearance": True,
@@ -736,7 +752,7 @@ class OandaProtectiveOffsetPlanner:
         funded = oanda_margin_available is not None and total_margin <= oanda_margin_available
         return OffsetPlan(
             broker_id=broker_id,
-            venue=BROKER_OANDA_PRACTICE,
+            venue=self.venue_id,
             orders=tuple(orders),
             exposure_before=dict(exposure),
             exposure_after=after,
@@ -802,7 +818,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         self._oracle_override = oracle
         self._oracle_cache: OandaQuoteTruthOracle | None = None
         self.barbell = barbell or BarbellCapitalPolicy.from_environ(self._env)
-        self.offset_planner = offset_planner or OandaProtectiveOffsetPlanner()
+        self.offset_planner = offset_planner or OandaProtectiveOffsetPlanner(venue_id=self._oanda_broker_id)
         self._attestations = dict(equity_attestations or {})
         for key, value in self._attestations.items():
             if key not in BROKER_SPECS:
@@ -866,7 +882,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
     def oracle(self) -> OandaQuoteTruthOracle:
         if self._oracle_override is not None:
             return self._oracle_override
-        oanda = self._venues.get(BROKER_OANDA_PRACTICE)
+        oanda = self._venues.get(self._oanda_broker_id)
         if isinstance(oanda, OandaPracticeFallbackVenue):
             if self._oracle_cache is None:
                 self._oracle_cache = OandaQuoteTruthOracle.from_oanda_client(oanda.client)
@@ -877,7 +893,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
 
     def equities(self) -> dict[str, Decimal]:
         out: dict[str, Decimal] = {}
-        for broker_id in (BROKER_OANDA_PRACTICE, BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
+        for broker_id in (self._oanda_broker_id, BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
             venue = self._venues.get(broker_id)
             value: Decimal | None = None
             if isinstance(venue, Mt5PaperBrokerVenue) and venue.account is not None:
@@ -920,7 +936,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         )
 
     def _offshore_route(self) -> tuple[str, ...]:
-        if self.primary_broker == BROKER_OANDA_PRACTICE:
+        if self.primary_broker in (BROKER_OANDA_PRACTICE, BROKER_OANDA_LIVE):
             return ()
         return tuple(b for b in self.priority_order if b in (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5))
 
@@ -1004,11 +1020,11 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 quote_verdicts=tuple(verdicts), stop_loss_risk=risk, stop_loss_risk_cap=cap,
             )
 
-        oanda = self._venues.get(BROKER_OANDA_PRACTICE)
+        oanda = self._venues.get(self._oanda_broker_id)
         if not isinstance(oanda, OandaPracticeFallbackVenue):
-            self._record(trail, BROKER_OANDA_PRACTICE, "NOT_CONNECTED", None)
+            self._record(trail, self._oanda_broker_id, "NOT_CONNECTED", None)
             raise BrokerFailoverExhaustedError(
-                "offshore venues refused/unavailable and the OANDA practice safe harbor is not connected: "
+                "offshore venues refused/unavailable and the OANDA safe harbor is not connected: "
                 + "; ".join(f"{t['broker_id']}={t['outcome']}" for t in trail)
             )
         required = self._safe_harbor_calc.required_margin(
@@ -1017,15 +1033,15 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         available = oanda.margin_available
         nav = oanda.nav
         if available is None or nav is None or required > available:
-            self._record(trail, BROKER_OANDA_PRACTICE, "MARGIN_REFUSED", "safe-harbor margin unavailable")
-            raise Mt5MarginRefusalError("OANDA practice safe harbor lacks margin for this order at 1:50")
+            self._record(trail, self._oanda_broker_id, "MARGIN_REFUSED", "safe-harbor margin unavailable")
+            raise Mt5MarginRefusalError("OANDA safe harbor lacks margin for this order at 1:50")
         self.barbell.require_sleeve(
-            BROKER_OANDA_PRACTICE, equities=self.equities(), used_margin_after=(nav - available) + required
+            self._oanda_broker_id, equities=self.equities(), used_margin_after=(nav - available) + required
         )
         result = oanda.execute(order, valve_decision=valve_decision)
-        self._record(trail, BROKER_OANDA_PRACTICE, "EXECUTED", "SAFE_HARBOR")
+        self._record(trail, self._oanda_broker_id, "EXECUTED", "SAFE_HARBOR")
         return DualShieldExecution(
-            result=result, executed_on=BROKER_OANDA_PRACTICE, safe_harbor=True, trail=tuple(trail),
+            result=result, executed_on=self._oanda_broker_id, safe_harbor=True, trail=tuple(trail),
             quote_verdicts=tuple(verdicts), stop_loss_risk=risk, stop_loss_risk_cap=cap,
         )
 
@@ -1060,7 +1076,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         for pos in frozen:
             symbols.extend(self._safe_harbor_calc.required_symbols(pos.symbol))
         reference = self.oracle().reference_quotes(symbols)
-        oanda = self._venues.get(BROKER_OANDA_PRACTICE)
+        oanda = self._venues.get(self._oanda_broker_id)
         available = oanda.margin_available if isinstance(oanda, OandaPracticeFallbackVenue) else None
         return self.offset_planner.plan(
             broker_id=broker_id, frozen_positions=frozen, reference_quotes=reference, oanda_margin_available=available
@@ -1069,9 +1085,9 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
     def execute_offset_plan(
         self, plan: OffsetPlan, *, valve_decisions: Mapping[str, ValveDecision]
     ) -> tuple[Mt5ExecutionResult, ...]:
-        oanda = self._venues.get(BROKER_OANDA_PRACTICE)
+        oanda = self._venues.get(self._oanda_broker_id)
         if not isinstance(oanda, OandaPracticeFallbackVenue):
-            raise BrokerFailoverExhaustedError("OANDA practice safe harbor is not connected; offsets cannot be placed")
+            raise BrokerFailoverExhaustedError("OANDA safe harbor is not connected; offsets cannot be placed")
         if not plan.fully_funded:
             raise Mt5MarginRefusalError("offset plan is not fully funded by OANDA practice margin")
         results = []
@@ -1102,9 +1118,9 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             "barbell": self.barbell.config_dict(),
             "allocation": alloc,
             "safe_harbor": {
-                "broker_id": BROKER_OANDA_PRACTICE,
+                "broker_id": self._oanda_broker_id,
                 "leverage": f"1:{OANDA_SAFE_HARBOR_LEVERAGE}",
-                "conservative_mode": self.primary_broker == BROKER_OANDA_PRACTICE,
+                "conservative_mode": self.primary_broker == self._oanda_broker_id,
                 "recent_degradations": list(self._degradations[-8:]),
             },
             "offset_planner": self.offset_planner.config_dict(),

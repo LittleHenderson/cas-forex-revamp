@@ -3,7 +3,7 @@
 // whitelisted string/boolean shape before rendering, and the renderer escapes all text.
 
 export const MAX_BROKER_ROUTING_BYTES = 65536;
-const BROKER_IDS = Object.freeze(['HUGOSWAY_MT5', 'LHFX_MT5', 'OANDA_PRACTICE']);
+const BROKER_IDS = Object.freeze(['HUGOSWAY_MT5', 'LHFX_MT5', 'OANDA_PRACTICE', 'OANDA_LIVE']);
 const STATUS_WORDS = Object.freeze(['ACTIVE', 'STANDBY', 'NOT_CONFIGURED', 'FAILED', 'DISCONNECTED', 'FROZEN', 'LIVE_FORBIDDEN', 'NOT_CONNECTED']);
 
 const str = (value, fallback = 'Unknown') => (typeof value === 'string' && value.length > 0 && value.length <= 200 ? value : fallback);
@@ -11,8 +11,10 @@ const str = (value, fallback = 'Unknown') => (typeof value === 'string' && value
 export const STATIC_BROKER_ROUTING = Object.freeze({
   connected: false,
   platform: 'MetaTrader 5',
+  executionMode: 'DEMO',
   demoOnly: true,
   liveLocked: true,
+  liveArmed: false,
   architecture: 'DUAL_SHIELD_BARBELL',
   primaryBroker: 'HUGOSWAY_MT5',
   activeBroker: 'None',
@@ -63,14 +65,19 @@ function normalizeShield(doc) {
 export function normalizeBrokerRouting(doc) {
   if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new Error('Broker routing must be a JSON object.');
   if (typeof doc.schema !== 'string' || !doc.schema.startsWith('cas-forex.broker-routing/')) throw new Error('Unexpected broker routing schema.');
-  if (doc.demo_only !== true || doc.live_trading_locked !== true) throw new Error('Broker routing must be demo-only with live trading locked.');
+  const mode = doc.execution_mode ?? (doc.demo_only === true ? 'DEMO' : 'INVALID');
+  const isDemo = mode === 'DEMO' && doc.demo_only === true && doc.live_trading_locked === true && doc.live_trading_armed !== true;
+  const isLive = mode === 'LIVE' && doc.execution_mode === 'LIVE' && doc.live_trading_armed === true && doc.demo_only === false && doc.live_trading_locked === false;
+  if (!isDemo && !isLive) throw new Error('Broker routing mode and lock flags are inconsistent or unauthorized.');
   if (!Array.isArray(doc.chain) || doc.chain.length < 1 || doc.chain.length > 3) throw new Error('Broker routing chain must list 1..3 brokers.');
   const valve = doc.valve ?? {};
   return Object.freeze({
     connected: true,
     platform: str(doc.platform),
-    demoOnly: true,
-    liveLocked: true,
+    executionMode: isLive ? 'LIVE' : 'DEMO',
+    demoOnly: isDemo,
+    liveLocked: isDemo,
+    liveArmed: isLive,
     architecture: str(doc.architecture, 'PRIORITY_FAILOVER'),
     primaryBroker: BROKER_IDS.includes(doc.primary_broker) ? doc.primary_broker : 'Unknown',
     activeBroker: BROKER_IDS.includes(doc.active_broker) ? doc.active_broker : 'None',

@@ -70,20 +70,31 @@ from cas_forex_revamp.contracts import ActionKind, ContractError, Side, canonica
 from cas_forex_revamp.contracts.primitives import decimal_value, identifier, utc_time
 from cas_forex_revamp.valve.tks_meta_valve_controller import ForexMetaValveGate, ValveDecision, ValveRefusalError
 from .external_paper_broker import (
+    DEFAULT_OANDA_LIVE_BASE_URL,
     DEFAULT_OANDA_PRACTICE_BASE_URL,
+    ENV_EXECUTION_MODE,
+    ENV_LIVE_ARM_PHRASE,
+    ENV_OANDA_LIVE_ACCOUNT_ID,
+    ENV_OANDA_LIVE_TOKEN,
     ENV_OANDA_PRACTICE_ACCOUNT_ID,
     ENV_OANDA_PRACTICE_TOKEN,
+    EXECUTION_MODE_DEMO,
+    EXECUTION_MODE_LIVE,
+    EXECUTION_MODES,
     EXPANDED_FX_PAIRS,
+    REQUIRED_LIVE_ARM_PHRASE,
     BrokerAuditReceipt,
     LiveBrokerEndpointForbiddenError,
     OandaPracticePaperClient,
     assert_safe_json_numbers,
+    resolve_execution_mode,
     strict_safe_json_loads,
 )
 
 __all__ = [
     "BROKER_HUGOSWAY_MT5",
     "BROKER_LHFX_MT5",
+    "BROKER_OANDA_LIVE",
     "BROKER_OANDA_PRACTICE",
     "BROKER_PRIORITY",
     "BROKER_SPECS",
@@ -120,6 +131,7 @@ __all__ = [
     "load_mt5_credentials",
     "require_valve_clearance",
     "validate_demo_server",
+    "validate_mt5_server_name",
 ]
 
 logger = logging.getLogger(__name__)
@@ -158,6 +170,7 @@ _SDK_DEFAULTS: dict[str, int] = {
     "POSITION_TYPE_BUY": 0,
     "POSITION_TYPE_SELL": 1,
     "ACCOUNT_TRADE_MODE_DEMO": 0,
+    "ACCOUNT_TRADE_MODE_REAL": 2,
     "TRADE_RETCODE_PLACED": 10008,
     "TRADE_RETCODE_DONE": 10009,
     "TRADE_RETCODE_DONE_PARTIAL": 10010,
@@ -176,7 +189,17 @@ ENV_LHFX_MT5_SERVER = "CAS_FOREX_LHFX_MT5_SERVER"
 BROKER_HUGOSWAY_MT5 = "HUGOSWAY_MT5"
 BROKER_LHFX_MT5 = "LHFX_MT5"
 BROKER_OANDA_PRACTICE = "OANDA_PRACTICE"
+BROKER_OANDA_LIVE = "OANDA_LIVE"
 BROKER_PRIORITY: tuple[str, ...] = (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5, BROKER_OANDA_PRACTICE)
+LIVE_BROKER_PRIORITY: tuple[str, ...] = (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5, BROKER_OANDA_LIVE)
+_DEFAULT_LIVE_MT5_SERVERS: dict[str, str] = {
+    BROKER_HUGOSWAY_MT5: "Hugo PRO5",
+    BROKER_LHFX_MT5: "LHFXSA-Live",
+}
+_PINNED_LIVE_MT5_SERVERS: dict[str, frozenset[str]] = {
+    BROKER_HUGOSWAY_MT5: frozenset({"hugo pro5", "hugopro5", "hugo-real", "hugosway-live"}),
+    BROKER_LHFX_MT5: frozenset({"lhfxsa-live", "lhfx-live", "lhfxsa-real"}),
+}
 
 TRANSPORT_AUTO = "AUTO"
 TRANSPORT_NATIVE_PYTHON = "NATIVE_PYTHON"
@@ -442,6 +465,19 @@ BROKER_SPECS: dict[str, BrokerSpec] = {
         password_env=None,
         server_env=None,
     ),
+    BROKER_OANDA_LIVE: BrokerSpec(
+        broker_id=BROKER_OANDA_LIVE,
+        rank=3,
+        role="TERTIARY_REST_FALLBACK",
+        label="OANDA",
+        platform="OANDA v20 REST",
+        default_server=DEFAULT_OANDA_LIVE_BASE_URL,
+        max_leverage=50,
+        account_type="fxTrade Live",
+        login_env=None,
+        password_env=None,
+        server_env=None,
+    ),
 }
 
 
@@ -465,19 +501,60 @@ def validate_demo_server(broker_id: str, server: str) -> str:
     return cleaned
 
 
+def validate_mt5_server_name(
+    broker_id: str,
+    server: str,
+    *,
+    execution_mode: str = EXECUTION_MODE_DEMO,
+    live_armed: bool = False,
+) -> str:
+    """Validate an MT5 server strictly against DEMO or two-key armed LIVE mode."""
+    if execution_mode == EXECUTION_MODE_DEMO:
+        return validate_demo_server(broker_id, server)
+    if execution_mode != EXECUTION_MODE_LIVE or not live_armed:
+        raise LiveBrokerEndpointForbiddenError("LIVE MT5 servers require explicit two-key LIVE arming")
+    if not isinstance(server, str) or not server.strip():
+        raise Mt5NotConfiguredError(f"{broker_id}: LIVE MT5 server name must be a non-empty string")
+    cleaned = server.strip()
+    if len(cleaned) > 64 or not cleaned.isascii() or any(ch in cleaned for ch in ("\r", "\n", "\x00", '"', "\\")):
+        raise ContractError(f"{broker_id}: MT5 server name contains forbidden characters")
+    low = cleaned.lower()
+    if "demo" in low or "practice" in low:
+        raise ContractError(f"demo/practice MT5 server {cleaned!r} refused for {broker_id} while LIVE mode is armed")
+    compact = re.sub(r"[\s_]+", " ", low)
+    allowed = _PINNED_LIVE_MT5_SERVERS.get(broker_id)
+    if allowed is None:
+        all_live = frozenset().union(*_PINNED_LIVE_MT5_SERVERS.values())
+        if compact not in all_live:
+            raise ContractError(f"unpinned LIVE MT5 server {cleaned!r} refused")
+    elif compact not in allowed:
+        raise ContractError(
+            f"unpinned LIVE MT5 server {cleaned!r} refused for {broker_id}; allowed={sorted(allowed)}"
+        )
+    return cleaned
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class Mt5Credentials:
     broker_id: str
     login: int
     server: str
     password: _RedactedSecret | None = None
+    execution_mode: str = EXECUTION_MODE_DEMO
 
     def __post_init__(self) -> None:
         if self.broker_id not in (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
             raise ContractError("Mt5Credentials only apply to MT5 brokers")
+        if self.execution_mode not in EXECUTION_MODES:
+            raise ContractError(f"execution_mode must be one of {EXECUTION_MODES}")
         if type(self.login) is not int or self.login <= 0:
             raise ContractError("MT5 login must be a positive integer")
-        validate_demo_server(self.broker_id, self.server)
+        validate_mt5_server_name(
+            self.broker_id,
+            self.server,
+            execution_mode=self.execution_mode,
+            live_armed=(self.execution_mode == EXECUTION_MODE_LIVE),
+        )
         if self.password is not None and not isinstance(self.password, _RedactedSecret):
             raise ContractError("MT5 password must be wrapped in _RedactedSecret")
 
@@ -500,11 +577,28 @@ def _env_get(environ: Mapping[str, str], name: str | None) -> str:
     return raw.strip()
 
 
-def resolve_server(broker_id: str, environ: Mapping[str, str]) -> str | None:
+def resolve_server(
+    broker_id: str,
+    environ: Mapping[str, str],
+    *,
+    execution_mode: str = EXECUTION_MODE_DEMO,
+    live_armed: bool = False,
+) -> str | None:
     spec = BROKER_SPECS[broker_id]
     if spec.server_env is None:
         return None
-    return validate_demo_server(broker_id, _env_get(environ, spec.server_env) or str(spec.default_server))
+    default_srv = (
+        _DEFAULT_LIVE_MT5_SERVERS[broker_id]
+        if execution_mode == EXECUTION_MODE_LIVE
+        else str(spec.default_server)
+    )
+    raw = _env_get(environ, spec.server_env)
+    return validate_mt5_server_name(
+        broker_id,
+        raw or default_srv,
+        execution_mode=execution_mode,
+        live_armed=live_armed,
+    )
 
 
 def load_mt5_credentials(
@@ -512,18 +606,23 @@ def load_mt5_credentials(
     environ: Mapping[str, str],
     *,
     password_required: bool = True,
+    execution_mode: str | None = None,
+    live_arm_phrase: str | None = None,
 ) -> Mt5Credentials | None:
     """Load MT5 credentials from an explicit runtime mapping (never a ``.env`` file).
 
-    Returns ``None`` when the broker is simply not configured. The server name is validated
-    even when credentials are absent, so a live server can never sit dormant in configuration.
+    Returns ``None`` when the broker is simply not configured. Server names are validated
+    strictly against the active execution mode (DEMO by default; two-key LIVE when armed).
     """
     if broker_id not in (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
         raise ContractError(f"{broker_id} is not an MT5 broker")
     if not isinstance(environ, Mapping):
         raise ContractError("environ must be a key-value Mapping (never a .env file path)")
+    mode, armed = resolve_execution_mode(
+        environ, execution_mode=execution_mode, live_arm_phrase=live_arm_phrase
+    )
     spec = BROKER_SPECS[broker_id]
-    server = resolve_server(broker_id, environ)
+    server = resolve_server(broker_id, environ, execution_mode=mode, live_armed=armed)
     login_raw = _env_get(environ, spec.login_env)
     password_raw = _env_get(environ, spec.password_env)
     if not login_raw and not password_raw:
@@ -539,6 +638,7 @@ def load_mt5_credentials(
         login=int(login_raw),
         server=str(server),
         password=_RedactedSecret(password_raw) if password_raw else None,
+        execution_mode=mode,
     )
 
 
@@ -1149,7 +1249,12 @@ class Mt5NativePythonTransport:
     def connect(self, credentials: Mt5Credentials) -> Mt5AccountSnapshot:
         if not isinstance(credentials, Mt5Credentials):
             raise ContractError("connect requires Mt5Credentials")
-        validate_demo_server(credentials.broker_id, credentials.server)
+        validate_mt5_server_name(
+            credentials.broker_id,
+            credentials.server,
+            execution_mode=credentials.execution_mode,
+            live_armed=(credentials.execution_mode == EXECUTION_MODE_LIVE),
+        )
         if credentials.password is None:
             raise Mt5NotConfiguredError(f"{credentials.broker_id}: native MT5 login requires a password")
         sdk = self._sdk()
@@ -1192,13 +1297,23 @@ class Mt5NativePythonTransport:
         const = _sdk_constants(sdk)
         trade_mode = int(_sdk_field(info, "trade_mode"))
         server = str(_sdk_field(info, "server"))
-        if trade_mode != const["ACCOUNT_TRADE_MODE_DEMO"]:
-            self.shutdown()
-            raise LiveBrokerEndpointForbiddenError("MT5 account trade mode is not DEMO; live/real accounts are forbidden")
-        validate_demo_server(self._credentials.broker_id if self._credentials else "MT5", server)
+        expected_mode = self._credentials.execution_mode if self._credentials else EXECUTION_MODE_DEMO
+        broker_id = self._credentials.broker_id if self._credentials else "MT5"
+        if expected_mode == EXECUTION_MODE_DEMO:
+            if trade_mode != const["ACCOUNT_TRADE_MODE_DEMO"]:
+                self.shutdown()
+                raise LiveBrokerEndpointForbiddenError("MT5 account trade mode is not DEMO; live/real accounts are forbidden")
+            validate_demo_server(broker_id, server)
+            trade_mode_label = "DEMO"
+        else:
+            if trade_mode != const["ACCOUNT_TRADE_MODE_REAL"]:
+                self.shutdown()
+                raise ContractError("LIVE execution mode requires ACCOUNT_TRADE_MODE_REAL; refusing DEMO/CONTEST account")
+            validate_mt5_server_name(broker_id, server, execution_mode=EXECUTION_MODE_LIVE, live_armed=True)
+            trade_mode_label = "REAL"
         leverage = int(_sdk_field(info, "leverage"))
         if leverage <= 0 or leverage > self._max_leverage:
-            raise Mt5MarginRefusalError(f"MT5 account leverage 1:{leverage} exceeds the 1:{self._max_leverage} demo cap")
+            raise Mt5MarginRefusalError(f"MT5 account leverage 1:{leverage} exceeds the 1:{self._max_leverage} cap")
         return Mt5AccountSnapshot(
             server=server,
             login=int(_sdk_field(info, "login")),
@@ -1208,7 +1323,7 @@ class Mt5NativePythonTransport:
             margin=_sdk_decimal(_sdk_field(info, "margin"), "margin"),
             margin_free=_sdk_decimal(_sdk_field(info, "margin_free"), "margin_free"),
             leverage=leverage,
-            trade_mode="DEMO",
+            trade_mode=trade_mode_label,
         )
 
     def symbol_tick(self, symbol: str) -> Mt5Tick:
@@ -1372,7 +1487,12 @@ class Mt5SpoolBridgeTransport:
     def connect(self, credentials: Mt5Credentials) -> Mt5AccountSnapshot:
         if not isinstance(credentials, Mt5Credentials):
             raise ContractError("connect requires Mt5Credentials")
-        validate_demo_server(credentials.broker_id, credentials.server)
+        validate_mt5_server_name(
+            credentials.broker_id,
+            credentials.server,
+            execution_mode=credentials.execution_mode,
+            live_armed=(credentials.execution_mode == EXECUTION_MODE_LIVE),
+        )
         self.prepare_spool_directory()
         self._credentials = credentials
         try:
@@ -1397,10 +1517,20 @@ class Mt5SpoolBridgeTransport:
             raise Mt5TransportError("market_ticks.json not published yet; is CasForexMt5Bridge EA running?") from None
         if type(doc) is not dict or doc.get("protocol") != MT5_SPOOL_PROTOCOL:
             raise Mt5TransportError("market_ticks.json protocol mismatch")
-        if doc.get("account_trade_mode") != "DEMO":
-            raise LiveBrokerEndpointForbiddenError("MT5 EA reports a non-DEMO account; live/real accounts are forbidden")
         creds = self._credentials
-        validate_demo_server(creds.broker_id if creds else "MT5", str(doc.get("server", "")))
+        expected_mode = creds.execution_mode if creds else EXECUTION_MODE_DEMO
+        broker_id = creds.broker_id if creds else "MT5"
+        reported_mode = doc.get("account_trade_mode")
+        if expected_mode == EXECUTION_MODE_DEMO:
+            if reported_mode != "DEMO":
+                raise LiveBrokerEndpointForbiddenError("MT5 EA reports a non-DEMO account; live/real accounts are forbidden")
+            validate_demo_server(broker_id, str(doc.get("server", "")))
+        else:
+            if reported_mode != "REAL":
+                raise ContractError("LIVE execution mode requires MT5 EA account_trade_mode=REAL")
+            validate_mt5_server_name(
+                broker_id, str(doc.get("server", "")), execution_mode=EXECUTION_MODE_LIVE, live_armed=True
+            )
         return doc
 
     def account_info(self) -> Mt5AccountSnapshot:
@@ -1429,7 +1559,7 @@ class Mt5SpoolBridgeTransport:
             margin=_wire_decimal(acct.get("margin"), "margin"),  # type: ignore[arg-type]
             margin_free=_wire_decimal(acct.get("margin_free"), "margin_free"),  # type: ignore[arg-type]
             leverage=leverage,
-            trade_mode="DEMO",
+            trade_mode=str(doc.get("account_trade_mode", "DEMO")),
         )
 
     def symbol_tick(self, symbol: str) -> Mt5Tick:
@@ -1502,9 +1632,17 @@ class Mt5SpoolBridgeTransport:
             raise Mt5TransportError("receipt values must all be strings")
         if doc.get("request_id") != request.request_id or doc.get("request_sha256") != request.request_sha256:
             raise Mt5TransportError("receipt does not bind the exact request_id/request_sha256")
-        if doc.get("account_trade_mode") != "DEMO":
-            raise LiveBrokerEndpointForbiddenError("MT5 receipt reports a non-DEMO account")
-        server = validate_demo_server(creds.broker_id, doc.get("server", ""))
+        reported_mode = doc.get("account_trade_mode")
+        if creds.execution_mode == EXECUTION_MODE_DEMO:
+            if reported_mode != "DEMO":
+                raise LiveBrokerEndpointForbiddenError("MT5 receipt reports a non-DEMO account")
+            server = validate_demo_server(creds.broker_id, doc.get("server", ""))
+        else:
+            if reported_mode != "REAL":
+                raise ContractError("LIVE receipt requires account_trade_mode=REAL")
+            server = validate_mt5_server_name(
+                creds.broker_id, doc.get("server", ""), execution_mode=EXECUTION_MODE_LIVE, live_armed=True
+            )
         if server.casefold() != creds.server.casefold():
             raise Mt5TransportError("receipt server does not match the configured MT5 server")
         retcode_raw = doc.get("retcode", "")
@@ -1916,10 +2054,13 @@ class Mt5PaperBrokerVenue:
 
     def connect(self) -> Mt5AccountSnapshot:
         snap = self._transport.connect(self._credentials)
-        if snap.trade_mode != "DEMO":
-            raise LiveBrokerEndpointForbiddenError("MT5 account is not a DEMO account")
+        expected_trade_mode = "REAL" if self._credentials.execution_mode == EXECUTION_MODE_LIVE else "DEMO"
+        if snap.trade_mode != expected_trade_mode:
+            if expected_trade_mode == "DEMO":
+                raise LiveBrokerEndpointForbiddenError("MT5 account is not a DEMO account")
+            raise ContractError("LIVE MT5 venue requires account trade_mode=REAL")
         if snap.leverage > BROKER_SPECS[self.broker_id].max_leverage:
-            raise Mt5MarginRefusalError("MT5 account leverage exceeds the 1:500 demo cap")
+            raise Mt5MarginRefusalError("MT5 account leverage exceeds the 1:500 cap")
         if snap.currency != self._calc.account_currency:
             self._calc = Mt5MarginCalculator(leverage=self._calc.leverage, account_currency=snap.currency)
         self._account = snap
@@ -2144,6 +2285,7 @@ class OandaPracticeFallbackVenue:
     ) -> None:
         if not isinstance(client, OandaPracticePaperClient):
             raise ContractError("client must be OandaPracticePaperClient")
+        self.broker_id = BROKER_OANDA_LIVE if client.execution_mode == EXECUTION_MODE_LIVE else BROKER_OANDA_PRACTICE
         self._client = client
         self._valve_sha = _expected_valve_sha(valve_gate, expected_valve_weights_sha256)
         self._clock = clock or _utc_now
@@ -2186,9 +2328,13 @@ class OandaPracticeFallbackVenue:
 
     def connect(self) -> dict[str, Any]:
         if not self._client.is_active:
-            raise Mt5NotConfiguredError(
-                f"OANDA practice fallback requires {ENV_OANDA_PRACTICE_TOKEN} and {ENV_OANDA_PRACTICE_ACCOUNT_ID}"
+            tok_env = ENV_OANDA_LIVE_TOKEN if self._client.execution_mode == EXECUTION_MODE_LIVE else ENV_OANDA_PRACTICE_TOKEN
+            acct_env = (
+                ENV_OANDA_LIVE_ACCOUNT_ID
+                if self._client.execution_mode == EXECUTION_MODE_LIVE
+                else ENV_OANDA_PRACTICE_ACCOUNT_ID
             )
+            raise Mt5NotConfiguredError(f"OANDA fallback requires {tok_env} and {acct_env}")
         self._summary = self._client.fetch_account_summary(now=self._clock())
         self._audit.append("OANDA_CONNECTED", self._clock(), {"broker_id": self.broker_id, "summary": self._summary})
         return self._summary
@@ -2277,7 +2423,9 @@ class BrokerHierarchyRouter:
         valve_gate: ForexMetaValveGate,
         transport_factory: TransportFactory | None = None,
         oanda_client_factory: Callable[[Mapping[str, str]], OandaPracticePaperClient] | None = None,
-        oanda_base_url: str = DEFAULT_OANDA_PRACTICE_BASE_URL,
+        oanda_base_url: str | None = None,
+        execution_mode: str | None = None,
+        live_arm_phrase: str | None = None,
         clock: Callable[[], datetime] | None = None,
         min_post_trade_margin_level_pct: Decimal = DEFAULT_MIN_POST_TRADE_MARGIN_LEVEL_PCT,
     ) -> None:
@@ -2286,36 +2434,68 @@ class BrokerHierarchyRouter:
         if not isinstance(valve_gate, ForexMetaValveGate):
             raise ContractError("BrokerHierarchyRouter requires a ForexMetaValveGate; 1:500 never bypasses the Valve")
         self._env = {k: v for k, v in environ.items() if isinstance(k, str) and k.startswith("CAS_FOREX_")}
+        self.execution_mode, self._live_armed = resolve_execution_mode(
+            self._env, execution_mode=execution_mode, live_arm_phrase=live_arm_phrase
+        )
+        if execution_mode is not None:
+            self._env[ENV_EXECUTION_MODE] = self.execution_mode
+        if live_arm_phrase is not None:
+            self._env[ENV_LIVE_ARM_PHRASE] = live_arm_phrase
+        self._oanda_broker_id = (
+            BROKER_OANDA_LIVE if self.execution_mode == EXECUTION_MODE_LIVE else BROKER_OANDA_PRACTICE
+        )
+        default_oanda_url = (
+            DEFAULT_OANDA_LIVE_BASE_URL if self.execution_mode == EXECUTION_MODE_LIVE else DEFAULT_OANDA_PRACTICE_BASE_URL
+        )
+        raw_oanda_url = default_oanda_url if oanda_base_url is None else oanda_base_url
+        self._oanda_base_url = OandaPracticePaperClient.validate_mode_url(
+            raw_oanda_url, execution_mode=self.execution_mode
+        )
         self._valve_gate = valve_gate
         self._transport_factory = transport_factory or build_default_mt5_transport
-        self._oanda_base_url = OandaPracticePaperClient.validate_practice_url(oanda_base_url)
         self._oanda_client_factory = oanda_client_factory
         self._clock = clock or _utc_now
         self._min_level = min_post_trade_margin_level_pct
 
+        base_chain = LIVE_BROKER_PRIORITY if self.execution_mode == EXECUTION_MODE_LIVE else BROKER_PRIORITY
         primary = _env_get(self._env, ENV_PRIMARY_BROKER).upper() or BROKER_HUGOSWAY_MT5
-        if primary not in BROKER_PRIORITY:
-            raise ContractError(f"{ENV_PRIMARY_BROKER} must be one of {BROKER_PRIORITY}")
+        if self.execution_mode == EXECUTION_MODE_LIVE and primary == BROKER_OANDA_PRACTICE:
+            primary = BROKER_OANDA_LIVE
+        if primary not in base_chain:
+            raise ContractError(f"{ENV_PRIMARY_BROKER} must be one of {base_chain}")
         mode = _env_get(self._env, ENV_MT5_TRANSPORT_MODE).upper() or TRANSPORT_AUTO
         if mode not in TRANSPORT_MODES:
             raise ContractError(f"{ENV_MT5_TRANSPORT_MODE} must be one of {TRANSPORT_MODES}")
         self.primary_broker = primary
         self.transport_mode = mode
         self._spool_root = _env_get(self._env, ENV_MT5_SPOOL_DIR) or None
-        self.priority_order: tuple[str, ...] = (primary,) + tuple(b for b in BROKER_PRIORITY if b != primary)
+        self.priority_order: tuple[str, ...] = (primary,) + tuple(b for b in base_chain if b != primary)
 
-        self._servers: dict[str, str | None] = {b: resolve_server(b, self._env) for b in BROKER_PRIORITY}
+        self._servers: dict[str, str | None] = {
+            b: resolve_server(b, self._env, execution_mode=self.execution_mode, live_armed=self._live_armed)
+            for b in base_chain
+        }
         self._credentials: dict[str, Mt5Credentials | None] = {
-            b: load_mt5_credentials(b, self._env, password_required=(mode != TRANSPORT_SPOOL_BRIDGE))
+            b: load_mt5_credentials(
+                b,
+                self._env,
+                password_required=(mode != TRANSPORT_SPOOL_BRIDGE),
+                execution_mode=self.execution_mode,
+                live_arm_phrase=(REQUIRED_LIVE_ARM_PHRASE if self._live_armed else None),
+            )
             for b in (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5)
         }
-        tok = _env_get(self._env, ENV_OANDA_PRACTICE_TOKEN)
-        acct = _env_get(self._env, ENV_OANDA_PRACTICE_ACCOUNT_ID)
+        tok_env = ENV_OANDA_LIVE_TOKEN if self.execution_mode == EXECUTION_MODE_LIVE else ENV_OANDA_PRACTICE_TOKEN
+        acct_env = (
+            ENV_OANDA_LIVE_ACCOUNT_ID if self.execution_mode == EXECUTION_MODE_LIVE else ENV_OANDA_PRACTICE_ACCOUNT_ID
+        )
+        tok = _env_get(self._env, tok_env)
+        acct = _env_get(self._env, acct_env)
         if bool(tok) != bool(acct):
-            raise Mt5NotConfiguredError(f"{ENV_OANDA_PRACTICE_TOKEN} and {ENV_OANDA_PRACTICE_ACCOUNT_ID} are required together")
+            raise Mt5NotConfiguredError(f"{tok_env} and {acct_env} are required together")
         self._oanda_configured = bool(tok and acct)
         self._status: dict[str, str] = {
-            b: ("STANDBY" if self.is_configured(b) else "NOT_CONFIGURED") for b in BROKER_PRIORITY
+            b: ("STANDBY" if self.is_configured(b) else "NOT_CONFIGURED") for b in base_chain
         }
         self._failures: dict[str, str] = {}
         self._active: Mt5PaperBrokerVenue | OandaPracticeFallbackVenue | None = None
@@ -2340,16 +2520,25 @@ class BrokerHierarchyRouter:
         return self._active
 
     def is_configured(self, broker_id: str) -> bool:
-        if broker_id == BROKER_OANDA_PRACTICE:
+        if broker_id in (BROKER_OANDA_PRACTICE, BROKER_OANDA_LIVE):
             return self._oanda_configured
         return self._credentials.get(broker_id) is not None
 
     def _build_venue(self, broker_id: str) -> Mt5PaperBrokerVenue | OandaPracticeFallbackVenue:
-        if broker_id == BROKER_OANDA_PRACTICE:
+        if broker_id in (BROKER_OANDA_PRACTICE, BROKER_OANDA_LIVE):
             if self._oanda_client_factory is not None:
                 client = self._oanda_client_factory(self._env)
+                if client.execution_mode != self.execution_mode:
+                    raise ContractError(
+                        f"oanda_client_factory mode {client.execution_mode!r} does not match router mode {self.execution_mode!r}"
+                    )
             else:
-                client = OandaPracticePaperClient.from_runtime_env(self._env, base_url=self._oanda_base_url)
+                client = OandaPracticePaperClient.from_runtime_env(
+                    self._env,
+                    base_url=self._oanda_base_url,
+                    execution_mode=self.execution_mode,
+                    live_arm_phrase=(REQUIRED_LIVE_ARM_PHRASE if self._live_armed else None),
+                )
             return OandaPracticeFallbackVenue(client=client, valve_gate=self._valve_gate, clock=self._clock)
         creds = self._credentials[broker_id]
         if creds is None:
@@ -2415,6 +2604,11 @@ class BrokerHierarchyRouter:
         chain = []
         for rank, broker_id in enumerate(self.priority_order, start=1):
             spec = BROKER_SPECS[broker_id]
+            acct_type = spec.account_type
+            if self.execution_mode == EXECUTION_MODE_LIVE and broker_id == BROKER_HUGOSWAY_MT5:
+                acct_type = "ECN live"
+            elif self.execution_mode == EXECUTION_MODE_LIVE and broker_id == BROKER_LHFX_MT5:
+                acct_type = "STP/ECN live"
             chain.append({
                 "broker_id": broker_id,
                 "priority": rank,
@@ -2422,7 +2616,7 @@ class BrokerHierarchyRouter:
                 "label": spec.label,
                 "platform": spec.platform,
                 "server": self._servers[broker_id] if spec.server_env else self._oanda_base_url,
-                "account_type": spec.account_type,
+                "account_type": acct_type,
                 "max_leverage": f"1:{spec.max_leverage}",
                 "configured": self.is_configured(broker_id),
                 "status": self._status[broker_id],
@@ -2432,8 +2626,10 @@ class BrokerHierarchyRouter:
             "schema": "cas-forex.broker-routing/1",
             "platform": MT5_PLATFORM_NAME,
             "platform_code": MT5_PLATFORM_CODE,
-            "demo_only": True,
-            "live_trading_locked": True,
+            "execution_mode": self.execution_mode,
+            "demo_only": self.execution_mode == EXECUTION_MODE_DEMO,
+            "live_trading_locked": self.execution_mode == EXECUTION_MODE_DEMO,
+            "live_trading_armed": self._live_armed,
             "primary_broker": self.primary_broker,
             "active_broker": self.active_broker,
             "transport_mode": self.transport_mode,

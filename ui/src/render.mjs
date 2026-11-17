@@ -184,13 +184,22 @@ const pct = (share) => { const n = Number(share); return Number.isFinite(n) ? `$
 export function renderBrokerRoutingPanel(routing) {
   const r = routing && typeof routing === 'object' && Array.isArray(routing.chain) ? routing : STATIC_BROKER_ROUTING;
   const s = r.shield ?? STATIC_BROKER_ROUTING.shield;
+  const isLive = r.executionMode === 'LIVE' && r.liveArmed === true;
+  const eyebrow = isLive ? 'LIVE REAL-MONEY EXECUTION ARMED' : 'DEMO ACCOUNTS ONLY';
+  const modeTag = isLive ? tag('LIVE MODE · real money armed', true) : tag('Demo only · live trading locked');
+  const lead = isLive
+    ? `Active platform ${e(r.platform)}. Hugo's Way (live), LHFX (live), and OANDA fxTrade Safe Harbor are armed under two-key authorization. Every trade still requires ForexMetaValveGate clearance and the 10% drawdown brake.`
+    : `Active platform ${e(r.platform)}. Hugo's Way is the primary main venue, LHFX is the secondary MetaTrader 5 venue, and the OANDA practice account is the regulated safe harbor. Every trade still needs ForexMetaValveGate clearance first.`;
+  const foot = isLive
+    ? 'Live execution mode: two-key owner authorization is active; demo servers are refused to prevent mixing funds. No credentials are shown or stored in this page.'
+    : 'Demo-only lock: live servers (Hugo PRO5, LHFXSA-Live, api-fxtrade.oanda.com) are refused in code. No credentials are shown or stored in this page.';
   const chain = r.chain.map((item) => `<div class="stage-row broker-row" data-broker-id="${e(item.brokerId)}"><div><span class="stage-letter">${e(item.priority)}</span><h3>${e(item.brokerId)} · ${e(item.label)}</h3><p>${e(item.role)} · ${e(item.platform)} · ${e(item.server)} · ${e(item.leverage)} ${e(item.accountType)}</p></div>${tag(item.status, item.status !== 'ACTIVE')}</div>`).join('');
-  return `<section class="panel broker-routing-panel" aria-labelledby="broker-routing-title"><div class="section-heading"><div><p class="eyebrow">DEMO ACCOUNTS ONLY</p><h2 id="broker-routing-title">Broker &amp; MetaTrader 5 Routing</h2></div>${tag('Demo only · live trading locked')}</div>
-    <p class="panel-copy">Active platform ${e(r.platform)}. Hugo&#39;s Way is the primary main venue, LHFX is the secondary MetaTrader 5 venue, and the OANDA practice account is the regulated safe harbor. Every trade still needs ForexMetaValveGate clearance first.</p>
-    <dl class="metadata">${meta('Active platform', r.platform)}${meta('Routing source', r.connected ? 'Loopback broker routing (read only)' : 'Static preview (not connected)')}${meta('Primary broker', r.primaryBroker)}${meta('Active broker', r.activeBroker)}${meta('MT5 transport', r.transportMode)}${meta('Safety valve', `${r.valve.controller} · ${r.valve.parameters} params · threshold ${r.valve.threshold}`)}</dl>
+  return `<section class="panel broker-routing-panel" aria-labelledby="broker-routing-title"><div class="section-heading"><div><p class="eyebrow">${eyebrow}</p><h2 id="broker-routing-title">Broker &amp; MetaTrader 5 Routing</h2></div>${modeTag}</div>
+    <p class="panel-copy">${lead}</p>
+    <dl class="metadata">${meta('Execution mode', isLive ? 'LIVE (two-key armed)' : 'DEMO (default locked)')}${meta('Active platform', r.platform)}${meta('Routing source', r.connected ? 'Loopback broker routing (read only)' : 'Static preview (not connected)')}${meta('Primary broker', r.primaryBroker)}${meta('Active broker', r.activeBroker)}${meta('MT5 transport', r.transportMode)}${meta('Safety valve', `${r.valve.controller} · ${r.valve.parameters} params · threshold ${r.valve.threshold}`)}</dl>
     <div class="broker-chain" aria-label="Broker priority chain">${chain}</div>
     <dl class="metadata" aria-label="Dual-shield barbell">${meta('Quote-truth shield', `${s.majorBps} bps majors / ${s.crossBps} bps crosses vs ${s.reference} · spread ≤ ${s.spreadMultiple}x`)}${meta('Barbell allocation', `${pct(s.reserveShare)} OANDA reserve · ${pct(s.hugoswayShare)} Hugo's Way · ${pct(s.lhfxShare)} LHFX`)}${meta('Stop-loss risk cap', `${s.maxStopRiskPct}% of total equity`)}${meta('Safe harbor', `${s.safeHarbor} ${s.safeHarborLeverage} · ${s.degradations} recent degradations`)}${meta('Protective offsets', s.offsetPlanner ? 'Delta-neutral OANDA hedge plan if an MT5 terminal freezes' : 'Unavailable')}</dl>
-    <p class="quiet-note">Demo-only lock: live servers (Hugo PRO5, LHFXSA-Live, api-fxtrade.oanda.com) are refused in code. No credentials are shown or stored in this page.</p>
+    <p class="quiet-note">${foot}</p>
   </section>`;
 }
 

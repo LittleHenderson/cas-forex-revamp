@@ -2,20 +2,22 @@
 //|                                           CasForexMt5Bridge.mq5  |
 //|            CAS Forex Revamp - Phase 6 MetaTrader 5 spool bridge   |
 //|                                                                  |
-//|  DEMO ACCOUNTS ONLY. Implements protocol "cas-forex-mt5-spool/1" |
-//|  between the Python Mt5SpoolBridgeTransport and this terminal:   |
+//|  DUAL-MODE (DEMO DEFAULT + TWO-KEY LIVE). Protocol:              |
+//|  "cas-forex-mt5-spool/1" between Python and this terminal:       |
 //|    order_request_<id>.json  (Python -> EA, flat, string values)  |
 //|    order_receipt_<id>.json  (EA -> Python, flat, string values)  |
 //|    market_ticks.json        (EA -> Python, account/ticks/pos)    |
 //|                                                                  |
-//|  Supported demo servers: "Hugo demo PRO5" (Hugo's Way, primary)  |
-//|  and "LHFXSA-Demo" (LHFX, secondary). The EA refuses to run on   |
-//|  any account whose ACCOUNT_TRADE_MODE is not DEMO, or whose      |
-//|  server name lacks "demo" or contains "live"/"real".             |
+//|  DEMO (default): requires ACCOUNT_TRADE_MODE_DEMO + "demo" srv.  |
+//|  LIVE (opt-in): requires InpLiveExecutionMode=true AND exact     |
+//|  InpLiveArmPhrase="I_AUTHORIZE_LIVE_REAL_MONEY_TRADING" plus     |
+//|  ACCOUNT_TRADE_MODE_REAL on pinned live server (Hugo PRO5 /      |
+//|  LHFXSA-Live). Mode mismatches are always refused.               |
 //+------------------------------------------------------------------+
 #property copyright   "CAS Forex Revamp"
-#property version     "1.00"
-#property description "Demo-only file-spool bridge for CAS Forex Revamp (Hugo demo PRO5 / LHFXSA-Demo)."
+#property version     "1.10"
+#property description "Dual-mode file-spool bridge for CAS Forex Revamp (Demo default + Two-Key Live)."
+#define LIVE_ARM_PHRASE "I_AUTHORIZE_LIVE_REAL_MONEY_TRADING"
 
 #include <Trade\Trade.mqh>
 
@@ -28,12 +30,14 @@ input string InpSymbols            = "EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,
 input string InpSymbolSuffix       = "";                 // Broker symbol suffix, e.g. ".ecn" (empty when none)
 input int    InpMaxDeviationPoints = 30;                 // Maximum slippage in points
 input double InpMaxVolumeLots      = 50.0;               // Hard per-order volume cap in lots
+input bool   InpLiveExecutionMode  = false;              // false=DEMO only, true=LIVE real-money
+input string InpLiveArmPhrase      = "";                 // Must be I_AUTHORIZE_LIVE_REAL_MONEY_TRADING when LIVE=true
 
 #define SPOOL_PROTOCOL "cas-forex-mt5-spool/1"
 
 CTrade   g_trade;
 string   g_symbols[];
-bool     g_demo_ok = false;
+bool     g_mode_ok = false;
 datetime g_last_publish = 0;
 
 //+------------------------------------------------------------------+
@@ -73,18 +77,48 @@ string SafeText(string text)
    return(text);
   }
 
-//--- Demo-account guard: trade mode must be DEMO and the server must be an explicit demo server.
-bool DemoGuard()
+string AccountTradeModeLabel()
   {
-   if((ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
+   ENUM_ACCOUNT_TRADE_MODE m = (ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE);
+   if(m == ACCOUNT_TRADE_MODE_REAL)
+      return("REAL");
+   if(m == ACCOUNT_TRADE_MODE_CONTEST)
+      return("CONTEST");
+   return("DEMO");
+  }
+
+bool IsPinnedLiveServer(string server)
+  {
+   StringToLower(server);
+   StringTrimLeft(server);
+   StringTrimRight(server);
+   if(StringFind(server, "demo") >= 0 || StringFind(server, "practice") >= 0)
       return(false);
+   return(server == "hugo pro5" || server == "hugopro5" || server == "hugo-real" || server == "hugosway-live" ||
+          server == "lhfxsa-live" || server == "lhfx-live" || server == "lhfxsa-real");
+  }
+
+//--- Strict mode guard: DEMO by default; two-key REAL when explicitly armed.
+bool ModeGuard()
+  {
+   ENUM_ACCOUNT_TRADE_MODE m = (ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE);
    string server = AccountInfoString(ACCOUNT_SERVER);
    StringToLower(server);
-   if(StringFind(server, "live") >= 0 || StringFind(server, "real") >= 0)
+   if(!InpLiveExecutionMode)
+     {
+      if(m != ACCOUNT_TRADE_MODE_DEMO)
+         return(false);
+      if(StringFind(server, "live") >= 0 || StringFind(server, "real") >= 0)
+         return(false);
+      if(StringFind(server, "demo") < 0)
+         return(false);
+      return(true);
+     }
+   if(InpLiveArmPhrase != LIVE_ARM_PHRASE)
       return(false);
-   if(StringFind(server, "demo") < 0)
+   if(m != ACCOUNT_TRADE_MODE_REAL)
       return(false);
-   return(true);
+   return(IsPinnedLiveServer(server));
   }
 
 //--- Extract a string value from a FLAT JSON object whose values are all plain strings.
@@ -180,9 +214,9 @@ string ReceiptJson(const string request_id, const string request_sha, const stri
    return(StringFormat(
       "{\"protocol\":\"%s\",\"request_id\":\"%s\",\"request_sha256\":\"%s\",\"status\":\"%s\",\"retcode\":\"%u\","
       "\"position_ticket\":\"%s\",\"deal_ticket\":\"%s\",\"volume\":\"%s\",\"price\":\"%s\",\"sl\":\"%s\","
-      "\"server\":\"%s\",\"account_trade_mode\":\"DEMO\",\"observed_at\":\"%s\",\"message\":\"%s\"}",
+      "\"server\":\"%s\",\"account_trade_mode\":\"%s\",\"observed_at\":\"%s\",\"message\":\"%s\"}",
       SPOOL_PROTOCOL, request_id, request_sha, status, retcode, position_ticket, deal_ticket, volume, price, sl,
-      SafeText(server), IsoNowUtc(), SafeText(message)));
+      SafeText(server), AccountTradeModeLabel(), IsoNowUtc(), SafeText(message)));
   }
 
 void WriteReceipt(const string request_id, const string json)
@@ -358,9 +392,9 @@ void ReportInterruptedRequests()
 void PublishMarket()
   {
    string json = StringFormat(
-      "{\"protocol\":\"%s\",\"server\":\"%s\",\"account_trade_mode\":\"DEMO\",\"observed_at\":\"%s\",\"account\":{"
+      "{\"protocol\":\"%s\",\"server\":\"%s\",\"account_trade_mode\":\"%s\",\"observed_at\":\"%s\",\"account\":{"
       "\"login\":\"%s\",\"currency\":\"%s\",\"balance\":\"%s\",\"equity\":\"%s\",\"margin\":\"%s\",\"margin_free\":\"%s\",\"leverage\":\"%s\"},\"ticks\":[",
-      SPOOL_PROTOCOL, SafeText(AccountInfoString(ACCOUNT_SERVER)), IsoNowUtc(),
+      SPOOL_PROTOCOL, SafeText(AccountInfoString(ACCOUNT_SERVER)), AccountTradeModeLabel(), IsoNowUtc(),
       IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)), AccountInfoString(ACCOUNT_CURRENCY),
       DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2), DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
       DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2), DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2),
@@ -405,9 +439,9 @@ void PublishMarket()
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   if(!DemoGuard())
+   if(!ModeGuard())
      {
-      Print("CasForexMt5Bridge: REFUSED - account is not a DEMO account on an explicit demo server.");
+      Print("CasForexMt5Bridge: REFUSED - account trade mode / server / two-key arm phrase mismatch.");
       return(INIT_FAILED);
      }
    if(InpBrokerChannel != "hugosway_mt5" && InpBrokerChannel != "lhfx_mt5")
@@ -428,11 +462,11 @@ int OnInit()
      }
    FolderCreate(InpSpoolFolder, CommonFlag());
    FolderCreate(SpoolDir(), CommonFlag());
-   g_demo_ok = true;
+   g_mode_ok = true;
    ReportInterruptedRequests();
    PublishMarket();
    EventSetMillisecondTimer(MathMax(50, InpTimerMs));
-   PrintFormat("CasForexMt5Bridge: running on demo server %s, spool %s", AccountInfoString(ACCOUNT_SERVER), SpoolDir());
+   PrintFormat("CasForexMt5Bridge: running [%s] on server %s, spool %s", AccountTradeModeLabel(), AccountInfoString(ACCOUNT_SERVER), SpoolDir());
    return(INIT_SUCCEEDED);
   }
 
@@ -443,10 +477,10 @@ void OnDeinit(const int reason)
 
 void OnTimer()
   {
-   g_demo_ok = DemoGuard();
-   if(!g_demo_ok)
+   g_mode_ok = ModeGuard();
+   if(!g_mode_ok)
      {
-      Print("CasForexMt5Bridge: demo guard failed - spool processing halted.");
+      Print("CasForexMt5Bridge: mode guard failed - spool processing halted.");
       ExpertRemove();
       return;
      }
@@ -457,7 +491,7 @@ void OnTimer()
 void OnTick()
   {
    // Ticks only refresh the market snapshot (at most once per second); orders run on the timer.
-   if(g_demo_ok && TimeCurrent() != g_last_publish)
+   if(g_mode_ok && TimeCurrent() != g_last_publish)
       PublishMarket();
   }
 //+------------------------------------------------------------------+
