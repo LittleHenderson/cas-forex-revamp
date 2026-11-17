@@ -60,6 +60,8 @@ DIRECT_KRAKEN_FX_PAIRS: tuple[str, ...] = (
     "AUDJPY",
 )
 
+INDEX_INSTRUMENTS: tuple[str, ...] = ("NAS100", "US30")
+
 EXPANDED_FX_PAIRS: tuple[str, ...] = (
     "EURUSD",
     "GBPUSD",
@@ -117,6 +119,8 @@ PAIR_MAX_SPREAD_BPS: dict[str, Decimal] = {
     "CADJPY": Decimal("350"),
 }
 
+EXPANDED_MARKETS: tuple[str, ...] = INDEX_INSTRUMENTS + EXPANDED_FX_PAIRS
+
 EXPANDED_PAIR_SPECS: dict[str, dict[str, Any]] = {
     "EURUSD": {"display": "EUR/USD", "category": "MAJOR", "base": "EUR", "quote": "USD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.50"), "max": Decimal("2.50"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["EURUSD"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["EURUSD"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("ZEURZUSD", "EURUSD", "EUR/USD"), "oanda": "EUR_USD"},
     "GBPUSD": {"display": "GBP/USD", "category": "MAJOR", "base": "GBP", "quote": "USD", "tick": Decimal("0.00001"), "pip": Decimal("0.0001"), "min": Decimal("0.50"), "max": Decimal("3.00"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["GBPUSD"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["GBPUSD"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("ZGBPZUSD", "GBPUSD", "GBP/USD"), "oanda": "GBP_USD"},
@@ -134,6 +138,37 @@ EXPANDED_PAIR_SPECS: dict[str, dict[str, Any]] = {
     "AUDJPY": {"display": "AUD/JPY", "category": "CROSS", "base": "AUD", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("40.0"), "max": Decimal("250.0"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["AUDJPY"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["AUDJPY"], "mode": "DIRECT_KRAKEN_ORDERBOOK", "kraken_keys": ("AUDJPY", "AUD/JPY"), "oanda": "AUD_JPY"},
     "CHFJPY": {"display": "CHF/JPY", "category": "CROSS", "base": "CHF", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("60.0"), "max": Decimal("380.0"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["CHFJPY"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["CHFJPY"], "mode": "SYNTHETIC_KRAKEN_CROSS_BOOK", "kraken_keys": (), "legs": ("DIV", "USDJPY", "USDCHF"), "oanda": "CHF_JPY"},
     "CADJPY": {"display": "CAD/JPY", "category": "CROSS", "base": "CAD", "quote": "JPY", "tick": Decimal("0.001"), "pip": Decimal("0.01"), "min": Decimal("40.0"), "max": Decimal("250.0"), "max_ref_dev_bps": PAIR_MAX_REFERENCE_DEVIATION_BPS["CADJPY"], "max_spread_bps": PAIR_MAX_SPREAD_BPS["CADJPY"], "mode": "SYNTHETIC_KRAKEN_CROSS_BOOK", "kraken_keys": (), "legs": ("DIV", "USDJPY", "USDCAD"), "oanda": "CAD_JPY"},
+}
+
+INDEX_MARKET_SPECS: dict[str, dict[str, Any]] = {
+    "NAS100": {
+        "display": "NAS100 / Nasdaq-100",
+        "category": "US_INDEX",
+        "base_currency": "NAS100",
+        "quote_currency": "USD",
+        "tick": Decimal("0.01"),
+        "point": Decimal("1.0"),
+        "min": Decimal("5000.00"),
+        "max": Decimal("60000.00"),
+        "max_ref_dev_bps": Decimal("150"),
+        "max_spread_bps": Decimal("35"),
+        "yahoo_paths": ("/v8/finance/chart/%5ENDX", "/v8/finance/chart/NQ=F"),
+        "oanda": "NAS100_USD",
+    },
+    "US30": {
+        "display": "US30 / Dow Jones 30",
+        "category": "US_INDEX",
+        "base_currency": "US30",
+        "quote_currency": "USD",
+        "tick": Decimal("0.01"),
+        "point": Decimal("1.0"),
+        "min": Decimal("10000.00"),
+        "max": Decimal("100000.00"),
+        "max_ref_dev_bps": Decimal("150"),
+        "max_spread_bps": Decimal("35"),
+        "yahoo_paths": ("/v8/finance/chart/%5EDJI", "/v8/finance/chart/YM=F"),
+        "oanda": "US30_USD",
+    },
 }
 
 KRAKEN_EXPANDED_TICKER_URL = (
@@ -157,7 +192,13 @@ PINNED_PUBLIC_FEED_HOST_PATHS: dict[str, frozenset[str]] = {
     "api.frankfurter.app": frozenset({"/latest"}),
 }
 ALLOWED_PUBLIC_FEED_HOSTS: frozenset[str] = frozenset(PINNED_PUBLIC_FEED_HOST_PATHS.keys())
-_YAHOO_ALLOWED_CHART_PATHS: frozenset[str] = frozenset({"/v8/finance/chart/NZDUSD=X"})
+_YAHOO_INDEX_ENCODED_PATHS: frozenset[str] = frozenset({
+    "/v8/finance/chart/%5ENDX",
+    "/v8/finance/chart/NQ=F",
+    "/v8/finance/chart/%5EDJI",
+    "/v8/finance/chart/YM=F",
+})
+_YAHOO_ALLOWED_CHART_PATHS: frozenset[str] = frozenset({"/v8/finance/chart/NZDUSD=X"}) | _YAHOO_INDEX_ENCODED_PATHS
 _ALLOWED_PUBLIC_HOSTS: frozenset[str] = ALLOWED_PUBLIC_FEED_HOSTS | frozenset({"query1.finance.yahoo.com"})
 
 _FORBIDDEN_LIVE_HOST_TOKENS: tuple[str, ...] = (
@@ -323,10 +364,12 @@ def validate_pinned_public_feed_url(
         raise ContractError(f"{label}: unpinned public FX feed host {host!r}")
 
     path = parsed.path
+    allowed_yahoo_pct = allow_yahoo_chart and host == "query1.finance.yahoo.com" and path in _YAHOO_INDEX_ENCODED_PATHS
     if (
         not path.startswith("/")
         or "//" in path
-        or "%" in path
+        or ("%" in path and not allowed_yahoo_pct)
+        or any(esc in path.lower() for esc in _FORBIDDEN_PERCENT_ESCAPES)
         or any(seg in (".", "..") for seg in path.split("/"))
     ):
         raise ContractError(f"{label}: non-canonical or traversal URL path {path!r}")
@@ -1729,3 +1772,122 @@ class ExpandedPublicLiveFxFeedClient:
                         )
                     out[spair] = (b, a)
         return out, wire_sha
+
+
+class PublicUsIndexFeedClient:
+    """Read-only pinned HTTPS reference feed for NAS100 (NDX/NQ) and US30 (DJI/YM).
+
+    Uses PinnedPublicHTTPSHandler + NoRedirectHandler and returns a safe-JSON dict (no floats).
+    """
+
+    def __init__(
+        self,
+        *,
+        transport: Callable[[str, float, int], bytes] | None = None,
+        timeout_seconds: float = 10.0,
+        max_wire_bytes: int = MAX_STREAM_WIRE_BYTES,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._transport = transport
+        self._timeout = float(timeout_seconds)
+        self._max_wire_bytes = integer(max_wire_bytes, "max_wire_bytes", minimum=1024)
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _get(self, url: str) -> bytes:
+        safe_url = validate_pinned_public_feed_url(url, allow_yahoo_chart=True)
+        if self._transport is not None:
+            raw = self._transport(safe_url, self._timeout, self._max_wire_bytes)
+            if not isinstance(raw, bytes) or len(raw) == 0 or len(raw) > self._max_wire_bytes:
+                raise ContractError("index transport returned invalid payload size")
+            return raw
+        return _open_pinned_public_url(safe_url, timeout_seconds=self._timeout, max_wire_bytes=self._max_wire_bytes)
+
+    def fetch_index_stream(self, *, sequence: int = 1) -> dict[str, Any]:
+        now_dt = utc_time(self._clock(), "index observed_at")
+        observed_str = now_dt.isoformat().replace("+00:00", "Z")
+        rows: list[dict[str, Any]] = []
+        for sym in INDEX_INSTRUMENTS:
+            spec = INDEX_MARKET_SPECS[sym]
+            tick = spec["tick"]
+            last_exc: Exception | None = None
+            chart_doc: dict[str, Any] | None = None
+            for ypath in spec["yahoo_paths"]:
+                url = f"https://query1.finance.yahoo.com{ypath}?interval=1m&range=1d"
+                try:
+                    raw = self._get(url)
+                    parsed = json.loads(raw.decode("utf-8"))
+                    result_list = ((parsed.get("chart") or {}).get("result") or [])
+                    if result_list and isinstance(result_list[0], dict):
+                        chart_doc = result_list[0]
+                        break
+                except Exception as exc:
+                    last_exc = exc
+            if chart_doc is None:
+                raise ContractError(f"pinned reference feed unavailable for {sym}: {type(last_exc).__name__ if last_exc else 'empty'}")
+            meta = chart_doc.get("meta") or {}
+            timestamps = chart_doc.get("timestamp") or []
+            quote_block = (((chart_doc.get("indicators") or {}).get("quote") or [{}])[0])
+            opens = quote_block.get("open") or []
+            highs = quote_block.get("high") or []
+            lows = quote_block.get("low") or []
+            closes = quote_block.get("close") or []
+            vols = quote_block.get("volume") or []
+            candles_m1: list[dict[str, Any]] = []
+            for idx, ts_val in enumerate(timestamps[-60:]):
+                if ts_val is None or idx >= len(closes):
+                    continue
+                c_raw = closes[-len(timestamps[-60:]) + idx] if len(timestamps) >= 60 else closes[idx]
+                o_raw = opens[-len(timestamps[-60:]) + idx] if len(timestamps) >= 60 and idx < len(opens) else opens[idx] if idx < len(opens) else c_raw
+                h_raw = highs[-len(timestamps[-60:]) + idx] if len(timestamps) >= 60 and idx < len(highs) else highs[idx] if idx < len(highs) else c_raw
+                l_raw = lows[-len(timestamps[-60:]) + idx] if len(timestamps) >= 60 and idx < len(lows) else lows[idx] if idx < len(lows) else c_raw
+                v_raw = vols[-len(timestamps[-60:]) + idx] if len(timestamps) >= 60 and idx < len(vols) else vols[idx] if idx < len(vols) else 0
+                if None in (o_raw, h_raw, l_raw, c_raw):
+                    continue
+                t_iso = datetime.fromtimestamp(int(ts_val), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+                o_dec = Decimal(str(o_raw)).quantize(tick)
+                h_dec = Decimal(str(h_raw)).quantize(tick)
+                l_dec = Decimal(str(l_raw)).quantize(tick)
+                c_dec = Decimal(str(c_raw)).quantize(tick)
+                v_dec = Decimal(str(v_raw or 0)).quantize(Decimal("0.01"))
+                candles_m1.append({
+                    "t": t_iso,
+                    "o": decimal_text(o_dec),
+                    "h": decimal_text(max(h_dec, o_dec, c_dec)),
+                    "l": decimal_text(min(l_dec, o_dec, c_dec)),
+                    "c": decimal_text(c_dec),
+                    "v": decimal_text(max(Decimal("0"), v_dec)),
+                    "n": 1,
+                })
+            raw_mid = meta.get("regularMarketPrice") or (candles_m1[-1]["c"] if candles_m1 else None)
+            if raw_mid is None:
+                raise ContractError(f"index price missing for {sym}")
+            mid = Decimal(str(raw_mid)).quantize(tick)
+            if not (spec["min"] <= mid <= spec["max"]):
+                raise ContractError(f"index reference price for {sym} out of bounds: {mid}")
+            half_spread = Decimal("1.25") if sym == "NAS100" else Decimal("2.00")
+            bid = (mid - half_spread).quantize(tick)
+            ask = (mid + half_spread).quantize(tick)
+            rows.append({
+                "pair": sym,
+                "display_pair": spec["display"],
+                "category": "US_INDEX",
+                "base_currency": spec["base_currency"],
+                "quote_currency": "USD",
+                "tick_size": decimal_text(tick),
+                "feed_mode": "PINNED_INDEX_REFERENCE_FEED",
+                "bid": decimal_text(bid),
+                "ask": decimal_text(ask),
+                "mid": decimal_text(mid),
+                "spread_points": decimal_text(ask - bid),
+                "observed_at": observed_str,
+                "candles_m1": candles_m1,
+                "candles_m5": candles_m1[-12:],
+                "candles_h1": candles_m1[-2:],
+            })
+        return {
+            "schema": "cas-forex.index-stream/1",
+            "sequence": int(sequence),
+            "observed_at": observed_str,
+            "instruments": list(INDEX_INSTRUMENTS),
+            "markets": rows,
+        }

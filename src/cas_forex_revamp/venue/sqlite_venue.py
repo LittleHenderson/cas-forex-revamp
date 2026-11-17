@@ -402,15 +402,16 @@ class SQLiteVenue:
             return "INVALID_RISK_PRICE_CEILING_TICK"
         if intent.quantity is not None and (intent.quantity < instrument.minimum_quantity or intent.quantity % instrument.quantity_step != 0):
             return "INVALID_QUANTITY_GEOMETRY"
-        for price in (intent.limit_price, intent.stop_price):
+        for price in (intent.limit_price, intent.stop_price, intent.take_profit_price):
             if price is not None and price % instrument.price_tick != 0:
                 return "INVALID_PRICE_TICK"
         if intent.kind is ActionKind.CANCEL_ORDER and any(
-                x is not None for x in (intent.side, intent.limit_price, intent.stop_price)):
+                x is not None for x in (intent.side, intent.limit_price, intent.stop_price, intent.take_profit_price)):
             return "UNSUPPORTED_ACTION_GEOMETRY"
         if intent.kind is ActionKind.AMEND_STOP and (intent.side is not None or intent.limit_price is not None):
             return "UNSUPPORTED_ACTION_GEOMETRY"
-        if intent.kind in (ActionKind.CLOSE, ActionKind.REDUCE) and intent.stop_price is not None:
+        if intent.kind in (ActionKind.CLOSE, ActionKind.REDUCE) and (
+                intent.stop_price is not None or intent.take_profit_price is not None):
             return "UNSUPPORTED_ACTION_GEOMETRY"
         plan = self._plan(state, command.command_id)
         if plan.get("reject_on_accept"):

@@ -26,6 +26,12 @@ def to_wire(value: Any) -> Any:
     if isinstance(value, Enum):
         return to_wire(value.value)
     if is_dataclass(value) and not isinstance(value, type):
+        if isinstance(value, ActionIntent):
+            return {
+                f.name: to_wire(getattr(value, f.name))
+                for f in fields(value)
+                if not (f.name == "take_profit_price" and getattr(value, f.name) is None)
+            }
         return {f.name: to_wire(getattr(value, f.name)) for f in fields(value)}
     if value is None or type(value) in (str, bool, int):
         return value

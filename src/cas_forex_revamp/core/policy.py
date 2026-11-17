@@ -59,7 +59,7 @@ class InstrumentPolicy:
                 intent.quantity < instrument.minimum_quantity or intent.quantity % instrument.quantity_step
             ):
                 raise AdmissionDenied("QUANTITY_STEP_OR_MINIMUM")
-            for price in (intent.limit_price, intent.stop_price):
+            for price in (intent.limit_price, intent.stop_price, intent.take_profit_price):
                 if price is not None and price % instrument.price_tick:
                     raise AdmissionDenied("PRICE_TICK")
 

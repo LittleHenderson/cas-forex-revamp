@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Context, Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, localcontext
 from hashlib import sha256
+import hmac
 import json
 from pathlib import Path
 import re
@@ -109,6 +110,44 @@ DEFAULT_OANDA_PRACTICE_BASE_URL = "https://api-fxpractice.oanda.com/v3"
 ALLOWED_OANDA_PRACTICE_HOST = "api-fxpractice.oanda.com"
 ENV_OANDA_PRACTICE_TOKEN = "CAS_FOREX_OANDA_PRACTICE_TOKEN"  # nosec B105: environment variable name constant, not a secret value
 ENV_OANDA_PRACTICE_ACCOUNT_ID = "CAS_FOREX_OANDA_PRACTICE_ACCOUNT_ID"
+
+ALLOWED_OANDA_LIVE_HOST = "api-fxtrade.oanda.com"
+DEFAULT_OANDA_LIVE_BASE_URL = "https://api-fxtrade.oanda.com/v3"
+ENV_EXECUTION_MODE = "CAS_FOREX_EXECUTION_MODE"
+ENV_LIVE_ARM_PHRASE = "CAS_FOREX_LIVE_ARM_PHRASE"  # nosec B105: environment variable name constant, not a secret value
+REQUIRED_LIVE_ARM_PHRASE = "I_AUTHORIZE_LIVE_REAL_MONEY_TRADING"  # nosec B105: explicit dual-confirmation arm phrase literal, not a credential
+ENV_OANDA_LIVE_TOKEN = "CAS_FOREX_OANDA_LIVE_TOKEN"  # nosec B105: environment variable name constant, not a secret value
+ENV_OANDA_LIVE_ACCOUNT_ID = "CAS_FOREX_OANDA_LIVE_ACCOUNT_ID"
+EXECUTION_MODE_DEMO = "DEMO"
+EXECUTION_MODE_LIVE = "LIVE"
+EXECUTION_MODES: tuple[str, str] = (EXECUTION_MODE_DEMO, EXECUTION_MODE_LIVE)
+
+
+def resolve_execution_mode(
+    environ: Mapping[str, str] | None = None,
+    *,
+    execution_mode: str | None = None,
+    live_arm_phrase: str | None = None,
+) -> tuple[str, bool]:
+    """Resolve ``(execution_mode, live_armed)`` with strict fail-closed two-key LIVE authorization."""
+    raw_mode = execution_mode
+    if raw_mode is None and environ is not None:
+        raw_mode = environ.get(ENV_EXECUTION_MODE, "")
+    mode = EXECUTION_MODE_DEMO if raw_mode is None or not str(raw_mode).strip() else str(raw_mode).strip().upper()
+    if mode not in EXECUTION_MODES:
+        raise ContractError(f"{ENV_EXECUTION_MODE} must be one of {EXECUTION_MODES}; got {mode!r}")
+    if mode == EXECUTION_MODE_DEMO:
+        return EXECUTION_MODE_DEMO, False
+    raw_phrase = live_arm_phrase
+    if raw_phrase is None and environ is not None:
+        raw_phrase = environ.get(ENV_LIVE_ARM_PHRASE, "")
+    phrase = "" if raw_phrase is None else str(raw_phrase).strip()
+    if not hmac.compare_digest(phrase.encode("utf-8"), REQUIRED_LIVE_ARM_PHRASE.encode("utf-8")):
+        raise LiveBrokerEndpointForbiddenError(
+            f"LIVE real-money mode requires two-key authorization: set {ENV_EXECUTION_MODE}=LIVE and "
+            f"{ENV_LIVE_ARM_PHRASE}={REQUIRED_LIVE_ARM_PHRASE}"
+        )
+    return EXECUTION_MODE_LIVE, True
 
 SUPPORTED_FX_PAIRS: tuple[str, ...] = ("EURUSD", "GBPUSD", "USDJPY")
 MAX_SAFE_JS_INTEGER = (1 << 53) - 1  # 9007199254740991
@@ -980,6 +1019,8 @@ class LiveFxFeedSnapshot:
         identifier(self.provider, "provider")
         if self.provider == "oanda-fxpractice-v3-pricing":
             OandaPracticePaperClient.validate_practice_url(self.source_url)
+        elif self.provider == "oanda-fxtrade-v3-pricing":
+            OandaPracticePaperClient.validate_live_url(self.source_url)
         else:
             validate_pinned_public_feed_url(
                 self.source_url,
@@ -1081,7 +1122,7 @@ class LiveFxFeedSnapshot:
                     rq.source_pair_key,
                 ):
                     raise LiveFeedVerificationError(f"stored quote for {sym} differs from captured Kraken wire bytes")
-        elif self.provider == "oanda-fxpractice-v3-pricing":
+        elif self.provider in ("oanda-fxpractice-v3-pricing", "oanda-fxtrade-v3-pricing"):
             reparsed = _parse_oanda_pricing_bytes(
                 raw_bytes,
                 pairs=tuple(sorted(self.quotes)),
@@ -1496,14 +1537,25 @@ class OandaPracticePaperClient:
     def __init__(
         self,
         *,
-        base_url: str = DEFAULT_OANDA_PRACTICE_BASE_URL,
+        base_url: str | None = None,
         environ: Mapping[str, str] | None = None,
+        execution_mode: str | None = None,
+        live_arm_phrase: str | None = None,
         max_spread_bps: Decimal = Decimal("500"),
         timeout_seconds: float = 10.0,
         max_wire_bytes: int = MAX_WIRE_RESPONSE_BYTES,
         transport: Callable[[str, str, dict[str, str], bytes | None, float, int], bytes] | None = None,
     ) -> None:
-        self.base_url = self.validate_practice_url(base_url)
+        if environ is not None and not isinstance(environ, Mapping):
+            raise ContractError("environ must be a key-value Mapping (never a .env file path)")
+        self.execution_mode, self._live_armed = resolve_execution_mode(
+            environ, execution_mode=execution_mode, live_arm_phrase=live_arm_phrase
+        )
+        default_url = (
+            DEFAULT_OANDA_LIVE_BASE_URL if self.execution_mode == EXECUTION_MODE_LIVE else DEFAULT_OANDA_PRACTICE_BASE_URL
+        )
+        raw_url = default_url if base_url is None else base_url
+        self.base_url = self.validate_mode_url(raw_url, execution_mode=self.execution_mode)
         self.max_spread_bps = decimal_value(max_spread_bps, "max_spread_bps", positive=True)
         if timeout_seconds <= 0 or timeout_seconds > 60:
             raise ContractError("timeout_seconds must be in (0, 60]")
@@ -1515,16 +1567,16 @@ class OandaPracticePaperClient:
         self._secret: _RedactedSecret | None = None
         self._account_id: str | None = None
         if environ is not None:
-            if not isinstance(environ, Mapping):
-                raise ContractError("environ must be a key-value Mapping (never a .env file path)")
-            raw_tok = environ.get(ENV_OANDA_PRACTICE_TOKEN, "").strip()
-            raw_acct = environ.get(ENV_OANDA_PRACTICE_ACCOUNT_ID, "").strip()
+            tok_env = ENV_OANDA_LIVE_TOKEN if self.execution_mode == EXECUTION_MODE_LIVE else ENV_OANDA_PRACTICE_TOKEN
+            acct_env = (
+                ENV_OANDA_LIVE_ACCOUNT_ID if self.execution_mode == EXECUTION_MODE_LIVE else ENV_OANDA_PRACTICE_ACCOUNT_ID
+            )
+            raw_tok = environ.get(tok_env, "").strip()
+            raw_acct = environ.get(acct_env, "").strip()
             if bool(raw_tok) != bool(raw_acct):
-                raise PaperBrokerNotConfiguredError(
-                    f"both {ENV_OANDA_PRACTICE_TOKEN} and {ENV_OANDA_PRACTICE_ACCOUNT_ID} are required together"
-                )
+                raise PaperBrokerNotConfiguredError(f"both {tok_env} and {acct_env} are required together")
             if raw_tok and raw_acct:
-                identifier(raw_acct, "oanda_practice_account_id")
+                identifier(raw_acct, "oanda_account_id")
                 self._secret = _RedactedSecret(raw_tok)
                 self._account_id = raw_acct
 
@@ -1533,10 +1585,18 @@ class OandaPracticePaperClient:
         cls,
         environ: Mapping[str, str],
         *,
-        base_url: str = DEFAULT_OANDA_PRACTICE_BASE_URL,
+        base_url: str | None = None,
+        execution_mode: str | None = None,
+        live_arm_phrase: str | None = None,
         transport: Callable[[str, str, dict[str, str], bytes | None, float, int], bytes] | None = None,
     ) -> "OandaPracticePaperClient":
-        return cls(base_url=base_url, environ=environ, transport=transport)
+        return cls(
+            base_url=base_url,
+            environ=environ,
+            execution_mode=execution_mode,
+            live_arm_phrase=live_arm_phrase,
+            transport=transport,
+        )
 
     @property
     def is_active(self) -> bool:
@@ -1548,7 +1608,7 @@ class OandaPracticePaperClient:
 
     def __repr__(self) -> str:
         return (
-            f"OandaPracticePaperClient(base_url={self.base_url!r}, "
+            f"OandaPracticePaperClient(mode={self.execution_mode!r}, base_url={self.base_url!r}, "
             f"active={self.is_active}, token='[REDACTED]')"
         )
 
@@ -1580,17 +1640,56 @@ class OandaPracticePaperClient:
             raise LiveBrokerEndpointForbiddenError("OANDA practice URL path must be rooted at /v3")
         return cleaned
 
+    @staticmethod
+    def validate_live_url(url: str) -> str:
+        if not isinstance(url, str) or not url.strip():
+            raise ContractError("OANDA live base URL must be a non-empty string")
+        cleaned = url.strip().rstrip("/")
+        parsed = urllib.parse.urlsplit(cleaned)
+        host = (parsed.hostname or "").lower()
+        if "fxpractice" in host or "demo" in host or "practice" in host:
+            raise ContractError(f"practice/demo host {host!r} refused while LIVE execution mode is armed")
+        if host == "stream-fxtrade.oanda.com":
+            raise ContractError("OANDA REST URL must target REST host api-fxtrade.oanda.com, not stream-fxtrade")
+        if parsed.scheme != "https":
+            raise ContractError("OANDA live adapter requires https:// scheme")
+        if host != ALLOWED_OANDA_LIVE_HOST:
+            raise ContractError(f"unpinned live host {host!r} refused; strictly pinned to {ALLOWED_OANDA_LIVE_HOST}")
+        if parsed.port not in (None, 443):
+            raise ContractError("non-standard port refused on OANDA live endpoint")
+        if parsed.username or parsed.password or parsed.fragment:
+            raise ContractError("credentials and URL fragments are forbidden in OANDA URLs")
+        if not (parsed.path == "/v3" or parsed.path.startswith("/v3/")):
+            raise ContractError("OANDA live URL path must be rooted at /v3")
+        return cleaned
+
+    @classmethod
+    def validate_mode_url(cls, url: str, *, execution_mode: str = EXECUTION_MODE_DEMO) -> str:
+        if execution_mode == EXECUTION_MODE_LIVE:
+            return cls.validate_live_url(url)
+        return cls.validate_practice_url(url)
+
     def _require_active(self) -> tuple[_RedactedSecret, str]:
         if self._secret is None or self._account_id is None:
+            tok_env = ENV_OANDA_LIVE_TOKEN if self.execution_mode == EXECUTION_MODE_LIVE else ENV_OANDA_PRACTICE_TOKEN
+            acct_env = (
+                ENV_OANDA_LIVE_ACCOUNT_ID if self.execution_mode == EXECUTION_MODE_LIVE else ENV_OANDA_PRACTICE_ACCOUNT_ID
+            )
             raise PaperBrokerNotConfiguredError(
-                f"OandaPracticePaperClient is inactive; pass explicit runtime env vars "
-                f"{ENV_OANDA_PRACTICE_TOKEN} and {ENV_OANDA_PRACTICE_ACCOUNT_ID}"
+                f"OandaPracticePaperClient ({self.execution_mode}) is inactive; pass explicit runtime env vars "
+                f"{tok_env} and {acct_env}"
             )
         return self._secret, self._account_id
 
+    @property
+    def provider_id(self) -> str:
+        return "oanda-fxtrade-v3" if self.execution_mode == EXECUTION_MODE_LIVE else "oanda-fxpractice-v3"
+
     def _request(self, method: str, relative_path: str, *, body_obj: dict[str, Any] | None = None) -> tuple[str, bytes]:
         secret, _ = self._require_active()
-        full_url = self.validate_practice_url(f"{self.base_url}/{relative_path.lstrip('/')}")
+        full_url = self.validate_mode_url(
+            f"{self.base_url}/{relative_path.lstrip('/')}", execution_mode=self.execution_mode
+        )
         body_bytes = None if body_obj is None else canonical_bytes(body_obj)
         headers = {
             "Authorization": f"Bearer {secret.reveal_for_header()}",
@@ -1661,7 +1760,7 @@ class OandaPracticePaperClient:
             max_spread_bps=self.max_spread_bps,
         )
         return _assemble_snapshot(
-            provider="oanda-fxpractice-v3-pricing",
+            provider=f"{self.provider_id}-pricing",
             source_url=full_url,
             fetched_at_utc=fetched_dt,
             fetched_at_ns=fetched_ns,
@@ -1680,7 +1779,7 @@ class OandaPracticePaperClient:
             raise PaperBrokerTransportError("OANDA practice summary missing account object")
         ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
         receipt = {
-            "provider": "oanda-fxpractice-v3",
+            "provider": self.provider_id,
             "account_id": str(acct.get("id", acct_id)),
             "currency": str(acct.get("currency", "USD")),
             "balance": decimal_text(parse_decimal(str(acct["balance"]), "balance")),
@@ -1703,6 +1802,7 @@ class OandaPracticePaperClient:
         units: Decimal,
         client_order_id: str,
         stop_loss_price: Decimal | None = None,
+        take_profit_price: Decimal | None = None,
         price_bound: Decimal | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
@@ -1725,10 +1825,17 @@ class OandaPracticePaperClient:
         }
         if price_bound is not None:
             order_spec["priceBound"] = decimal_text(decimal_value(price_bound, "price_bound", positive=True))
-        if stop_loss_price is not None:
-            order_spec["stopLossOnFill"] = {
-                "price": decimal_text(decimal_value(stop_loss_price, "stop_loss_price", positive=True))
-            }
+        sl_dec = decimal_value(stop_loss_price, "stop_loss_price", positive=True) if stop_loss_price is not None else None
+        tp_dec = decimal_value(take_profit_price, "take_profit_price", positive=True) if take_profit_price is not None else None
+        if sl_dec is not None and tp_dec is not None:
+            if side is Side.BUY and sl_dec >= tp_dec:
+                raise ContractError("OANDA BUY stop_loss_price must be below take_profit_price")
+            if side is Side.SELL and tp_dec >= sl_dec:
+                raise ContractError("OANDA SELL take_profit_price must be below stop_loss_price")
+        if sl_dec is not None:
+            order_spec["stopLossOnFill"] = {"price": decimal_text(sl_dec)}
+        if tp_dec is not None:
+            order_spec["takeProfitOnFill"] = {"price": decimal_text(tp_dec)}
         _, raw = self._request("POST", f"accounts/{acct_id}/orders", body_obj={"order": order_spec})
         doc = _parse_external_wire_json(raw, label="oanda_practice_order")
         if type(doc) is not dict:
@@ -1737,7 +1844,7 @@ class OandaPracticePaperClient:
         create_tx = doc.get("orderCreateTransaction")
         ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
         receipt = {
-            "provider": "oanda-fxpractice-v3",
+            "provider": self.provider_id,
             "client_order_id": client_order_id,
             "instrument": order_spec["instrument"],
             "side": side.value,
@@ -1750,12 +1857,55 @@ class OandaPracticePaperClient:
                 if type(fill_tx) is not dict or "price" not in fill_tx
                 else decimal_text(parse_decimal(str(fill_tx["price"]), "fill_price"))
             ),
+            "stop_loss_price": None if sl_dec is None else decimal_text(sl_dec),
+            "take_profit_price": None if tp_dec is None else decimal_text(tp_dec),
             "last_transaction_id": str(doc.get("lastTransactionID", "0")),
             "observed_at": _format_utc_micros(ts, "observed_at"),
             "raw_wire_sha256": sha256(raw).hexdigest(),
         }
         assert_safe_json_numbers(receipt)
         return receipt
+
+    def amend_trade_protection(
+        self,
+        *,
+        trade_id: str,
+        stop_loss_price: Decimal | None = None,
+        take_profit_price: Decimal | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Update resting trade-level SL/TP via OANDA v20 ``PUT accounts/{id}/trades/{trade}/orders``."""
+        _, acct_id = self._require_active()
+        tid = identifier(str(trade_id), "trade_id")
+        if stop_loss_price is None and take_profit_price is None:
+            raise ContractError("amend_trade_protection requires stop_loss_price and/or take_profit_price")
+        body: dict[str, Any] = {}
+        sl_dec = decimal_value(stop_loss_price, "stop_loss_price", positive=True) if stop_loss_price is not None else None
+        tp_dec = decimal_value(take_profit_price, "take_profit_price", positive=True) if take_profit_price is not None else None
+        if sl_dec is not None:
+            body["stopLoss"] = {"price": decimal_text(sl_dec), "timeInForce": "GTC"}
+        if tp_dec is not None:
+            body["takeProfit"] = {"price": decimal_text(tp_dec), "timeInForce": "GTC"}
+        _, raw = self._request("PUT", f"accounts/{acct_id}/trades/{tid}/orders", body_obj=body)
+        doc = _parse_external_wire_json(raw, label="oanda_trade_amend")
+        if type(doc) is not dict:
+            raise PaperBrokerTransportError("malformed OANDA trade protection amend response")
+        ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        receipt = {
+            "provider": self.provider_id,
+            "trade_id": tid,
+            "status": "MODIFIED",
+            "stop_loss_price": None if sl_dec is None else decimal_text(sl_dec),
+            "take_profit_price": None if tp_dec is None else decimal_text(tp_dec),
+            "last_transaction_id": str(doc.get("lastTransactionID", "0")),
+            "observed_at": _format_utc_micros(ts, "observed_at"),
+            "raw_wire_sha256": sha256(raw).hexdigest(),
+        }
+        assert_safe_json_numbers(receipt)
+        return receipt
+
+
+OandaV20BrokerClient = OandaPracticePaperClient
 
 
 @dataclass(frozen=True, slots=True)

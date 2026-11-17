@@ -2,38 +2,44 @@
 //|                                           CasForexMt5Bridge.mq5  |
 //|            CAS Forex Revamp - Phase 6 MetaTrader 5 spool bridge   |
 //|                                                                  |
-//|  DEMO ACCOUNTS ONLY. Implements protocol "cas-forex-mt5-spool/1" |
-//|  between the Python Mt5SpoolBridgeTransport and this terminal:   |
+//|  DUAL-MODE (DEMO DEFAULT + TWO-KEY LIVE). Protocol:              |
+//|  "cas-forex-mt5-spool/1" between Python and this terminal:       |
 //|    order_request_<id>.json  (Python -> EA, flat, string values)  |
 //|    order_receipt_<id>.json  (EA -> Python, flat, string values)  |
 //|    market_ticks.json        (EA -> Python, account/ticks/pos)    |
 //|                                                                  |
-//|  Supported demo servers: "Hugo demo PRO5" (Hugo's Way, primary)  |
-//|  and "LHFXSA-Demo" (LHFX, secondary). The EA refuses to run on   |
-//|  any account whose ACCOUNT_TRADE_MODE is not DEMO, or whose      |
-//|  server name lacks "demo" or contains "live"/"real".             |
+//|  DEMO (default): requires ACCOUNT_TRADE_MODE_DEMO + "demo" srv.  |
+//|  LIVE (opt-in): requires InpLiveExecutionMode=true AND exact     |
+//|  InpLiveArmPhrase="I_AUTHORIZE_LIVE_REAL_MONEY_TRADING" plus     |
+//|  ACCOUNT_TRADE_MODE_REAL on pinned live server (Hugo PRO5 /      |
+//|  LHFXSA-Live). Mode mismatches are always refused.               |
 //+------------------------------------------------------------------+
 #property copyright   "CAS Forex Revamp"
-#property version     "1.00"
-#property description "Demo-only file-spool bridge for CAS Forex Revamp (Hugo demo PRO5 / LHFXSA-Demo)."
+#property version     "1.10"
+#property description "Dual-mode file-spool bridge for CAS Forex Revamp (Demo default + Two-Key Live)."
+#define LIVE_ARM_PHRASE "I_AUTHORIZE_LIVE_REAL_MONEY_TRADING"
 
 #include <Trade\Trade.mqh>
 
 //--- inputs
 input string InpSpoolFolder        = "cas_forex_spool";  // Spool root under MQL5\Files (or Common\Files)
 input string InpBrokerChannel      = "hugosway_mt5";     // hugosway_mt5 or lhfx_mt5 (matches Python broker id)
-input bool   InpUseCommonFolder    = true;               // true: Terminal\Common\Files (shared by terminals)
-input int    InpTimerMs            = 250;                // Spool polling interval in milliseconds
-input string InpSymbols            = "EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,EURGBP,EURJPY,GBPJPY,EURCHF,EURAUD,EURCAD,AUDJPY,CHFJPY,CADJPY";
+input bool   InpUseCommonFolder    = true;               // true: Terminal\Common\Files; false: portable MQL5\Files junction
+input int    InpTimerMs            = 50;                 // Spool polling interval in ms (50ms fast-tick for NAS100/US30)
+input string InpSymbols            = "NAS100,US30,EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,EURGBP,EURJPY,GBPJPY,EURCHF,EURAUD,EURCAD,AUDJPY,CHFJPY,CADJPY";
+input string InpNas100Symbol       = "NAS100";           // Broker Nasdaq-100 symbol name (e.g. NAS100, USTEC, US100)
+input string InpUs30Symbol         = "US30";             // Broker Dow Jones 30 symbol name (e.g. US30, DJ30, WS30)
 input string InpSymbolSuffix       = "";                 // Broker symbol suffix, e.g. ".ecn" (empty when none)
 input int    InpMaxDeviationPoints = 30;                 // Maximum slippage in points
 input double InpMaxVolumeLots      = 50.0;               // Hard per-order volume cap in lots
+input bool   InpLiveExecutionMode  = false;              // false=DEMO only, true=LIVE real-money
+input string InpLiveArmPhrase      = "";                 // Must be I_AUTHORIZE_LIVE_REAL_MONEY_TRADING when LIVE=true
 
 #define SPOOL_PROTOCOL "cas-forex-mt5-spool/1"
 
 CTrade   g_trade;
 string   g_symbols[];
-bool     g_demo_ok = false;
+bool     g_mode_ok = false;
 datetime g_last_publish = 0;
 
 //+------------------------------------------------------------------+
@@ -73,18 +79,48 @@ string SafeText(string text)
    return(text);
   }
 
-//--- Demo-account guard: trade mode must be DEMO and the server must be an explicit demo server.
-bool DemoGuard()
+string AccountTradeModeLabel()
   {
-   if((ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
+   ENUM_ACCOUNT_TRADE_MODE m = (ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE);
+   if(m == ACCOUNT_TRADE_MODE_REAL)
+      return("REAL");
+   if(m == ACCOUNT_TRADE_MODE_CONTEST)
+      return("CONTEST");
+   return("DEMO");
+  }
+
+bool IsPinnedLiveServer(string server)
+  {
+   StringToLower(server);
+   StringTrimLeft(server);
+   StringTrimRight(server);
+   if(StringFind(server, "demo") >= 0 || StringFind(server, "practice") >= 0)
       return(false);
+   return(server == "hugo pro5" || server == "hugopro5" || server == "hugo-real" || server == "hugosway-live" ||
+          server == "lhfxsa-live" || server == "lhfx-live" || server == "lhfxsa-real");
+  }
+
+//--- Strict mode guard: DEMO by default; two-key REAL when explicitly armed.
+bool ModeGuard()
+  {
+   ENUM_ACCOUNT_TRADE_MODE m = (ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE);
    string server = AccountInfoString(ACCOUNT_SERVER);
    StringToLower(server);
-   if(StringFind(server, "live") >= 0 || StringFind(server, "real") >= 0)
+   if(!InpLiveExecutionMode)
+     {
+      if(m != ACCOUNT_TRADE_MODE_DEMO)
+         return(false);
+      if(StringFind(server, "live") >= 0 || StringFind(server, "real") >= 0)
+         return(false);
+      if(StringFind(server, "demo") < 0)
+         return(false);
+      return(true);
+     }
+   if(InpLiveArmPhrase != LIVE_ARM_PHRASE)
       return(false);
-   if(StringFind(server, "demo") < 0)
+   if(m != ACCOUNT_TRADE_MODE_REAL)
       return(false);
-   return(true);
+   return(IsPinnedLiveServer(server));
   }
 
 //--- Extract a string value from a FLAT JSON object whose values are all plain strings.
@@ -153,6 +189,10 @@ bool WriteAtomic(const string name, const string text)
 
 string BrokerSymbol(const string cas_symbol)
   {
+   if(cas_symbol == "NAS100")
+      return(InpNas100Symbol + InpSymbolSuffix);
+   if(cas_symbol == "US30")
+      return(InpUs30Symbol + InpSymbolSuffix);
    return(cas_symbol + InpSymbolSuffix);
   }
 
@@ -160,6 +200,10 @@ string CasSymbol(string broker_symbol)
   {
    if(StringLen(InpSymbolSuffix) > 0)
       StringReplace(broker_symbol, InpSymbolSuffix, "");
+   if(broker_symbol == InpNas100Symbol || broker_symbol == "USTEC" || broker_symbol == "US100" || broker_symbol == "NAS100USD")
+      return("NAS100");
+   if(broker_symbol == InpUs30Symbol || broker_symbol == "DJ30" || broker_symbol == "WS30" || broker_symbol == "US30USD")
+      return("US30");
    return(broker_symbol);
   }
 
@@ -174,15 +218,15 @@ string Price(const string broker_symbol, const double value)
 //+------------------------------------------------------------------+
 string ReceiptJson(const string request_id, const string request_sha, const string status, const uint retcode,
                    const string position_ticket, const string deal_ticket, const string volume,
-                   const string price, const string sl, const string message)
+                   const string price, const string sl, const string tp, const string message)
   {
    string server = AccountInfoString(ACCOUNT_SERVER);
    return(StringFormat(
       "{\"protocol\":\"%s\",\"request_id\":\"%s\",\"request_sha256\":\"%s\",\"status\":\"%s\",\"retcode\":\"%u\","
-      "\"position_ticket\":\"%s\",\"deal_ticket\":\"%s\",\"volume\":\"%s\",\"price\":\"%s\",\"sl\":\"%s\","
-      "\"server\":\"%s\",\"account_trade_mode\":\"DEMO\",\"observed_at\":\"%s\",\"message\":\"%s\"}",
-      SPOOL_PROTOCOL, request_id, request_sha, status, retcode, position_ticket, deal_ticket, volume, price, sl,
-      SafeText(server), IsoNowUtc(), SafeText(message)));
+      "\"position_ticket\":\"%s\",\"deal_ticket\":\"%s\",\"volume\":\"%s\",\"price\":\"%s\",\"sl\":\"%s\",\"tp\":\"%s\","
+      "\"server\":\"%s\",\"account_trade_mode\":\"%s\",\"observed_at\":\"%s\",\"message\":\"%s\"}",
+      SPOOL_PROTOCOL, request_id, request_sha, status, retcode, position_ticket, deal_ticket, volume, price, sl, tp,
+      SafeText(server), AccountTradeModeLabel(), IsoNowUtc(), SafeText(message)));
   }
 
 void WriteReceipt(const string request_id, const string json)
@@ -210,12 +254,12 @@ void ExecuteRequest(const string request_id, const string text)
    StringTrimRight(core);
    if(JsonGet(text, "protocol") != SPOOL_PROTOCOL || StringLen(request_sha) != 64 || Sha256Hex(core) != request_sha)
      {
-      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "request hash mismatch"));
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "request hash mismatch"));
       return;
      }
-   if(!DemoGuard())
+   if(!ModeGuard())
      {
-      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10017, "0", "0", "0", "0", "0", "demo guard failed"));
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10017, "0", "0", "0", "0", "0", "0", "mode guard failed"));
       return;
      }
 
@@ -224,6 +268,7 @@ void ExecuteRequest(const string request_id, const string text)
    string side    = JsonGet(text, "side");
    double volume  = StringToDouble(JsonGet(text, "volume"));
    double sl      = StringToDouble(JsonGet(text, "sl"));
+   double tp      = StringToDouble(JsonGet(text, "tp"));
    ulong  ticket  = (ulong)StringToInteger(JsonGet(text, "position_ticket"));
    ulong  magic   = (ulong)StringToInteger(JsonGet(text, "magic"));
    int    dev     = (int)StringToInteger(JsonGet(text, "deviation_points"));
@@ -231,7 +276,7 @@ void ExecuteRequest(const string request_id, const string text)
 
    if(!SymbolSelect(symbol, true))
      {
-      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "unknown symbol"));
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "unknown symbol"));
       return;
      }
    if(dev <= 0 || dev > InpMaxDeviationPoints)
@@ -249,12 +294,18 @@ void ExecuteRequest(const string request_id, const string text)
          volume = MathRound(volume / step) * step;
       if(volume <= 0.0 || volume > InpMaxVolumeLots || sl <= 0.0)
         {
-         WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10014, "0", "0", "0", "0", "0", "volume cap or missing protective stop"));
+         WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10014, "0", "0", "0", "0", "0", "0", "volume cap or missing protective stop"));
          return;
         }
       ENUM_ORDER_TYPE type = (side == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
       double price = (side == "BUY") ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
-      ok = g_trade.PositionOpen(symbol, type, volume, price, sl, 0.0, comment);
+      if((side == "BUY" && (sl >= price || (tp > 0.0 && tp <= price))) ||
+         (side == "SELL" && (sl <= price || (tp > 0.0 && tp >= price))))
+        {
+         WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10016, "0", "0", "0", "0", "0", "0", "inverted stop or take-profit"));
+         return;
+        }
+      ok = g_trade.PositionOpen(symbol, type, volume, price, sl, (tp > 0.0) ? tp : 0.0, comment);
       ulong deal = g_trade.ResultDeal();
       ulong position_id = g_trade.ResultOrder();
       if(deal > 0 && HistoryDealSelect(deal))
@@ -266,12 +317,16 @@ void ExecuteRequest(const string request_id, const string text)
      {
       if(!PositionSelectByTicket(ticket) || PositionGetString(POSITION_SYMBOL) != symbol)
         {
-         WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10036, "0", "0", "0", "0", "0", "position not found"));
+         WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10036, "0", "0", "0", "0", "0", "0", "position not found"));
          return;
         }
       pos_text = IntegerToString((long)ticket);
       if(action == "AMEND_STOP")
-         ok = g_trade.PositionModify(ticket, sl, PositionGetDouble(POSITION_TP));
+        {
+         double eff_sl = (sl > 0.0) ? sl : PositionGetDouble(POSITION_SL);
+         double eff_tp = (tp > 0.0) ? tp : PositionGetDouble(POSITION_TP);
+         ok = g_trade.PositionModify(ticket, eff_sl, eff_tp);
+        }
       else
          if(action == "REDUCE")
             ok = g_trade.PositionClosePartial(ticket, volume, dev);
@@ -280,7 +335,7 @@ void ExecuteRequest(const string request_id, const string text)
                ok = g_trade.PositionClose(ticket, dev);
             else
               {
-               WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "unsupported action"));
+               WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "unsupported action"));
                return;
               }
      }
@@ -291,10 +346,11 @@ void ExecuteRequest(const string request_id, const string text)
    string vol_text  = (g_trade.ResultVolume() > 0.0) ? DoubleToString(g_trade.ResultVolume(), 2) : "0";
    string px_text   = (g_trade.ResultPrice() > 0.0) ? Price(symbol, g_trade.ResultPrice()) : "0";
    string sl_text   = (sl > 0.0) ? Price(symbol, sl) : "0";
+   string tp_text   = (tp > 0.0) ? Price(symbol, tp) : "0";
    if(!ok && status != "REJECTED")
       status = "REJECTED";
    WriteReceipt(request_id, ReceiptJson(request_id, request_sha, status, retcode, (status == "REJECTED") ? "0" : pos_text,
-                                        deal_text, vol_text, px_text, sl_text, g_trade.ResultRetcodeDescription()));
+                                        deal_text, vol_text, px_text, sl_text, tp_text, g_trade.ResultRetcodeDescription()));
   }
 
 //--- Claim each request by renaming it to processing_<id>.json BEFORE executing, so a restart
@@ -358,9 +414,9 @@ void ReportInterruptedRequests()
 void PublishMarket()
   {
    string json = StringFormat(
-      "{\"protocol\":\"%s\",\"server\":\"%s\",\"account_trade_mode\":\"DEMO\",\"observed_at\":\"%s\",\"account\":{"
+      "{\"protocol\":\"%s\",\"server\":\"%s\",\"account_trade_mode\":\"%s\",\"observed_at\":\"%s\",\"account\":{"
       "\"login\":\"%s\",\"currency\":\"%s\",\"balance\":\"%s\",\"equity\":\"%s\",\"margin\":\"%s\",\"margin_free\":\"%s\",\"leverage\":\"%s\"},\"ticks\":[",
-      SPOOL_PROTOCOL, SafeText(AccountInfoString(ACCOUNT_SERVER)), IsoNowUtc(),
+      SPOOL_PROTOCOL, SafeText(AccountInfoString(ACCOUNT_SERVER)), AccountTradeModeLabel(), IsoNowUtc(),
       IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)), AccountInfoString(ACCOUNT_CURRENCY),
       DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2), DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
       DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2), DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2),
@@ -389,10 +445,11 @@ void PublishMarket()
       string bsym = PositionGetString(POSITION_SYMBOL);
       string side = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
       double psl = PositionGetDouble(POSITION_SL);
-      json += StringFormat("%s{\"ticket\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":\"%s\",\"price_open\":\"%s\",\"sl\":\"%s\",\"profit\":\"%s\"}",
+      double ptp = PositionGetDouble(POSITION_TP);
+      json += StringFormat("%s{\"ticket\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":\"%s\",\"price_open\":\"%s\",\"sl\":\"%s\",\"tp\":\"%s\",\"profit\":\"%s\"}",
                            first ? "" : ",", IntegerToString((long)ticket), CasSymbol(bsym), side,
                            DoubleToString(PositionGetDouble(POSITION_VOLUME), 2), Price(bsym, PositionGetDouble(POSITION_PRICE_OPEN)),
-                           (psl > 0.0) ? Price(bsym, psl) : "0", DoubleToString(PositionGetDouble(POSITION_PROFIT), 2));
+                           (psl > 0.0) ? Price(bsym, psl) : "0", (ptp > 0.0) ? Price(bsym, ptp) : "0", DoubleToString(PositionGetDouble(POSITION_PROFIT), 2));
       first = false;
      }
    json += "]}";
@@ -405,9 +462,9 @@ void PublishMarket()
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   if(!DemoGuard())
+   if(!ModeGuard())
      {
-      Print("CasForexMt5Bridge: REFUSED - account is not a DEMO account on an explicit demo server.");
+      Print("CasForexMt5Bridge: REFUSED - account trade mode / server / two-key arm phrase mismatch.");
       return(INIT_FAILED);
      }
    if(InpBrokerChannel != "hugosway_mt5" && InpBrokerChannel != "lhfx_mt5")
@@ -428,11 +485,11 @@ int OnInit()
      }
    FolderCreate(InpSpoolFolder, CommonFlag());
    FolderCreate(SpoolDir(), CommonFlag());
-   g_demo_ok = true;
+   g_mode_ok = true;
    ReportInterruptedRequests();
    PublishMarket();
    EventSetMillisecondTimer(MathMax(50, InpTimerMs));
-   PrintFormat("CasForexMt5Bridge: running on demo server %s, spool %s", AccountInfoString(ACCOUNT_SERVER), SpoolDir());
+   PrintFormat("CasForexMt5Bridge: running [%s] on server %s, spool %s", AccountTradeModeLabel(), AccountInfoString(ACCOUNT_SERVER), SpoolDir());
    return(INIT_SUCCEEDED);
   }
 
@@ -443,10 +500,10 @@ void OnDeinit(const int reason)
 
 void OnTimer()
   {
-   g_demo_ok = DemoGuard();
-   if(!g_demo_ok)
+   g_mode_ok = ModeGuard();
+   if(!g_mode_ok)
      {
-      Print("CasForexMt5Bridge: demo guard failed - spool processing halted.");
+      Print("CasForexMt5Bridge: mode guard failed - spool processing halted.");
       ExpertRemove();
       return;
      }
@@ -457,7 +514,7 @@ void OnTimer()
 void OnTick()
   {
    // Ticks only refresh the market snapshot (at most once per second); orders run on the timer.
-   if(g_demo_ok && TimeCurrent() != g_last_publish)
+   if(g_mode_ok && TimeCurrent() != g_last_publish)
       PublishMarket();
   }
 //+------------------------------------------------------------------+

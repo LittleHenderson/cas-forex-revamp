@@ -188,25 +188,25 @@ class ExpandedBrokerAndChartTests(unittest.TestCase):
         )
         base_url = srv.start()
         try:
-            with urllib.request.urlopen(base_url + "/ui/index.html", timeout=5) as r_html:
+            with urllib.request.urlopen(base_url + "/ui/index.html", timeout=5) as r_html:  # nosec B310: local loopback cockpit test URL
                 self.assertEqual(r_html.status, 200)
                 self.assertIn("default-src 'none'", r_html.headers.get("Content-Security-Policy", ""))
                 body_html = r_html.read().decode("utf-8")
                 self.assertIn("CAS Forex", body_html)
 
             with self.assertRaises(urllib.error.HTTPError) as unauth_ms:
-                urllib.request.urlopen(base_url + "/api/market-stream", timeout=5)
+                urllib.request.urlopen(base_url + "/api/market-stream", timeout=5)  # nosec B310: local loopback cockpit test URL
             self.assertEqual(unauth_ms.exception.code, 401)
             unauth_ms.exception.close()
 
             req_ms = urllib.request.Request(base_url + "/api/market-stream", headers=srv.auth_headers(), method="GET")
-            with urllib.request.urlopen(req_ms, timeout=5) as r_ms:
+            with urllib.request.urlopen(req_ms, timeout=5) as r_ms:  # nosec B310: local loopback cockpit test URL
                 self.assertEqual(r_ms.status, 200)
                 doc = json.loads(r_ms.read().decode("utf-8"))
                 self.assertEqual(len(doc["streams"]), 16)
 
             with self.assertRaises(urllib.error.HTTPError) as ctx:
-                urllib.request.urlopen(base_url + "/../src/cas_forex_revamp/venue/live_market_stream.py", timeout=5)
+                urllib.request.urlopen(base_url + "/../src/cas_forex_revamp/venue/live_market_stream.py", timeout=5)  # nosec B310: local loopback cockpit test URL
             self.assertEqual(ctx.exception.code, 404)
             ctx.exception.close()
         finally:

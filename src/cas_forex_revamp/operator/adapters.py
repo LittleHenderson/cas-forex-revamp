@@ -112,3 +112,13 @@ class ReplayDecisionAdapter:
         ))
         self._index += 1
         return result
+
+from .frontier_backends import (
+    FRONTIER_MODEL_CATALOG,
+    FrontierChatBackend,
+    FrontierConfigurationError,
+    FrontierModelCatalogEntry,
+    FrontierModelRegistry,
+    FrontierReceiptVerifier,
+    FrontierTransportError,
+)

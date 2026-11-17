@@ -15,7 +15,9 @@ Security & Honesty Invariants:
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+import argparse
+from collections.abc import Callable, Mapping
+import os
 import hmac
 from http import HTTPStatus
 from http import cookies as http_cookies
@@ -29,6 +31,7 @@ from typing import Any
 import urllib.parse
 
 from cas_forex_revamp.contracts import ContractError
+from cas_forex_revamp.operator.frontier_backends import assert_safe_ai_catalog_payload
 
 MAX_HTTP_RPC_BYTES = 262_144
 MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
@@ -125,6 +128,9 @@ class LoopbackCockpitServer:
         ui_service: Any | None = None,
         market_stream_reader: Callable[[], dict[str, Any] | None] | None = None,
         broker_router_reader: Callable[[], dict[str, Any] | None] | None = None,
+        ai_model_registry: Any | None = None,
+        autonomous_trader: Any | None = None,
+        index_stream_reader: Callable[[], dict[str, Any] | None] | None = None,
     ) -> None:
         self._host = validate_loopback_host(host)
         if type(port) is not int or not (0 <= port <= 65535):
@@ -138,6 +144,11 @@ class LoopbackCockpitServer:
         if broker_router_reader is not None and not callable(broker_router_reader):
             raise ContractError("broker_router_reader must be callable")
         self._broker_router_reader = broker_router_reader
+        if index_stream_reader is not None and not callable(index_stream_reader):
+            raise ContractError("index_stream_reader must be callable")
+        self._ai_model_registry = ai_model_registry
+        self._autonomous_trader = autonomous_trader
+        self._index_stream_reader = index_stream_reader
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -430,6 +441,35 @@ class LoopbackCockpitServer:
                         else:
                             self._write_json(HTTPStatus.OK, routing)
                         return
+                    if route == "/api/ai-models":
+                        if outer._ai_model_registry is None:
+                            self._write_json(HTTPStatus.NOT_FOUND, {"error": "AI model registry not configured"})
+                            return
+                        try:
+                            cat = assert_safe_ai_catalog_payload(outer._ai_model_registry.catalog_snapshot())
+                            self._write_json(HTTPStatus.OK, cat)
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "AI catalog unavailable"})
+                        return
+                    if route == "/api/ai-trader":
+                        if outer._autonomous_trader is None:
+                            self._write_json(HTTPStatus.NOT_FOUND, {"error": "Autonomous AI trader not attached"})
+                            return
+                        try:
+                            snap = assert_safe_ai_catalog_payload(outer._autonomous_trader.status_snapshot())
+                            self._write_json(HTTPStatus.OK, snap)
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Autonomous AI snapshot unavailable"})
+                        return
+                    if route == "/api/index-stream":
+                        idx_snap = outer._index_stream_reader() if outer._index_stream_reader is not None else None
+                        if idx_snap is None:
+                            self._write_json(HTTPStatus.NOT_FOUND, {"error": "Index stream not configured"})
+                        else:
+                            self._write_json(HTTPStatus.OK, idx_snap)
+                        return
                     if route == "/api/market-events":
                         self.send_response(int(HTTPStatus.OK))
                         self._send_security_headers("text/event-stream; charset=utf-8")
@@ -457,7 +497,15 @@ class LoopbackCockpitServer:
                                     if snap is not None:
                                         frame = f"event: market\ndata: {json.dumps(snap, sort_keys=False)}\n\n".encode("utf-8")
                                         self.wfile.write(frame)
-                                        self.wfile.flush()
+                                    if outer._autonomous_trader is not None:
+                                        tsnap = assert_safe_ai_catalog_payload(outer._autonomous_trader.status_snapshot())
+                                        tframe = f"event: ai_trader\ndata: {json.dumps(tsnap, sort_keys=False)}\n\n".encode("utf-8")
+                                        self.wfile.write(tframe)
+                                    if outer._ai_model_registry is not None:
+                                        csnap = assert_safe_ai_catalog_payload(outer._ai_model_registry.catalog_snapshot())
+                                        cframe = f"event: ai_models\ndata: {json.dumps(csnap, sort_keys=False)}\n\n".encode("utf-8")
+                                        self.wfile.write(cframe)
+                                    self.wfile.flush()
                                 else:
                                     self.wfile.write(b": heartbeat\n\n")
                                     self.wfile.flush()
@@ -519,10 +567,70 @@ class LoopbackCockpitServer:
                 if not authed:
                     self._reject_unauthorized()
                     return
+                route = urllib.parse.urlsplit(self.path).path
+                if route == "/api/select-ai-model":
+                    if outer._ai_model_registry is None:
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "AI model registry not configured"})
+                        return
+                    try:
+                        body = self._read_json_body()
+                        if type(body) is not dict or "model_id" not in body:
+                            raise ContractError("model_id field required")
+                        if "fast_scout_enabled" in body:
+                            outer._ai_model_registry.set_fast_scout_enabled(bool(body["fast_scout_enabled"]))
+                        updated = assert_safe_ai_catalog_payload(outer._ai_model_registry.select_model(str(body["model_id"])))
+                        outer.notify_stream_updated()
+                        self._write_json(HTTPStatus.OK, updated)
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                if route == "/api/ai-overseer-action":
+                    try:
+                        body = self._read_json_body()
+                        if type(body) is not dict or not isinstance(body.get("action"), str):
+                            raise ContractError("action field required")
+                        act = body["action"].strip().upper()
+                        reason = str(body.get("reason") or f"Overseer {act}")
+                        if act == "TOGGLE_FAST_SCOUT":
+                            if outer._ai_model_registry is None:
+                                raise ContractError("AI model registry not configured")
+                            enabled = bool(body.get("enabled", not outer._ai_model_registry.fast_scout_enabled))
+                            res = assert_safe_ai_catalog_payload(outer._ai_model_registry.set_fast_scout_enabled(enabled))
+                            outer.notify_stream_updated()
+                            self._write_json(HTTPStatus.OK, res)
+                            return
+                        if outer._autonomous_trader is None:
+                            self._write_json(HTTPStatus.NOT_FOUND, {"error": "Autonomous AI trader not attached"})
+                            return
+                        if act == "PAUSE_NEW_RISK":
+                            res = outer._autonomous_trader.pause_new_risk(reason=reason)
+                        elif act == "RESUME_AUTONOMOUS":
+                            res = outer._autonomous_trader.resume_autonomous(reason=reason)
+                        elif act == "STOP_AUTOMATION":
+                            res = outer._autonomous_trader.stop_automation(reason=reason)
+                        elif act == "EMERGENCY_CLOSE_ALL":
+                            res = outer._autonomous_trader.emergency_close_all(reason=reason)
+                        elif act == "REARM_DRAWDOWN":
+                            req_id = str(body.get("owner_request_id") or "overseer-unlock-1")
+                            res = outer._autonomous_trader.rearm_and_unlock(owner_request_id=req_id, reason=reason)
+                        elif act == "UPDATE_QUOTA_TARGETS":
+                            res = outer._autonomous_trader.quota_store.update_targets(
+                                soft_quota_usd=body.get("soft_quota_usd"),
+                                hard_quota_usd=body.get("hard_quota_usd"),
+                                daily_quota_pct=body.get("daily_quota_pct"),
+                                quota_mode=body.get("quota_mode"),
+                            )
+                            res = assert_safe_ai_catalog_payload(res)
+                        else:
+                            raise ContractError(f"unsupported overseer action {act!r}")
+                        outer.notify_stream_updated()
+                        self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(res))
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
                 if outer._ui_service is None:
                     self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "ScopedUIService not attached"})
                     return
-                route = urllib.parse.urlsplit(self.path).path
                 dispatch = {
                     "/api/resolve-evidence": outer._ui_service.resolveEvidence,
                     "/api/prepare-control": outer._ui_service.prepareControl,
@@ -567,3 +675,227 @@ class LoopbackCockpitServer:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+
+
+def load_dotenv_file(path: str | Path) -> dict[str, str]:
+    """Parse KEY=VALUE lines from an explicit CLI ``--env-file`` (never called automatically on import)."""
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file() or resolved.is_symlink():
+        raise ContractError(f"env file must be a regular non-symlink file: {resolved}")
+    loaded: dict[str, str] = {}
+    for lineno, raw_line in enumerate(resolved.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ContractError(f"{resolved.name}:{lineno}: expected KEY=VALUE line")
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+            val = val[1:-1]
+        if not key.isascii() or not key.replace("_", "").isalnum():
+            raise ContractError(f"{resolved.name}:{lineno}: invalid env var name {key!r}")
+        loaded[key] = val
+    return loaded
+
+
+def run_cockpit_cli(
+    argv: list[str] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    repo_root: str | Path | None = None,
+) -> int:
+    """Explicit 1-command launcher for LoopbackCockpitServer + DualShieldBrokerRouter (DEMO or two-key LIVE)."""
+    ap = argparse.ArgumentParser(description="CAS Forex Revamp Cockpit & Dual-Shield Broker Launcher")
+    ap.add_argument("--env-file", type=Path, default=None, help="Optional KEY=VALUE file with CAS_FOREX_* settings")
+    ap.add_argument("--host", default="127.0.0.1", help="Loopback bind IP (127.0.0.1 or ::1)")
+    ap.add_argument("--port", type=int, default=8787, help="Loopback port (0 picks an ephemeral port)")
+    ap.add_argument("--poll-seconds", type=int, default=15, help="Live 18-market poll interval in seconds (0=disable)")
+    ap.add_argument("--fast-tick-ms", type=int, default=50, help="Direct MT5 fast-tick interval in ms for NAS100/US30 (0=disable)")
+    ap.add_argument("--no-autonomous-ai", dest="autonomous_ai", action="store_false", default=True, help="Disable continuous autonomous AI trading loop")
+    ap.add_argument("--activate-brokers", action="store_true", help="Attempt live/demo connection to configured brokers")
+    ap.add_argument("--print-check-only", action="store_true", help="Validate config/routing/AI catalog, print JSON, and exit")
+    args = ap.parse_args(argv)
+    if args.poll_seconds < 0 or args.poll_seconds > 3600:
+        raise ContractError("--poll-seconds must be in 0..3600")
+    if args.fast_tick_ms < 0 or args.fast_tick_ms > 5000:
+        raise ContractError("--fast-tick-ms must be in 0..5000")
+
+    root = Path(repo_root).resolve() if repo_root is not None else Path(__file__).resolve().parents[3]
+    merged: dict[str, str] = dict(os.environ if environ is None else environ)
+    if args.env_file is not None:
+        merged.update(load_dotenv_file(args.env_file))
+
+    from cas_forex_revamp.composition.autonomous_trader import AutonomousAiTrader
+    from cas_forex_revamp.operator.frontier_backends import FrontierModelRegistry
+    from cas_forex_revamp.valve.daily_quota import DailyQuotaGovernanceStore
+    from cas_forex_revamp.valve.tks_meta_valve_controller import load_default_forex_valve_gate
+    from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
+    from cas_forex_revamp.venue.live_market_stream import (
+        EXPANDED_MARKETS,
+        ExpandedPublicLiveFxFeedClient,
+        PublicUsIndexFeedClient,
+    )
+    from cas_forex_revamp.venue.mt5_broker_bridge import resolve_mt5_spool_dir
+
+    gate = load_default_forex_valve_gate()
+    from cas_forex_revamp.contracts import parse_decimal as _parse_dec
+    stream_lock = threading.Lock()
+    latest_index_stream: list[dict[str, Any] | None] = [None]
+
+    def _read_index_ref(symbols: Any) -> dict[str, tuple[Any, Any]]:
+        with stream_lock:
+            doc = latest_index_stream[0]
+        if not isinstance(doc, dict):
+            return {}
+        out: dict[str, tuple[Any, Any]] = {}
+        wanted = set(symbols)
+        for row in doc.get("markets") or ():
+            sym = row.get("pair")
+            if sym in wanted and "bid" in row and "ask" in row:
+                out[sym] = (_parse_dec(str(row["bid"])), _parse_dec(str(row["ask"])))
+        return out
+
+    router = DualShieldBrokerRouter(environ=merged, valve_gate=gate, index_reference_source=_read_index_ref)
+    registry = FrontierModelRegistry(environ=merged)
+    quota_store = DailyQuotaGovernanceStore.from_environ(merged)
+    trader = AutonomousAiTrader(
+        router=router,
+        model_registry=registry,
+        valve_gate=gate,
+        quota_store=quota_store,
+        fast_tick_ms=args.fast_tick_ms,
+    )
+    if not args.autonomous_ai:
+        trader.stop_automation(reason="CLI launched with --no-autonomous-ai")
+    if args.activate_brokers:
+        router.activate_all()
+
+    routing_summary = safe_broker_routing_payload(router.routing_snapshot())
+    cat_snap = assert_safe_ai_catalog_payload(registry.catalog_snapshot())
+    routing_summary.update({
+        "markets_supported": len(EXPANDED_MARKETS),
+        "portable_mt5_spool": resolve_mt5_spool_dir(merged),
+        "ai_model_selected": cat_snap["active_model_id"],
+        "ai_model_status": cat_snap["active_status"],
+        "ai_catalog_order": [m["model_id"] for m in cat_snap["models"]],
+        "fast_scout_enabled": cat_snap["fast_scout_enabled"],
+        "fast_tick_ms": int(args.fast_tick_ms),
+        "autonomous_trader_ready": bool(args.autonomous_ai),
+        "daily_quota": assert_safe_ai_catalog_payload(quota_store.snapshot()),
+    })
+    safe_broker_routing_payload(routing_summary)
+    if args.print_check_only:
+        print(json.dumps(routing_summary, indent=2))
+        return 0
+
+    fixture_path = root / "docs" / "contracts" / "initial-market-stream.json"
+    latest_stream: list[dict[str, Any] | None] = [
+        json.loads(fixture_path.read_text(encoding="utf-8")) if fixture_path.is_file() else None
+    ]
+    feed_client = ExpandedPublicLiveFxFeedClient() if args.poll_seconds > 0 else None
+    index_client = PublicUsIndexFeedClient() if args.poll_seconds > 0 else None
+    if feed_client is not None:
+        try:
+            env_stream = feed_client.fetch_market_stream()
+            latest_stream[0] = env_stream.to_wire_dict()
+        except Exception as exc:
+            print(f"[feed] Initial live quote fetch skipped ({type(exc).__name__}); using sealed fixture until next poll.")
+    if index_client is not None:
+        try:
+            latest_index_stream[0] = index_client.fetch_index_stream()
+        except Exception as exc:
+            print(f"[feed] Initial index fetch skipped ({type(exc).__name__}); awaiting MT5 ticks.")
+
+    def _read_stream() -> dict[str, Any] | None:
+        with stream_lock:
+            return latest_stream[0]
+
+    def _read_index_stream() -> dict[str, Any] | None:
+        with stream_lock:
+            return latest_index_stream[0]
+
+    srv = LoopbackCockpitServer(
+        repo_root=root,
+        host=args.host,
+        port=args.port,
+        market_stream_reader=_read_stream,
+        broker_router_reader=router.routing_snapshot,
+        ai_model_registry=registry,
+        autonomous_trader=trader,
+        index_stream_reader=_read_index_stream,
+    )
+    srv.start()
+    stop_flag = threading.Event()
+
+    def _poll_loop() -> None:
+        while not stop_flag.wait(float(args.poll_seconds)):
+            if feed_client is None:
+                break
+            try:
+                env_stream = feed_client.fetch_market_stream().to_wire_dict()
+                idx_stream = latest_index_stream[0]
+                if index_client is not None:
+                    try:
+                        idx_stream = index_client.fetch_index_stream()
+                    except Exception as exc_idx:
+                        print(f"[feed] Index poll skipped ({type(exc_idx).__name__}).")
+                with stream_lock:
+                    latest_stream[0] = env_stream
+                    latest_index_stream[0] = idx_stream
+                if args.autonomous_ai:
+                    try:
+                        trader.run_cycle(env_stream, index_stream=idx_stream)
+                    except Exception as exc_ai:
+                        print(f"[ai] Standard cycle skipped ({type(exc_ai).__name__}).")
+                srv.notify_stream_updated()
+            except Exception as exc:
+                print(f"[feed] Poll skipped ({type(exc).__name__}); keeping last verified snapshot.")
+
+    def _fast_tick_loop() -> None:
+        interval = max(0.05, float(args.fast_tick_ms) / 1000.0)
+        while not stop_flag.wait(interval):
+            if not args.autonomous_ai:
+                continue
+            try:
+                mt5_q: dict[str, tuple[Any, Any]] = {}
+                for v in router.venues.values():
+                    if hasattr(v, "_transport") and v.account is not None:
+                        for sym in EXPANDED_MARKETS[:2]:
+                            try:
+                                tk = v._transport.symbol_tick(sym)
+                                mt5_q[sym] = (tk.bid, tk.ask)
+                            except (ContractError, OSError) as exc_sym:
+                                print(f"[ai-fast] Tick skipped for {sym}: {type(exc_sym).__name__}")
+                if mt5_q:
+                    trader.run_fast_tick_cycle(mt5_quotes=mt5_q)
+                    srv.notify_stream_updated()
+            except Exception as exc_ft:
+                print(f"[ai-fast] Fast tick skipped ({type(exc_ft).__name__}).")
+
+    poller = threading.Thread(target=_poll_loop, name="cas-forex-feed-poll", daemon=True)
+    fast_poller = threading.Thread(target=_fast_tick_loop, name="cas-forex-mt5-50ms", daemon=True)
+    if args.poll_seconds > 0 and feed_client is not None:
+        poller.start()
+    if args.fast_tick_ms > 0 and args.autonomous_ai and router.venues:
+        fast_poller.start()
+
+    print(f"CAS Forex Cockpit Execution Mode : {router.execution_mode} (live_armed={routing_summary['live_trading_armed']})")
+    for row in routing_summary["chain"]:
+        print(f"  [{row['priority']}] {row['broker_id']} ({row['server']}) configured={row['configured']} status={row['status']}")
+    print(f"Open Authenticated UI            : {srv.bootstrap_url}")
+    print("Press Ctrl+C to stop cleanly.")
+    try:
+        while not stop_flag.wait(1.0):
+            continue
+    except KeyboardInterrupt:
+        print("\nShutting down CAS Forex Cockpit...")
+    finally:
+        stop_flag.set()
+        srv.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_cockpit_cli())
