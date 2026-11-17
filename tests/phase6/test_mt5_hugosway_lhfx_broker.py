@@ -252,6 +252,10 @@ class FakeOandaTransport:
             price = ask if not order["units"].startswith("-") else bid
             return json.dumps({"orderCreateTransaction": {"id": "10"}, "orderFillTransaction": {"id": "11", "price": str(price)},
                                "lastTransactionID": "11"}).encode()
+        if method == "PUT" and "/trades/" in url and url.endswith("/orders"):
+            amend = json.loads(body)
+            self.orders.append(amend)
+            return json.dumps({"stopLossOrderTransaction": {"id": "12"}, "lastTransactionID": "12"}).encode()
         raise RuntimeError("unexpected OANDA call")
 
 
@@ -727,9 +731,14 @@ class HierarchyFailoverTests(unittest.TestCase):
             self.assertEqual(res.oanda_receipt["status"], "FILLED")
             self.assertEqual(rig.oanda.orders[0]["stopLossOnFill"]["price"], "1.095")
             amend = OrderIntent(order_id="oanda-amend", action_ref="act-oanda-amend", kind=ActionKind.AMEND_STOP, symbol="EURUSD",
-                                stop_price=D("1.09700"), position_ticket="1")
+                                stop_price=D("1.09700"), take_profit_price=D("1.10600"), position_ticket="1")
+            amend_res = router.execute(amend, valve_decision=clear(amend))
+            self.assertEqual(amend_res.oanda_receipt["status"], "MODIFIED")
+            self.assertEqual(rig.oanda.orders[-1]["takeProfit"]["price"], "1.106")
+            close_bad = OrderIntent(order_id="oanda-close", action_ref="act-oanda-close", kind=ActionKind.CLOSE,
+                                    symbol="EURUSD", quantity_units=D("1000"), position_ticket="1")
             with self.assertRaises(Mt5BridgeError):
-                router.execute(amend, valve_decision=clear(amend))
+                router.execute(close_bad, valve_decision=clear(close_bad))
             self.assertTrue(router.active_venue.verify_audit_chain())
 
     def test_nothing_configured_and_live_account_abort(self) -> None:
@@ -1008,7 +1017,7 @@ class DualShieldBarbellTests(unittest.TestCase):
 class CockpitBrokerRoutingEndpointTests(unittest.TestCase):
     def _get(self, base: str, path: str, headers: dict[str, str] | None = None):
         req = urllib.request.Request(base + path, headers=headers or {}, method="GET")
-        return urllib.request.urlopen(req, timeout=5)
+        return urllib.request.urlopen(req, timeout=5)  # nosec B310: local loopback cockpit test URL
 
     def test_broker_routing_endpoint_requires_auth_and_serves_safe_json_with_csp(self) -> None:
         router = DualShieldBrokerRouter(environ={}, valve_gate=GATE)

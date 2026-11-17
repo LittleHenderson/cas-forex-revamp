@@ -41,6 +41,7 @@ from cas_forex_revamp.valve.tks_meta_valve_controller import (
     compute_drawdown_pct,
 )
 from .external_paper_broker import EXECUTION_MODE_LIVE, EXPANDED_FX_PAIRS, OandaPracticePaperClient, assert_safe_json_numbers
+from .live_market_stream import INDEX_INSTRUMENTS
 from .mt5_broker_bridge import (
     BROKER_HUGOSWAY_MT5,
     BROKER_LHFX_MT5,
@@ -122,6 +123,8 @@ def _bps(numerator: Decimal, denominator: Decimal) -> Decimal:
 
 
 def _price_tick(symbol: str) -> Decimal:
+    if symbol in INDEX_INSTRUMENTS:
+        return Decimal("0.01")
     return Decimal("0.001") if symbol.endswith("JPY") else Decimal("0.00001")
 
 
@@ -201,6 +204,7 @@ class OandaQuoteTruthOracle:
         reference_name: str,
         max_divergence_bps_major: Decimal = Decimal("15"),
         max_divergence_bps_cross: Decimal = Decimal("25"),
+        max_divergence_bps_index: Decimal = Decimal("25"),
         max_spread_bps: Decimal = Decimal("30"),
         max_oanda_spread_multiple: Decimal = Decimal("3.0"),
     ) -> None:
@@ -212,6 +216,7 @@ class OandaQuoteTruthOracle:
         self.reference_name = reference_name
         self.max_divergence_bps_major = decimal_value(max_divergence_bps_major, "max_divergence_bps_major", positive=True)
         self.max_divergence_bps_cross = decimal_value(max_divergence_bps_cross, "max_divergence_bps_cross", positive=True)
+        self.max_divergence_bps_index = decimal_value(max_divergence_bps_index, "max_divergence_bps_index", positive=True)
         self.max_spread_bps = decimal_value(max_spread_bps, "max_spread_bps", positive=True)
         self.max_oanda_spread_multiple = decimal_value(max_oanda_spread_multiple, "max_oanda_spread_multiple", positive=True)
 
@@ -249,7 +254,35 @@ class OandaQuoteTruthOracle:
                    reference_name=reference_name, **kwargs)
 
     def max_divergence_for(self, symbol: str) -> Decimal:
+        if symbol in INDEX_INSTRUMENTS:
+            return self.max_divergence_bps_index
         return self.max_divergence_bps_major if symbol in MAJOR_FX_PAIRS else self.max_divergence_bps_cross
+
+    def verify_cross_venue_index_quotes(
+        self,
+        *,
+        symbol: str,
+        hugo_quote: tuple[Decimal, Decimal] | None,
+        lhfx_quote: tuple[Decimal, Decimal] | None,
+        reference_quote: tuple[Decimal, Decimal],
+    ) -> tuple[QuoteTruthVerdict, ...]:
+        if symbol not in INDEX_INSTRUMENTS:
+            raise ContractError(f"{symbol} is not a supported US index instrument")
+        ref = {symbol: reference_quote}
+        verdicts: list[QuoteTruthVerdict] = []
+        for broker_id, q in ((BROKER_HUGOSWAY_MT5, hugo_quote), (BROKER_LHFX_MT5, lhfx_quote)):
+            if q is None:
+                continue
+            verdicts.append(self.require_truthful(broker_id, symbol, q[0], q[1], reference=ref))
+        if hugo_quote is not None and lhfx_quote is not None:
+            hmid = (hugo_quote[0] + hugo_quote[1]) / Decimal("2")
+            lmid = (lhfx_quote[0] + lhfx_quote[1]) / Decimal("2")
+            cross_bps = _bps(abs(hmid - lmid), (hmid + lmid) / Decimal("2"))
+            if cross_bps > self.max_divergence_bps_index:
+                raise OffMarketBrokerQuoteError(
+                    f"Hugo's Way vs LHFX {symbol} cross-venue mid divergence {decimal_text(cross_bps)} bps exceeds limit"
+                )
+        return tuple(verdicts)
 
     def reference_quotes(self, symbols: Iterable[str]) -> dict[str, tuple[Decimal, Decimal]]:
         wanted = tuple(dict.fromkeys(symbols))
@@ -812,11 +845,13 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         peak_equity_store: PeakEquityStore | None = None,
         initial_peak_equity: Decimal | None = None,
         drawdown_scope_id: str = "dual-shield-barbell",
+        index_reference_source: Callable[[Iterable[str]], Mapping[str, tuple[Decimal, Decimal]]] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(environ=environ, valve_gate=valve_gate, **kwargs)
         self._oracle_override = oracle
         self._oracle_cache: OandaQuoteTruthOracle | None = None
+        self._index_reference_source = index_reference_source
         self.barbell = barbell or BarbellCapitalPolicy.from_environ(self._env)
         self.offset_planner = offset_planner or OandaProtectiveOffsetPlanner(venue_id=self._oanda_broker_id)
         self._attestations = dict(equity_attestations or {})
@@ -878,6 +913,49 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         if self._active is None:
             raise BrokerFailoverExhaustedError("no venue in the dual-shield barbell could be activated")
         return self._active.broker_id
+
+    def _index_reference_quotes(self, symbol: str) -> tuple[OandaQuoteTruthOracle, dict[str, tuple[Decimal, Decimal]]]:
+        """Resolve verified reference quotes for US index CFDs (which US OANDA does not quote)."""
+        if self._oracle_override is not None:
+            try:
+                ref = self._oracle_override.reference_quotes((symbol,))
+                return self._oracle_override, ref
+            except QuoteReferenceUnavailableError:
+                logging.getLogger(__name__).debug("oracle override lacks index quote for %s; falling back", symbol)
+        if self._index_reference_source is not None:
+            raw = self._index_reference_source((symbol,))
+            if isinstance(raw, Mapping) and symbol in raw:
+                bid, ask = _validated_quote(symbol, raw[symbol][0], raw[symbol][1], "index_reference")
+                ref = {symbol: (bid, ask)}
+                oracle = OandaQuoteTruthOracle.from_static_quotes(ref, reference_name="INDEX_REFERENCE")
+                return oracle, ref
+        hugo = self._venues.get(BROKER_HUGOSWAY_MT5)
+        lhfx = self._venues.get(BROKER_LHFX_MT5)
+        if not isinstance(hugo, Mt5PaperBrokerVenue) or not isinstance(lhfx, Mt5PaperBrokerVenue):
+            raise QuoteReferenceUnavailableError(
+                f"{symbol} requires either an independent index_reference_source or dual connected MT5 venues for cross-venue corroboration"
+            )
+        try:
+            ht = hugo._transport.symbol_tick(symbol)
+            lt = lhfx._transport.symbol_tick(symbol)
+        except (ContractError, OSError) as exc:
+            raise QuoteReferenceUnavailableError(
+                f"dual-MT5 index corroboration unavailable for {symbol} ({type(exc).__name__}); admission fails closed"
+            ) from None
+        tick_sz = _price_tick(symbol)
+        cons_bid = ((ht.bid + lt.bid) / Decimal("2")).quantize(tick_sz)
+        cons_ask = ((ht.ask + lt.ask) / Decimal("2")).quantize(tick_sz)
+        if cons_ask <= cons_bid:
+            cons_ask = (cons_bid + tick_sz).quantize(tick_sz)
+        ref_q = _validated_quote(symbol, cons_bid, cons_ask, "dual_mt5_consensus")
+        oracle = OandaQuoteTruthOracle.from_static_quotes({symbol: ref_q}, reference_name="DUAL_MT5_INDEX_CONSENSUS")
+        oracle.verify_cross_venue_index_quotes(
+            symbol=symbol,
+            hugo_quote=(ht.bid, ht.ask),
+            lhfx_quote=(lt.bid, lt.ask),
+            reference_quote=ref_q,
+        )
+        return oracle, {symbol: ref_q}
 
     def oracle(self) -> OandaQuoteTruthOracle:
         if self._oracle_override is not None:
@@ -951,13 +1029,16 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         if not isinstance(order, OrderIntent) or order.kind is not ActionKind.OPEN:
             raise ContractError("execute_open requires an OPEN OrderIntent; use execute_management otherwise")
         require_valve_clearance(order, valve_decision, expected_weights_sha256=self._valve_gate.weights_sha256)
-        oracle = self.oracle()
-        reference = oracle.reference_quotes(
-            tuple(dict.fromkeys(
-                self.barbell.quote_conversion_symbols(order.symbol)
-                + self._safe_harbor_calc.required_symbols(order.symbol)
-            ))
-        )
+        if order.symbol in INDEX_INSTRUMENTS:
+            oracle, reference = self._index_reference_quotes(order.symbol)
+        else:
+            oracle = self.oracle()
+            reference = oracle.reference_quotes(
+                tuple(dict.fromkeys(
+                    self.barbell.quote_conversion_symbols(order.symbol)
+                    + self._safe_harbor_calc.required_symbols(order.symbol)
+                ))
+            )
         rbid, rask = reference[order.symbol]
         entry = rask if order.side is Side.BUY else rbid
         equities = self.equities()
@@ -1020,6 +1101,11 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 quote_verdicts=tuple(verdicts), stop_loss_risk=risk, stop_loss_risk_cap=cap,
             )
 
+        if order.symbol in INDEX_INSTRUMENTS and str(self._env.get("CAS_FOREX_OANDA_ALLOW_INDEX_CFD", "")).strip().lower() not in ("1", "true", "yes"):
+            self._record(trail, self._oanda_broker_id, "INDEX_CFD_RESTRICTED", "US-regulated OANDA index CFDs restricted")
+            raise BrokerFailoverExhaustedError(
+                f"offshore MT5 venues refused/unavailable for {order.symbol}; US-regulated OANDA restricts index CFDs (fail closed)"
+            )
         oanda = self._venues.get(self._oanda_broker_id)
         if not isinstance(oanda, OandaPracticeFallbackVenue):
             self._record(trail, self._oanda_broker_id, "NOT_CONNECTED", None)
@@ -1052,7 +1138,14 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             raise Mt5TransportError(f"{broker_id} is not connected")
         if not isinstance(venue, Mt5PaperBrokerVenue):
             return venue.execute(order, valve_decision=valve_decision)
-        guard = self.oracle().guard() if order.kind is ActionKind.AMEND_STOP else None
+        if order.kind is ActionKind.AMEND_STOP:
+            if order.symbol in INDEX_INSTRUMENTS:
+                idx_oracle, idx_ref = self._index_reference_quotes(order.symbol)
+                guard = idx_oracle.guard(reference=idx_ref)
+            else:
+                guard = self.oracle().guard()
+        else:
+            guard = None
         return venue.execute(order, valve_decision=valve_decision, quote_guard=guard)
 
     def detect_frozen_positions(self, broker_id: str) -> tuple[Mt5Position, ...] | None:

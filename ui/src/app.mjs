@@ -5,8 +5,9 @@ import { displayFreshness } from './freshness.mjs';
 import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose, replaceSafeHTML } from './render.mjs';
 import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decision-read.mjs';
 import { ScopedBridge, createAuthenticatedLoopbackBridge } from './bridge.mjs';
-import { ALL_CHART_PAIRS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts } from './chart.mjs';
+import { ALL_WATCHLIST_MARKETS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts } from './chart.mjs';
 import { MAX_BROKER_ROUTING_BYTES, normalizeBrokerRouting } from './broker-routing.mjs';
+import { MAX_AI_PAYLOAD_BYTES, normalizeAiModels, normalizeAiTrader, normalizeIndexStream } from './ai-overseer.mjs';
 
 // Fixed same-origin assets. Only explicit trusted bootstrap may inject a scoped bridge.
 const schemaURL = new URL('../docs/contracts/cockpit.schema.json', document.baseURI);
@@ -56,6 +57,7 @@ let state = {
   reviewEnvelope: null, reviewIssue: null, reviewSchemaReady: false, lastLoaded: null, transport: null,
   marketStream: null, chartPair: 'EURUSD', chartTimeframe: 'M5', chartLayout: 'single', chartCategory: 'all',
   liveStreamConnected: false, chartMicroBars: {}, brokerRouting: null,
+  aiModels: null, aiTrader: null, indexStream: null, aiActionBusy: false, aiIssue: null,
 };
 
 function routeFromHash() {
@@ -215,6 +217,18 @@ async function connectLoopbackLiveFeed() {
         else render();
       } catch { /* Ignore malformed frame. */ }
     });
+    es.addEventListener('ai_trader', (ev) => {
+      try {
+        state.aiTrader = normalizeAiTrader(parseUniqueJSON(ev.data, MAX_AI_PAYLOAD_BYTES));
+        render();
+      } catch { /* Ignore malformed ai_trader frame. */ }
+    });
+    es.addEventListener('ai_models', (ev) => {
+      try {
+        state.aiModels = normalizeAiModels(parseUniqueJSON(ev.data, MAX_AI_PAYLOAD_BYTES));
+        render();
+      } catch { /* Ignore malformed ai_models frame. */ }
+    });
     es.onerror = () => { stopLoopbackStream(); render(); };
     liveEventSource = es;
   }
@@ -233,8 +247,9 @@ async function connectLoopbackLiveFeed() {
     } catch { /* Operate with verified market stream even if ScopedUIService is absent. */ }
   }
   await readBrokerRouting();
+  await readAiCockpitFeeds();
   render();
-  announce('Connected to verified loopback multi-currency market stream.');
+  announce('Connected to verified loopback market stream and autonomous AI overseer.');
 }
 
 // Optional loopback-only broker routing summary. Any failure keeps the static Setup preview.
@@ -244,6 +259,76 @@ async function readBrokerRouting() {
     state.brokerRouting = normalizeBrokerRouting(parseUniqueJSON(raw, MAX_BROKER_ROUTING_BYTES));
   } catch {
     state.brokerRouting = null; // Static/offline mode: no routing endpoint, nothing changes.
+  }
+}
+
+async function readAiCockpitFeeds() {
+  try {
+    const rawModels = await readStatic(new URL('/api/ai-models', window.location.origin), MAX_AI_PAYLOAD_BYTES);
+    state.aiModels = normalizeAiModels(parseUniqueJSON(rawModels, MAX_AI_PAYLOAD_BYTES));
+  } catch { state.aiModels = null; }
+  try {
+    const rawTrader = await readStatic(new URL('/api/ai-trader', window.location.origin), MAX_AI_PAYLOAD_BYTES);
+    state.aiTrader = normalizeAiTrader(parseUniqueJSON(rawTrader, MAX_AI_PAYLOAD_BYTES));
+  } catch { state.aiTrader = null; }
+  try {
+    const rawIndex = await readStatic(new URL('/api/index-stream', window.location.origin), MAX_MARKET_STREAM_BYTES);
+    state.indexStream = normalizeIndexStream(parseUniqueJSON(rawIndex, MAX_MARKET_STREAM_BYTES));
+  } catch { state.indexStream = null; }
+}
+
+async function postLoopbackJson(pathname, payload) {
+  const url = new URL(pathname, window.location.origin);
+  if (url.origin !== window.location.origin || !['http:', 'https:'].includes(url.protocol)) {
+    throw new Error('Loopback action requires same-origin HTTP preview.');
+  }
+  const headers = { 'Content-Type': 'application/json' };
+  if (loopbackAuthToken) headers.Authorization = `Bearer ${loopbackAuthToken}`;
+  const response = await fetch(url, {
+    method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+    headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000),
+  });
+  const raw = await response.text();
+  const parsed = parseUniqueJSON(raw, MAX_AI_PAYLOAD_BYTES);
+  if (!response.ok) throw new Error(parsed?.error || `Request failed (${response.status}).`);
+  return parsed;
+}
+
+async function sendOverseerAction(action) {
+  if (state.aiActionBusy) return;
+  state.aiActionBusy = true;
+  state.aiIssue = null;
+  render();
+  try {
+    const res = await postLoopbackJson('/api/ai-overseer-action', { action });
+    if (res?.schema === 'cas-forex.ai-models/1') state.aiModels = normalizeAiModels(res);
+    else await readAiCockpitFeeds();
+    announce(`Overseer action ${action} applied.`);
+  } catch (error) {
+    state.aiIssue = error instanceof Error ? error.message : 'Overseer action failed.';
+    announce(state.aiIssue);
+  } finally {
+    state.aiActionBusy = false;
+    render();
+  }
+}
+
+async function selectAiModel(modelId) {
+  if (state.aiActionBusy) return;
+  state.aiActionBusy = true;
+  state.aiIssue = null;
+  render();
+  try {
+    const res = await postLoopbackJson('/api/select-ai-model', { model_id: modelId });
+    state.aiModels = normalizeAiModels(res);
+    await readAiCockpitFeeds();
+    announce(`Active AI model switched to ${modelId}.`);
+  } catch (error) {
+    state.aiIssue = error instanceof Error ? error.message : 'Model switch failed.';
+    announce(state.aiIssue);
+  } finally {
+    state.aiActionBusy = false;
+    render();
   }
 }
 
@@ -376,7 +461,8 @@ root.addEventListener('click', (event) => {
   if (transportClick(target)) return;
   if (target.dataset.connectLoopback) { report(connectLoopbackLiveFeed()); return; }
   if (target.dataset.disconnectLoopback) { stopLoopbackStream(); render(); announce('Live market stream paused.'); return; }
-  if (target.dataset.chartPair && ALL_CHART_PAIRS.includes(target.dataset.chartPair)) {
+  if (target.dataset.aiOverseerAction) { void sendOverseerAction(target.dataset.aiOverseerAction); return; }
+  if (target.dataset.chartPair && ALL_WATCHLIST_MARKETS.includes(target.dataset.chartPair)) {
     state.chartPair = target.dataset.chartPair; render();
     root.querySelector(`[data-chart-pair="${state.chartPair}"]`)?.focus(); return;
   }
@@ -388,7 +474,7 @@ root.addEventListener('click', (event) => {
     state.chartLayout = target.dataset.chartLayout; render();
     root.querySelector(`[data-chart-layout="${state.chartLayout}"]`)?.focus(); return;
   }
-  if (target.dataset.chartCat && ['all', 'MAJOR', 'CROSS'].includes(target.dataset.chartCat)) {
+  if (target.dataset.chartCat && ['all', 'US_INDEX', 'MAJOR', 'CROSS'].includes(target.dataset.chartCat)) {
     state.chartCategory = target.dataset.chartCat; render();
     root.querySelector(`[data-chart-cat="${state.chartCategory}"]`)?.focus(); return;
   }
@@ -438,6 +524,7 @@ root.addEventListener('click', (event) => {
 });
 
 root.addEventListener('change', async (event) => {
+  if (event.target.dataset?.selectAiModel) { void selectAiModel(event.target.value); return; }
   if (event.target.name === 'theme') {
     const theme = event.target.value;
     if (!['system', 'light', 'dark'].includes(theme)) return;

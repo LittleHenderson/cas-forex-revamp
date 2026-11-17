@@ -8,9 +8,15 @@ import { canonicalJSON } from './decision-read.mjs';
 export const MAX_MARKET_STREAM_BYTES = 1048576;
 export const CHART_TIMEFRAMES = Object.freeze(['1s', 'M1', 'M5', 'M15', 'H1']);
 export const CHART_LAYOUTS = Object.freeze(['single', 'quad']);
+export const INDEX_INSTRUMENTS = Object.freeze(['NAS100', 'US30']);
 export const ALL_CHART_PAIRS = Object.freeze([
   'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD',
   'EURGBP', 'EURJPY', 'GBPJPY', 'EURCHF', 'EURAUD', 'EURCAD', 'AUDJPY', 'CHFJPY', 'CADJPY',
+]);
+export const ALL_WATCHLIST_MARKETS = Object.freeze([...INDEX_INSTRUMENTS, ...ALL_CHART_PAIRS]);
+const INDEX_ALIAS_PAIRS = Object.freeze([
+  ['USTEC', 'NAS100'], ['US100', 'NAS100'], ['NAS100', 'NAS100'], ['NASDAQ100', 'NAS100'], ['NDX', 'NAS100'],
+  ['DJ30', 'US30'], ['WS30', 'US30'], ['US30', 'US30'], ['DJIA', 'US30'], ['YM', 'US30'],
 ]);
 
 const fail = (message) => { throw new SnapshotError(message); };
@@ -75,26 +81,36 @@ export async function verifyMarketStreamDigest(envelope, hashBytes) {
 
 export function normalizePairSymbol(instrumentId) {
   if (typeof instrumentId !== 'string') return '';
-  const upper = instrumentId.toUpperCase().replace(/[^A-Z]/g, '');
+  const rawUpper = instrumentId.toUpperCase();
+  const coreAlnum = rawUpper.split('.')[0].replace(/[^A-Z0-9]/g, '');
+  for (const [alias, canonical] of INDEX_ALIAS_PAIRS) {
+    if (coreAlnum === alias || coreAlnum.startsWith(`${alias}USD`)) return canonical;
+  }
+  const upper = rawUpper.replace(/[^A-Z]/g, '');
   for (const pair of ALL_CHART_PAIRS) {
     if (upper === pair || upper.endsWith(pair)) return pair;
   }
-  return upper;
+  return coreAlnum || upper;
 }
 
-export function matchPositionsForPair(projection, pair) {
-  if (!projection?.positions?.length) return Object.freeze([]);
-  const target = String(pair).toUpperCase();
-  const matched = projection.positions
-    .filter((pos) => normalizePairSymbol(pos.instrument_id) === target)
+export function matchPositionsForPair(projection, pair, brokerPositions = []) {
+  const combined = [
+    ...(Array.isArray(projection?.positions) ? projection.positions : []),
+    ...(Array.isArray(brokerPositions) ? brokerPositions : []),
+  ];
+  if (!combined.length) return Object.freeze([]);
+  const target = normalizePairSymbol(String(pair)) || String(pair).toUpperCase();
+  const matched = combined
+    .filter((pos) => normalizePairSymbol(pos.instrument_id ?? pos.symbol ?? '') === target)
     .map((pos) => Object.freeze({
-      position_id: pos.position_id,
-      instrument_id: pos.instrument_id,
+      position_id: pos.position_id ?? String(pos.ticket ?? 'pos'),
+      instrument_id: pos.instrument_id ?? pos.symbol ?? target,
       side: pos.side,
-      quantity: pos.quantity,
-      entry_price: pos.entry_price,
-      stop_price: pos.stop_price,
-      version: pos.version,
+      quantity: pos.quantity ?? pos.volume_lots ?? '0',
+      entry_price: pos.entry_price ?? pos.price_open,
+      stop_price: pos.stop_price ?? pos.sl ?? null,
+      take_profit_price: pos.take_profit_price ?? pos.tp ?? null,
+      version: pos.version ?? 1,
     }));
   return Object.freeze(matched);
 }
@@ -159,6 +175,7 @@ export function computeEMA(candles, period = 14) {
 export function computeChartGeometry(pairStream, {
   timeframe = 'M5',
   projection = null,
+  brokerPositions = [],
   valveStatus = null,
   microBars = [],
   width = 860,
@@ -174,7 +191,7 @@ export function computeChartGeometry(pairStream, {
   const volTop = padTop + plotH + 10;
   const volH = Math.max(24, padBottom - 26);
 
-  const positions = matchPositionsForPair(projection, pairStream.pair);
+  const positions = matchPositionsForPair(projection, pairStream.pair, brokerPositions);
   let lowMin = Infinity;
   let highMax = -Infinity;
   let maxVol = 0;
@@ -203,6 +220,13 @@ export function computeChartGeometry(pairStream, {
       if (Number.isFinite(stop)) {
         if (stop < lowMin) lowMin = stop;
         if (stop > highMax) highMax = stop;
+      }
+    }
+    if (pos.take_profit_price !== null && pos.take_profit_price !== undefined) {
+      const tp = Number(pos.take_profit_price);
+      if (Number.isFinite(tp)) {
+        if (tp < lowMin) lowMin = tp;
+        if (tp > highMax) highMax = tp;
       }
     }
   }
@@ -281,6 +305,18 @@ export function computeChartGeometry(pairStream, {
         label: `STOP @ ${pos.stop_price}`,
       }));
     }
+    if (pos.take_profit_price !== null && pos.take_profit_price !== undefined) {
+      const tpNum = Number(pos.take_profit_price);
+      positionLines.push(Object.freeze({
+        kind: 'TAKE_PROFIT',
+        position_id: pos.position_id,
+        side: pos.side,
+        quantity: pos.quantity,
+        price: pos.take_profit_price,
+        y: priceToY(tpNum),
+        label: `TP @ ${pos.take_profit_price}`,
+      }));
+    }
   }
 
   const effectiveValve = valveStatus ?? {
@@ -331,10 +367,13 @@ function formatValveSummary(valve) {
 export function renderMarketChartSection(projection, state) {
   const e = escapeText;
   const stream = state.marketStream ?? null;
-  const selectedPair = ALL_CHART_PAIRS.includes(state.chartPair) ? state.chartPair : 'EURUSD';
+  const indexMarkets = Array.isArray(state?.indexStream?.markets) ? state.indexStream.markets : [];
+  const allStreams = stream ? [...indexMarkets, ...stream.streams] : indexMarkets;
+  const allowedPairs = allStreams.length ? ALL_WATCHLIST_MARKETS : ALL_CHART_PAIRS;
+  const selectedPair = allowedPairs.includes(state.chartPair) ? state.chartPair : 'EURUSD';
   const timeframe = CHART_TIMEFRAMES.includes(state.chartTimeframe) ? state.chartTimeframe : 'M5';
   const layout = CHART_LAYOUTS.includes(state.chartLayout) ? state.chartLayout : 'single';
-  const categoryFilter = ['all', 'MAJOR', 'CROSS'].includes(state.chartCategory) ? state.chartCategory : 'all';
+  const categoryFilter = ['all', 'US_INDEX', 'MAJOR', 'CROSS'].includes(state.chartCategory) ? state.chartCategory : 'all';
 
   const valveInfo = formatValveSummary(stream?.valve_status ?? null);
   const streamBadge = stream
@@ -345,7 +384,7 @@ export function renderMarketChartSection(projection, state) {
     ? `<button type="button" class="button button-small" data-connect-loopback="true">Connect live broker stream</button>`
     : `<button type="button" class="button button-small button-secondary" data-disconnect-loopback="true">Pause live stream</button>`;
 
-  if (!stream) {
+  if (!stream && !allStreams.length) {
     return `<section class="panel market-chart-panel" aria-label="Multi-currency market chart">
       <div class="section-heading">
         <div><p class="eyebrow">MULTI-CURRENCY FEED / 16 PAIRS</p><h2>Live candlestick chart</h2></div>
@@ -359,15 +398,16 @@ export function renderMarketChartSection(projection, state) {
     </section>`;
   }
 
+  const brokerPositions = state?.aiTrader?.openPositions ?? [];
   const visibleStreams = categoryFilter === 'all'
-    ? stream.streams
-    : stream.streams.filter((item) => item.category === categoryFilter);
-  const activeStream = stream.streams.find((item) => item.pair === selectedPair) ?? stream.streams[0];
+    ? allStreams
+    : allStreams.filter((item) => item.category === categoryFilter);
+  const activeStream = allStreams.find((item) => item.pair === selectedPair) ?? allStreams[0];
   const latestCandle = deriveTimeframeCandles(activeStream, timeframe, state.chartMicroBars?.[activeStream.pair]).at(-1);
-  const matchedPositions = matchPositionsForPair(projection, activeStream.pair);
+  const matchedPositions = matchPositionsForPair(projection, activeStream.pair, brokerPositions);
 
   const quadPairs = [activeStream.pair, 'EURUSD', 'GBPUSD', 'USDJPY', 'GBPJPY', 'AUDUSD']
-    .filter((pair, idx, arr) => arr.indexOf(pair) === idx && stream.streams.some((s) => s.pair === pair))
+    .filter((pair, idx, arr) => arr.indexOf(pair) === idx && allStreams.some((s) => s.pair === pair))
     .slice(0, 4);
 
   const tfButtons = CHART_TIMEFRAMES.map((tf) => (
@@ -381,17 +421,20 @@ export function renderMarketChartSection(projection, state) {
     `<button type="button" class="button button-small ${mode === layout ? 'selected' : 'button-secondary'}" data-chart-layout="${e(mode)}" aria-pressed="${mode === layout}">${e(label)}</button>`
   )).join('');
 
-  const catButtons = [
-    ['all', `All / ${stream.streams.length}`],
-    ['MAJOR', `Majors / ${stream.streams.filter((s) => s.category === 'MAJOR').length}`],
-    ['CROSS', `Crosses / ${stream.streams.filter((s) => s.category === 'CROSS').length}`],
-  ].map(([cat, label]) => (
+  const catEntries = [
+    ['all', `All / ${allStreams.length}`],
+    ...(indexMarkets.length ? [['US_INDEX', `US Indices / ${indexMarkets.length}`]] : []),
+    ['MAJOR', `Majors / ${allStreams.filter((s) => s.category === 'MAJOR').length}`],
+    ['CROSS', `Crosses / ${allStreams.filter((s) => s.category === 'CROSS').length}`],
+  ];
+  const catButtons = catEntries.map(([cat, label]) => (
     `<button type="button" class="button button-small ${cat === categoryFilter ? 'selected' : 'button-secondary'}" data-chart-cat="${e(cat)}" aria-pressed="${cat === categoryFilter}">${e(label)}</button>`
   )).join('');
 
   const watchlistItems = visibleStreams.map((item) => {
-    const hasPos = matchPositionsForPair(projection, item.pair).length > 0;
-    const neg = item.change_24h_pct.startsWith('-');
+    const hasPos = matchPositionsForPair(projection, item.pair, brokerPositions).length > 0;
+    const changeStr = typeof item.change_24h_pct === 'string' ? item.change_24h_pct : '0.00';
+    const neg = changeStr.startsWith('-');
     const selected = item.pair === activeStream.pair;
     return `<button type="button" class="watchlist-row${selected ? ' is-selected' : ''}" data-chart-pair="${e(item.pair)}" aria-pressed="${selected}">
       <span class="watchlist-pair">
@@ -400,14 +443,14 @@ export function renderMarketChartSection(projection, state) {
       </span>
       <span class="watchlist-quotes numeric">
         <span>${e(item.bid)} / ${e(item.ask)}</span>
-        <small class="${neg ? 'delta-neg' : 'delta-pos'}">${neg ? '' : '+'}${e(item.change_24h_pct)}% · ${e(item.spread_pips)}p</small>
+        <small class="${neg ? 'delta-neg' : 'delta-pos'}">${neg ? '' : '+'}${e(changeStr)}% · ${e(item.spread_pips ?? item.spread_points ?? '0')}${item.category === 'US_INDEX' ? 'pt' : 'p'}</small>
       </span>
     </button>`;
   }).join('');
 
   const canvasesHtml = layout === 'quad'
     ? `<div class="market-quad-grid">${quadPairs.map((qPair) => {
-        const qs = stream.streams.find((s) => s.pair === qPair);
+        const qs = allStreams.find((s) => s.pair === qPair);
         return `<div class="market-canvas-card">
           <div class="market-canvas-header">
             <strong>${e(qs.display_pair)} · ${e(timeframe)}</strong>
@@ -435,13 +478,13 @@ export function renderMarketChartSection(projection, state) {
       </div>`;
 
   const positionSummaryText = matchedPositions.length
-    ? matchedPositions.map((p) => `${p.side} ${p.quantity} @ ${p.entry_price} (Stop ${p.stop_price ?? 'none'})`).join(' · ')
-    : 'No open position on selected pair';
+    ? matchedPositions.map((p) => `${p.side} ${p.quantity} @ ${p.entry_price} (SL ${p.stop_price ?? 'none'}, TP ${p.take_profit_price ?? 'none'})`).join(' · ')
+    : 'No open position on selected market';
 
   return `<section class="panel market-chart-panel" aria-label="Multi-currency market chart">
     <div class="section-heading">
       <div>
-        <p class="eyebrow">VERIFIED BROKER FEED · ${e(stream.streams.length)} CURRENCY PAIRS · SEQ #${e(stream.sequence)}</p>
+        <p class="eyebrow">VERIFIED BROKER FEED · ${e(allStreams.length)} ${indexMarkets.length ? 'MARKETS (US INDICES + FX)' : 'CURRENCY PAIRS'} · SEQ #${e(stream?.sequence ?? state.indexStream?.sequence ?? 0)}</p>
         <h2>Live multi-currency candlestick chart</h2>
       </div>
       <div class="market-chart-badges">
@@ -490,6 +533,7 @@ function resolvePalette() {
         ask: '#f09436',
         entry: '#38bdf8',
         stop: '#f43f5e',
+        tp: '#2dd4bf',
         crosshair: 'rgba(215, 221, 228, 0.45)',
       }
     : {
@@ -507,6 +551,7 @@ function resolvePalette() {
         ask: '#b85c00',
         entry: '#0369a1',
         stop: '#be123c',
+        tp: '#0d9488',
         crosshair: 'rgba(22, 25, 29, 0.40)',
       };
 }
@@ -529,6 +574,7 @@ function drawSingleCanvas(canvas, pairStream, state, hoverX = null) {
   const geom = computeChartGeometry(pairStream, {
     timeframe,
     projection: state.projection,
+    brokerPositions: state.aiTrader?.openPositions ?? [],
     valveStatus: state.marketStream?.valve_status ?? null,
     microBars: state.chartMicroBars?.[pairStream.pair] ?? [],
     width: cssW,
@@ -606,17 +652,19 @@ function drawSingleCanvas(canvas, pairStream, state, hoverX = null) {
   ctx.stroke();
   ctx.restore();
 
-  // CAS Position Entry & Protective Stop lines
+  // CAS Position Entry, Protective Stop, & Resting Take Profit lines
   for (const line of geom.positionLines) {
+    const lineColor = line.kind === 'ENTRY' ? pal.entry : (line.kind === 'TAKE_PROFIT' ? pal.tp : pal.stop);
     ctx.save();
-    ctx.strokeStyle = line.kind === 'ENTRY' ? pal.entry : pal.stop;
+    ctx.strokeStyle = lineColor;
     ctx.lineWidth = 1.8;
     if (line.kind === 'STOP') ctx.setLineDash([6, 3]);
+    if (line.kind === 'TAKE_PROFIT') ctx.setLineDash([4, 2]);
     ctx.beginPath();
     ctx.moveTo(left, line.y);
     ctx.lineTo(left + plotW, line.y);
     ctx.stroke();
-    ctx.fillStyle = line.kind === 'ENTRY' ? pal.entry : pal.stop;
+    ctx.fillStyle = lineColor;
     ctx.fillText(line.label, left + 6, Math.max(top + 12, line.y - 4));
     ctx.restore();
   }
@@ -649,11 +697,15 @@ function drawSingleCanvas(canvas, pairStream, state, hoverX = null) {
 
 export function mountMarketCharts(root, state) {
   const stream = state?.marketStream;
-  if (!root || !stream) return;
+  const allStreams = [
+    ...(Array.isArray(state?.indexStream?.markets) ? state.indexStream.markets : []),
+    ...(Array.isArray(stream?.streams) ? stream.streams : []),
+  ];
+  if (!root || !allStreams.length) return;
   const canvases = root.querySelectorAll('canvas[data-market-canvas]');
   for (const canvas of canvases) {
     const pair = canvas.dataset.marketCanvas;
-    const pairStream = stream.streams.find((s) => s.pair === pair);
+    const pairStream = allStreams.find((s) => s.pair === pair);
     if (!pairStream) continue;
     drawSingleCanvas(canvas, pairStream, state, null);
     if (!canvas.dataset.boundHover) {

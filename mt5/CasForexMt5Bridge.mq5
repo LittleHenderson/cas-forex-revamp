@@ -24,9 +24,11 @@
 //--- inputs
 input string InpSpoolFolder        = "cas_forex_spool";  // Spool root under MQL5\Files (or Common\Files)
 input string InpBrokerChannel      = "hugosway_mt5";     // hugosway_mt5 or lhfx_mt5 (matches Python broker id)
-input bool   InpUseCommonFolder    = true;               // true: Terminal\Common\Files (shared by terminals)
-input int    InpTimerMs            = 250;                // Spool polling interval in milliseconds
-input string InpSymbols            = "EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,EURGBP,EURJPY,GBPJPY,EURCHF,EURAUD,EURCAD,AUDJPY,CHFJPY,CADJPY";
+input bool   InpUseCommonFolder    = true;               // true: Terminal\Common\Files; false: portable MQL5\Files junction
+input int    InpTimerMs            = 50;                 // Spool polling interval in ms (50ms fast-tick for NAS100/US30)
+input string InpSymbols            = "NAS100,US30,EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,EURGBP,EURJPY,GBPJPY,EURCHF,EURAUD,EURCAD,AUDJPY,CHFJPY,CADJPY";
+input string InpNas100Symbol       = "NAS100";           // Broker Nasdaq-100 symbol name (e.g. NAS100, USTEC, US100)
+input string InpUs30Symbol         = "US30";             // Broker Dow Jones 30 symbol name (e.g. US30, DJ30, WS30)
 input string InpSymbolSuffix       = "";                 // Broker symbol suffix, e.g. ".ecn" (empty when none)
 input int    InpMaxDeviationPoints = 30;                 // Maximum slippage in points
 input double InpMaxVolumeLots      = 50.0;               // Hard per-order volume cap in lots
@@ -187,6 +189,10 @@ bool WriteAtomic(const string name, const string text)
 
 string BrokerSymbol(const string cas_symbol)
   {
+   if(cas_symbol == "NAS100")
+      return(InpNas100Symbol + InpSymbolSuffix);
+   if(cas_symbol == "US30")
+      return(InpUs30Symbol + InpSymbolSuffix);
    return(cas_symbol + InpSymbolSuffix);
   }
 
@@ -194,6 +200,10 @@ string CasSymbol(string broker_symbol)
   {
    if(StringLen(InpSymbolSuffix) > 0)
       StringReplace(broker_symbol, InpSymbolSuffix, "");
+   if(broker_symbol == InpNas100Symbol || broker_symbol == "USTEC" || broker_symbol == "US100" || broker_symbol == "NAS100USD")
+      return("NAS100");
+   if(broker_symbol == InpUs30Symbol || broker_symbol == "DJ30" || broker_symbol == "WS30" || broker_symbol == "US30USD")
+      return("US30");
    return(broker_symbol);
   }
 
@@ -208,14 +218,14 @@ string Price(const string broker_symbol, const double value)
 //+------------------------------------------------------------------+
 string ReceiptJson(const string request_id, const string request_sha, const string status, const uint retcode,
                    const string position_ticket, const string deal_ticket, const string volume,
-                   const string price, const string sl, const string message)
+                   const string price, const string sl, const string tp, const string message)
   {
    string server = AccountInfoString(ACCOUNT_SERVER);
    return(StringFormat(
       "{\"protocol\":\"%s\",\"request_id\":\"%s\",\"request_sha256\":\"%s\",\"status\":\"%s\",\"retcode\":\"%u\","
-      "\"position_ticket\":\"%s\",\"deal_ticket\":\"%s\",\"volume\":\"%s\",\"price\":\"%s\",\"sl\":\"%s\","
+      "\"position_ticket\":\"%s\",\"deal_ticket\":\"%s\",\"volume\":\"%s\",\"price\":\"%s\",\"sl\":\"%s\",\"tp\":\"%s\","
       "\"server\":\"%s\",\"account_trade_mode\":\"%s\",\"observed_at\":\"%s\",\"message\":\"%s\"}",
-      SPOOL_PROTOCOL, request_id, request_sha, status, retcode, position_ticket, deal_ticket, volume, price, sl,
+      SPOOL_PROTOCOL, request_id, request_sha, status, retcode, position_ticket, deal_ticket, volume, price, sl, tp,
       SafeText(server), AccountTradeModeLabel(), IsoNowUtc(), SafeText(message)));
   }
 
@@ -244,12 +254,12 @@ void ExecuteRequest(const string request_id, const string text)
    StringTrimRight(core);
    if(JsonGet(text, "protocol") != SPOOL_PROTOCOL || StringLen(request_sha) != 64 || Sha256Hex(core) != request_sha)
      {
-      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "request hash mismatch"));
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "request hash mismatch"));
       return;
      }
-   if(!DemoGuard())
+   if(!ModeGuard())
      {
-      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10017, "0", "0", "0", "0", "0", "demo guard failed"));
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10017, "0", "0", "0", "0", "0", "0", "mode guard failed"));
       return;
      }
 
@@ -258,6 +268,7 @@ void ExecuteRequest(const string request_id, const string text)
    string side    = JsonGet(text, "side");
    double volume  = StringToDouble(JsonGet(text, "volume"));
    double sl      = StringToDouble(JsonGet(text, "sl"));
+   double tp      = StringToDouble(JsonGet(text, "tp"));
    ulong  ticket  = (ulong)StringToInteger(JsonGet(text, "position_ticket"));
    ulong  magic   = (ulong)StringToInteger(JsonGet(text, "magic"));
    int    dev     = (int)StringToInteger(JsonGet(text, "deviation_points"));
@@ -265,7 +276,7 @@ void ExecuteRequest(const string request_id, const string text)
 
    if(!SymbolSelect(symbol, true))
      {
-      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "unknown symbol"));
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "unknown symbol"));
       return;
      }
    if(dev <= 0 || dev > InpMaxDeviationPoints)
@@ -283,12 +294,18 @@ void ExecuteRequest(const string request_id, const string text)
          volume = MathRound(volume / step) * step;
       if(volume <= 0.0 || volume > InpMaxVolumeLots || sl <= 0.0)
         {
-         WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10014, "0", "0", "0", "0", "0", "volume cap or missing protective stop"));
+         WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10014, "0", "0", "0", "0", "0", "0", "volume cap or missing protective stop"));
          return;
         }
       ENUM_ORDER_TYPE type = (side == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
       double price = (side == "BUY") ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
-      ok = g_trade.PositionOpen(symbol, type, volume, price, sl, 0.0, comment);
+      if((side == "BUY" && (sl >= price || (tp > 0.0 && tp <= price))) ||
+         (side == "SELL" && (sl <= price || (tp > 0.0 && tp >= price))))
+        {
+         WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10016, "0", "0", "0", "0", "0", "0", "inverted stop or take-profit"));
+         return;
+        }
+      ok = g_trade.PositionOpen(symbol, type, volume, price, sl, (tp > 0.0) ? tp : 0.0, comment);
       ulong deal = g_trade.ResultDeal();
       ulong position_id = g_trade.ResultOrder();
       if(deal > 0 && HistoryDealSelect(deal))
@@ -300,12 +317,16 @@ void ExecuteRequest(const string request_id, const string text)
      {
       if(!PositionSelectByTicket(ticket) || PositionGetString(POSITION_SYMBOL) != symbol)
         {
-         WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10036, "0", "0", "0", "0", "0", "position not found"));
+         WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10036, "0", "0", "0", "0", "0", "0", "position not found"));
          return;
         }
       pos_text = IntegerToString((long)ticket);
       if(action == "AMEND_STOP")
-         ok = g_trade.PositionModify(ticket, sl, PositionGetDouble(POSITION_TP));
+        {
+         double eff_sl = (sl > 0.0) ? sl : PositionGetDouble(POSITION_SL);
+         double eff_tp = (tp > 0.0) ? tp : PositionGetDouble(POSITION_TP);
+         ok = g_trade.PositionModify(ticket, eff_sl, eff_tp);
+        }
       else
          if(action == "REDUCE")
             ok = g_trade.PositionClosePartial(ticket, volume, dev);
@@ -314,7 +335,7 @@ void ExecuteRequest(const string request_id, const string text)
                ok = g_trade.PositionClose(ticket, dev);
             else
               {
-               WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "unsupported action"));
+               WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "unsupported action"));
                return;
               }
      }
@@ -325,10 +346,11 @@ void ExecuteRequest(const string request_id, const string text)
    string vol_text  = (g_trade.ResultVolume() > 0.0) ? DoubleToString(g_trade.ResultVolume(), 2) : "0";
    string px_text   = (g_trade.ResultPrice() > 0.0) ? Price(symbol, g_trade.ResultPrice()) : "0";
    string sl_text   = (sl > 0.0) ? Price(symbol, sl) : "0";
+   string tp_text   = (tp > 0.0) ? Price(symbol, tp) : "0";
    if(!ok && status != "REJECTED")
       status = "REJECTED";
    WriteReceipt(request_id, ReceiptJson(request_id, request_sha, status, retcode, (status == "REJECTED") ? "0" : pos_text,
-                                        deal_text, vol_text, px_text, sl_text, g_trade.ResultRetcodeDescription()));
+                                        deal_text, vol_text, px_text, sl_text, tp_text, g_trade.ResultRetcodeDescription()));
   }
 
 //--- Claim each request by renaming it to processing_<id>.json BEFORE executing, so a restart
@@ -423,10 +445,11 @@ void PublishMarket()
       string bsym = PositionGetString(POSITION_SYMBOL);
       string side = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
       double psl = PositionGetDouble(POSITION_SL);
-      json += StringFormat("%s{\"ticket\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":\"%s\",\"price_open\":\"%s\",\"sl\":\"%s\",\"profit\":\"%s\"}",
+      double ptp = PositionGetDouble(POSITION_TP);
+      json += StringFormat("%s{\"ticket\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":\"%s\",\"price_open\":\"%s\",\"sl\":\"%s\",\"tp\":\"%s\",\"profit\":\"%s\"}",
                            first ? "" : ",", IntegerToString((long)ticket), CasSymbol(bsym), side,
                            DoubleToString(PositionGetDouble(POSITION_VOLUME), 2), Price(bsym, PositionGetDouble(POSITION_PRICE_OPEN)),
-                           (psl > 0.0) ? Price(bsym, psl) : "0", DoubleToString(PositionGetDouble(POSITION_PROFIT), 2));
+                           (psl > 0.0) ? Price(bsym, psl) : "0", (ptp > 0.0) ? Price(bsym, ptp) : "0", DoubleToString(PositionGetDouble(POSITION_PROFIT), 2));
       first = false;
      }
    json += "]}";

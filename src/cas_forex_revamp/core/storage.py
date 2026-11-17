@@ -13,7 +13,7 @@ import sqlite3
 from types import UnionType
 from typing import Union, get_args, get_origin, get_type_hints
 
-from cas_forex_revamp.contracts import AccountRunKey, AuthorizedCommand, canonical_bytes, content_digest, parse_decimal
+from cas_forex_revamp.contracts import AccountRunKey, ActionIntent, AuthorizedCommand, canonical_bytes, content_digest, parse_decimal
 from .records import AccountRecord, CommandRecord, CoreError, CoreEvent, IdentityConflict, OwnerApproval
 
 SCHEMA_VERSION = "core.sqlite/1"
@@ -64,6 +64,9 @@ def _typed(value, expected):
         if (expected is AuthorizedCommand and type(value) is dict
                 and set(value) == {f.name for f in fields(expected)} - {"risk_price_ceiling"}):
             value = {**value, "risk_price_ceiling": None}
+        if (expected is ActionIntent and type(value) is dict
+                and set(value) == {f.name for f in fields(expected)} - {"take_profit_price"}):
+            value = {**value, "take_profit_price": None}
         if type(value) is not dict or set(value) != {f.name for f in fields(expected)}:
             raise CoreError("durable record fields differ from schema")
         hints = get_type_hints(expected)

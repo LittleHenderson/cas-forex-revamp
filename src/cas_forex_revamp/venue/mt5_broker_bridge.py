@@ -90,6 +90,7 @@ from .external_paper_broker import (
     resolve_execution_mode,
     strict_safe_json_loads,
 )
+from .live_market_stream import EXPANDED_MARKETS, INDEX_INSTRUMENTS
 
 __all__ = [
     "BROKER_HUGOSWAY_MT5",
@@ -124,9 +125,14 @@ __all__ = [
     "Mt5Tick",
     "Mt5Transport",
     "Mt5TransportError",
+    "DEFAULT_WINDOWS_PORTABLE_SPOOL_DIR",
+    "EXPANDED_MARKETS",
+    "INDEX_INSTRUMENTS",
     "Mt5ValveClearanceError",
     "OandaPracticeFallbackVenue",
     "OrderIntent",
+    "normalize_market_symbol",
+    "resolve_mt5_spool_dir",
     "apply_verified_directory_mode",
     "load_mt5_credentials",
     "require_valve_clearance",
@@ -144,10 +150,58 @@ MT5_PLATFORM_CODE = "MT5"
 MT5_PLATFORM_NAME = "MetaTrader 5"
 MT5_SPOOL_PROTOCOL = "cas-forex-mt5-spool/1"
 MT5_CONTRACT_SIZE = Decimal("100000")
+MT5_INDEX_CONTRACT_SIZE = Decimal("1")
 MT5_VOLUME_STEP = Decimal("0.01")
 MT5_MIN_VOLUME = Decimal("0.01")
 MT5_MAX_VOLUME_DEFAULT = Decimal("50")
 MAX_DEMO_LEVERAGE = 500
+DEFAULT_MT5_INDEX_LEVERAGE = 200
+ENV_INDEX_LEVERAGE = "CAS_FOREX_INDEX_LEVERAGE"
+DEFAULT_WINDOWS_PORTABLE_SPOOL_DIR = Path(r"D:\MetaTrader5\cas_forex_spool")
+_INDEX_SYMBOL_ALIASES: dict[str, str] = {
+    "NAS100": "NAS100",
+    "USTEC": "NAS100",
+    "US100": "NAS100",
+    "NAS100USD": "NAS100",
+    "NDX100": "NAS100",
+    "US30": "US30",
+    "DJ30": "US30",
+    "WS30": "US30",
+    "US30USD": "US30",
+    "DJI30": "US30",
+}
+
+
+def normalize_market_symbol(raw: str) -> str:
+    """Normalize broker suffixes (.ecn/.pro/.raw/.cash) & index aliases into EXPANDED_MARKETS."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ContractError("market symbol must be a non-empty string")
+    cleaned = raw.strip().upper()
+    for suffix in (".ECN", ".PRO", ".RAW", ".CASH", "_I", ".I", ".M"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)]
+            break
+    cleaned = re.sub(r"[^A-Z0-9]", "", cleaned)
+    if cleaned in _INDEX_SYMBOL_ALIASES:
+        return _INDEX_SYMBOL_ALIASES[cleaned]
+    if cleaned in EXPANDED_FX_PAIRS:
+        return cleaned
+    raise ContractError(f"unsupported MT5 symbol {raw!r}; expected one of the 18 EXPANDED_MARKETS")
+
+
+def resolve_mt5_spool_dir(environ: Mapping[str, str], *, is_windows: bool | None = None, default_dir: Path | None = None) -> str | None:
+    """Resolve explicit CAS_FOREX_MT5_SPOOL_DIR or auto-discover staged D:\\MetaTrader5\\cas_forex_spool on Windows."""
+    explicit = str(environ.get(ENV_MT5_SPOOL_DIR, "")).strip()
+    if explicit:
+        return explicit
+    win = (os.name == "nt") if is_windows is None else is_windows
+    if not win:
+        return None
+    has_mt5_cfg = bool(str(environ.get(ENV_HUGOSWAY_MT5_LOGIN, "")).strip() or str(environ.get(ENV_LHFX_MT5_LOGIN, "")).strip())
+    candidate = default_dir if default_dir is not None else DEFAULT_WINDOWS_PORTABLE_SPOOL_DIR
+    if has_mt5_cfg and candidate.is_dir():
+        return str(candidate)
+    return None
 DEFAULT_MIN_POST_TRADE_MARGIN_LEVEL_PCT = Decimal("1000")
 DEFAULT_MAGIC = 20261116
 MAX_SPOOL_FILE_BYTES = 262_144
@@ -690,38 +744,56 @@ class Mt5MarginCalculator:
         leverage: int = MAX_DEMO_LEVERAGE,
         account_currency: str = "USD",
         contract_size: Decimal = MT5_CONTRACT_SIZE,
+        index_leverage: int = DEFAULT_MT5_INDEX_LEVERAGE,
+        index_contract_size: Decimal = MT5_INDEX_CONTRACT_SIZE,
     ) -> None:
         if type(leverage) is not int or not (1 <= leverage <= MAX_DEMO_LEVERAGE):
             raise ContractError(f"leverage must be an integer in 1..{MAX_DEMO_LEVERAGE}")
+        if type(index_leverage) is not int or not (1 <= index_leverage <= MAX_DEMO_LEVERAGE):
+            raise ContractError(f"index_leverage must be an integer in 1..{MAX_DEMO_LEVERAGE}")
         if not isinstance(account_currency, str) or not re.fullmatch(r"[A-Z]{3}", account_currency):
             raise ContractError("account_currency must be an ISO-4217 code")
         self.leverage = leverage
+        self.index_leverage = min(index_leverage, leverage)
         self.account_currency = account_currency
         self.contract_size = decimal_value(contract_size, "contract_size", positive=True)
+        self.index_contract_size = decimal_value(index_contract_size, "index_contract_size", positive=True)
 
     @staticmethod
     def split_symbol(symbol: str) -> tuple[str, str]:
-        if not isinstance(symbol, str) or symbol not in EXPANDED_FX_PAIRS:
-            raise ContractError(f"unsupported MT5 symbol {symbol!r}; expected one of the 16 EXPANDED_FX_PAIRS")
-        return symbol[:3], symbol[3:]
+        if not isinstance(symbol, str):
+            raise ContractError("MT5 symbol must be a string")
+        if symbol in INDEX_INSTRUMENTS:
+            return symbol, "USD"
+        if symbol in EXPANDED_FX_PAIRS:
+            return symbol[:3], symbol[3:]
+        raise ContractError(f"unsupported MT5 symbol {symbol!r}; expected one of the 18 EXPANDED_MARKETS")
 
-    def units_to_lots(self, units: Decimal) -> Decimal:
+    def contract_size_for(self, symbol: str | None) -> Decimal:
+        return self.index_contract_size if symbol in INDEX_INSTRUMENTS else self.contract_size
+
+    def leverage_for(self, symbol: str | None) -> int:
+        return self.index_leverage if symbol in INDEX_INSTRUMENTS else self.leverage
+
+    def units_to_lots(self, units: Decimal, *, symbol: str | None = None) -> Decimal:
         decimal_value(units, "units", positive=True)
+        csize = self.contract_size_for(symbol)
         with localcontext() as ctx:
             ctx.prec = 40
-            lots = units / self.contract_size
+            lots = units / csize
         if lots < MT5_MIN_VOLUME or lots % MT5_VOLUME_STEP != 0:
             raise ContractError(
                 f"units {decimal_text(units)} must map to a positive multiple of {MT5_VOLUME_STEP} lots "
-                f"(1 lot = {decimal_text(self.contract_size)} base units)"
+                f"(1 lot = {decimal_text(csize)} base units)"
             )
         return lots.quantize(MT5_VOLUME_STEP)
 
-    def lots_to_units(self, lots: Decimal) -> Decimal:
+    def lots_to_units(self, lots: Decimal, *, symbol: str | None = None) -> Decimal:
         decimal_value(lots, "lots", positive=True)
+        csize = self.contract_size_for(symbol)
         with localcontext() as ctx:
             ctx.prec = 40
-            return (lots * self.contract_size).normalize()
+            return (lots * csize).normalize()
 
     @staticmethod
     def _quote(quotes: Mapping[str, tuple[Decimal, Decimal]], symbol: str) -> tuple[Decimal, Decimal]:
@@ -787,9 +859,10 @@ class Mt5MarginCalculator:
         self, symbol: str, side: Side, units: Decimal, quotes: Mapping[str, tuple[Decimal, Decimal]]
     ) -> Decimal:
         notional = self.notional_in_account(symbol, side, units, quotes)
+        lev = self.leverage_for(symbol)
         with localcontext() as ctx:
             ctx.prec = 40
-            return (notional / Decimal(self.leverage)).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+            return (notional / Decimal(lev)).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
 
     @staticmethod
     def margin_level_pct(equity: Decimal, used_margin: Decimal) -> Decimal | None:
@@ -822,7 +895,7 @@ class Mt5MarginCalculator:
         free_margin: Decimal,
         min_margin_level_pct: Decimal = DEFAULT_MIN_POST_TRADE_MARGIN_LEVEL_PCT,
     ) -> Mt5MarginCheck:
-        lots = self.units_to_lots(units)
+        lots = self.units_to_lots(units, symbol=symbol)
         notional = self.notional_in_account(symbol, side, units, quotes)
         required = self.required_margin(symbol, side, units, quotes)
         used_after = used_margin + required
@@ -870,6 +943,7 @@ class OrderIntent:
     stop_price: Decimal | None = None
     limit_price: Decimal | None = None
     position_ticket: str | None = None
+    take_profit_price: Decimal | None = None
 
     def __post_init__(self) -> None:
         identifier(self.order_id, "order_id")
@@ -879,7 +953,7 @@ class OrderIntent:
         Mt5MarginCalculator.split_symbol(self.symbol)
         if self.side is not None and not isinstance(self.side, Side):
             raise ContractError("side must be Side")
-        for name in ("quantity_units", "stop_price", "limit_price"):
+        for name in ("quantity_units", "stop_price", "limit_price", "take_profit_price"):
             value = getattr(self, name)
             if value is not None:
                 decimal_value(value, name, positive=True)
@@ -897,12 +971,21 @@ class OrderIntent:
                     raise ContractError("BUY protective stop must be below the limit price")
                 if self.side is Side.SELL and self.stop_price <= self.limit_price:
                     raise ContractError("SELL protective stop must be above the limit price")
+            if self.take_profit_price is not None:
+                if self.side is Side.BUY and (self.stop_price >= self.take_profit_price or (
+                        self.limit_price is not None and self.limit_price >= self.take_profit_price)):
+                    raise ContractError("BUY resting take_profit_price must exceed entry/limit and stop_price")
+                if self.side is Side.SELL and (self.stop_price <= self.take_profit_price or (
+                        self.limit_price is not None and self.limit_price <= self.take_profit_price)):
+                    raise ContractError("SELL resting take_profit_price must sit below entry/limit and stop_price")
         else:
             if self.position_ticket is None:
                 raise ContractError(f"{self.kind.value} requires an exact position_ticket")
         if self.kind is ActionKind.AMEND_STOP:
-            if self.stop_price is None or self.quantity_units is not None:
-                raise ContractError("AMEND_STOP requires a replacement stop and no quantity")
+            if (self.stop_price is None and self.take_profit_price is None) or self.quantity_units is not None:
+                raise ContractError("AMEND_STOP requires a replacement stop_price or take_profit_price and no quantity")
+        if self.kind in (ActionKind.REDUCE, ActionKind.CLOSE) and self.take_profit_price is not None:
+            raise ContractError(f"{self.kind.value} must not carry take_profit_price")
         if self.kind is ActionKind.REDUCE and self.quantity_units is None:
             raise ContractError("REDUCE requires an exact quantity")
 
@@ -927,7 +1010,7 @@ class OrderIntent:
             order_id=str(intent.intent_id),
             action_ref=str(intent.action_ref),
             kind=kind,
-            symbol=(symbol or str(intent.instrument_id)).upper(),
+            symbol=normalize_market_symbol(symbol or str(intent.instrument_id)),
             quantity_units=quantity,
             side=side if kind is ActionKind.OPEN else None,
             stop_price=getattr(intent, "stop_price", None),
@@ -935,6 +1018,7 @@ class OrderIntent:
             position_ticket=position_ticket if position_ticket is not None else (
                 None if kind is ActionKind.OPEN else getattr(intent, "target_id", None)
             ),
+            take_profit_price=getattr(intent, "take_profit_price", None) if kind in (ActionKind.OPEN, ActionKind.AMEND_STOP) else None,
         )
 
     def fingerprint(self) -> str:
@@ -966,6 +1050,7 @@ class Mt5Position:
     price_open: Decimal
     stop_loss: Decimal | None
     profit: Decimal
+    take_profit: Decimal | None = None
 
     def to_wire_dict(self) -> dict[str, Any]:
         return {
@@ -975,6 +1060,7 @@ class Mt5Position:
             "volume_lots": decimal_text(self.volume_lots),
             "price_open": decimal_text(self.price_open),
             "stop_loss": None if self.stop_loss is None else decimal_text(self.stop_loss),
+            "take_profit": None if self.take_profit is None else decimal_text(self.take_profit),
             "profit": decimal_text(self.profit),
         }
 
@@ -1018,6 +1104,7 @@ class Mt5OrderRequest:
     magic: int
     comment: str
     created_at: datetime
+    take_profit: Decimal | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_id, str) or not _SPOOL_ID_RE.fullmatch(self.request_id):
@@ -1028,12 +1115,14 @@ class Mt5OrderRequest:
         if not isinstance(self.side, Side):
             raise ContractError("side must be Side")
         if self.action == "AMEND_STOP":
-            if self.stop_loss is None or self.position_ticket is None:
-                raise ContractError("AMEND_STOP request requires stop_loss and position_ticket")
+            if (self.stop_loss is None and self.take_profit is None) or self.position_ticket is None:
+                raise ContractError("AMEND_STOP request requires stop_loss or take_profit and position_ticket")
         else:
             if self.volume_lots is None:
                 raise ContractError("deal requests require volume_lots")
             decimal_value(self.volume_lots, "volume_lots", positive=True)
+        if self.take_profit is not None:
+            decimal_value(self.take_profit, "take_profit", positive=True)
         if self.action in ("REDUCE", "CLOSE") and self.position_ticket is None:
             raise ContractError("REDUCE/CLOSE requests require position_ticket")
         if type(self.deviation_points) is not int or not (0 <= self.deviation_points <= 1000):
@@ -1053,7 +1142,7 @@ class Mt5OrderRequest:
             "volume": "0" if self.volume_lots is None else decimal_text(self.volume_lots),
             "price": "0" if self.price is None else decimal_text(self.price),
             "sl": "0" if self.stop_loss is None else decimal_text(self.stop_loss),
-            "tp": "0",
+            "tp": "0" if self.take_profit is None else decimal_text(self.take_profit),
             "position_ticket": self.position_ticket or "0",
             "deviation_points": str(self.deviation_points),
             "magic": str(self.magic),
@@ -1079,8 +1168,8 @@ class Mt5OrderRequest:
                 "action": const["TRADE_ACTION_SLTP"],
                 "symbol": self.symbol,
                 "position": int(str(self.position_ticket)),
-                "sl": float(self.stop_loss),  # type: ignore[arg-type]
-                "tp": 0.0,
+                "sl": 0.0 if self.stop_loss is None else float(self.stop_loss),
+                "tp": 0.0 if self.take_profit is None else float(self.take_profit),
                 "magic": self.magic,
                 "comment": self.comment,
             }
@@ -1099,6 +1188,8 @@ class Mt5OrderRequest:
             payload["price"] = float(self.price)
         if self.stop_loss is not None and self.action == "OPEN":
             payload["sl"] = float(self.stop_loss)
+        if self.take_profit is not None and self.action == "OPEN":
+            payload["tp"] = float(self.take_profit)
         if self.position_ticket is not None:
             payload["position"] = int(self.position_ticket)
         return payload
@@ -1122,6 +1213,7 @@ class Mt5OrderReceipt:
     observed_at: datetime
     transport: str
     message: str = ""
+    take_profit: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.status not in _RECEIPT_STATUSES:
@@ -1145,6 +1237,7 @@ class Mt5OrderReceipt:
             "volume_lots": None if self.volume_lots is None else decimal_text(self.volume_lots),
             "price": None if self.price is None else decimal_text(self.price),
             "stop_loss": None if self.stop_loss is None else decimal_text(self.stop_loss),
+            "take_profit": None if self.take_profit is None else decimal_text(self.take_profit),
             "server": self.server,
             "observed_at": _iso(self.observed_at),
             "transport": self.transport,
@@ -1382,14 +1475,17 @@ class Mt5NativePythonTransport:
             if ptype not in (const["POSITION_TYPE_BUY"], const["POSITION_TYPE_SELL"]):
                 raise Mt5TransportError("unknown MT5 position type")
             sl = _sdk_decimal(_sdk_field(row, "sl"), "sl")
+            raw_tp = getattr(row, "tp", None) if not isinstance(row, Mapping) else row.get("tp")
+            tp = Decimal("0") if raw_tp is None else _sdk_decimal(raw_tp, "tp")
             out.append(Mt5Position(
                 ticket=_ticket_text(int(_sdk_field(row, "ticket"))),
-                symbol=str(_sdk_field(row, "symbol")),
+                symbol=normalize_market_symbol(str(_sdk_field(row, "symbol"))),
                 side=Side.BUY if ptype == const["POSITION_TYPE_BUY"] else Side.SELL,
                 volume_lots=_sdk_decimal(_sdk_field(row, "volume"), "volume"),
                 price_open=_sdk_decimal(_sdk_field(row, "price_open"), "price_open"),
                 stop_loss=None if sl == 0 else sl,
                 profit=_sdk_decimal(_sdk_field(row, "profit"), "profit"),
+                take_profit=None if tp == 0 else tp,
             ))
         return tuple(out)
 
@@ -1424,6 +1520,7 @@ class Mt5NativePythonTransport:
             observed_at=self._clock(),
             transport=self.transport_name,
             message="".join(ch for ch in comment if ch.isascii() and ch.isprintable()),
+            take_profit=request.take_profit,
         )
 
     def shutdown(self) -> None:
@@ -1569,7 +1666,7 @@ class Mt5SpoolBridgeTransport:
         if type(ticks) is not list:
             raise Mt5TransportError("market_ticks.json missing ticks list")
         for item in ticks:
-            if type(item) is dict and item.get("symbol") == symbol:
+            if type(item) is dict and isinstance(item.get("symbol"), str) and normalize_market_symbol(item["symbol"]) == symbol:
                 return Mt5Tick(
                     symbol=symbol,
                     bid=_wire_decimal(item.get("bid"), "bid", positive=True),  # type: ignore[arg-type]
@@ -1592,12 +1689,13 @@ class Mt5SpoolBridgeTransport:
                 raise Mt5TransportError("position side must be BUY or SELL")
             out.append(Mt5Position(
                 ticket=_ticket_text(item.get("ticket")),
-                symbol=str(item.get("symbol")),
+                symbol=normalize_market_symbol(str(item.get("symbol"))),
                 side=Side(side_raw),
                 volume_lots=_wire_decimal(item.get("volume"), "volume", positive=True),  # type: ignore[arg-type]
                 price_open=_wire_decimal(item.get("price_open"), "price_open", positive=True),  # type: ignore[arg-type]
                 stop_loss=_wire_decimal(item.get("sl", "0"), "sl", allow_zero_as_none=True),
                 profit=_wire_decimal(item.get("profit", "0"), "profit"),  # type: ignore[arg-type]
+                take_profit=_wire_decimal(item.get("tp", "0"), "tp", allow_zero_as_none=True),
             ))
         return tuple(out)
 
@@ -1666,6 +1764,7 @@ class Mt5SpoolBridgeTransport:
             message="".join(
                 ch for ch in doc.get("message", "")[:64] if ch.isascii() and ch.isprintable() and ch not in ('"', "\\")
             ),
+            take_profit=_wire_decimal(doc.get("tp", "0"), "tp", allow_zero_as_none=True),
         )
 
     def shutdown(self) -> None:
@@ -1721,7 +1820,7 @@ class Mt5SpoolPaperTerminalEmulator:
     def _used_margin(self) -> Decimal:
         total = Decimal("0")
         for pos in self._positions.values():
-            units = self._calc.lots_to_units(pos["volume"])
+            units = self._calc.lots_to_units(pos["volume"], symbol=pos["symbol"])
             total += self._calc.required_margin(pos["symbol"], pos["side"], units, self.quotes)
         return total
 
@@ -1730,12 +1829,12 @@ class Mt5SpoolPaperTerminalEmulator:
         return bid if pos["side"] is Side.BUY else ask
 
     def _pnl(self, pos: Mapping[str, Any], close_price: Decimal, lots: Decimal) -> Decimal:
-        units = self._calc.lots_to_units(lots)
+        units = self._calc.lots_to_units(lots, symbol=pos["symbol"])
         direction = Decimal(1) if pos["side"] is Side.BUY else Decimal(-1)
         with localcontext() as ctx:
             ctx.prec = 40
             pnl_quote = (close_price - pos["price_open"]) * units * direction
-            quote_ccy = pos["symbol"][3:]
+            _, quote_ccy = Mt5MarginCalculator.split_symbol(pos["symbol"])
             rate = self._calc.conversion_rate(quote_ccy, self.quotes) if quote_ccy != self.currency else Decimal(1)
             return (pnl_quote * rate).quantize(Decimal("0.01"))
 
@@ -1772,6 +1871,7 @@ class Mt5SpoolPaperTerminalEmulator:
                     "volume": decimal_text(pos["volume"]),
                     "price_open": decimal_text(pos["price_open"]),
                     "sl": "0" if pos["sl"] is None else decimal_text(pos["sl"]),
+                    "tp": "0" if pos.get("tp") is None else decimal_text(pos["tp"]),
                     "profit": decimal_text(self._pnl(pos, self._close_price(pos), pos["volume"])),
                 }
                 for ticket, pos in sorted(self._positions.items())
@@ -1791,6 +1891,7 @@ class Mt5SpoolPaperTerminalEmulator:
             "volume": "0",
             "price": "0",
             "sl": "0",
+            "tp": "0",
             "server": self.server,
             "account_trade_mode": self.trade_mode,
             "observed_at": _iso(self._clock()),
@@ -1813,33 +1914,48 @@ class Mt5SpoolPaperTerminalEmulator:
             return self._receipt(req, "REJECTED", 10013, message="unknown symbol")
         bid, ask = self.quotes[symbol]
         sl = Decimal(req["sl"]) if req["sl"] != "0" else None
+        tp = Decimal(req.get("tp", "0")) if req.get("tp", "0") != "0" else None
         if action == "OPEN":
             side = Side(req["side"])
             lots = Decimal(req["volume"])
             price = ask if side is Side.BUY else bid
             if sl is None or (side is Side.BUY and sl >= bid) or (side is Side.SELL and sl <= ask):
                 return self._receipt(req, "REJECTED", 10016, message="invalid stops")
-            units = self._calc.lots_to_units(lots)
+            if tp is not None and ((side is Side.BUY and tp <= ask) or (side is Side.SELL and tp >= bid)):
+                return self._receipt(req, "REJECTED", 10016, message="invalid take profit")
+            units = self._calc.lots_to_units(lots, symbol=symbol)
             required = self._calc.required_margin(symbol, side, units, self.quotes)
             free = self.balance + self._floating() - self._used_margin()
             if required > free:
                 return self._receipt(req, "REJECTED", 10019, message="no money")
             ticket = str(self._next_ticket)
             self._next_ticket += 1
-            self._positions[ticket] = {"symbol": symbol, "side": side, "volume": lots, "price_open": price, "sl": sl}
+            self._positions[ticket] = {"symbol": symbol, "side": side, "volume": lots, "price_open": price, "sl": sl, "tp": tp}
             return self._receipt(
                 req, "FILLED", 10009, position_ticket=ticket, deal_ticket=self._deal_ticket(),
                 volume=decimal_text(lots), price=decimal_text(price), sl=decimal_text(sl),
+                tp="0" if tp is None else decimal_text(tp),
             )
         ticket = req["position_ticket"]
         pos = self._positions.get(ticket)
         if pos is None or pos["symbol"] != symbol:
             return self._receipt(req, "REJECTED", 10036, message="position not found")
         if action == "AMEND_STOP":
-            if sl is None or (pos["side"] is Side.BUY and sl >= bid) or (pos["side"] is Side.SELL and sl <= ask):
+            eff_sl = sl if sl is not None else pos["sl"]
+            eff_tp = tp if tp is not None else pos.get("tp")
+            if eff_sl is None and eff_tp is None:
+                return self._receipt(req, "REJECTED", 10016, message="missing stops")
+            if eff_sl is not None and ((pos["side"] is Side.BUY and eff_sl >= bid) or (pos["side"] is Side.SELL and eff_sl <= ask)):
                 return self._receipt(req, "REJECTED", 10016, message="invalid stops")
-            pos["sl"] = sl
-            return self._receipt(req, "MODIFIED", 10009, position_ticket=ticket, sl=decimal_text(sl))
+            if eff_tp is not None and ((pos["side"] is Side.BUY and eff_tp <= ask) or (pos["side"] is Side.SELL and eff_tp >= bid)):
+                return self._receipt(req, "REJECTED", 10016, message="invalid take profit")
+            pos["sl"] = eff_sl
+            pos["tp"] = eff_tp
+            return self._receipt(
+                req, "MODIFIED", 10009, position_ticket=ticket,
+                sl="0" if eff_sl is None else decimal_text(eff_sl),
+                tp="0" if eff_tp is None else decimal_text(eff_tp),
+            )
         lots = Decimal(req["volume"])
         if action == "REDUCE" and not (Decimal("0") < lots < pos["volume"]):
             return self._receipt(req, "REJECTED", 10014, message="invalid reduce volume")
@@ -2128,7 +2244,7 @@ class Mt5PaperBrokerVenue:
             units = order.quantity_units
             if side is None or units is None or order.stop_price is None:
                 raise ContractError("OPEN requires side, quantity and protective stop")
-            lots = self._calc.units_to_lots(units)
+            lots = self._calc.units_to_lots(units, symbol=order.symbol)
             if lots > self._max_lots:
                 raise Mt5MarginRefusalError(f"OPEN volume {decimal_text(lots)} lots exceeds venue cap {decimal_text(self._max_lots)}")
             quotes = self._quotes_for(order.symbol)
@@ -2139,6 +2255,11 @@ class Mt5PaperBrokerVenue:
                 raise ContractError("BUY protective stop must be below the current bid")
             if side is Side.SELL and order.stop_price <= ask:
                 raise ContractError("SELL protective stop must be above the current ask")
+            if order.take_profit_price is not None:
+                if side is Side.BUY and order.take_profit_price <= ask:
+                    raise ContractError("BUY resting take_profit_price must be above the current ask")
+                if side is Side.SELL and order.take_profit_price >= bid:
+                    raise ContractError("SELL resting take_profit_price must be below the current bid")
             price = ask if side is Side.BUY else bid
             if order.limit_price is not None:
                 if side is Side.BUY and price > order.limit_price:
@@ -2169,6 +2290,7 @@ class Mt5PaperBrokerVenue:
                 request_id=request_id, action="OPEN", symbol=order.symbol, side=side, volume_lots=lots,
                 price=price, stop_loss=order.stop_price, position_ticket=None,
                 deviation_points=self._deviation, magic=self._magic, comment=comment, created_at=now,
+                take_profit=order.take_profit_price,
             )
         else:
             ticket = str(order.position_ticket)
@@ -2180,25 +2302,33 @@ class Mt5PaperBrokerVenue:
                 tick = self._transport.symbol_tick(order.symbol)
                 if quote_guard is not None:
                     quote_guard(self.broker_id, tick)
-                stop = order.stop_price
-                if stop is None:
-                    raise ContractError("AMEND_STOP requires stop_price")
-                if pos.side is Side.BUY and stop >= tick.bid:
-                    raise ContractError("BUY position stop must stay below the current bid")
-                if pos.side is Side.SELL and stop <= tick.ask:
-                    raise ContractError("SELL position stop must stay above the current ask")
+                eff_stop = order.stop_price if order.stop_price is not None else pos.stop_loss
+                eff_tp = order.take_profit_price if order.take_profit_price is not None else pos.take_profit
+                if eff_stop is None and eff_tp is None:
+                    raise ContractError("AMEND_STOP requires stop_price and/or take_profit_price")
+                if eff_stop is not None:
+                    if pos.side is Side.BUY and eff_stop >= tick.bid:
+                        raise ContractError("BUY position stop must stay below the current bid")
+                    if pos.side is Side.SELL and eff_stop <= tick.ask:
+                        raise ContractError("SELL position stop must stay above the current ask")
+                if eff_tp is not None:
+                    if pos.side is Side.BUY and eff_tp <= tick.ask:
+                        raise ContractError("BUY resting take_profit_price must stay above the current ask")
+                    if pos.side is Side.SELL and eff_tp >= tick.bid:
+                        raise ContractError("SELL resting take_profit_price must stay below the current bid")
                 request = Mt5OrderRequest(
                     request_id=request_id, action="AMEND_STOP", symbol=order.symbol, side=pos.side, volume_lots=None,
-                    price=None, stop_loss=stop, position_ticket=ticket,
+                    price=None, stop_loss=eff_stop, position_ticket=ticket,
                     deviation_points=self._deviation, magic=self._magic, comment=comment, created_at=now,
+                    take_profit=eff_tp,
                 )
             else:
                 if order.kind is ActionKind.CLOSE:
                     lots = pos.volume_lots
-                    if order.quantity_units is not None and self._calc.units_to_lots(order.quantity_units) != lots:
+                    if order.quantity_units is not None and self._calc.units_to_lots(order.quantity_units, symbol=order.symbol) != lots:
                         raise ContractError("CLOSE quantity must equal the full MT5 position volume")
                 else:
-                    lots = self._calc.units_to_lots(order.quantity_units)  # type: ignore[arg-type]
+                    lots = self._calc.units_to_lots(order.quantity_units, symbol=order.symbol)  # type: ignore[arg-type]
                     if not lots < pos.volume_lots:
                         raise ContractError("REDUCE volume must be strictly below the open position volume")
                 tick = self._transport.symbol_tick(order.symbol)
@@ -2343,17 +2473,26 @@ class OandaPracticeFallbackVenue:
         if self._summary is None:
             raise Mt5TransportError("OANDA practice fallback is not connected")
         decision = require_valve_clearance(order, valve_decision, expected_weights_sha256=self._valve_sha)
-        if order.kind is not ActionKind.OPEN:
+        if order.kind is ActionKind.AMEND_STOP:
+            receipt = self._client.amend_trade_protection(
+                trade_id=str(order.position_ticket),
+                stop_loss_price=order.stop_price,
+                take_profit_price=order.take_profit_price,
+                now=self._clock(),
+            )
+        elif order.kind is ActionKind.OPEN:
+            receipt = self._client.submit_paper_market_order(
+                symbol=order.symbol,
+                side=order.side,  # type: ignore[arg-type]
+                units=order.quantity_units,  # type: ignore[arg-type]
+                client_order_id=order.order_id,
+                stop_loss_price=order.stop_price,
+                take_profit_price=order.take_profit_price,
+                price_bound=order.limit_price,
+                now=self._clock(),
+            )
+        else:
             raise Mt5BridgeError(f"{order.kind.value} is not supported on the OANDA practice fallback v1")
-        receipt = self._client.submit_paper_market_order(
-            symbol=order.symbol,
-            side=order.side,  # type: ignore[arg-type]
-            units=order.quantity_units,  # type: ignore[arg-type]
-            client_order_id=order.order_id,
-            stop_loss_price=order.stop_price,
-            price_bound=order.limit_price,
-            now=self._clock(),
-        )
         record = self._audit.append("OANDA_ORDER_RECEIPT", self._clock(), {
             "broker_id": self.broker_id,
             "order_id": order.order_id,
@@ -2468,7 +2607,7 @@ class BrokerHierarchyRouter:
             raise ContractError(f"{ENV_MT5_TRANSPORT_MODE} must be one of {TRANSPORT_MODES}")
         self.primary_broker = primary
         self.transport_mode = mode
-        self._spool_root = _env_get(self._env, ENV_MT5_SPOOL_DIR) or None
+        self._spool_root = resolve_mt5_spool_dir(self._env)
         self.priority_order: tuple[str, ...] = (primary,) + tuple(b for b in base_chain if b != primary)
 
         self._servers: dict[str, str | None] = {

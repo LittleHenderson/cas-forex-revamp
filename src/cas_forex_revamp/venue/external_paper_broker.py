@@ -1802,6 +1802,7 @@ class OandaPracticePaperClient:
         units: Decimal,
         client_order_id: str,
         stop_loss_price: Decimal | None = None,
+        take_profit_price: Decimal | None = None,
         price_bound: Decimal | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
@@ -1824,10 +1825,17 @@ class OandaPracticePaperClient:
         }
         if price_bound is not None:
             order_spec["priceBound"] = decimal_text(decimal_value(price_bound, "price_bound", positive=True))
-        if stop_loss_price is not None:
-            order_spec["stopLossOnFill"] = {
-                "price": decimal_text(decimal_value(stop_loss_price, "stop_loss_price", positive=True))
-            }
+        sl_dec = decimal_value(stop_loss_price, "stop_loss_price", positive=True) if stop_loss_price is not None else None
+        tp_dec = decimal_value(take_profit_price, "take_profit_price", positive=True) if take_profit_price is not None else None
+        if sl_dec is not None and tp_dec is not None:
+            if side is Side.BUY and sl_dec >= tp_dec:
+                raise ContractError("OANDA BUY stop_loss_price must be below take_profit_price")
+            if side is Side.SELL and tp_dec >= sl_dec:
+                raise ContractError("OANDA SELL take_profit_price must be below stop_loss_price")
+        if sl_dec is not None:
+            order_spec["stopLossOnFill"] = {"price": decimal_text(sl_dec)}
+        if tp_dec is not None:
+            order_spec["takeProfitOnFill"] = {"price": decimal_text(tp_dec)}
         _, raw = self._request("POST", f"accounts/{acct_id}/orders", body_obj={"order": order_spec})
         doc = _parse_external_wire_json(raw, label="oanda_practice_order")
         if type(doc) is not dict:
@@ -1849,6 +1857,46 @@ class OandaPracticePaperClient:
                 if type(fill_tx) is not dict or "price" not in fill_tx
                 else decimal_text(parse_decimal(str(fill_tx["price"]), "fill_price"))
             ),
+            "stop_loss_price": None if sl_dec is None else decimal_text(sl_dec),
+            "take_profit_price": None if tp_dec is None else decimal_text(tp_dec),
+            "last_transaction_id": str(doc.get("lastTransactionID", "0")),
+            "observed_at": _format_utc_micros(ts, "observed_at"),
+            "raw_wire_sha256": sha256(raw).hexdigest(),
+        }
+        assert_safe_json_numbers(receipt)
+        return receipt
+
+    def amend_trade_protection(
+        self,
+        *,
+        trade_id: str,
+        stop_loss_price: Decimal | None = None,
+        take_profit_price: Decimal | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Update resting trade-level SL/TP via OANDA v20 ``PUT accounts/{id}/trades/{trade}/orders``."""
+        _, acct_id = self._require_active()
+        tid = identifier(str(trade_id), "trade_id")
+        if stop_loss_price is None and take_profit_price is None:
+            raise ContractError("amend_trade_protection requires stop_loss_price and/or take_profit_price")
+        body: dict[str, Any] = {}
+        sl_dec = decimal_value(stop_loss_price, "stop_loss_price", positive=True) if stop_loss_price is not None else None
+        tp_dec = decimal_value(take_profit_price, "take_profit_price", positive=True) if take_profit_price is not None else None
+        if sl_dec is not None:
+            body["stopLoss"] = {"price": decimal_text(sl_dec), "timeInForce": "GTC"}
+        if tp_dec is not None:
+            body["takeProfit"] = {"price": decimal_text(tp_dec), "timeInForce": "GTC"}
+        _, raw = self._request("PUT", f"accounts/{acct_id}/trades/{tid}/orders", body_obj=body)
+        doc = _parse_external_wire_json(raw, label="oanda_trade_amend")
+        if type(doc) is not dict:
+            raise PaperBrokerTransportError("malformed OANDA trade protection amend response")
+        ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        receipt = {
+            "provider": self.provider_id,
+            "trade_id": tid,
+            "status": "MODIFIED",
+            "stop_loss_price": None if sl_dec is None else decimal_text(sl_dec),
+            "take_profit_price": None if tp_dec is None else decimal_text(tp_dec),
             "last_transaction_id": str(doc.get("lastTransactionID", "0")),
             "observed_at": _format_utc_micros(ts, "observed_at"),
             "raw_wire_sha256": sha256(raw).hexdigest(),

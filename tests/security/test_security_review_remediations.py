@@ -196,17 +196,17 @@ class SecurityReviewNineFindingsTests(unittest.TestCase):
         base = srv.start()
         try:
             with self.assertRaises(urllib.error.HTTPError) as unauth:
-                urllib.request.urlopen(base + "/api/broker-routing", timeout=5)
+                urllib.request.urlopen(base + "/api/broker-routing", timeout=5)  # nosec B310: local loopback cockpit test URL
             self.assertEqual(unauth.exception.code, 401)
             unauth.exception.close()
 
             old_headers = srv.auth_headers()
-            with urllib.request.urlopen(urllib.request.Request(base + "/api/broker-routing", headers=old_headers), timeout=5) as ok_resp:
+            with urllib.request.urlopen(urllib.request.Request(base + "/api/broker-routing", headers=old_headers), timeout=5) as ok_resp:  # nosec B310: local loopback cockpit test URL
                 self.assertEqual(ok_resp.status, 200)
 
             srv.rotate_auth_token()
             with self.assertRaises(urllib.error.HTTPError) as rotated:
-                urllib.request.urlopen(urllib.request.Request(base + "/api/broker-routing", headers=old_headers), timeout=5)
+                urllib.request.urlopen(urllib.request.Request(base + "/api/broker-routing", headers=old_headers), timeout=5)  # nosec B310: local loopback cockpit test URL
             self.assertEqual(rotated.exception.code, 401)
             rotated.exception.close()
         finally:

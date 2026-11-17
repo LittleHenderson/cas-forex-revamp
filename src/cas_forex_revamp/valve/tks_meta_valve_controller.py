@@ -731,8 +731,23 @@ def extract_forex_valve_features(
     if intent is not None and reason_inj > 0.0:
         vetoes.append("PROMPT_INJECTION_IN_REASON")
 
-    # 6. Protective stop deficit on OPEN/ADD entries
+    # 6. Protective stop and resting take-profit geometry checks
     stop_deficit = 0.0
+    obs_bid = obs_ask = obs_pos_side = None
+    for f in request.facts:
+        if f.fact_id.startswith("observed-") and f.value.startswith("{"):
+            try:
+                obs_meta = json.loads(f.value)
+            except (ValueError, TypeError):
+                obs_meta = None
+            if isinstance(obs_meta, dict):
+                obs_bid = obs_bid or _safe_decimal(obs_meta.get("bid"))
+                obs_ask = obs_ask or _safe_decimal(obs_meta.get("ask"))
+                if obs_meta.get("position_side") in ("BUY", "SELL"):
+                    obs_pos_side = str(obs_meta.get("position_side"))
+                elif obs_meta.get("side") in ("BUY", "SELL"):
+                    obs_pos_side = str(obs_meta.get("side"))
+    tp_p = _safe_decimal(getattr(intent, "take_profit_price", None)) if intent is not None else None
     if intent is not None and intent.kind in (ActionKind.OPEN, ActionKind.ADD):
         stop_p = _safe_decimal(intent.stop_price)
         limit_p = _safe_decimal(intent.limit_price)
@@ -747,6 +762,36 @@ def extract_forex_valve_features(
             elif side_val == "SELL" and stop_p <= limit_p:
                 stop_deficit = 1.0
                 vetoes.append("INVERTED_SELL_PROTECTIVE_STOP")
+        if tp_p is not None:
+            if tp_p <= Decimal("0"):
+                stop_deficit = 1.0
+                vetoes.append("INVALID_TAKE_PROFIT_PRICE")
+            elif side_val == "BUY" and (
+                (stop_p is not None and tp_p <= stop_p)
+                or (limit_p is not None and tp_p <= limit_p)
+                or (obs_ask is not None and tp_p <= obs_ask)
+            ):
+                stop_deficit = 1.0
+                vetoes.append("INVERTED_BUY_TAKE_PROFIT")
+            elif side_val == "SELL" and (
+                (stop_p is not None and tp_p >= stop_p)
+                or (limit_p is not None and tp_p >= limit_p)
+                or (obs_bid is not None and tp_p >= obs_bid)
+            ):
+                stop_deficit = 1.0
+                vetoes.append("INVERTED_SELL_TAKE_PROFIT")
+    elif intent is not None and intent.kind is ActionKind.AMEND_STOP and tp_p is not None:
+        stop_p = _safe_decimal(intent.stop_price)
+        amend_side = obs_pos_side or (intent.side.value if hasattr(intent.side, "value") else (None if intent.side is None else str(intent.side)))
+        if tp_p <= Decimal("0"):
+            stop_deficit = 1.0
+            vetoes.append("INVALID_TAKE_PROFIT_PRICE")
+        elif amend_side == "BUY" and ((stop_p is not None and tp_p <= stop_p) or (obs_ask is not None and tp_p <= obs_ask)):
+            stop_deficit = 1.0
+            vetoes.append("INVERTED_BUY_TAKE_PROFIT")
+        elif amend_side == "SELL" and ((stop_p is not None and tp_p >= stop_p) or (obs_bid is not None and tp_p >= obs_bid)):
+            stop_deficit = 1.0
+            vetoes.append("INVERTED_SELL_TAKE_PROFIT")
 
     # 7. Quote / state staleness ratio
     staleness = 0.0

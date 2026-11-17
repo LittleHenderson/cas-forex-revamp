@@ -229,11 +229,13 @@ class CoreCoordinator:
         if spec is None:
             raise AdmissionDenied("UNKNOWN_INSTRUMENT")
         spec.validate_geometry(intent)
-        if intent.kind is ActionKind.CANCEL_ORDER and any(x is not None for x in (intent.side, intent.limit_price, intent.stop_price)):
+        if intent.kind is ActionKind.CANCEL_ORDER and any(
+                x is not None for x in (intent.side, intent.limit_price, intent.stop_price, intent.take_profit_price)):
             raise AdmissionDenied("UNSUPPORTED_ACTION_GEOMETRY")
         if intent.kind is ActionKind.AMEND_STOP and (intent.side is not None or intent.limit_price is not None):
             raise AdmissionDenied("UNSUPPORTED_ACTION_GEOMETRY")
-        if intent.kind in (ActionKind.CLOSE, ActionKind.REDUCE) and intent.stop_price is not None:
+        if intent.kind in (ActionKind.CLOSE, ActionKind.REDUCE) and (
+                intent.stop_price is not None or intent.take_profit_price is not None):
             raise AdmissionDenied("UNSUPPORTED_ACTION_GEOMETRY")
         owner_close = intent.origin is DecisionOrigin.OWNER_REVIEWED
         if owner_close and intent.kind is not ActionKind.CLOSE:
@@ -288,11 +290,17 @@ class CoreCoordinator:
                 # Protection may tighten; increasing risk needs another reviewed
                 # capability rather than hiding expansion in management.
                 quote = self._market(account.snapshot, intent.instrument_id, now)
-                if position.side is Side.BUY:
-                    if intent.stop_price >= quote.bid or (position.stop_price is not None and intent.stop_price < position.stop_price):
+                if intent.stop_price is not None:
+                    if position.side is Side.BUY:
+                        if intent.stop_price >= quote.bid or (position.stop_price is not None and intent.stop_price < position.stop_price):
+                            raise AdmissionDenied("STOP_EXPANDS_OR_CROSSES_MARKET")
+                    elif intent.stop_price <= quote.ask or (position.stop_price is not None and intent.stop_price > position.stop_price):
                         raise AdmissionDenied("STOP_EXPANDS_OR_CROSSES_MARKET")
-                elif intent.stop_price <= quote.ask or (position.stop_price is not None and intent.stop_price > position.stop_price):
-                    raise AdmissionDenied("STOP_EXPANDS_OR_CROSSES_MARKET")
+                if intent.take_profit_price is not None:
+                    if position.side is Side.BUY and intent.take_profit_price <= quote.ask:
+                        raise AdmissionDenied("TAKE_PROFIT_CROSSES_MARKET")
+                    if position.side is Side.SELL and intent.take_profit_price >= quote.bid:
+                        raise AdmissionDenied("TAKE_PROFIT_CROSSES_MARKET")
 
         reserve = ZERO
         if intent.kind in RISK_ACTIONS:

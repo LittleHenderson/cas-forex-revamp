@@ -54,6 +54,7 @@ class ActionIntent:
     target_version: int | None = None
     limit_price: Decimal | None = None
     stop_price: Decimal | None = None
+    take_profit_price: Decimal | None = None
 
     def __post_init__(self) -> None:
         for field in ("intent_id", "decision_id", "opportunity_id", "action_ref", "instrument_id"):
@@ -72,7 +73,7 @@ class ActionIntent:
             decimal_value(self.quantity, "quantity", positive=True)
         if self.side is not None and not isinstance(self.side, Side):
             raise ContractError("side must use Side")
-        for field in ("limit_price", "stop_price"):
+        for field in ("limit_price", "stop_price", "take_profit_price"):
             value = getattr(self, field)
             if value is not None:
                 decimal_value(value, field, positive=True)
@@ -89,8 +90,10 @@ class ActionIntent:
             raise ContractError("management/ADD requires exact target and version")
         if self.kind in (ActionKind.AMEND_STOP, ActionKind.CANCEL_ORDER) and self.quantity is not None:
             raise ContractError("non-quantity action must not carry a quantity")
-        if self.kind is ActionKind.AMEND_STOP and self.stop_price is None:
+        if self.kind is ActionKind.AMEND_STOP and self.stop_price is None and self.take_profit_price is None:
             raise ContractError("AMEND_STOP requires the exact replacement stop")
+        if self.kind in (ActionKind.CANCEL_ORDER, ActionKind.REDUCE, ActionKind.CLOSE) and self.take_profit_price is not None:
+            raise ContractError("non-entry action must not carry take_profit_price")
 
 
 @dataclass(frozen=True, slots=True)
