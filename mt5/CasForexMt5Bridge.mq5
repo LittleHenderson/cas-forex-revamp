@@ -400,7 +400,7 @@ void ReportInterruptedRequests()
      {
       string request_id = StringSubstr(found, StringLen("processing_"), StringLen(found) - StringLen("processing_") - StringLen(".json"));
       string text = ReadText(SpoolPath(found));
-      WriteReceipt(request_id, ReceiptJson(request_id, JsonGet(text, "request_sha256"), "UNKNOWN", 0, "0", "0", "0", "0", "0",
+      WriteReceipt(request_id, ReceiptJson(request_id, JsonGet(text, "request_sha256"), "UNKNOWN", (uint)0, "0", "0", "0", "0", "0", "0",
                                            "EA restarted mid-order; check terminal history"));
       FileDelete(SpoolPath(found), CommonFlag());
      }
