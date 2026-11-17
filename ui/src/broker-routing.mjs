@@ -21,8 +21,8 @@ export const STATIC_BROKER_ROUTING = Object.freeze({
   transportMode: 'AUTO',
   valve: Object.freeze({ controller: 'tks_meta_valve_controller', parameters: '161', threshold: '0.55' }),
   chain: Object.freeze([
-    Object.freeze({ brokerId: 'HUGOSWAY_MT5', priority: '1', role: 'PRIMARY_MAIN', label: "Hugo's Way", platform: 'MetaTrader 5', server: 'Hugo demo PRO5', leverage: '1:500', accountType: 'ECN demo', configured: false, status: 'NOT_CONNECTED' }),
-    Object.freeze({ brokerId: 'LHFX_MT5', priority: '2', role: 'SECONDARY_MT5', label: 'LHFX', platform: 'MetaTrader 5', server: 'LHFXSA-Demo', leverage: '1:500', accountType: 'STP/ECN demo', configured: false, status: 'NOT_CONNECTED' }),
+    Object.freeze({ brokerId: 'HUGOSWAY_MT5', priority: '1', role: 'PRIMARY_MAIN', label: "Hugo's Way", platform: 'MetaTrader 5', server: 'Hugosway-Demo', leverage: '1:500', accountType: 'ECN demo', configured: false, status: 'NOT_CONNECTED' }),
+    Object.freeze({ brokerId: 'LHFX_MT5', priority: '2', role: 'SECONDARY_MT5', label: 'LHFX', platform: 'MetaTrader 5', server: 'LHFXSA-Trade', leverage: '1:500', accountType: 'STP/ECN demo', configured: false, status: 'NOT_CONNECTED' }),
     Object.freeze({ brokerId: 'OANDA_PRACTICE', priority: '3', role: 'TERTIARY_REST_FALLBACK', label: 'OANDA', platform: 'OANDA v20 REST', server: 'https://api-fxpractice.oanda.com/v3', leverage: '1:50', accountType: 'fxPractice', configured: false, status: 'NOT_CONNECTED' }),
   ]),
   shield: Object.freeze({

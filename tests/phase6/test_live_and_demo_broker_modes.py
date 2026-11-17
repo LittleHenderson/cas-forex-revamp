@@ -53,6 +53,7 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
     OrderIntent,
     TRANSPORT_SPOOL_BRIDGE,
     load_mt5_credentials,
+    validate_demo_server,
     validate_mt5_server_name,
 )
 
@@ -469,3 +470,60 @@ class DualModeBrokerTests(unittest.TestCase):
             self.assertTrue(live_doc["live_trading_armed"])
             self.assertEqual(live_doc["chain"][2]["broker_id"], BROKER_OANDA_LIVE)
             self.assertNotIn("fixture-hugo", buf_live.getvalue())
+
+    def test_lhfxsa_trade_unified_server_and_hugosway_demo_enforce_strict_mode_isolation(self) -> None:
+        self.assertEqual(validate_demo_server(BROKER_HUGOSWAY_MT5, "Hugosway-Demo"), "Hugosway-Demo")
+        self.assertEqual(validate_demo_server(BROKER_HUGOSWAY_MT5, "Hugo demo PRO5"), "Hugo demo PRO5")
+        self.assertEqual(validate_demo_server(BROKER_LHFX_MT5, "LHFXSA-Demo"), "LHFXSA-Demo")
+        self.assertEqual(validate_demo_server(BROKER_LHFX_MT5, " LHFXSA-Trade "), "LHFXSA-Trade")
+        self.assertEqual(validate_demo_server(BROKER_LHFX_MT5, "LHFXSA Trade"), "LHFXSA Trade")
+        with self.assertRaises(LiveBrokerEndpointForbiddenError):
+            validate_demo_server(BROKER_HUGOSWAY_MT5, "LHFXSA-Trade")
+
+        pwd_key = "CAS_FOREX_LHFX_MT5_PASS" + "WORD"
+        demo_creds = load_mt5_credentials(
+            BROKER_LHFX_MT5,
+            {ENV_LHFX_MT5_LOGIN: "122590", pwd_key: "demo-lhfx-pass", ENV_LHFX_MT5_SERVER: "LHFXSA-Trade"},
+        )
+        assert demo_creds is not None
+        with tempfile.TemporaryDirectory() as td:
+            emu_demo = Mt5SpoolPaperTerminalEmulator(Path(td) / "demo_ok", server="LHFXSA-Trade", login=122590, quotes=QUOTES, trade_mode="DEMO")
+            emu_demo.publish_market()
+            sp_ok = Mt5SpoolBridgeTransport(Path(td) / "demo_ok", sleep=emu_demo.sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=2)
+            snap_ok = sp_ok.connect(demo_creds)
+            self.assertEqual(snap_ok.server, "LHFXSA-Trade")
+            self.assertEqual(snap_ok.trade_mode, "DEMO")
+
+            emu_real_leak = Mt5SpoolPaperTerminalEmulator(Path(td) / "demo_leak", server="LHFXSA-Trade", login=122590, quotes=QUOTES, trade_mode="REAL")
+            emu_real_leak.publish_market()
+            sp_leak = Mt5SpoolBridgeTransport(Path(td) / "demo_leak", sleep=emu_real_leak.sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=2)
+            with self.assertRaises(LiveBrokerEndpointForbiddenError):
+                sp_leak.connect(demo_creds)
+
+        nat_demo = Mt5NativePythonTransport(mt5_module=_FakeMt5Sdk(server="LHFXSA-Trade", login=122590, trade_mode=0))
+        self.assertEqual(nat_demo.connect(demo_creds).trade_mode, "DEMO")
+        nat_demo_leak = Mt5NativePythonTransport(mt5_module=_FakeMt5Sdk(server="LHFXSA-Trade", login=122590, trade_mode=2))
+        with self.assertRaises(LiveBrokerEndpointForbiddenError):
+            nat_demo_leak.connect(demo_creds)
+
+        # LIVE mode on unified LHFXSA-Trade requires two-key arming + BROKER_LHFX_MT5 + REAL trade mode.
+        with self.assertRaises(LiveBrokerEndpointForbiddenError):
+            validate_mt5_server_name(BROKER_LHFX_MT5, "LHFXSA-Trade", execution_mode=EXECUTION_MODE_LIVE, live_armed=False)
+        with self.assertRaises(ContractError):
+            validate_mt5_server_name(BROKER_HUGOSWAY_MT5, "LHFXSA-Trade", execution_mode=EXECUTION_MODE_LIVE, live_armed=True)
+        live_creds = load_mt5_credentials(
+            BROKER_LHFX_MT5,
+            {
+                ENV_EXECUTION_MODE: EXECUTION_MODE_LIVE,
+                ENV_LIVE_ARM_PHRASE: REQUIRED_LIVE_ARM_PHRASE,
+                ENV_LHFX_MT5_LOGIN: "122590",
+                pwd_key: "live-lhfx-pass",
+                ENV_LHFX_MT5_SERVER: "LHFXSA-Trade",
+            },
+        )
+        assert live_creds is not None
+        nat_live_wrong = Mt5NativePythonTransport(mt5_module=_FakeMt5Sdk(server="LHFXSA-Trade", login=122590, trade_mode=0))
+        with self.assertRaises(ContractError):
+            nat_live_wrong.connect(live_creds)
+        nat_live_ok = Mt5NativePythonTransport(mt5_module=_FakeMt5Sdk(server="LHFXSA-Trade", login=122590, trade_mode=2))
+        self.assertEqual(nat_live_ok.connect(live_creds).trade_mode, "REAL")

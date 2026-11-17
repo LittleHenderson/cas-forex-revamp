@@ -97,7 +97,7 @@ bool IsPinnedLiveServer(string server)
    if(StringFind(server, "demo") >= 0 || StringFind(server, "practice") >= 0)
       return(false);
    return(server == "hugo pro5" || server == "hugopro5" || server == "hugo-real" || server == "hugosway-live" ||
-          server == "lhfxsa-live" || server == "lhfx-live" || server == "lhfxsa-real");
+          server == "lhfxsa-live" || server == "lhfx-live" || server == "lhfxsa-real" || server == "lhfxsa-trade");
   }
 
 //--- Strict mode guard: DEMO by default; two-key REAL when explicitly armed.
@@ -106,13 +106,15 @@ bool ModeGuard()
    ENUM_ACCOUNT_TRADE_MODE m = (ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE);
    string server = AccountInfoString(ACCOUNT_SERVER);
    StringToLower(server);
+   StringTrimLeft(server);
+   StringTrimRight(server);
    if(!InpLiveExecutionMode)
      {
       if(m != ACCOUNT_TRADE_MODE_DEMO)
          return(false);
       if(StringFind(server, "live") >= 0 || StringFind(server, "real") >= 0)
          return(false);
-      if(StringFind(server, "demo") < 0)
+      if(StringFind(server, "demo") < 0 && !(InpBrokerChannel == "lhfx_mt5" && server == "lhfxsa-trade"))
          return(false);
       return(true);
      }

@@ -29,8 +29,8 @@ test('static Setup preview shows the MT5 hierarchy without any routing endpoint'
   const html = renderApp(displayState(fixture(), 'setup'));
   assert.match(html, /Broker &amp; MetaTrader 5 Routing/);
   assert.match(html, /Static preview \(not connected\)/);
-  assert.match(html, /HUGOSWAY_MT5/); assert.match(html, /Hugo demo PRO5/);
-  assert.match(html, /LHFX_MT5/); assert.match(html, /LHFXSA-Demo/);
+  assert.match(html, /HUGOSWAY_MT5/); assert.match(html, /Hugosway-Demo/);
+  assert.match(html, /LHFX_MT5/); assert.match(html, /LHFXSA-Trade/);
   assert.match(html, /OANDA_PRACTICE/); assert.match(html, /api-fxpractice\.oanda\.com/);
   assert.match(html, /Demo only · live trading locked/);
   assert.match(html, /80% OANDA reserve/);
