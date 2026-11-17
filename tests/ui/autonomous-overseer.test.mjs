@@ -263,6 +263,6 @@ test('OVERSEER05 Hostile HTML payloads in AI trader & model catalog are escaped 
   assert.ok(html.includes('&lt;img'));
 
   const catHtml = renderAiModelCatalogPanel(STATIC_AI_MODELS);
-  assert.match(catHtml, /Static preview/);
+  assert.match(catHtml, /AI catalog preview \(not attached\)/);
   assert.ok(STATIC_AI_TRADER.humanRole === 'OVERSEER_ONLY');
 });

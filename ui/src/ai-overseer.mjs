@@ -66,7 +66,7 @@ export const STATIC_AI_TRADER = Object.freeze({
   connected: false,
   humanRole: 'OVERSEER_ONLY',
   governanceMode: 'STANDBY',
-  governanceReason: 'Static preview (not connected). Connect loopback live server to observe AI autonomy.',
+  governanceReason: 'AI trader standby (not attached). Connect loopback live server to observe AI autonomy.',
   effectiveStatus: 'STANDBY',
   fastTickMs: '50',
   cadence: '50ms_FAST_TICK',
@@ -328,7 +328,7 @@ export function renderAiOverseerPanel(state) {
     <div class="section-heading">
       <div><p class="eyebrow">HUMAN AS OVERSEER · ${esc(trader.marketsEvaluated)} MARKETS (${esc(trader.fastTickMs)}ms MT5 FAST-TICK)</p><h2>Autonomous AI Trader &amp; Daily Quota</h2></div>
       <div class="market-chart-badges">
-        <span class="tag${modeWarning ? ' tag-warning' : ''}" data-ai-status="${esc(trader.effectiveStatus)}"><span class="state-rule" aria-hidden="true"></span>${esc(trader.connected ? trader.effectiveStatus : 'Static preview (not connected)')}</span>
+        <span class="tag${modeWarning ? ' tag-warning' : ''}" data-ai-status="${esc(trader.effectiveStatus)}"><span class="state-rule" aria-hidden="true"></span>${esc(trader.connected ? trader.effectiveStatus : 'AI standby (not attached)')}</span>
         <span class="tag"><span class="state-rule" aria-hidden="true"></span>${esc(trader.valveController)} · ${esc(trader.valveParameters)} params</span>
       </div>
     </div>
@@ -369,7 +369,7 @@ export function renderAiModelCatalogPanel(aiModels) {
   return `<section class="panel ai-catalog-panel" aria-label="AI model priority catalog">
     <div class="section-heading">
       <div><p class="eyebrow">AI MODEL HIERARCHY · QWEN #9 LAST</p><h2>Frontier &amp; Local Decision Models</h2></div>
-      <span class="tag${m.connected ? '' : ' tag-warning'}"><span class="state-rule" aria-hidden="true"></span>${esc(m.connected ? `Active: ${m.activeDisplayName} (${m.activeStatus})` : 'Static preview (not connected)')}</span>
+      <span class="tag${m.connected ? '' : ' tag-warning'}"><span class="state-rule" aria-hidden="true"></span>${esc(m.connected ? `Active: ${m.activeDisplayName} (${m.activeStatus})` : 'AI catalog preview (not attached)')}</span>
     </div>
     <p class="panel-copy">All 9 models propose structured trades only; <strong>tks_meta_valve_controller</strong> (161 params) remains mandatory ahead of every MT5 or OANDA execution. Gemini Decision 1 optionally accelerates 18-market opportunity scouting.</p>
     <div class="broker-chain">${m.models.map((entry) => (

@@ -70,7 +70,7 @@ T0 = datetime(2026, 11, 17, 14, 0, tzinfo=timezone.utc)
 SYNTH_MT5_PASS = "Demo-Pass-9f3K!q"  # synthetic test value, not a real credential
 SYNTH_OANDA_TOK = "practice-token-abc123"  # synthetic test value, not a real credential
 SYNTH_OANDA_ACCT = "101-001-1234567-001"
-SYNTH_API_KEY = "sk-ant-synth-0000000000000001"  # synthetic test value
+SYNTH_API_KEY = "test-placeholder-ant-alpha-01"  # synthetic test value
 
 QUOTES_18: dict[str, tuple[Decimal, Decimal]] = {
     "NAS100": (D("20500.00"), D("20502.50")),
@@ -612,9 +612,9 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
         fake_http = _FakeFrontierHttp(choice_ref="opt-0", probability="0.91")
         env = {
             "CAS_FOREX_ANTHROPIC_API_KEY": SYNTH_API_KEY,
-            "CAS_FOREX_GEMINI_API_KEY": "gem-synth-1234567890",
-            "CAS_FOREX_OPENAI_API_KEY": "sk-openai-synth-1234567890",
-            "CAS_FOREX_DEEPSEEK_API_KEY": "sk-deepseek-synth-1234567890",
+            "CAS_FOREX_GEMINI_API_KEY": "test-placeholder-gem-alpha-01",
+            "CAS_FOREX_OPENAI_API_KEY": "test-placeholder-oai-alpha-01",
+            "CAS_FOREX_DEEPSEEK_API_KEY": "test-placeholder-ds-alpha-01",
             "CAS_FOREX_OLLAMA_FALLBACK_ENABLED": "1",
         }
         reg = FrontierModelRegistry(environ=env, clock=lambda: T0, http_post=fake_http, ollama_http_post=fake_http, resolve_dns=lambda _h: None)
