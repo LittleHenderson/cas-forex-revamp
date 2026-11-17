@@ -13,6 +13,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import re
 import pickle
 import sys
 import tempfile
@@ -1063,6 +1064,183 @@ class CockpitBrokerRoutingEndpointTests(unittest.TestCase):
                 srv.stop()
         with self.assertRaises(ContractError):
             LoopbackCockpitServer(repo_root=REPO_ROOT, broker_router_reader="not-callable")  # type: ignore[arg-type]
+
+
+
+
+def _strip_mql5_comments_preserving_strings(src: str) -> str:
+    """Strip MQL5 // and /* ... */ comments while keeping string literals and line numbers intact."""
+    out: list[str] = []
+    n = len(src)
+    i = 0
+    in_str = False
+    while i < n:
+        ch = src[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(src[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and src[i + 1] == "*":
+            i += 2
+            while i < n and not (src[i] == "*" and i + 1 < n and src[i + 1] == "/"):
+                if src[i] == "\n":
+                    out.append("\n")
+                i += 1
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _extract_balanced_parens(src: str, open_paren_idx: int) -> tuple[str, int]:
+    """Return content inside (...) starting at open_paren_idx and closing index."""
+    depth = 0
+    in_str = False
+    i = open_paren_idx
+    n = len(src)
+    while i < n:
+        ch = src[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return src[open_paren_idx + 1 : i], i
+        i += 1
+    raise AssertionError("Unclosed '(' in MQL5 source")
+
+
+def _split_top_level_commas(expr: str) -> list[str]:
+    """Split comma-separated MQL5 arguments/parameters ignoring nested parens and strings."""
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    in_str = False
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                parts.append(expr[start:i].strip())
+                start = i + 1
+        i += 1
+    tail = expr[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+class Mql5BridgeSourceContractTests(unittest.TestCase):
+    _NUMERIC_LITERAL_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+
+    def _assert_receipt_json_contract(self, src: str, *, expected_min_calls: int = 1) -> tuple[list[str], list[tuple[int, list[str]]]]:
+        cleaned = _strip_mql5_comments_preserving_strings(src)
+        sig_match = re.search(r"\bstring\s+ReceiptJson\s*\(", cleaned)
+        self.assertIsNotNone(sig_match, "ReceiptJson signature missing from MQL5 source")
+        if sig_match is None:
+            raise AssertionError("ReceiptJson signature missing")
+        sig_open = sig_match.end() - 1
+        sig_inner, _ = _extract_balanced_parens(cleaned, sig_open)
+        params = _split_top_level_commas(sig_inner)
+        self.assertEqual(len(params), 11, f"Expected 11 ReceiptJson params, got {len(params)}: {params}")
+        self.assertEqual(" ".join(params[3].split()), "const uint retcode")
+        for idx, param in enumerate(params):
+            if idx != 3:
+                self.assertTrue(" ".join(param.split()).startswith("const string "), f"Param {idx} changed unexpectedly: {param}")
+
+        calls: list[tuple[int, list[str]]] = []
+        for match in re.finditer(r"\bReceiptJson\s*\(", cleaned):
+            open_idx = match.end() - 1
+            if open_idx == sig_open:
+                continue
+            line_no = cleaned[: match.start()].count("\n") + 1
+            inner, _ = _extract_balanced_parens(cleaned, open_idx)
+            args = _split_top_level_commas(inner)
+            self.assertEqual(len(args), 11, f"ReceiptJson call at line {line_no} has {len(args)} args, expected 11: {args}")
+            ret_arg = args[3].strip()
+            self.assertFalse(ret_arg.startswith('"'), f"ReceiptJson retcode at line {line_no} must be uint, got string {ret_arg}")
+            self.assertNotEqual(ret_arg, "0", f"ReceiptJson retcode at line {line_no} uses untyped 0 instead of (uint)0")
+            for idx, arg in enumerate(args):
+                if idx == 3:
+                    continue
+                stripped = arg.strip()
+                self.assertTrue(bool(stripped), f"Empty string arg {idx} at line {line_no}")
+                self.assertIsNone(
+                    self._NUMERIC_LITERAL_RE.fullmatch(stripped),
+                    f"Implicit number-to-string arg {idx}={stripped!r} at line {line_no}",
+                )
+            calls.append((line_no, args))
+
+        self.assertGreaterEqual(len(calls), expected_min_calls)
+        return params, calls
+
+    def test_cas_forex_mt5_bridge_all_receipt_json_calls_pass_11_typed_args(self) -> None:
+        mq5_path = REPO_ROOT / "mt5" / "CasForexMt5Bridge.mq5"
+        src = mq5_path.read_text(encoding="utf-8")
+        _, calls = self._assert_receipt_json_contract(src, expected_min_calls=9)
+        self.assertEqual(len(calls), 9)
+
+    def test_receipt_json_contract_catches_10_arg_and_untyped_number_regressions(self) -> None:
+        sig_header = (
+            "string ReceiptJson(const string request_id, const string request_sha, const string status, const uint retcode,\n"
+            "                   const string position_ticket, const string deal_ticket, const string volume,\n"
+            "                   const string price, const string sl, const string tp, const string message) { return(""); }\n"
+        )
+        missing_tp_10_args = sig_header + (
+            'void f() { WriteReceipt("r1", ReceiptJson("r1", "sha", "UNKNOWN", (uint)0, "0", "0", "0", "0", "0", "msg")); }\n'
+        )
+        with self.assertRaises(AssertionError):
+            self._assert_receipt_json_contract(missing_tp_10_args)
+
+        untyped_retcode_zero = sig_header + (
+            'void f() { WriteReceipt("r1", ReceiptJson("r1", "sha", "UNKNOWN", 0, "0", "0", "0", "0", "0", "0", "msg")); }\n'
+        )
+        with self.assertRaises(AssertionError):
+            self._assert_receipt_json_contract(untyped_retcode_zero)
+
+        implicit_number_to_string_tp = sig_header + (
+            'void f() { WriteReceipt("r1", ReceiptJson("r1", "sha", "REJECTED", (uint)10013, "0", "0", "0", "0", "0", 0, "msg")); }\n'
+        )
+        with self.assertRaises(AssertionError):
+            self._assert_receipt_json_contract(implicit_number_to_string_tp)
 
 
 if __name__ == "__main__":
