@@ -152,7 +152,7 @@ class _Rig:
         self.emus = {
             BROKER_HUGOSWAY_MT5: Mt5SpoolPaperTerminalEmulator(
                 self.root / "hugosway_mt5",
-                server="Hugo demo PRO5",
+                server="Hugosway-Demo",
                 login=7001234,
                 quotes=QUOTES_18,
                 balance=D("12000"),
@@ -161,7 +161,7 @@ class _Rig:
             ),
             BROKER_LHFX_MT5: Mt5SpoolPaperTerminalEmulator(
                 self.root / "lhfx_mt5",
-                server="LHFXSA-Demo",
+                server="LHFXSA-Trade",
                 login=8005678,
                 quotes=QUOTES_18,
                 balance=D("8000"),

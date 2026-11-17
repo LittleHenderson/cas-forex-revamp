@@ -307,7 +307,7 @@ class DrawdownGateRemediationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp2:
             spool = Path(tmp2) / "spool"
             quotes = {"EURUSD": (D("1.10000"), D("1.10010"))}
-            emu = Mt5SpoolPaperTerminalEmulator(spool / "hugosway_mt5", server="Hugo demo PRO5", login=7001234, quotes=quotes, balance=D("8000"))
+            emu = Mt5SpoolPaperTerminalEmulator(spool / "hugosway_mt5", server="Hugosway-Demo", login=7001234, quotes=quotes, balance=D("8000"))
             emu.publish_market()
             router = DualShieldBrokerRouter(
                 environ={"CAS_FOREX_MT5_TRANSPORT_MODE": "SPOOL_BRIDGE", "CAS_FOREX_MT5_SPOOL_DIR": str(spool), "CAS_FOREX_HUGOSWAY_MT5_LOGIN": "7001234"},

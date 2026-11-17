@@ -159,7 +159,7 @@ class FakeMt5Sdk:
     TIMEFRAME_M5 = 5
     TIMEFRAME_H1 = 16385
 
-    def __init__(self, *, trade_mode: int = 0, leverage: int = 500, server: str = "Hugo demo PRO5", login: int = 7001234) -> None:
+    def __init__(self, *, trade_mode: int = 0, leverage: int = 500, server: str = "Hugosway-Demo", login: int = 7001234) -> None:
         self.trade_mode = trade_mode
         self.leverage = leverage
         self.server = server
@@ -282,9 +282,9 @@ class _Rig:
         self.root = Path(tmp)
         self.clock = _Clock()
         self.emus = {
-            BROKER_HUGOSWAY_MT5: Mt5SpoolPaperTerminalEmulator(self.root / "hugosway_mt5", server="Hugo demo PRO5", login=7001234,
+            BROKER_HUGOSWAY_MT5: Mt5SpoolPaperTerminalEmulator(self.root / "hugosway_mt5", server="Hugosway-Demo", login=7001234,
                                                                quotes=QUOTES, balance=D(hugo_balance), trade_mode=hugo_trade_mode),
-            BROKER_LHFX_MT5: Mt5SpoolPaperTerminalEmulator(self.root / "lhfx_mt5", server="LHFXSA-Demo", login=8005678,
+            BROKER_LHFX_MT5: Mt5SpoolPaperTerminalEmulator(self.root / "lhfx_mt5", server="LHFXSA-Trade", login=8005678,
                                                            quotes=QUOTES, balance=D(lhfx_balance)),
         }
         for broker_id in publish:
@@ -328,9 +328,9 @@ class BrokerHierarchyConfigTests(unittest.TestCase):
         chain = snap["chain"]
         self.assertEqual([c["broker_id"] for c in chain], list(router.priority_order))
         self.assertEqual(chain[0]["role"], "PRIMARY_MAIN")
-        self.assertEqual(chain[0]["server"], "Hugo demo PRO5")
+        self.assertEqual(chain[0]["server"], "Hugosway-Demo")
         self.assertEqual(chain[1]["role"], "SECONDARY_MT5")
-        self.assertEqual(chain[1]["server"], "LHFXSA-Demo")
+        self.assertEqual(chain[1]["server"], "LHFXSA-Trade")
         self.assertEqual(chain[2]["role"], "TERTIARY_REST_FALLBACK")
         self.assertEqual(chain[2]["server"], "https://api-fxpractice.oanda.com/v3")
         self.assertEqual(chain[0]["max_leverage"], "1:500")
@@ -392,7 +392,7 @@ class BrokerHierarchyConfigTests(unittest.TestCase):
             BrokerHierarchyRouter(environ={"CAS_FOREX_OANDA_PRACTICE_TOKEN": OANDA_TOKEN_VALUE}, valve_gate=GATE)
         self.assertIsNone(load_mt5_credentials(BROKER_HUGOSWAY_MT5, {}))
         spool_ok = load_mt5_credentials(BROKER_LHFX_MT5, {"CAS_FOREX_LHFX_MT5_LOGIN": "8005678"}, password_required=False)
-        self.assertEqual(spool_ok.server, "LHFXSA-Demo")
+        self.assertEqual(spool_ok.server, "LHFXSA-Trade")
 
     def test_construction_is_inert(self) -> None:
         had_sdk = "MetaTrader5" in sys.modules
@@ -473,7 +473,7 @@ class NativePythonTransportTests(unittest.TestCase):
         venue = self._venue(sdk)
         snap = venue.connect()
         self.assertEqual(snap.trade_mode, "DEMO")
-        self.assertEqual(sdk.initialize_kwargs["server"], "Hugo demo PRO5")
+        self.assertEqual(sdk.initialize_kwargs["server"], "Hugosway-Demo")
         self.assertEqual(sdk.initialize_kwargs["password"], PASSWORD_VALUE)
 
         o1 = open_order("n-open-1")
@@ -1035,7 +1035,7 @@ class CockpitBrokerRoutingEndpointTests(unittest.TestCase):
                 self.assertIn("default-src 'none'", resp.headers.get("Content-Security-Policy", ""))
                 doc = json.loads(resp.read().decode("utf-8"))
             self.assertEqual(doc["chain"][0]["broker_id"], BROKER_HUGOSWAY_MT5)
-            self.assertEqual(doc["chain"][0]["server"], "Hugo demo PRO5")
+            self.assertEqual(doc["chain"][0]["server"], "Hugosway-Demo")
             self.assertEqual(doc["platform"], "MetaTrader 5")
             self.assertIn("dual_shield", doc)
             self.assertEqual(doc["dual_shield"]["barbell"]["max_drawdown_pct"], "0.1")
@@ -1241,6 +1241,26 @@ class Mql5BridgeSourceContractTests(unittest.TestCase):
         )
         with self.assertRaises(AssertionError):
             self._assert_receipt_json_contract(implicit_number_to_string_tp)
+
+    def test_cas_forex_mt5_bridge_lhfxsa_trade_mode_guard_requires_demo_or_two_key_real(self) -> None:
+        src = (REPO_ROOT / "mt5" / "CasForexMt5Bridge.mq5").read_text(encoding="utf-8")
+        cleaned = _strip_mql5_comments_preserving_strings(src)
+        pinned_match = re.search(r"bool\s+IsPinnedLiveServer\s*\([^)]*\)\s*\{(.*?)\n\s*\}", cleaned, re.DOTALL)
+        self.assertIsNotNone(pinned_match)
+        assert pinned_match is not None
+        self.assertIn('"lhfxsa-trade"', pinned_match.group(1))
+        guard_match = re.search(r"bool\s+ModeGuard\s*\(\s*\)\s*\{(.*?)\n\s*\}", cleaned, re.DOTALL)
+        self.assertIsNotNone(guard_match)
+        assert guard_match is not None
+        guard_body = guard_match.group(1)
+        demo_pos = guard_body.find("m != ACCOUNT_TRADE_MODE_DEMO")
+        lhfx_pos = guard_body.find('InpBrokerChannel == "lhfx_mt5" && server == "lhfxsa-trade"')
+        live_sub_pos = guard_body.find('StringFind(server, "live") >= 0')
+        self.assertGreater(demo_pos, 0)
+        self.assertGreater(live_sub_pos, demo_pos)
+        self.assertGreater(lhfx_pos, live_sub_pos)
+        self.assertIn("StringTrimLeft(server);", guard_body)
+        self.assertIn("StringTrimRight(server);", guard_body)
 
 
 if __name__ == "__main__":

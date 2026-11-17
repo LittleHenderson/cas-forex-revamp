@@ -248,11 +248,11 @@ BROKER_PRIORITY: tuple[str, ...] = (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5, BROKER
 LIVE_BROKER_PRIORITY: tuple[str, ...] = (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5, BROKER_OANDA_LIVE)
 _DEFAULT_LIVE_MT5_SERVERS: dict[str, str] = {
     BROKER_HUGOSWAY_MT5: "Hugo PRO5",
-    BROKER_LHFX_MT5: "LHFXSA-Live",
+    BROKER_LHFX_MT5: "LHFXSA-Trade",
 }
 _PINNED_LIVE_MT5_SERVERS: dict[str, frozenset[str]] = {
-    BROKER_HUGOSWAY_MT5: frozenset({"hugo pro5", "hugopro5", "hugo-real", "hugosway-live"}),
-    BROKER_LHFX_MT5: frozenset({"lhfxsa-live", "lhfx-live", "lhfxsa-real"}),
+    BROKER_HUGOSWAY_MT5: frozenset({"hugo pro5", "hugopro5", "hugo-real", "hugosway-live", "hugosway live"}),
+    BROKER_LHFX_MT5: frozenset({"lhfxsa-live", "lhfx-live", "lhfxsa-real", "lhfxsa-trade", "lhfxsa trade"}),
 }
 
 TRANSPORT_AUTO = "AUTO"
@@ -486,7 +486,7 @@ BROKER_SPECS: dict[str, BrokerSpec] = {
         role="PRIMARY_MAIN",
         label="Hugo's Way",
         platform=MT5_PLATFORM_NAME,
-        default_server="Hugo demo PRO5",
+        default_server="Hugosway-Demo",
         max_leverage=500,
         account_type="ECN demo",
         login_env=ENV_HUGOSWAY_MT5_LOGIN,
@@ -499,7 +499,7 @@ BROKER_SPECS: dict[str, BrokerSpec] = {
         role="SECONDARY_MT5",
         label="LHFX",
         platform=MT5_PLATFORM_NAME,
-        default_server="LHFXSA-Demo",
+        default_server="LHFXSA-Trade",
         max_leverage=500,
         account_type="STP/ECN demo",
         login_env=ENV_LHFX_MT5_LOGIN,
@@ -548,7 +548,10 @@ def validate_demo_server(broker_id: str, server: str) -> str:
         raise LiveBrokerEndpointForbiddenError(
             f"LIVE REAL-MONEY MT5 SERVER FORBIDDEN for {broker_id}: {cleaned!r} is hard-rejected; demo servers only"
         )
-    if "demo" not in low:
+    # LHFX hosts both Demo (ACCOUNT_TRADE_MODE_DEMO) and Real (ACCOUNT_TRADE_MODE_REAL) on unified LHFXSA-Trade;
+    # runtime transports and ModeGuard strictly verify account trade mode on every snapshot and receipt.
+    is_lhfx_unified_demo = broker_id == BROKER_LHFX_MT5 and compact in {"lhfxsa-trade", "lhfxsa trade"}
+    if "demo" not in low and not is_lhfx_unified_demo:
         raise LiveBrokerEndpointForbiddenError(
             f"non-demo MT5 server {cleaned!r} refused for {broker_id}; only explicit demo servers are allowed"
         )
