@@ -71,7 +71,7 @@ function sampleTraderPayload() {
     effective_status: 'ACTIVE',
     fast_tick_ms: 50,
     cadence: '50ms_FAST_TICK',
-    markets_evaluated: 18,
+    markets_evaluated: 20,
     watchlist_markets: [...ALL_WATCHLIST_MARKETS],
     active_model_id: 'claude-fable-5.2',
     active_display_name: 'Claude Fable 5.2',
@@ -182,12 +182,14 @@ function sampleIndexPayload() {
   };
 }
 
-test('OVERSEER01 chart constants preserve 16 FX pairs while expanding watchlist to 18 with NAS100 & US30', () => {
+test('OVERSEER01 chart constants preserve 16 FX pairs while expanding watchlist to 20 with NAS100, US30, SPX500 & XAUUSD', () => {
   assert.equal(ALL_CHART_PAIRS.length, 16);
-  assert.deepEqual(INDEX_INSTRUMENTS, ['NAS100', 'US30']);
-  assert.equal(ALL_WATCHLIST_MARKETS.length, 18);
+  assert.deepEqual(INDEX_INSTRUMENTS, ['NAS100', 'US30', 'SPX500', 'XAUUSD']);
+  assert.equal(ALL_WATCHLIST_MARKETS.length, 20);
   assert.equal(ALL_WATCHLIST_MARKETS[0], 'NAS100');
   assert.equal(ALL_WATCHLIST_MARKETS[1], 'US30');
+  assert.equal(ALL_WATCHLIST_MARKETS[2], 'SPX500');
+  assert.equal(ALL_WATCHLIST_MARKETS[3], 'XAUUSD');
 });
 
 test('OVERSEER02 normalizeAiModels enforces 9-model priority catalog with qwen3:0.6b strictly #9 last', () => {
@@ -225,7 +227,7 @@ test('OVERSEER03 normalizeIndexStream & computeChartGeometry render NAS100 ENTRY
   assert.equal(matched[0].take_profit_price, '20560.00');
 });
 
-test('OVERSEER04 Operate and Setup panels render Human Overseer controls, quota progress, 18 markets, and zero inline styles', () => {
+test('OVERSEER04 Operate and Setup panels render Human Overseer controls, quota progress, 20 markets, and zero inline styles', () => {
   const fx = decodeMarketStream(marketFixtureRaw, marketSchema);
   const state = displayState(fixture(), 'operate');
   state.marketStream = fx;
@@ -239,9 +241,9 @@ test('OVERSEER04 Operate and Setup panels render Human Overseer controls, quota 
   assert.match(operateHtml, /BREAKEVEN_LOCKED/);
   assert.match(operateHtml, /SOFT_QUOTA_REACHED/);
   assert.match(operateHtml, /Gemini Decision 1 Fast Scout: ON/);
-  assert.match(operateHtml, /18 MARKETS/);
+  assert.match(operateHtml, /20 MARKETS/);
   assert.match(operateHtml, /data-market-canvas="NAS100"/);
-  assert.match(operateHtml, /US Indices \/ 2/);
+  assert.match(operateHtml, /Indices &amp; Gold \/ 2/);
   assert.equal(/\bstyle\s*=/.test(operateHtml), false);
   assert.equal(/data-record=/.test(renderMarketChartSection(state.projection, state)), false);
   assert.equal(/data-record=/.test(renderAiOverseerPanel(state)), false);

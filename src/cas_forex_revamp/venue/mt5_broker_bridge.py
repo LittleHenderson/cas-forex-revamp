@@ -157,6 +157,7 @@ MT5_PLATFORM_NAME = "MetaTrader 5"
 MT5_SPOOL_PROTOCOL = "cas-forex-mt5-spool/2"
 MT5_CONTRACT_SIZE = Decimal("100000")
 MT5_INDEX_CONTRACT_SIZE = Decimal("1")
+MT5_GOLD_CONTRACT_SIZE = Decimal("100")
 MT5_VOLUME_STEP = Decimal("0.01")
 MT5_MIN_VOLUME = Decimal("0.01")
 MT5_MAX_VOLUME_DEFAULT = Decimal("50")
@@ -175,6 +176,17 @@ _INDEX_SYMBOL_ALIASES: dict[str, str] = {
     "WS30": "US30",
     "US30USD": "US30",
     "DJI30": "US30",
+    "SPX500": "SPX500",
+    "US500": "SPX500",
+    "SP500": "SPX500",
+    "SPX500USD": "SPX500",
+    "US500CASH": "SPX500",
+    "US500247": "SPX500",
+    "XAUUSD": "XAUUSD",
+    "GOLD": "XAUUSD",
+    "GOLD247": "XAUUSD",
+    "GOLDUSD": "XAUUSD",
+    "XAUUSDUSD": "XAUUSD",
 }
 
 
@@ -192,7 +204,7 @@ def normalize_market_symbol(raw: str) -> str:
         return _INDEX_SYMBOL_ALIASES[cleaned]
     if cleaned in EXPANDED_FX_PAIRS:
         return cleaned
-    raise ContractError(f"unsupported MT5 symbol {raw!r}; expected one of the 18 EXPANDED_MARKETS")
+    raise ContractError(f"unsupported MT5 symbol {raw!r}; expected one of the {len(EXPANDED_MARKETS)} EXPANDED_MARKETS")
 
 
 def resolve_mt5_spool_dir(environ: Mapping[str, str], *, is_windows: bool | None = None, default_dir: Path | None = None) -> str | None:
@@ -921,6 +933,7 @@ class Mt5MarginCalculator:
         contract_size: Decimal = MT5_CONTRACT_SIZE,
         index_leverage: int = DEFAULT_MT5_INDEX_LEVERAGE,
         index_contract_size: Decimal = MT5_INDEX_CONTRACT_SIZE,
+        gold_contract_size: Decimal = MT5_GOLD_CONTRACT_SIZE,
     ) -> None:
         if type(leverage) is not int or not (1 <= leverage <= MAX_DEMO_LEVERAGE):
             raise ContractError(f"leverage must be an integer in 1..{MAX_DEMO_LEVERAGE}")
@@ -933,6 +946,7 @@ class Mt5MarginCalculator:
         self.account_currency = account_currency
         self.contract_size = decimal_value(contract_size, "contract_size", positive=True)
         self.index_contract_size = decimal_value(index_contract_size, "index_contract_size", positive=True)
+        self.gold_contract_size = decimal_value(gold_contract_size, "gold_contract_size", positive=True)
 
     @staticmethod
     def split_symbol(symbol: str) -> tuple[str, str]:
@@ -942,9 +956,11 @@ class Mt5MarginCalculator:
             return symbol, "USD"
         if symbol in EXPANDED_FX_PAIRS:
             return symbol[:3], symbol[3:]
-        raise ContractError(f"unsupported MT5 symbol {symbol!r}; expected one of the 18 EXPANDED_MARKETS")
+        raise ContractError(f"unsupported MT5 symbol {symbol!r}; expected one of the {len(EXPANDED_MARKETS)} EXPANDED_MARKETS")
 
     def contract_size_for(self, symbol: str | None) -> Decimal:
+        if symbol == "XAUUSD":
+            return self.gold_contract_size
         return self.index_contract_size if symbol in INDEX_INSTRUMENTS else self.contract_size
 
     def leverage_for(self, symbol: str | None) -> int:
@@ -1877,6 +1893,41 @@ class Mt5SpoolBridgeTransport:
                     time_msc=_ticket_text(item.get("time_msc"), "time_msc"),
                 )
         raise Mt5TransportError(f"no published MT5 tick for {symbol}")
+
+    def read_index_candles(self, symbol: str) -> dict[str, list[dict[str, Any]]] | None:
+        """Read optional broker-native M1/M5/H1 candle bars from market_candles.json if present."""
+        cpath = self.spool_dir / "market_candles.json"
+        if not cpath.is_file():
+            return None
+        try:
+            doc = _read_spool_json(cpath, max_bytes=self._max_file_bytes)
+        except Exception:
+            return None
+        markets = doc.get("markets")
+        if not isinstance(markets, dict):
+            return None
+        entry = markets.get(symbol)
+        if not isinstance(entry, dict):
+            return None
+        out: dict[str, list[dict[str, Any]]] = {}
+        for tf_key in ("candles_m1", "candles_m5", "candles_h1"):
+            rows = entry.get(tf_key)
+            if isinstance(rows, list) and rows:
+                clean_rows: list[dict[str, Any]] = []
+                for r in rows[-48:]:
+                    if isinstance(r, dict) and all(k in r for k in ("t", "o", "h", "l", "c")):
+                        clean_rows.append({
+                            "t": str(r["t"]),
+                            "o": str(r["o"]),
+                            "h": str(r["h"]),
+                            "l": str(r["l"]),
+                            "c": str(r["c"]),
+                            "v": str(r.get("v", "1")),
+                            "n": int(r.get("n", 1)),
+                        })
+                if clean_rows:
+                    out[tf_key] = clean_rows
+        return out or None
 
     def positions(self) -> tuple[Mt5Position, ...]:
         doc = self._market_doc()

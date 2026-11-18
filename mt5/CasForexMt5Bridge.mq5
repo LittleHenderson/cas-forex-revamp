@@ -23,9 +23,11 @@ input string InpSpoolFolder        = "cas_forex_spool";
 input string InpBrokerChannel      = "hugosway_mt5";
 input bool   InpUseCommonFolder    = true;
 input int    InpTimerMs            = 50;
-input string InpSymbols            = "NAS100,US30,EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,EURGBP,EURJPY,GBPJPY,EURCHF,EURAUD,EURCAD,AUDJPY,CHFJPY,CADJPY";
+input string InpSymbols            = "NAS100,US30,SPX500,XAUUSD,EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,EURGBP,EURJPY,GBPJPY,EURCHF,EURAUD,EURCAD,AUDJPY,CHFJPY,CADJPY";
 input string InpNas100Symbol       = "NAS100";
 input string InpUs30Symbol         = "US30";
+input string InpSpx500Symbol       = "SPX500";
+input string InpXauusdSymbol       = "XAUUSD";
 input string InpSymbolSuffix       = "";
 input int    InpMaxDeviationPoints = 30;
 input double InpMaxVolumeLots      = 50.0;
@@ -38,6 +40,7 @@ CTrade   g_trade;
 string   g_symbols[];
 bool     g_mode_ok = false;
 datetime g_last_publish = 0;
+datetime g_last_candles = 0;
 string   g_active_nonce = "0";
 ulong    g_last_monotonic_nonce = 0;
 uchar    g_hmac_key[];
@@ -385,12 +388,14 @@ bool WriteAtomic(const string name, const string text)
    FileWriteString(h, text + "\n");
    FileFlush(h);
    FileClose(h);
-   if(!FileMove(tmp, CommonFlag(), SpoolPath(name), FILE_REWRITE | CommonFlag()))
+   for(int attempt = 0; attempt < 6; attempt++)
      {
-      PrintFormat("CasForexMt5Bridge: cannot publish %s (error %d)", name, GetLastError());
-      return(false);
+      if(FileMove(tmp, CommonFlag(), SpoolPath(name), FILE_REWRITE | CommonFlag()))
+         return(true);
+      Sleep(8);
      }
-   return(true);
+   PrintFormat("CasForexMt5Bridge: cannot publish %s (error %d)", name, GetLastError());
+   return(false);
   }
 
 string BrokerSymbol(const string cas_symbol)
@@ -399,6 +404,10 @@ string BrokerSymbol(const string cas_symbol)
       return(InpNas100Symbol + InpSymbolSuffix);
    if(cas_symbol == "US30")
       return(InpUs30Symbol + InpSymbolSuffix);
+   if(cas_symbol == "SPX500")
+      return(InpSpx500Symbol + InpSymbolSuffix);
+   if(cas_symbol == "XAUUSD")
+      return(InpXauusdSymbol + InpSymbolSuffix);
    return(cas_symbol + InpSymbolSuffix);
   }
 
@@ -410,6 +419,10 @@ string CasSymbol(string broker_symbol)
       return("NAS100");
    if(broker_symbol == InpUs30Symbol || broker_symbol == "DJ30" || broker_symbol == "WS30" || broker_symbol == "US30USD")
       return("US30");
+   if(broker_symbol == InpSpx500Symbol || broker_symbol == "US500" || broker_symbol == "SP500" || broker_symbol == "SPX500USD" || broker_symbol == "US500.247")
+      return("SPX500");
+   if(broker_symbol == InpXauusdSymbol || broker_symbol == "GOLD" || broker_symbol == "XAU_USD" || broker_symbol == "GOLD.247")
+      return("XAUUSD");
    return(broker_symbol);
   }
 
@@ -661,6 +674,54 @@ void ReportInterruptedRequests()
    FileFindClose(search);
   }
 
+
+string CandleSeriesJson(const string bsym, const ENUM_TIMEFRAMES tf, const int count)
+  {
+   MqlRates rates[];
+   ArraySetAsSeries(rates, false);
+   int got = CopyRates(bsym, tf, 0, count, rates);
+   string out = "[";
+   bool first = true;
+   for(int i = 0; i < got; i++)
+     {
+      double hi = MathMax(rates[i].high, MathMax(rates[i].open, rates[i].close));
+      double lo = MathMin(rates[i].low, MathMin(rates[i].open, rates[i].close));
+      if(lo <= 0.0)
+         continue;
+      MqlDateTime dt;
+      TimeToStruct(rates[i].time, dt);
+      string t_iso = StringFormat("%04d-%02d-%02dT%02d:%02d:00Z", dt.year, dt.mon, dt.day, dt.hour, dt.min);
+      out += StringFormat("%s{\"t\":\"%s\",\"o\":\"%s\",\"h\":\"%s\",\"l\":\"%s\",\"c\":\"%s\",\"v\":\"%s\",\"n\":1}",
+                          first ? "" : ",", t_iso, Price(bsym, rates[i].open), Price(bsym, hi),
+                          Price(bsym, lo), Price(bsym, rates[i].close),
+                          IntegerToString((long)MathMax((long)1, rates[i].tick_volume)));
+      first = false;
+     }
+   out += "]";
+   return(out);
+  }
+
+void PublishCandles()
+  {
+   string idx_syms[4] = {"NAS100", "US30", "SPX500", "XAUUSD"};
+   string json = StringFormat("{\"protocol\":\"%s\",\"observed_at\":\"%s\",\"markets\":{", SPOOL_PROTOCOL, IsoNowUtc());
+   bool first = true;
+   for(int i = 0; i < 4; i++)
+     {
+      string sym = idx_syms[i];
+      string bsym = BrokerSymbol(sym);
+      string m1 = CandleSeriesJson(bsym, PERIOD_M1, 36);
+      string m5 = CandleSeriesJson(bsym, PERIOD_M5, 36);
+      string h1 = CandleSeriesJson(bsym, PERIOD_H1, 24);
+      json += StringFormat("%s\"%s\":{\"candles_m1\":%s,\"candles_m5\":%s,\"candles_h1\":%s}",
+                           first ? "" : ",", sym, m1, m5, h1);
+      first = false;
+     }
+   json += "}}";
+   WriteAtomic("market_candles.json", json);
+   g_last_candles = TimeCurrent();
+  }
+
 void PublishMarket()
   {
    string json = StringFormat(
@@ -737,6 +798,7 @@ int OnInit()
    g_mode_ok = true;
    ReportInterruptedRequests();
    PublishMarket();
+   PublishCandles();
    EventSetMillisecondTimer(MathMax(50, InpTimerMs));
    PrintFormat("CasForexMt5Bridge v2: running [%s] on server %s, spool %s (hmac_loaded=%s)",
                AccountTradeModeLabel(), AccountInfoString(ACCOUNT_SERVER), SpoolDir(), g_hmac_key_loaded ? "true" : "false");
@@ -759,6 +821,8 @@ void OnTimer()
      }
    ProcessRequests();
    PublishMarket();
+   if(TimeCurrent() - g_last_candles >= 5)
+      PublishCandles();
   }
 
 void OnTick()

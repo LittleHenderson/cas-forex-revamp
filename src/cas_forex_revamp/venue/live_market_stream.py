@@ -60,7 +60,7 @@ DIRECT_KRAKEN_FX_PAIRS: tuple[str, ...] = (
     "AUDJPY",
 )
 
-INDEX_INSTRUMENTS: tuple[str, ...] = ("NAS100", "US30")
+INDEX_INSTRUMENTS: tuple[str, ...] = ("NAS100", "US30", "SPX500", "XAUUSD")
 
 EXPANDED_FX_PAIRS: tuple[str, ...] = (
     "EURUSD",
@@ -169,6 +169,34 @@ INDEX_MARKET_SPECS: dict[str, dict[str, Any]] = {
         "yahoo_paths": ("/v8/finance/chart/%5EDJI", "/v8/finance/chart/YM=F"),
         "oanda": "US30_USD",
     },
+    "SPX500": {
+        "display": "SPX500 / S&P 500",
+        "category": "US_INDEX",
+        "base_currency": "SPX500",
+        "quote_currency": "USD",
+        "tick": Decimal("0.01"),
+        "point": Decimal("1.0"),
+        "min": Decimal("1500.00"),
+        "max": Decimal("20000.00"),
+        "max_ref_dev_bps": Decimal("150"),
+        "max_spread_bps": Decimal("35"),
+        "yahoo_paths": ("/v8/finance/chart/%5EGSPC", "/v8/finance/chart/ES=F"),
+        "oanda": "SPX500_USD",
+    },
+    "XAUUSD": {
+        "display": "XAU/USD · Spot Gold",
+        "category": "US_INDEX",
+        "base_currency": "XAU",
+        "quote_currency": "USD",
+        "tick": Decimal("0.01"),
+        "point": Decimal("1.0"),
+        "min": Decimal("800.00"),
+        "max": Decimal("15000.00"),
+        "max_ref_dev_bps": Decimal("150"),
+        "max_spread_bps": Decimal("40"),
+        "yahoo_paths": ("/v8/finance/chart/GC=F", "/v8/finance/chart/XAUUSD=X"),
+        "oanda": "XAU_USD",
+    },
 }
 
 KRAKEN_EXPANDED_TICKER_URL = (
@@ -197,6 +225,10 @@ _YAHOO_INDEX_ENCODED_PATHS: frozenset[str] = frozenset({
     "/v8/finance/chart/NQ=F",
     "/v8/finance/chart/%5EDJI",
     "/v8/finance/chart/YM=F",
+    "/v8/finance/chart/%5EGSPC",
+    "/v8/finance/chart/ES=F",
+    "/v8/finance/chart/GC=F",
+    "/v8/finance/chart/XAUUSD=X",
 })
 _YAHOO_ALLOWED_CHART_PATHS: frozenset[str] = frozenset({"/v8/finance/chart/NZDUSD=X"}) | _YAHOO_INDEX_ENCODED_PATHS
 _ALLOWED_PUBLIC_HOSTS: frozenset[str] = ALLOWED_PUBLIC_FEED_HOSTS | frozenset({"query1.finance.yahoo.com"})
@@ -1864,7 +1896,10 @@ class PublicUsIndexFeedClient:
             mid = Decimal(str(raw_mid)).quantize(tick)
             if not (spec["min"] <= mid <= spec["max"]):
                 raise ContractError(f"index reference price for {sym} out of bounds: {mid}")
-            half_spread = Decimal("1.25") if sym == "NAS100" else Decimal("2.00")
+            half_spread = (
+                Decimal("0.25") if sym == "SPX500"
+                else (Decimal("0.30") if sym == "XAUUSD" else (Decimal("1.25") if sym == "NAS100" else Decimal("2.00")))
+            )
             bid = (mid - half_spread).quantize(tick)
             ask = (mid + half_spread).quantize(tick)
             rows.append({

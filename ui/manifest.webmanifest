@@ -1,0 +1,18 @@
+{
+  "name": "CAS Forex Cockpit",
+  "short_name": "CAS Forex",
+  "description": "Protected 20-market live candlestick cockpit, 5-tier sizing, and emergency trading controls.",
+  "start_url": "/ui/index.html",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0b1525",
+  "theme_color": "#0b1525",
+  "icons": [
+    {
+      "src": "./assets/app-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

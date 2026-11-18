@@ -77,6 +77,8 @@ SYNTH_API_KEY = "test-placeholder-ant-alpha-01"  # synthetic test value
 QUOTES_18: dict[str, tuple[Decimal, Decimal]] = {
     "NAS100": (D("20500.00"), D("20502.50")),
     "US30": (D("43800.00"), D("43804.00")),
+    "SPX500": (D("6000.00"), D("6000.50")),
+    "XAUUSD": (D("2600.00"), D("2600.60")),
     "EURUSD": (D("1.10000"), D("1.10010")),
     "GBPUSD": (D("1.27000"), D("1.27012")),
     "USDJPY": (D("150.000"), D("150.012")),
@@ -316,8 +318,10 @@ def _decision_proposal(order: OrderIntent, *, gate, view: dict, reason: str = "V
 class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
     def test_18_markets_us_indices_oracle_and_oanda_cfd_block(self) -> None:
         self.assertEqual(len(EXPANDED_FX_PAIRS), 16)
-        self.assertEqual(INDEX_INSTRUMENTS, ("NAS100", "US30"))
-        self.assertEqual(len(EXPANDED_MARKETS), 18)
+        self.assertEqual(INDEX_INSTRUMENTS, ("NAS100", "US30", "SPX500", "XAUUSD"))
+        self.assertEqual(len(EXPANDED_MARKETS), 20)
+        self.assertEqual(normalize_market_symbol("US500.pro"), "SPX500")
+        self.assertEqual(normalize_market_symbol("GOLD.ecn"), "XAUUSD")
         self.assertEqual(normalize_market_symbol("USTEC.pro"), "NAS100")
         self.assertEqual(normalize_market_symbol("US100"), "NAS100")
         self.assertEqual(normalize_market_symbol("NAS100USD"), "NAS100")
@@ -346,15 +350,41 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
                     }]
                 }
             }).encode(),
+            "GSPC": json.dumps({
+                "chart": {
+                    "result": [{
+                        "meta": {"regularMarketPrice": 6000.25},
+                        "timestamp": [1794834000, 1794834060],
+                        "indicators": {"quote": [{"open": [5995.0, 5998.0], "high": [6002.0, 6004.0],
+                                                  "low": [5994.0, 5997.0], "close": [5998.0, 6000.25], "volume": [8, 12]}]},
+                    }]
+                }
+            }).encode(),
+            "GOLD": json.dumps({
+                "chart": {
+                    "result": [{
+                        "meta": {"regularMarketPrice": 2600.30},
+                        "timestamp": [1794834000, 1794834060],
+                        "indicators": {"quote": [{"open": [2598.0, 2599.0], "high": [2601.0, 2602.0],
+                                                  "low": [2597.0, 2598.5], "close": [2599.0, 2600.30], "volume": [9, 11]}]},
+                    }]
+                }
+            }).encode(),
         }
 
         def fake_index_get(url: str, timeout: float, max_bytes: int) -> bytes:
-            return yahoo_payloads["NDX"] if "NDX" in url or "NQ" in url else yahoo_payloads["DJI"]
+            if "NDX" in url or "NQ" in url:
+                return yahoo_payloads["NDX"]
+            if "DJI" in url or "YM" in url:
+                return yahoo_payloads["DJI"]
+            if "GSPC" in url or "ES=F" in url:
+                return yahoo_payloads["GSPC"]
+            return yahoo_payloads["GOLD"]
 
         idx_client = PublicUsIndexFeedClient(transport=fake_index_get, clock=lambda: T0)
         idx_env = idx_client.fetch_index_stream(sequence=4)
         self.assertEqual(idx_env["schema"], "cas-forex.index-stream/1")
-        self.assertEqual([m["pair"] for m in idx_env["markets"]], ["NAS100", "US30"])
+        self.assertEqual([m["pair"] for m in idx_env["markets"]], ["NAS100", "US30", "SPX500", "XAUUSD"])
 
         gate = load_default_forex_valve_gate()
         with tempfile.TemporaryDirectory() as tmp:
@@ -896,7 +926,7 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
             idx_snap, mt5_q = _build_mt5_index_snapshot_from_router(router2)
             self.assertIsNotNone(idx_snap)
             self.assertEqual(idx_snap["feed_mode"], "MT5_DIRECT_SPOOL_50MS")
-            self.assertEqual([m["pair"] for m in idx_snap["markets"]], ["NAS100", "US30"])
+            self.assertEqual([m["pair"] for m in idx_snap["markets"]], ["NAS100", "US30", "SPX500", "XAUUSD"])
             self.assertIn("NAS100", mt5_q)
             self.assertGreaterEqual(len(idx_snap["markets"][0]["candles_m1"]), 1)
             self.assertGreaterEqual(len(idx_snap["markets"][0]["candles_m5"]), 1)
@@ -935,6 +965,43 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
             self.assertEqual(cat_res["models"][3]["last_status"], "SCOUT_DEGRADED")
             self.assertEqual(cat_res["models"][0]["calls"], 1)
             self.assertEqual(snap_t["cycle_count"], 1)
+
+
+    def test_phase7_xauusd_100oz_contract_token_file_and_pwa_manifest(self) -> None:
+        from cas_forex_revamp.venue.mt5_broker_bridge import Mt5MarginCalculator, MT5_GOLD_CONTRACT_SIZE
+
+        calc = Mt5MarginCalculator(leverage=500, index_leverage=200)
+        self.assertEqual(calc.contract_size_for("XAUUSD"), MT5_GOLD_CONTRACT_SIZE)
+        self.assertEqual(calc.units_to_lots(D("1"), symbol="XAUUSD"), D("0.01"))
+        with tempfile.TemporaryDirectory() as td3:
+            tok_path = Path(td3) / "cockpit.token"
+            srv_p7 = LoopbackCockpitServer(
+                repo_root=Path(__file__).resolve().parents[2],
+                token_file=tok_path,
+                public_origin="https://52-33-1-177.sslip.io",
+            )
+            srv_p7.start()
+            try:
+                tok1 = srv_p7.auth_token
+                self.assertEqual(tok_path.read_text(encoding="utf-8").strip(), tok1)
+                c = http.client.HTTPConnection("127.0.0.1", srv_p7.bound_port, timeout=5)
+                try:
+                    c.request("GET", "/ui/manifest.webmanifest", headers={"Host": "52-33-1-177.sslip.io"})
+                    rm = c.getresponse()
+                    raw_mf = rm.read()
+                    self.assertEqual(rm.status, 200)
+                    self.assertEqual(json.loads(raw_mf.decode("utf-8"))["short_name"], "CAS Forex")
+                finally:
+                    c.close()
+            finally:
+                srv_p7.stop()
+
+            srv_p7_b = LoopbackCockpitServer(repo_root=Path(__file__).resolve().parents[2], token_file=tok_path)
+            srv_p7_b.start()
+            try:
+                self.assertEqual(srv_p7_b.auth_token, tok1)
+            finally:
+                srv_p7_b.stop()
 
 
 if __name__ == "__main__":

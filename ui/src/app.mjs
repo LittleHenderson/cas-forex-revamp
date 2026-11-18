@@ -670,6 +670,23 @@ root.addEventListener('click', (event) => {
   }
 });
 
+root.addEventListener('submit', async (event) => {
+  const form = event.target?.closest?.('[data-cockpit-unlock-form]');
+  if (!form) return;
+  event.preventDefault();
+  const input = form.querySelector('input[name="cockpit_access_key"]');
+  const val = String(input?.value ?? '').trim();
+  if (!val) { state.aiIssue = 'Enter your Cockpit access key to unlock live feeds.'; render(); return; }
+  try {
+    setLoopbackAuthToken(val);
+    if (input) input.value = '';
+    await connectLoopbackLiveFeed();
+  } catch (error) {
+    state.aiIssue = error instanceof Error ? error.message : 'Cockpit unlock failed.';
+    render();
+  }
+});
+
 root.addEventListener('change', async (event) => {
   if (event.target.dataset?.selectAiModel) { void selectAiModel(event.target.value); return; }
   if (event.target.name === 'theme') {

@@ -679,3 +679,38 @@ dialog::backdrop { background: rgba(32, 30, 29, .65); }
 .market-telemetry-strip {
   margin-top: 0.75rem;
 }
+/* Phone / PWA Mobile Unlock Bar & Touch Ergonomics */
+.mobile-unlock-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 0.5rem 0 0.75rem;
+  padding: 0.6rem;
+  border: 1px solid var(--line, rgba(128, 128, 128, 0.25));
+  background: var(--panel-soft, rgba(128, 128, 128, 0.06));
+}
+.mobile-unlock-input {
+  flex: 1 1 220px;
+  min-height: 44px;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--line, rgba(128, 128, 128, 0.35));
+  background: var(--panel, #132238);
+  color: var(--ink, #f3f5f8);
+  border-radius: 2px;
+}
+@media (max-width: 780px) {
+  .segmented {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100%;
+  }
+  .segmented .button-small {
+    min-height: 44px;
+    flex: 1 1 auto;
+  }
+  .watchlist-row {
+    min-height: 46px;
+    padding: 0.55rem 0.65rem;
+  }
+}

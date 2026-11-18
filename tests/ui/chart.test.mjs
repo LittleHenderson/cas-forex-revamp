@@ -286,3 +286,30 @@ test('CHART11 HiDPI hover and wheel redraws preserve fixed logical dimensions wi
     else delete globalThis.document;
   }
 });
+
+test('CHART12 PWA manifest, viewport fit, zero-inline unlock bar, and SPX500/XAUUSD symbol aliases work cleanly', async () => {
+  const indexHtml = await readFile(new URL('../../ui/index.html', import.meta.url), 'utf8');
+  const manifestRaw = await readFile(new URL('../../ui/manifest.webmanifest', import.meta.url), 'utf8');
+  const manifest = JSON.parse(manifestRaw);
+  assert.match(indexHtml, /manifest\.webmanifest/);
+  assert.match(indexHtml, /manifest-src 'self'/);
+  assert.equal(manifest.display, 'standalone');
+  assert.equal(manifest.start_url, '/ui/index.html');
+
+  const decoded = decodeMarketStream(marketFixtureRaw, marketSchema);
+  const state = displayState(fixture(), 'operate');
+  state.marketStream = decoded;
+  state.liveStreamConnected = false;
+  const html = renderApp(state, Date.parse(time));
+  assert.match(html, /data-cockpit-unlock-form="true"/);
+  assert.match(html, /autocomplete="current-password"/);
+  assert.equal(/\bstyle\s*=/.test(html), false);
+
+  const p = fixture();
+  p.positions = [
+    { ...samplePosition(), position_id: 'pos-spx', instrument_id: 'US500.pro' },
+    { ...samplePosition(), position_id: 'pos-xau', instrument_id: 'GOLD' },
+  ];
+  assert.equal(matchPositionsForPair(p, 'SPX500').length, 1);
+  assert.equal(matchPositionsForPair(p, 'XAUUSD').length, 1);
+});

@@ -19,7 +19,7 @@ export const PRIORITY_AI_MODELS = Object.freeze([
 const GOVERNANCE_MODES = Object.freeze(['ACTIVE', 'PAUSED_NEW_RISK', 'PAUSED', 'STOPPED', 'STANDBY']);
 const QUOTA_STATUSES = Object.freeze(['OPEN', 'SOFT_QUOTA_REACHED', 'DAILY_QUOTA_LOCKED', 'DAILY_LOSS_CIRCUIT_TRIPPED']);
 const PROTECTION_STAGES = Object.freeze(['INITIAL_SL', 'BREAKEVEN_LOCKED', 'TRAILING_ACTIVE']);
-const INDEX_PAIRS = Object.freeze(['NAS100', 'US30']);
+const INDEX_PAIRS = Object.freeze(['NAS100', 'US30', 'SPX500', 'XAUUSD']);
 
 const esc = (value) => String(value).replace(/[&<>"']/g, (ch) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
@@ -279,7 +279,7 @@ export function normalizeIndexStream(doc) {
     const spreadVal = str(row.spread_points ?? row.spread_pips ?? '0', '0');
     return Object.freeze({
       pair: row.pair,
-      display_pair: str(row.display_pair, row.pair === 'NAS100' ? 'NAS100 / NDX' : 'US30 / DJIA'),
+      display_pair: str(row.display_pair, ({ NAS100: 'NAS100 / NDX', US30: 'US30 / DJIA', SPX500: 'SPX500 / S&P 500', XAUUSD: 'XAU/USD · Gold' }[row.pair] ?? row.pair)),
       category: 'US_INDEX',
       base_currency: str(row.base_currency, row.pair),
       quote_currency: str(row.quote_currency, 'USD'),

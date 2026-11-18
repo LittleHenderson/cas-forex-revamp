@@ -115,26 +115,42 @@ def _build_mt5_index_snapshot_from_router(
         for row in prev_stream["markets"]:
             if isinstance(row, Mapping) and isinstance(row.get("pair"), str):
                 prev_by_pair[row["pair"]] = row
+    _DISP = {"NAS100": "NAS100 / NDX", "US30": "US30 / DJIA", "SPX500": "SPX500 / S&P 500", "XAUUSD": "XAU/USD · Gold"}
+    _TICK = {"NAS100": "0.25", "US30": "0.25", "SPX500": "0.01", "XAUUSD": "0.01"}
+    native_cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for venue in router.venues.values():
+        tr = getattr(venue, "_transport", None)
+        rc_fn = getattr(tr, "read_index_candles", None)
+        if callable(rc_fn):
+            for sym_idx in INDEX_INSTRUMENTS:
+                if sym_idx not in native_cache:
+                    got_c = rc_fn(sym_idx)
+                    if isinstance(got_c, dict):
+                        native_cache[sym_idx] = got_c
     idx_rows = []
     for sym_idx in INDEX_INSTRUMENTS:
         if sym_idx in mt5_q:
             b_px, a_px = mt5_q[sym_idx]
             mid_px = (b_px + a_px) / 2
             prev_row = prev_by_pair.get(sym_idx, {})
+            nat = native_cache.get(sym_idx, {})
+            p_m1 = prev_row.get("candles_m1") if isinstance(prev_row.get("candles_m1"), list) and len(prev_row["candles_m1"]) >= 2 else (nat.get("candles_m1") or prev_row.get("candles_m1"))
+            p_m5 = prev_row.get("candles_m5") if isinstance(prev_row.get("candles_m5"), list) and len(prev_row["candles_m5"]) >= 2 else (nat.get("candles_m5") or prev_row.get("candles_m5"))
+            p_h1 = prev_row.get("candles_h1") if isinstance(prev_row.get("candles_h1"), list) and len(prev_row["candles_h1"]) >= 2 else (nat.get("candles_h1") or prev_row.get("candles_h1"))
             idx_rows.append({
                 "pair": sym_idx,
-                "display_pair": "NAS100 / NDX" if sym_idx == "NAS100" else "US30 / DJIA",
+                "display_pair": _DISP.get(sym_idx, f"{sym_idx} / USD"),
                 "category": "US_INDEX",
-                "tick_size": "0.25",
+                "tick_size": _TICK.get(sym_idx, "0.25"),
                 "bid": _dec_txt(b_px),
                 "ask": _dec_txt(a_px),
                 "mid": _dec_txt(mid_px),
                 "spread_points": _dec_txt(a_px - b_px),
                 "observed_at": obs_iso,
                 "feed_mode": "MT5_DIRECT_SPOOL_50MS",
-                "candles_m1": _roll_mt5_index_bars(prev_row.get("candles_m1"), b_m1, mid_px, _dec_txt),
-                "candles_m5": _roll_mt5_index_bars(prev_row.get("candles_m5"), b_m5, mid_px, _dec_txt),
-                "candles_h1": _roll_mt5_index_bars(prev_row.get("candles_h1"), b_h1, mid_px, _dec_txt),
+                "candles_m1": _roll_mt5_index_bars(p_m1, b_m1, mid_px, _dec_txt),
+                "candles_m5": _roll_mt5_index_bars(p_m5, b_m5, mid_px, _dec_txt),
+                "candles_h1": _roll_mt5_index_bars(p_h1, b_h1, mid_px, _dec_txt),
             })
     if not idx_rows:
         return None, mt5_q
@@ -162,7 +178,7 @@ _FORBIDDEN_ROUTING_KEY_TOKENS: tuple[str, ...] = (
 )
 STRICT_CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; "
-    "connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
+    "connect-src 'self'; img-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
 )
 
 _CONTENT_TYPES: dict[str, str] = {
@@ -171,8 +187,22 @@ _CONTENT_TYPES: dict[str, str] = {
     ".mjs": "text/javascript; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
     ".json": "application/json; charset=utf-8",
+    ".webmanifest": "application/manifest+json; charset=utf-8",
     ".svg": "image/svg+xml",
 }
+
+
+def validate_public_origin(raw: str | None) -> tuple[str | None, str | None]:
+    """Validate optional HTTPS reverse-proxy origin for Phone/Cloud TLS access."""
+    if raw is None or not str(raw).strip():
+        return None, None
+    cleaned = str(raw).strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(cleaned)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise ContractError("public_origin must use clean https://hostname")
+    if parsed.port not in (None, 443) or parsed.path or parsed.query or parsed.fragment:
+        raise ContractError("public_origin must not contain path, query, fragment, or non-443 port")
+    return cleaned, parsed.netloc
 
 
 class _CockpitSecret:
@@ -249,6 +279,8 @@ class LoopbackCockpitServer:
         profit_vault: Any | None = None,
         parallel_tiers: Any | None = None,
         owner_recovery: Any | None = None,
+        token_file: str | Path | None = None,
+        public_origin: str | None = None,
     ) -> None:
         self._host = validate_loopback_host(host)
         if type(port) is not int or not (0 <= port <= 65535):
@@ -286,6 +318,8 @@ class LoopbackCockpitServer:
         self._sse_sem = threading.BoundedSemaphore(4)
         self._sockets_lock = threading.Lock()
         self._active_sockets: set[socket.socket] = set()
+        self._token_file: Path | None = Path(token_file).resolve() if token_file else None
+        self._public_origin, self._public_host = validate_public_origin(public_origin)
 
     def __repr__(self) -> str:
         return (
@@ -363,6 +397,29 @@ class LoopbackCockpitServer:
                 return False
             return hmac.compare_digest(bearer_token.encode("utf-8"), self._auth_secret.reveal().encode("utf-8"))
 
+    def _write_token_file(self, tok_value: str) -> None:
+        if self._token_file is None:
+            return
+        self._token_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp_p = self._token_file.with_suffix(".tmp")
+        tmp_p.write_text(tok_value + "\n", encoding="utf-8")
+        tmp_p.replace(self._token_file)
+        if os.name != "nt":
+            os.chmod(self._token_file, 0o600)
+
+    def _load_or_init_auth_token(self) -> None:
+        if self._token_file is not None and self._token_file.is_file():
+            raw = self._token_file.read_text(encoding="utf-8").strip()
+            if len(raw) >= 32 and not any(ch in raw for ch in ("\r", "\n", "\x00")):
+                new_epoch = "epoch-" + secrets.token_hex(16)
+                with self._auth_lock:
+                    self._auth_secret = _CockpitSecret(raw)
+                    self._session_epoch = new_epoch
+                    if self._ui_service is not None and callable(getattr(self._ui_service, "rotate_adapter_session", None)):
+                        self._ui_service.rotate_adapter_session(new_epoch)
+                return
+        self.rotate_auth_token()
+
     def rotate_auth_token(self) -> str:
         """Rotate per-launch bearer secret + session_epoch, terminating prior connections."""
         with self._auth_lock:
@@ -372,6 +429,8 @@ class LoopbackCockpitServer:
             self._session_epoch = new_epoch
             if self._ui_service is not None and callable(getattr(self._ui_service, "rotate_adapter_session", None)):
                 self._ui_service.rotate_adapter_session(new_epoch)
+            if self._token_file is not None:
+                self._write_token_file(new_tok.reveal())
         self.notify_stream_updated()
         self._close_active_sockets()
         return new_tok.reveal()
@@ -475,8 +534,13 @@ class LoopbackCockpitServer:
                     self._write_json(HTTPStatus.FORBIDDEN, {"error": "Loopback clients only"})
                     return False
 
+                allowed_hosts = {outer.expected_host_header}
+                allowed_origins = {outer.base_url}
+                if outer._public_host and outer._public_origin:
+                    allowed_hosts.add(outer._public_host)
+                    allowed_origins.add(outer._public_origin)
                 hosts = self.headers.get_all("Host") or []
-                if len(hosts) != 1 or hosts[0].strip() != outer.expected_host_header:
+                if len(hosts) != 1 or hosts[0].strip() not in allowed_hosts:
                     self._write_json(HTTPStatus.FORBIDDEN, {"error": "Invalid or foreign Host header"})
                     return False
 
@@ -484,7 +548,7 @@ class LoopbackCockpitServer:
                 if len(origins) > 1:
                     self._write_json(HTTPStatus.FORBIDDEN, {"error": "Multiple Origin headers forbidden"})
                     return False
-                if len(origins) == 1 and origins[0].strip() != outer.base_url:
+                if len(origins) == 1 and origins[0].strip() not in allowed_origins:
                     self._write_json(HTTPStatus.FORBIDDEN, {"error": "Cross-origin loopback request forbidden"})
                     return False
 
@@ -528,7 +592,8 @@ class LoopbackCockpitServer:
                         return False, True, epoch, ""
                     if is_post:
                         origins = self.headers.get_all("Origin") or []
-                        if len(origins) == 1 and origins[0].strip() != outer.base_url:
+                        allowed_origins = {outer.base_url} | ({outer._public_origin} if outer._public_origin else set())
+                        if len(origins) == 1 and origins[0].strip() not in allowed_origins:
                             return False, True, epoch, ""
                     ok = hmac.compare_digest(candidate.encode("utf-8"), expected_bytes)
                     return ok, True, epoch, candidate
@@ -1002,7 +1067,7 @@ class LoopbackCockpitServer:
                     self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
         self._stop_event.clear()
-        self.rotate_auth_token()
+        self._load_or_init_auth_token()
         self._httpd = _ExclusiveThreadingHTTPServer((self._host, self._port), _Handler)
         self._httpd.daemon_threads = True
         self._httpd.request_queue_size = 32
@@ -1256,6 +1321,8 @@ def run_cockpit_cli(
         profit_vault=runtime_state.profit_vault,
         parallel_tiers=runtime_state.parallel_tiers,
         owner_recovery=runtime_state.owner_recovery,
+        token_file=str(merged.get("CAS_FOREX_COCKPIT_TOKEN_FILE", "")).strip() or None,
+        public_origin=str(merged.get("CAS_FOREX_PUBLIC_ORIGIN", "")).strip() or None,
     )
     srv.start()
     stop_flag = threading.Event()
