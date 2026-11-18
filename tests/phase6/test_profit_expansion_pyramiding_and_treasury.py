@@ -34,6 +34,7 @@ from cas_forex_revamp.composition.trend_regime import (
 from cas_forex_revamp.contracts import ActionKind, Side, canonical_bytes, content_digest, decimal_text
 from cas_forex_revamp.operator.frontier_backends import (
     FrontierModelRegistry,
+    assert_safe_ai_catalog_payload,
     _CATALOG_BY_ID,
     _build_provider_payload,
     _extract_provider_text_and_usage,
@@ -256,6 +257,24 @@ class ProfitExpansionTests(unittest.TestCase):
             self.assertEqual(by_id["TIER_5_300"]["last_skip_reason"], "LOT_FLOOR_RISK_EXCEEDED")
             self.assertEqual(by_id["TIER_2_1000"]["open_positions"], 1)
             self.assertEqual(by_id["TIER_1_CURRENT"]["open_positions"], 1)
+            safe_snap = assert_safe_ai_catalog_payload(eng.snapshot())
+            self.assertEqual(safe_snap["tiers"][0]["color_class"], "tier-300k")
+            srv = LoopbackCockpitServer(repo_root=Path(__file__).resolve().parents[2], port=0, parallel_tiers=eng)
+            base_url = srv.start()
+            try:
+                host, port_s = base_url.replace("http://", "").split(":", 1)
+                conn = http.client.HTTPConnection(host, int(port_s), timeout=5)
+                try:
+                    conn.request("GET", "/api/parallel-tiers", headers=srv.auth_headers())
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 200)
+                    payload = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(payload["tier_count"], 5)
+                    self.assertEqual(payload["tiers"][0]["color_class"], "tier-300k")
+                finally:
+                    conn.close()
+            finally:
+                srv.stop()
 
     def test_section_b6_2speed_brain_thinking_payloads_and_nonblocking_50ms_protection(self) -> None:
         # 928-byte SYSTEM_POLICY invariant unchanged

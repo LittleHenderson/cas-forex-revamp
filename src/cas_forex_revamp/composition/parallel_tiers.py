@@ -71,7 +71,7 @@ class ParallelTierSpec:
     tier_id: str
     label: str
     starting_capital_usd: Decimal
-    color_token: str
+    color_class: str
 
 
 DEFAULT_PARALLEL_TIER_SPECS: tuple[ParallelTierSpec, ...] = (
@@ -220,7 +220,7 @@ class ParallelTierEngine:
                 CREATE TABLE IF NOT EXISTS tier_accounts (
                     tier_id TEXT PRIMARY KEY,
                     label TEXT NOT NULL,
-                    color_token TEXT NOT NULL,
+                    color_class TEXT NOT NULL,
                     starting_capital_usd TEXT NOT NULL,
                     balance_usd TEXT NOT NULL,
                     equity_usd TEXT NOT NULL,
@@ -271,6 +271,11 @@ class ParallelTierEngine:
                 );
                 """
             )
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(tier_accounts)").fetchall()}
+            if "color_class" not in cols:
+                conn.execute("ALTER TABLE tier_accounts ADD COLUMN color_class TEXT NOT NULL DEFAULT 'tier-300k'")
+                if "color_token" in cols:
+                    conn.execute("UPDATE tier_accounts SET color_class = color_token")
             ts = _iso(self._clock())
             vault_db = self.db_path.parent / f"{self.db_path.stem}_vault.sqlite3"
             for spec in self._specs:
@@ -280,12 +285,12 @@ class ParallelTierEngine:
                     conn.execute(
                         """
                         INSERT INTO tier_accounts(
-                            tier_id, label, color_token, starting_capital_usd, balance_usd,
+                            tier_id, label, color_class, starting_capital_usd, balance_usd,
                             equity_usd, peak_equity_usd, realized_net_usd, win_count, loss_count,
                             gross_profit_usd, gross_loss_usd, last_skip_reason, updated_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, '0', 0, 0, '0', '0', NULL, ?)
                         """,
-                        (spec.tier_id, spec.label, spec.color_token, start_txt, start_txt, start_txt, start_txt, ts),
+                        (spec.tier_id, spec.label, spec.color_class, start_txt, start_txt, start_txt, start_txt, ts),
                     )
                     conn.execute(
                         "INSERT INTO tier_equity_history(tier_id, observed_at, equity_usd, growth_pct) VALUES (?, ?, ?, '0')",
@@ -773,7 +778,7 @@ class ParallelTierEngine:
                 tiers.append({
                     "tier_id": tid,
                     "label": str(acct["label"]),
-                    "color_token": str(acct["color_token"]),
+                    "color_class": str(acct["color_class"]),
                     "starting_capital_usd": decimal_text(start_v),
                     "balance_usd": str(acct["balance_usd"]),
                     "equity_usd": decimal_text(eq_v),

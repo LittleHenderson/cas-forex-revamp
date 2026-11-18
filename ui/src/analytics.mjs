@@ -100,7 +100,7 @@ export function normalizeParallelTiers(doc) {
   const tiers = rawTiers.map((t) => Object.freeze({
     tierId: str(t.tier_id, ''),
     label: str(t.label, ''),
-    colorToken: str(t.color_token, 'tier-300k'),
+    colorToken: str(t.color_class || t.color_token, 'tier-300k'),
     startingCapitalUsd: numStr(t.starting_capital_usd, '0'),
     balanceUsd: numStr(t.balance_usd, '0'),
     equityUsd: numStr(t.equity_usd, '0'),

@@ -604,13 +604,13 @@ class StageBSecurityRemediationTests(unittest.TestCase):
         dst_clean = self.tmp_root / "dst_clean_tree"
         (src_clean / "nested").mkdir(parents=True, exist_ok=True)
         if os.name == "posix":
-            os.chmod(src_clean, 0o755)
-            os.chmod(src_clean / "nested", 0o755)
+            os.chmod(src_clean, 0o755)  # nosec B103: intentional permissive source fixture to verify strict mode sanitization
+            os.chmod(src_clean / "nested", 0o755)  # nosec B103: intentional permissive source fixture to verify strict mode sanitization
         (src_clean / "nested/data.json").write_bytes(b'{"clean":true}')
         (src_clean / "nested/run.sh").write_bytes(b"#!/bin/sh\nexit 0\n")
         if os.name == "posix":
             os.chmod(src_clean / "nested/data.json", 0o644)
-            os.chmod(src_clean / "nested/run.sh", 0o755)
+            os.chmod(src_clean / "nested/run.sh", 0o755)  # nosec B103: intentional permissive source fixture to verify strict mode sanitization
 
         _materialize_regular_tree(src_clean, dst_clean, dir_mode=0o550, file_mode=0o440, exec_file_mode=0o550)
         try:

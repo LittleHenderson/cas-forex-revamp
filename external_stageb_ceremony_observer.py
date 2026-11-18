@@ -1035,7 +1035,7 @@ def orchestrate_guest_ceremony(
         stderr=subprocess.PIPE,
         text=True,
     )
-    unit_name = "cas-forex-stageb-" + cfg["run_id"]
+    unit_name = "cas-forex-" + cfg["run_id"]
     unit_handle = subprocess.Popen(unit_argv, env=clean_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     ceilings_verified = False
     deadline_poll = time.monotonic() + 10.0
