@@ -651,8 +651,14 @@ dialog::backdrop { background: rgba(32, 30, 29, .65); }
 .market-chart-canvas {
   display: block;
   width: 100%;
+  aspect-ratio: 860 / 360;
+  min-height: 240px;
   height: auto;
   cursor: crosshair;
+}
+.market-chart-canvas-quad {
+  aspect-ratio: 460 / 220;
+  min-height: 170px;
 }
 .market-quad-grid {
   display: grid;

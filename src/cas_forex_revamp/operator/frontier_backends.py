@@ -175,7 +175,7 @@ FRONTIER_MODEL_CATALOG: tuple[FrontierModelCatalogEntry, ...] = (
         allowed_host="api.anthropic.com",
         credential_env=ENV_ANTHROPIC_API_KEY,
         slug_env=ENV_ANTHROPIC_FABLE_MODEL_ID,
-        default_slug="claude-fable",
+        default_slug="claude-fable-5",
         tier="FRONTIER",
         is_fallback=False,
         reasoning_policy="structured-risk-first",
@@ -260,7 +260,7 @@ FRONTIER_MODEL_CATALOG: tuple[FrontierModelCatalogEntry, ...] = (
         allowed_host="api.openai.com",
         credential_env=ENV_OPENAI_API_KEY,
         slug_env=ENV_OPENAI_ASTRA_MODEL_ID,
-        default_slug="openai-astra",
+        default_slug="gpt-5.5-2026-04-23",
         tier="FRONTIER",
         is_fallback=False,
         reasoning_policy="structured-risk-first",
@@ -277,7 +277,7 @@ FRONTIER_MODEL_CATALOG: tuple[FrontierModelCatalogEntry, ...] = (
         allowed_host="api.deepseek.com",
         credential_env=ENV_DEEPSEEK_API_KEY,
         slug_env=ENV_DEEPSEEK_FLASH_MODEL_ID,
-        default_slug="deepseek-flash-1017",
+        default_slug="deepseek-flash",
         tier="FRONTIER",
         is_fallback=False,
         reasoning_policy="structured-risk-first",
@@ -621,20 +621,34 @@ def _build_provider_payload(
         url = _validate_frontier_https_url(entry.endpoint_template, expected_host=entry.allowed_host)
         headers["x-api-key"] = secret.reveal_for_header()
         headers["anthropic-version"] = "2023-06-01"
-        if effort in ("medium", "high"):
-            think_budget = 2048 if effort == "medium" else 6144
-            body_obj: dict[str, Any] = {
-                "model": api_slug,
-                "max_tokens": max(max_tokens, think_budget + 1024),
-                "thinking": {"type": "enabled", "budget_tokens": think_budget},
-                "system": invocation.system_policy,
-                "messages": [{"role": "user", "content": user_content}],
-            }
+        low_slug = api_slug.lower()
+        is_legacy_claude = "-4-" in low_slug or low_slug.endswith("-4") or low_slug.startswith("claude-3")
+        if is_legacy_claude:
+            if effort in ("medium", "high"):
+                think_budget = 2048 if effort == "medium" else 6144
+                body_obj: dict[str, Any] = {
+                    "model": api_slug,
+                    "max_tokens": max(max_tokens, think_budget + 1024),
+                    "thinking": {"type": "enabled", "budget_tokens": think_budget},
+                    "system": invocation.system_policy,
+                    "messages": [{"role": "user", "content": user_content}],
+                }
+            else:
+                body_obj = {
+                    "model": api_slug,
+                    "max_tokens": max_tokens,
+                    "temperature": 0,
+                    "system": invocation.system_policy,
+                    "messages": [{"role": "user", "content": user_content}],
+                }
         else:
+            ant_effort = effort if effort in ("low", "medium", "high") else "low"
+            min_tok = 1024 if ant_effort == "low" else (4096 if ant_effort == "medium" else 8192)
             body_obj = {
                 "model": api_slug,
-                "max_tokens": max_tokens,
-                "temperature": 0,
+                "max_tokens": max(max_tokens, min_tok),
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": ant_effort},
                 "system": invocation.system_policy,
                 "messages": [{"role": "user", "content": user_content}],
             }
@@ -683,18 +697,32 @@ def _build_provider_payload(
             raise FrontierTransportError(f"{entry.display_name} requires {entry.credential_env}")
         url = _validate_frontier_https_url(entry.endpoint_template, expected_host=entry.allowed_host)
         headers["Authorization"] = f"Bearer {secret.reveal_for_header()}"
-        body_obj = {
-            "model": api_slug,
-            "temperature": 0,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": invocation.system_policy},
-                {"role": "user", "content": user_content},
-            ],
-        }
-        if effort in ("medium", "high"):
-            body_obj["reasoning_effort"] = effort
+        is_reasoning_openai = entry.provider == "openai" and api_slug.lower().startswith(("gpt-5", "o1", "o3", "o4"))
+        if is_reasoning_openai:
+            oai_effort = effort if effort in ("low", "medium", "high") else "low"
+            body_obj = {
+                "model": api_slug,
+                "max_completion_tokens": max_tokens,
+                "reasoning_effort": oai_effort,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": invocation.system_policy},
+                    {"role": "user", "content": user_content},
+                ],
+            }
+        else:
+            body_obj = {
+                "model": api_slug,
+                "temperature": 0,
+                "max_tokens": max_tokens,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": invocation.system_policy},
+                    {"role": "user", "content": user_content},
+                ],
+            }
+            if effort in ("medium", "high"):
+                body_obj["reasoning_effort"] = effort
         if invocation.seed is not None and entry.provider == "openai":
             body_obj["seed"] = invocation.seed
         return url, headers, canonical_bytes(body_obj)
@@ -714,6 +742,57 @@ def _build_provider_payload(
         return OLLAMA_LOOPBACK_ENDPOINT, headers, canonical_bytes(body_obj)
 
     raise FrontierConfigurationError(f"unknown provider {entry.provider!r}")
+
+
+def _build_gemini_fast_json_payload(
+    *,
+    clean_slug: str,
+    system_text: str,
+    user_text: str,
+    max_tokens: int,
+    secret: _RedactedSecret,
+    allowed_host: str,
+) -> tuple[str, dict[str, str], bytes]:
+    raw_url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_slug}:generateContent"
+    url = _validate_frontier_https_url(raw_url, expected_host=allowed_host)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "x-goog-api-key": secret.reveal_for_header(),
+    }
+    body_obj = {
+        "systemInstruction": {"parts": [{"text": system_text}]},
+        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": max(128, int(max_tokens)),
+            "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    return url, headers, canonical_bytes(body_obj)
+
+
+def _extract_gemini_cand_text(raw_doc: dict[str, Any]) -> str:
+    cands = raw_doc.get("candidates")
+    if type(cands) is not list or not cands:
+        raise FrontierTransportError("Gemini response missing candidates")
+    content = cands[0].get("content") if type(cands[0]) is dict else None
+    parts = content.get("parts") if type(content) is dict else None
+    text = None
+    if type(parts) is list:
+        for part in parts:
+            if type(part) is dict and not part.get("thought") and isinstance(part.get("text"), str):
+                text = part.get("text")
+                break
+        if text is None:
+            for part in reversed(parts):
+                if type(part) is dict and isinstance(part.get("text"), str):
+                    text = part.get("text")
+                    break
+    if not isinstance(text, str) or not text.strip():
+        raise FrontierTransportError("Gemini returned empty selection text")
+    return _strip_optional_json_fence(text)
 
 
 class FrontierReceiptVerifier:
@@ -768,6 +847,7 @@ class FrontierChatBackend(ModelBackend):
         self._min_probability = min_probability
         self._seq = 0
         self._lock = Lock()
+        self._decide_404: bool = False
         self.last_decision_probability: Decimal | None = None
 
     def __repr__(self) -> str:
@@ -802,23 +882,69 @@ class FrontierChatBackend(ModelBackend):
 
         started_at = utc_time(self._clock(), "started_at")
         input_tokens = self.count_input_tokens(invocation)
-        url, headers, body = _build_provider_payload(self._entry, self._api_slug, invocation, self._secret)
-        try:
-            status, raw = self._dispatch_http(
-                url,
-                headers,
-                body,
-                min(self._timeout, float(invocation.budget.max_seconds_per_call)),
-            )
-        finally:
-            headers.clear()
+        timeout_s = min(self._timeout, float(invocation.budget.max_seconds_per_call))
+        extract_provider = self._entry.provider
+        if self._entry.provider == "gemini_decision":
+            if self._secret is None:
+                raise FrontierTransportError(f"{self._entry.display_name} requires {self._entry.credential_env}")
+            clean_slug = self._api_slug.removeprefix("models/")
+            status = 404
+            raw = b""
+            with self._lock:
+                skip_decide = self._decide_404
+            if clean_slug.startswith("gemini-decision") and not skip_decide:
+                url, headers, body = _build_provider_payload(self._entry, self._api_slug, invocation, self._secret)
+                try:
+                    status, raw = self._dispatch_http(url, headers, body, min(timeout_s, 4.0))
+                except FrontierTransportError as exc:
+                    if "HTTP status 404" not in str(exc):
+                        raise
+                    status, raw = 404, b""
+                finally:
+                    headers.clear()
+                if status == 404:
+                    with self._lock:
+                        self._decide_404 = True
+            if status == 404 or not clean_slug.startswith("gemini-decision"):
+                fb_candidates = (
+                    ("gemini-2.5-flash", "gemini-3.8-flash")
+                    if clean_slug == "gemini-decision-1"
+                    else (clean_slug,)
+                )
+                for idx_fb, fb_slug in enumerate(fb_candidates):
+                    fb_url, fb_hdrs, fb_body = _build_gemini_fast_json_payload(
+                        clean_slug=fb_slug,
+                        system_text=invocation.system_policy,
+                        user_text=invocation.packet_json,
+                        max_tokens=invocation.budget.max_generated_tokens_per_call,
+                        secret=self._secret,
+                        allowed_host=self._entry.allowed_host,
+                    )
+                    try:
+                        status, raw = self._dispatch_http(fb_url, fb_hdrs, fb_body, timeout_s)
+                    except FrontierTransportError as exc:
+                        if idx_fb + 1 < len(fb_candidates) and "HTTP status 404" in str(exc):
+                            status, raw = 404, b""
+                            continue
+                        raise
+                    finally:
+                        fb_hdrs.clear()
+                    if status != 404 or idx_fb + 1 == len(fb_candidates):
+                        break
+                extract_provider = "gemini"
+        else:
+            url, headers, body = _build_provider_payload(self._entry, self._api_slug, invocation, self._secret)
+            try:
+                status, raw = self._dispatch_http(url, headers, body, timeout_s)
+            finally:
+                headers.clear()
 
         if status < 200 or status >= 300:
             raise FrontierTransportError(f"{self._entry.display_name} returned HTTP status {status}")
 
         doc = _decode_json_dict(raw, max_bytes=self._max_wire_bytes)
         selection_text, generated_tokens, prob = _extract_provider_text_and_usage(
-            self._entry.provider, doc, invocation, min_probability=self._min_probability
+            extract_provider, doc, invocation, min_probability=self._min_probability
         )
         self.last_decision_probability = prob
         completed_at = utc_time(self._clock(), "completed_at")
@@ -917,6 +1043,7 @@ class FrontierModelRegistry:
             )
         self._thinking_depth: str = raw_depth
         self._thinking_depth_persist_cb: Any = None
+        self._decide_404: bool = False
         self._last_effective_effort: str = "low"
         self._last_latency_ms: int | None = None
 
@@ -1100,34 +1227,82 @@ class FrontierModelRegistry:
                 self._last_scout = summary
             return summary
 
-        clean_slug = self._slugs["gemini-decision-1"].removeprefix("models/")
-        url = _validate_frontier_https_url(entry.endpoint_template.format(slug=clean_slug), expected_host=entry.allowed_host)
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "x-goog-api-key": secret.reveal_for_header(),
-        }
-        body = canonical_bytes({
-            "model": f"models/{clean_slug}",
-            "batch_questions": questions[:1000],
-            "zero_output_tokens": True,
-        })
-        t0 = _utc_now()
-        try:
-            if self._http_post is not None:
-                status, raw = self._http_post(url, dict(headers), body, 5.0, MAX_PROVIDER_WIRE_BYTES)
-            else:
-                status, raw = default_frontier_https_post(
-                    url, dict(headers), body, 5.0, MAX_PROVIDER_WIRE_BYTES,
+        def _post(u: str, h: dict[str, str], b: bytes, timeout_s: float = 8.0) -> tuple[int, bytes]:
+            try:
+                if self._http_post is not None:
+                    return self._http_post(u, dict(h), b, timeout_s, MAX_PROVIDER_WIRE_BYTES)
+                return default_frontier_https_post(
+                    u, dict(h), b, timeout_s, MAX_PROVIDER_WIRE_BYTES,
                     expected_host=entry.allowed_host, resolve_dns=self._resolve_dns,
                 )
-        finally:
-            headers.clear()
+            finally:
+                h.clear()
+
+        clean_slug = self._slugs["gemini-decision-1"].removeprefix("models/")
+        t0 = _utc_now()
+        status = 404
+        raw = b""
+        used_generate = False
+        with self._lock:
+            skip_decide = self._decide_404
+        if clean_slug.startswith("gemini-decision") and not skip_decide:
+            url = _validate_frontier_https_url(entry.endpoint_template.format(slug=clean_slug), expected_host=entry.allowed_host)
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "x-goog-api-key": secret.reveal_for_header(),
+            }
+            body = canonical_bytes({
+                "model": f"models/{clean_slug}",
+                "batch_questions": questions[:1000],
+                "zero_output_tokens": True,
+            })
+            try:
+                status, raw = _post(url, headers, body, 4.0)
+            except FrontierTransportError as exc:
+                if "HTTP status 404" not in str(exc):
+                    raise
+                status, raw = 404, b""
+            if status == 404:
+                with self._lock:
+                    self._decide_404 = True
+        if status == 404 or not clean_slug.startswith("gemini-decision"):
+            fb_candidates = (
+                ("gemini-2.5-flash", "gemini-3.8-flash")
+                if clean_slug == "gemini-decision-1"
+                else (clean_slug,)
+            )
+            fb_sys = (
+                "Screen candidate forex/index setups quickly and respond ONLY with valid JSON: "
+                '{"decisions":[{"market":"SYMBOL","choice":"WAIT or exact choice","probability":"0.01-0.99"}]}.'
+            )
+            fb_user = canonical_bytes({"min_probability": decimal_text(gate_prob), "candidates": questions[:1000]}).decode("utf-8")
+            for idx_fb, fb_slug in enumerate(fb_candidates):
+                fb_url, fb_hdrs, fb_body = _build_gemini_fast_json_payload(
+                    clean_slug=fb_slug,
+                    system_text=fb_sys,
+                    user_text=fb_user,
+                    max_tokens=512,
+                    secret=secret,
+                    allowed_host=entry.allowed_host,
+                )
+                try:
+                    status, raw = _post(fb_url, fb_hdrs, fb_body, 8.0)
+                except FrontierTransportError as exc:
+                    if idx_fb + 1 < len(fb_candidates) and "HTTP status 404" in str(exc):
+                        status, raw = 404, b""
+                        continue
+                    raise
+                used_generate = True
+                if status != 404 or idx_fb + 1 == len(fb_candidates):
+                    break
 
         latency_ms = max(1, int((_utc_now() - t0).total_seconds() * 1000))
         if status < 200 or status >= 300:
             raise FrontierTransportError(f"Gemini Decision 1 scout returned HTTP {status}")
         doc = _decode_json_dict(raw)
+        if used_generate and "decisions" not in doc and "candidates" in doc:
+            doc = _decode_json_dict(_extract_gemini_cand_text(doc).encode("utf-8"))
         raw_decisions = doc.get("decisions") if isinstance(doc.get("decisions"), list) else [doc]
         parsed: list[dict[str, Any]] = []
         best_prob = Decimal("0")

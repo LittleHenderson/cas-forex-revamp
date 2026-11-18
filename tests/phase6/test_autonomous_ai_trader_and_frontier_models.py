@@ -782,6 +782,160 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
         cli_rc = run_cockpit_cli(["--print-check-only"], environ={}, repo_root=Path(__file__).resolve().parents[2])
         self.assertEqual(cli_rc, 0)
 
+    def test_pr11_exclusive_port_bind_mt5_index_seed_and_gemini_404_fallback_and_scout_degraded(self) -> None:
+        # 1. _ExclusiveThreadingHTTPServer blocks duplicate port hijack immediately.
+        srv1 = LoopbackCockpitServer(repo_root=Path(__file__).resolve().parents[2], host="127.0.0.1", port=0)
+        srv1.start()
+        try:
+            srv2 = LoopbackCockpitServer(repo_root=Path(__file__).resolve().parents[2], host="127.0.0.1", port=srv1.bound_port)
+            with self.assertRaises(OSError):
+                srv2.start()
+            c = http.client.HTTPConnection("127.0.0.1", srv1.bound_port, timeout=5)
+            try:
+                c.request("GET", "/api/health", headers=srv1.auth_headers())
+                r = c.getresponse()
+                self.assertEqual(r.status, 200)
+                self.assertTrue(json.loads(r.read().decode("utf-8"))["authenticated"])
+            finally:
+                c.close()
+        finally:
+            srv1.stop()
+
+        # 2. Gemini Decision 1 HTTP 404 on :decide falls back to ("gemini-2.5-flash", "gemini-3.8-flash"),
+        #    memoizes _decide_404 so :decide is not re-requested, and if scout fails, AutonomousAiTrader marks SCOUT_DEGRADED.
+        seen_urls: list[str] = []
+
+        def scout_404_then_flash_http(url: str, headers: dict, body: bytes, timeout: float, max_bytes: int):
+            seen_urls.append(url)
+            if url.endswith(":decide") or "gemini-2.5-flash:generateContent" in url:
+                return 404, b'{"error":"not found"}'
+            if "gemini-3.8-flash:generateContent" in url:
+                return 200, json.dumps({
+                    "candidates": [{"content": {"parts": [{"text": json.dumps({"decisions": [{"market": "NAS100", "choice": "OPEN_BUY", "probability": "0.86"}]})}]}}],
+                    "usageMetadata": {"candidatesTokenCount": 24},
+                }).encode("utf-8")
+            user_doc = json.loads(json.loads(body.decode("utf-8"))["messages"][0]["content"])
+            sel = {
+                "request_id": user_doc["request_id"],
+                "opportunity_set_id": user_doc["opportunity_set_id"],
+                "source_state_id": user_doc["state"]["state_id"],
+                "selected_action_ref": None,
+                "reason": "ID=0wait_after_scout",
+                "evidence_ids": [e["evidence_id"] for e in user_doc["evidence"][:1]] or ["ev-1"],
+            }
+            return 200, json.dumps({"content": [{"type": "text", "text": json.dumps(sel)}], "usage": {"output_tokens": 32}}).encode("utf-8")
+
+        reg_fb = FrontierModelRegistry(
+            environ={"CAS_FOREX_GEMINI_API_KEY": "test-placeholder-gem-alpha-01"},
+            clock=lambda: T0,
+            http_post=scout_404_then_flash_http,
+            resolve_dns=lambda _h: None,
+        )
+        fb_out = reg_fb.scout_opportunities([{"market": "NAS100", "choices": ["WAIT", "opt-1"]}])
+        self.assertTrue(fb_out["executed"])
+        self.assertEqual(fb_out["best_market"], "NAS100")
+        self.assertTrue(any("gemini-2.5-flash:generateContent" in u for u in seen_urls))
+        self.assertTrue(any("gemini-3.8-flash:generateContent" in u for u in seen_urls))
+        fb_out2 = reg_fb.scout_opportunities([{"market": "NAS100", "choices": ["WAIT", "opt-1"]}])
+        self.assertTrue(fb_out2["executed"])
+        self.assertEqual(sum(1 for u in seen_urls if u.endswith(":decide")), 1)
+        g_spec, g_back, g_ver = reg_fb.build_backend("gemini-decision-1")
+        from cas_forex_revamp.contracts import ActionIntent, ActionOption, DecisionFact, DecisionOrigin, DecisionRequest, EvidenceKind, EvidenceReference, RunScope, StateReference, canonical_bytes, content_digest
+        g_scope = RunScope("acct-g", "run-g", 1, "b1", "p1", "s1", "adapter-g")
+        g_st = StateReference("st-g", g_scope, 1, T0, T0 + timedelta(seconds=30), 1)
+        g_intent = ActionIntent(intent_id="g-ord-1", scope=g_scope, decision_id="dec-g1", opportunity_id="opp-g1", action_ref="opt-g", kind=ActionKind.OPEN, origin=DecisionOrigin.ACTUAL_MODEL, instrument_id="NAS100", source_state=g_st, created_at=T0, expires_at=T0 + timedelta(seconds=30), quantity=D("1"), side=Side.BUY, limit_price=D("20502.50"), stop_price=D("20475.00"), take_profit_price=D("20560.00"))
+        g_fact = {"sym": "NAS100"}
+        g_req = DecisionRequest(request_id="req-g1", opportunity_set_id="set-g1", state=g_st, options=(ActionOption("opt-g", "wait", "50ms", "WAIT", g_intent),), facts=(DecisionFact("fg1", "q", canonical_bytes(g_fact).decode("utf-8"), ("ev-g1",)),), evidence=(EvidenceReference("ev-g1", EvidenceKind.OBSERVATION, "test", content_digest(g_fact), T0),))
+        g2_urls: list[str] = []
+        class _FakeGen404:
+            def __call__(self, u, h, b, t, m):
+                g2_urls.append(u)
+                if u.endswith(":decide"):
+                    raise FrontierTransportError("frontier AI HTTP status 404")
+                ud = json.loads(json.loads(b.decode("utf-8"))["contents"][0]["parts"][0]["text"])
+                if "candidates" in ud:
+                    payload = {"decisions": [{"market": "EURUSD", "choice": "OPEN LONG", "probability": "0.88"}]}
+                    return 200, json.dumps({"candidates": [{"content": {"parts": [{"text": json.dumps(payload)}]}}], "usageMetadata": {"candidatesTokenCount": 16}}).encode("utf-8")
+                return 200, json.dumps({"candidates": [{"content": {"parts": [{"text": json.dumps({"request_id": ud["request_id"], "opportunity_set_id": ud["opportunity_set_id"], "source_state_id": ud["state"]["state_id"], "selected_action_ref": None, "reason": "ID=0wait_flash", "evidence_ids": ["ev-g1"]})}]}}], "usageMetadata": {"candidatesTokenCount": 20}}).encode("utf-8")
+        reg_g2 = FrontierModelRegistry(environ={"CAS_FOREX_GEMINI_API_KEY": "test-placeholder-gem-alpha-01"}, clock=lambda: T0, http_post=_FakeGen404(), resolve_dns=lambda _h: None)
+        scout_exc_out = reg_g2.scout_opportunities([{"market": "EURUSD", "choice": "OPEN LONG", "question": "q"}])
+        self.assertTrue(scout_exc_out["executed"])
+        self.assertEqual(scout_exc_out["best_market"], "EURUSD")
+        self.assertEqual([d["market"] for d in scout_exc_out["decisions"] if d["admitted"]], ["EURUSD"])
+        self.assertTrue(any("gemini-2.5-flash:generateContent" in u for u in g2_urls))
+        gs2, gb2, gv2 = reg_g2.build_backend("gemini-decision-1")
+        g_res = ActualModelDecisionAdapter(adapter_id="test-g404", model=gs2, budget=InferenceBudget(max_calls=1, max_input_tokens_per_call=16_384, max_generated_tokens_per_call=512, max_seconds_per_call=10, max_total_seconds=10), backend=gb2, receipt_verifier=gv2, execution_gate=lambda _: None, clock=lambda: T0).decide(g_req)
+        self.assertIsNone(g_res.selection.selected_action_ref)
+        g_req2 = DecisionRequest(request_id="req-g2", opportunity_set_id="set-g2", state=g_st, options=(ActionOption("opt-g", "wait", "50ms", "WAIT", g_intent),), facts=(DecisionFact("fg1", "q", canonical_bytes(g_fact).decode("utf-8"), ("ev-g1",)),), evidence=(EvidenceReference("ev-g1", EvidenceKind.OBSERVATION, "test", content_digest(g_fact), T0),))
+        ActualModelDecisionAdapter(adapter_id="test-g404-2", model=gs2, budget=InferenceBudget(max_calls=1, max_input_tokens_per_call=16_384, max_generated_tokens_per_call=512, max_seconds_per_call=10, max_total_seconds=10), backend=gb2, receipt_verifier=gv2, execution_gate=lambda _: None, clock=lambda: T0).decide(g_req2)
+        self.assertEqual(sum(1 for u in g2_urls if u.endswith(":decide")), 2)
+
+        def scout_503_primary_ok_http(url: str, headers: dict, body: bytes, timeout: float, max_bytes: int):
+            if "generativelanguage.googleapis.com" in url:
+                return 503, b'{"error":"unavailable"}'
+            req_b = json.loads(body.decode("utf-8"))
+            self.assertEqual(req_b["thinking"], {"type": "adaptive"})
+            self.assertEqual(req_b["output_config"], {"effort": "low"})
+            self.assertNotIn("temperature", req_b)
+            user_doc = json.loads(req_b["messages"][0]["content"])
+            sel = {
+                "request_id": user_doc["request_id"],
+                "opportunity_set_id": user_doc["opportunity_set_id"],
+                "source_state_id": user_doc["state"]["state_id"],
+                "selected_action_ref": None,
+                "reason": "ID=0wait_primary_ok",
+                "evidence_ids": [e["evidence_id"] for e in user_doc["evidence"][:1]] or ["ev-1"],
+            }
+            return 200, json.dumps({"content": [{"type": "text", "text": json.dumps(sel)}], "usage": {"output_tokens": 28}}).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp2:
+            from cas_forex_revamp.composition.live_cockpit_server import _build_mt5_index_snapshot_from_router
+
+            rig2 = _Rig(tmp2)
+            router2 = rig2.dual_router()
+            idx_snap, mt5_q = _build_mt5_index_snapshot_from_router(router2)
+            self.assertIsNotNone(idx_snap)
+            self.assertEqual(idx_snap["feed_mode"], "MT5_DIRECT_SPOOL_50MS")
+            self.assertEqual([m["pair"] for m in idx_snap["markets"]], ["NAS100", "US30"])
+            self.assertIn("NAS100", mt5_q)
+            self.assertGreaterEqual(len(idx_snap["markets"][0]["candles_m1"]), 1)
+            self.assertGreaterEqual(len(idx_snap["markets"][0]["candles_m5"]), 1)
+            self.assertGreaterEqual(len(idx_snap["markets"][0]["candles_h1"]), 1)
+            idx_snap2, _ = _build_mt5_index_snapshot_from_router(router2, prev_stream=idx_snap)
+            self.assertEqual(idx_snap2["sequence"], 2)
+            self.assertGreaterEqual(len(idx_snap2["markets"][0]["candles_m5"]), 1)
+
+            gate2 = load_default_forex_valve_gate()
+            reg_res = FrontierModelRegistry(
+                environ=rig2.env(
+                    CAS_FOREX_ANTHROPIC_API_KEY=SYNTH_API_KEY,
+                    CAS_FOREX_GEMINI_API_KEY="test-placeholder-gem-alpha-01",
+                    CAS_FOREX_GEMINI_DECISION_SCOUT="true",
+                ),
+                clock=lambda: T0,
+                http_post=scout_503_primary_ok_http,
+                resolve_dns=lambda _h: None,
+            )
+            trader2 = AutonomousAiTrader(
+                router=router2,
+                model_registry=reg_res,
+                valve_gate=gate2,
+                quota_store=DailyQuotaGovernanceStore(path=Path(tmp2) / "q2.sqlite3"),
+                execution_gate=DurableModelExecutionGate(Path(tmp2) / "g2.sqlite3"),
+                clock=lambda: T0,
+            )
+            quotes = dict(QUOTES_18)
+            for dlt in (D("0"), D("6"), D("14")):
+                trader2._tick_history["NAS100"].append((quotes["NAS100"][0] + dlt, quotes["NAS100"][1] + dlt))
+            cyc = trader2.run_fast_tick_cycle(mt5_quotes={"NAS100": (quotes["NAS100"][0] + D("14"), quotes["NAS100"][1] + D("14"))}, now=T0)
+            self.assertEqual(cyc["action"], "WAIT")
+            snap_t = trader2.status_snapshot()
+            self.assertIn("SCOUT_DEGRADED", trader2._last_scout["reason"])
+            cat_res = reg_res.catalog_snapshot()
+            self.assertEqual(cat_res["models"][3]["last_status"], "SCOUT_DEGRADED")
+            self.assertEqual(cat_res["models"][0]["calls"], 1)
+            self.assertEqual(snap_t["cycle_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

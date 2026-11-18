@@ -12,7 +12,8 @@
     "phase_5_external_broker_and_stageb_custody": "VALIDATED",
     "phase_6_16pair_live_chart_and_lantern_hardening": "VALIDATED",
     "phase_6_autonomous_ai_and_live_broker": "VALIDATED",
-    "phase_6_security14_pyramiding_treasury_2speed": "VALIDATED"
+    "phase_6_security14_pyramiding_treasury_2speed": "VALIDATED",
+    "phase_6_claude5_adaptive_chart11_rolling_indices": "VALIDATED"
   },
   "stop_condition": "Keep merging passing AI-agent PRs continuously while revamp_completed is false. Set revamp_completed to true only after Lantern ameliorations and Phase 5+6 AWS end-to-end pilot validation pass.",
   "validation_receipts": {
@@ -123,6 +124,66 @@
       "zero_aws_residue": true,
       "pytest_passed": 1061,
       "pytest_subtests_passed": 369
+    },
+    "phase_6_claude5_adaptive_chart11_rolling_indices": {
+      "aws_run_id": "fx-b-6f6baef8f24c466d",
+      "aws_instance_id": "i-095c1deb915c76c80",
+      "volume_id": "vol-0d34e4838462a7811",
+      "ssm_execution_id": "f66b1eb8-2bd5-4ea2-be9d-e3cec109d040",
+      "validated_source_commit_sha": "70092543a8bd303edd846af61725f74e78a5ee2f",
+      "source_manifest_sha256": "79939ff1331bf2376fad7e32372379d58cbc55b7ec42845b2df55f60e77370d3",
+      "pr_number": 11,
+      "export_archive_bytes": 15239197,
+      "export_archive_sha256": "3f88b9c10c48f99bab0a6940c38b21598bac53e134cd240818a03fac6052f953",
+      "lantern_version": "0.11.0",
+      "lantern_preseal_score": 100,
+      "lantern_airgap_score": 100,
+      "lantern_critical_high_medium_findings": 0,
+      "pip_audit_vulns": 0,
+      "npm_audit_ok": true,
+      "bandit_src_findings": 0,
+      "pytest_junit_tests": 1431,
+      "pytest_passed": 1062,
+      "pytest_subtests_passed": 369,
+      "node_ui_passed": 128,
+      "suite18_groups_passed": 18,
+      "suite18_tests_passed": 1759,
+      "stageb_run_id": "fx-b-d878b0ea0563a73f",
+      "stageb_calls_passed": 32,
+      "stageb_traps_blocked": 17,
+      "stageb_public_aggregate_status": "ACCEPT",
+      "unit3b_checks_passed": 30,
+      "unit3b_model_calls_passed": 11,
+      "ctt_rows_evaluated": 3634,
+      "valve_parameter_count": 161,
+      "ai_models_catalog_count": 9,
+      "markets_total": 18,
+      "billed_seconds": 4253,
+      "compute_cost_usd_exact": "0.204144000000",
+      "ipv4_cost_usd_exact": "0.005906944444",
+      "combined_cost_usd_exact": "0.210050944444",
+      "cumulative_pilot_billed_seconds": 76337,
+      "cumulative_pilot_spend_usd_exact": "3.664176000000",
+      "historical_failed_runs_not_licensed": [
+        {
+          "run_label": "run-08",
+          "aws_run_id": "fx-b-9563907fccdf4d0f",
+          "status": "NOT_LICENSED",
+          "billed_seconds": 2148,
+          "compute_cost_usd_exact": "0.103104000000",
+          "combined_cost_usd_exact": "0.106087333333"
+        },
+        {
+          "run_label": "run-10",
+          "aws_run_id": "fx-b-f29331792df74e31",
+          "aws_instance_id": "i-09d53c4f94d0ccf85",
+          "status": "NOT_LICENSED",
+          "billed_seconds": 4323,
+          "compute_cost_usd_exact": "0.207504000000",
+          "combined_cost_usd_exact": "0.213508166667"
+        }
+      ],
+      "zero_aws_residue": true
     }
   }
 }
