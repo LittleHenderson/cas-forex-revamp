@@ -10,7 +10,10 @@ import {
   decodeMarketStream,
   deriveTimeframeCandles,
   matchPositionsForPair,
+  mountMarketCharts,
+  releaseDetachedCanvases,
   renderMarketChartSection,
+  resolveLogicalCanvasSize,
   verifyMarketStreamDigest,
 } from '../../ui/src/chart.mjs';
 import { renderApp } from '../../ui/src/render.mjs';
@@ -215,4 +218,71 @@ test('CHART10 ScopedBridge optional readMarketStream verifies SHA-256 and reject
   payload = structuredClone(payload);
   payload.streams[0].mid = payload.streams[0].ask;
   await assert.rejects(consumer.readMarketStream(marketSchema), /SHA-256 mismatch/);
+});
+test('CHART11 HiDPI hover and wheel redraws preserve fixed logical dimensions without DPR blowup and releaseDetachedCanvases frees buffers', () => {
+  const decoded = decodeMarketStream(marketFixtureRaw, marketSchema);
+  const state = displayState(fixture(), 'operate');
+  state.marketStream = decoded;
+  state.chartPair = 'EURUSD';
+  state.chartTimeframe = 'M5';
+
+  const attributes = { width: '860', height: '360' };
+  let backingW = 860;
+  let backingH = 360;
+  const listeners = new Map();
+  const noop = () => {};
+  const ctx = {
+    fillStyle: '', strokeStyle: '', font: '', lineWidth: 1,
+    save: noop, restore: noop, scale: noop, setTransform: noop,
+    fillRect: noop, beginPath: noop, moveTo: noop, lineTo: noop,
+    stroke: noop, fillText: noop, setLineDash: noop,
+  };
+  const canvas = {
+    dataset: { marketCanvas: 'EURUSD', logicalWidth: '860', logicalHeight: '360' },
+    classList: { contains: () => false },
+    parentElement: { querySelector: () => null },
+    getAttribute: (name) => attributes[name] ?? null,
+    setAttribute: (name, val) => { attributes[name] = String(val); },
+    getContext: () => ctx,
+    getBoundingClientRect: () => ({ left: 0, width: 860 }),
+    addEventListener: (ev, fn) => { listeners.set(ev, fn); },
+    get width() { return backingW; },
+    set width(v) { backingW = Math.trunc(Number(v)); attributes.width = String(backingW); },
+    get height() { return backingH; },
+    set height(v) { backingH = Math.trunc(Number(v)); attributes.height = String(backingH); },
+  };
+  const mockRoot = {
+    querySelectorAll: (sel) => (sel.includes('canvas') ? [canvas] : []),
+  };
+
+  const origDpr = Object.getOwnPropertyDescriptor(globalThis, 'devicePixelRatio');
+  const origDoc = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  Object.defineProperty(globalThis, 'devicePixelRatio', { value: 1.5, configurable: true, writable: true });
+  Object.defineProperty(globalThis, 'document', { value: { documentElement: { dataset: { theme: 'dark' } } }, configurable: true, writable: true });
+  try {
+    const resolved = resolveLogicalCanvasSize(canvas);
+    assert.deepEqual(resolved, { cssW: 860, cssH: 360 });
+    mountMarketCharts(mockRoot, state);
+    const onMove = listeners.get('pointermove');
+    const onLeave = listeners.get('pointerleave');
+    const onWheel = listeners.get('wheel');
+    for (let i = 0; i < 60; i += 1) onMove({ clientX: 50 + (i % 700) });
+    for (let i = 0; i < 10; i += 1) onWheel({ preventDefault: noop, deltaY: i % 2 === 0 ? 120 : -120 });
+    for (let i = 0; i < 5; i += 1) onLeave();
+
+    assert.equal(canvas.width, 1290);
+    assert.equal(canvas.height, 540);
+    assert.equal(canvas.dataset.logicalWidth, '860');
+    assert.equal(canvas.dataset.logicalHeight, '360');
+
+    const freed = releaseDetachedCanvases(mockRoot);
+    assert.equal(freed, 1);
+    assert.equal(canvas.width, 0);
+    assert.equal(canvas.height, 0);
+  } finally {
+    if (origDpr) Object.defineProperty(globalThis, 'devicePixelRatio', origDpr);
+    else delete globalThis.devicePixelRatio;
+    if (origDoc) Object.defineProperty(globalThis, 'document', origDoc);
+    else delete globalThis.document;
+  }
 });

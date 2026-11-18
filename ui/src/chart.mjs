@@ -470,7 +470,7 @@ export function renderMarketChartSection(projection, state) {
             <strong>${e(qs.display_pair)} · ${e(timeframe)}</strong>
             <span class="numeric">${e(qs.bid)} / ${e(qs.ask)} (${e(qs.spread_pips)}p)</span>
           </div>
-          <canvas class="market-chart-canvas market-chart-canvas-quad" data-market-canvas="${e(qs.pair)}" width="460" height="220" aria-label="${e(qs.display_pair)} ${e(timeframe)} candlestick chart"></canvas>
+          <canvas class="market-chart-canvas market-chart-canvas-quad" data-market-canvas="${e(qs.pair)}" data-logical-width="460" data-logical-height="220" width="460" height="220" aria-label="${e(qs.display_pair)} ${e(timeframe)} candlestick chart"></canvas>
         </div>`;
       }).join('')}</div>`
     : `<div class="market-canvas-card">
@@ -485,7 +485,7 @@ export function renderMarketChartSection(projection, state) {
             <span>Spread <strong>${e(activeStream.spread_pips)} pips</strong></span>
           </div>
         </div>
-        <canvas class="market-chart-canvas" data-market-canvas="${e(activeStream.pair)}" width="860" height="360" aria-label="${e(activeStream.display_pair)} ${e(timeframe)} candlestick chart"></canvas>
+        <canvas class="market-chart-canvas" data-market-canvas="${e(activeStream.pair)}" data-logical-width="860" data-logical-height="360" width="860" height="360" aria-label="${e(activeStream.display_pair)} ${e(timeframe)} candlestick chart"></canvas>
         <div class="market-crosshair-readout" data-chart-readout="${e(activeStream.pair)}">
           ${latestCandle ? `Bar ${e(latestCandle.t)} · O ${e(latestCandle.o)} · H ${e(latestCandle.h)} · L ${e(latestCandle.l)} · C ${e(latestCandle.c)} · Vol ${e(latestCandle.v)} (${e(latestCandle.n)} trades)` : 'No candle bar'}
         </div>
@@ -575,18 +575,52 @@ function resolvePalette() {
       };
 }
 
+export function resolveLogicalCanvasSize(canvas, fallbackW = 860, fallbackH = 360) {
+  let cssW = Number(canvas?.dataset?.logicalWidth);
+  let cssH = Number(canvas?.dataset?.logicalHeight);
+  if (!Number.isFinite(cssW) || cssW <= 0) {
+    const attrW = Number(canvas?.getAttribute?.('width'));
+    cssW = Number.isFinite(attrW) && attrW > 0 && attrW <= 4096 ? attrW : fallbackW;
+    if (canvas?.dataset) canvas.dataset.logicalWidth = String(cssW);
+  }
+  if (!Number.isFinite(cssH) || cssH <= 0) {
+    const attrH = Number(canvas?.getAttribute?.('height'));
+    cssH = Number.isFinite(attrH) && attrH > 0 && attrH <= 4096 ? attrH : fallbackH;
+    if (canvas?.dataset) canvas.dataset.logicalHeight = String(cssH);
+  }
+  return { cssW, cssH };
+}
+
+export function releaseDetachedCanvases(root) {
+  if (!root || typeof root.querySelectorAll !== 'function') return 0;
+  const existing = root.querySelectorAll('canvas');
+  let count = 0;
+  for (const c of existing) {
+    c.width = 0;
+    c.height = 0;
+    count += 1;
+  }
+  return count;
+}
+
 function drawSingleCanvas(canvas, pairStream, state, hoverX = null) {
   const ctx = canvas.getContext?.('2d');
   if (!ctx) return;
-  const dpr = Math.min(2, Math.max(1, globalThis.devicePixelRatio || 1));
-  const cssW = Number(canvas.getAttribute('width')) || 860;
-  const cssH = Number(canvas.getAttribute('height')) || 360;
-  if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
-    canvas.width = Math.round(cssW * dpr);
-    canvas.height = Math.round(cssH * dpr);
+  const isQuad = Boolean(canvas.classList?.contains?.('market-chart-canvas-quad'));
+  const { cssW, cssH } = resolveLogicalCanvasSize(canvas, isQuad ? 460 : 860, isQuad ? 220 : 360);
+  const dpr = Math.min(1.5, Math.max(1, Number(globalThis.devicePixelRatio) || 1));
+  const targetW = Math.round(cssW * dpr);
+  const targetH = Math.round(cssH * dpr);
+  if (canvas.width !== targetW || canvas.height !== targetH) {
+    canvas.width = targetW;
+    canvas.height = targetH;
   }
   ctx.save();
-  ctx.scale(dpr, dpr);
+  if (typeof ctx.setTransform === 'function') {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  } else {
+    ctx.scale(dpr, dpr);
+  }
 
   const pal = resolvePalette();
   const timeframe = CHART_TIMEFRAMES.includes(state.chartTimeframe) ? state.chartTimeframe : 'M5';
@@ -739,7 +773,9 @@ export function mountMarketCharts(root, state) {
       canvas.dataset.boundHover = 'true';
       canvas.addEventListener('pointermove', (ev) => {
         const rect = canvas.getBoundingClientRect();
-        const scaleX = (Number(canvas.getAttribute('width')) || rect.width) / Math.max(1, rect.width);
+        const isQuad = Boolean(canvas.classList?.contains?.('market-chart-canvas-quad'));
+        const { cssW } = resolveLogicalCanvasSize(canvas, isQuad ? 460 : 860, isQuad ? 220 : 360);
+        const scaleX = cssW / Math.max(1, rect.width);
         drawSingleCanvas(canvas, pairStream, state, (ev.clientX - rect.left) * scaleX);
       });
       canvas.addEventListener('pointerleave', () => {
