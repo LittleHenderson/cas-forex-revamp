@@ -8,7 +8,7 @@ import { canonicalJSON } from './decision-read.mjs';
 export const MAX_MARKET_STREAM_BYTES = 1048576;
 export const CHART_TIMEFRAMES = Object.freeze(['50ms', '1s', 'M1', 'M5', 'M15', 'H1']);
 export const CHART_LAYOUTS = Object.freeze(['single', 'quad']);
-export const INDEX_INSTRUMENTS = Object.freeze(['NAS100', 'US30']);
+export const INDEX_INSTRUMENTS = Object.freeze(['NAS100', 'US30', 'SPX500', 'XAUUSD']);
 export const ALL_CHART_PAIRS = Object.freeze([
   'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD',
   'EURGBP', 'EURJPY', 'GBPJPY', 'EURCHF', 'EURAUD', 'EURCAD', 'AUDJPY', 'CHFJPY', 'CADJPY',
@@ -17,6 +17,8 @@ export const ALL_WATCHLIST_MARKETS = Object.freeze([...INDEX_INSTRUMENTS, ...ALL
 const INDEX_ALIAS_PAIRS = Object.freeze([
   ['USTEC', 'NAS100'], ['US100', 'NAS100'], ['NAS100', 'NAS100'], ['NASDAQ100', 'NAS100'], ['NDX', 'NAS100'],
   ['DJ30', 'US30'], ['WS30', 'US30'], ['US30', 'US30'], ['DJIA', 'US30'], ['YM', 'US30'],
+  ['SPX500', 'SPX500'], ['US500', 'SPX500'], ['SP500', 'SPX500'], ['SPX', 'SPX500'],
+  ['XAUUSD', 'XAUUSD'], ['XAU', 'XAUUSD'], ['GOLD', 'XAUUSD'],
 ]);
 
 const fail = (message) => { throw new SnapshotError(message); };
@@ -437,7 +439,7 @@ export function renderMarketChartSection(projection, state) {
 
   const catEntries = [
     ['all', `All / ${allStreams.length}`],
-    ...(indexMarkets.length ? [['US_INDEX', `US Indices / ${indexMarkets.length}`]] : []),
+    ...(indexMarkets.length ? [['US_INDEX', `Indices & Gold / ${indexMarkets.length}`]] : []),
     ['MAJOR', `Majors / ${allStreams.filter((s) => s.category === 'MAJOR').length}`],
     ['CROSS', `Crosses / ${allStreams.filter((s) => s.category === 'CROSS').length}`],
   ];
@@ -498,7 +500,7 @@ export function renderMarketChartSection(projection, state) {
   return `<section class="panel market-chart-panel" aria-label="Multi-currency market chart">
     <div class="section-heading">
       <div>
-        <p class="eyebrow">VERIFIED BROKER FEED · ${e(allStreams.length)} ${indexMarkets.length ? 'MARKETS (US INDICES + FX)' : 'CURRENCY PAIRS'} · SEQ #${e(stream?.sequence ?? state.indexStream?.sequence ?? 0)}</p>
+        <p class="eyebrow">VERIFIED BROKER FEED · ${e(allStreams.length)} ${indexMarkets.length ? 'MARKETS (INDICES, GOLD + FX)' : 'CURRENCY PAIRS'} · SEQ #${e(stream?.sequence ?? state.indexStream?.sequence ?? 0)}</p>
         <h2>Live multi-currency candlestick chart</h2>
       </div>
       <div class="market-chart-badges">
@@ -507,6 +509,11 @@ export function renderMarketChartSection(projection, state) {
         ${connectBtn}
       </div>
     </div>
+    ${!state.liveStreamConnected ? `<form class="mobile-unlock-bar" data-cockpit-unlock-form="true" autocomplete="on">
+      <label class="sr-only" for="cockpit-access-key">Cockpit access key</label>
+      <input id="cockpit-access-key" class="mobile-unlock-input" type="password" name="cockpit_access_key" autocomplete="current-password" placeholder="Access key (saved in Phone FaceID / Keychain)">
+      <button type="submit" class="button button-small">Unlock live stream</button>
+    </form>` : ''}
     <div class="market-chart-toolbar" role="toolbar" aria-label="Chart controls">
       <div class="segmented" role="group" aria-label="Pair category">${catButtons}</div>
       <div class="segmented" role="group" aria-label="Candle timeframe">${tfButtons}</div>

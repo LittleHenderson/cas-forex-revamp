@@ -4,6 +4,7 @@ Section B.5 5-Tier Parallel Account Engine, and Section B.6 Auto-Adaptive 2-Spee
 from __future__ import annotations
 
 import base64
+import dataclasses
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import http.client
@@ -317,6 +318,9 @@ class ProfitExpansionTests(unittest.TestCase):
 
         _, _, gem_body = _build_provider_payload(_CATALOG_BY_ID["gemini-carbon"], "gemini-4-carbon", inv_hi, reg._secrets["CAS_FOREX_GEMINI_API_KEY"])
         self.assertEqual(json.loads(gem_body.decode("utf-8"))["generationConfig"]["thinkingConfig"], {"thinkingBudget": 6144})
+        inv_lo = dataclasses.replace(inv_hi, model=ModelSpecification("cas-gemini-4-carbon", "b" * 64, "low", "frontier-v2"))
+        _, _, gem_lo_body = _build_provider_payload(_CATALOG_BY_ID["gemini-carbon"], "gemini-4-carbon", inv_lo, reg._secrets["CAS_FOREX_GEMINI_API_KEY"])
+        self.assertEqual(json.loads(gem_lo_body.decode("utf-8"))["generationConfig"]["thinkingConfig"], {"thinkingBudget": 256})
         txt_gem, _, _ = _extract_provider_text_and_usage(
             "gemini",
             {"candidates": [{"content": {"parts": [{"thought": True, "text": "hmm"}, {"text": '{"ok":2}'}]}}]},

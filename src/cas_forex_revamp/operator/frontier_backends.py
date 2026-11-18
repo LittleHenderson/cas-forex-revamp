@@ -685,6 +685,8 @@ def _build_provider_payload(
         }
         if effort in ("medium", "high"):
             gen_cfg["thinkingConfig"] = {"thinkingBudget": 2048 if effort == "medium" else 6144}
+        else:
+            gen_cfg["thinkingConfig"] = {"thinkingBudget": 256}
         body_obj = {
             "systemInstruction": {"parts": [{"text": invocation.system_policy}]},
             "contents": [{"role": "user", "parts": [{"text": user_content}]}],

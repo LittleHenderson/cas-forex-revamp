@@ -13,7 +13,8 @@
     "phase_6_16pair_live_chart_and_lantern_hardening": "VALIDATED",
     "phase_6_autonomous_ai_and_live_broker": "VALIDATED",
     "phase_6_security14_pyramiding_treasury_2speed": "VALIDATED",
-    "phase_6_claude5_adaptive_chart11_rolling_indices": "VALIDATED"
+    "phase_6_claude5_adaptive_chart11_rolling_indices": "VALIDATED",
+    "phase_7_spx500_xauusd_mobile_pwa_cloud": "VALIDATED"
   },
   "stop_condition": "Keep merging passing AI-agent PRs continuously while revamp_completed is false. Set revamp_completed to true only after Lantern ameliorations and Phase 5+6 AWS end-to-end pilot validation pass.",
   "validation_receipts": {
@@ -183,6 +184,47 @@
           "combined_cost_usd_exact": "0.213508166667"
         }
       ],
+      "zero_aws_residue": true
+    },
+    "phase_7_spx500_xauusd_mobile_pwa_cloud": {
+      "aws_run_id": "fx-b-0cc7ec57743f4525",
+      "aws_instance_id": "i-0d5f60e80048044f4",
+      "volume_id": "vol-0fbd2b33d697f970c",
+      "ssm_execution_id": "120d8800-575d-4dd7-9436-81115ae0a5e2",
+      "validated_source_commit_sha": "825130357bd70f173dc32b05b5fc667dc510787a",
+      "source_manifest_sha256": "caacaeaca051f7e62c36699d47fa18affa02108cfe145abb6b9dea441553e422",
+      "pr_number": 12,
+      "export_archive_bytes": 15249740,
+      "export_archive_sha256": "16e1519dce1abebb6d99a6b55656f6c60014443f7828d317c0754b5215cc6d4a",
+      "lantern_version": "0.11.0",
+      "lantern_preseal_score": 100,
+      "lantern_airgap_score": 100,
+      "lantern_critical_high_medium_findings": 0,
+      "pip_audit_vulns": 0,
+      "npm_audit_ok": true,
+      "bandit_src_findings": 0,
+      "pytest_junit_tests": 1432,
+      "pytest_passed": 1063,
+      "pytest_subtests_passed": 369,
+      "node_ui_passed": 129,
+      "suite18_groups_passed": 18,
+      "suite18_tests_passed": 1761,
+      "stageb_run_id": "fx-b-be863531028fcd42",
+      "stageb_calls_passed": 32,
+      "stageb_traps_blocked": 17,
+      "stageb_public_aggregate_status": "ACCEPT",
+      "unit3b_checks_passed": 30,
+      "unit3b_model_calls_passed": 11,
+      "ctt_rows_evaluated": 3634,
+      "valve_parameter_count": 161,
+      "ai_models_catalog_count": 9,
+      "markets_total": 20,
+      "billed_seconds": 4256,
+      "compute_cost_usd_exact": "0.204288000000",
+      "ipv4_cost_usd_exact": "0.005911111111",
+      "combined_cost_usd_exact": "0.210199111111",
+      "cumulative_pilot_billed_seconds": 80593,
+      "cumulative_pilot_spend_usd_exact": "3.868464000000",
       "zero_aws_residue": true
     }
   }
