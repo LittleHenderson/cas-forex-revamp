@@ -20,6 +20,7 @@ import {
   normalizeIndexStream,
   renderAiModelCatalogPanel,
   renderAiOverseerPanel,
+  shouldAutoConnectLiveFeed,
 } from '../../ui/src/ai-overseer.mjs';
 import { renderApp } from '../../ui/src/render.mjs';
 import { displayState, fixture, samplePosition, time } from './helpers.mjs';
@@ -267,4 +268,25 @@ test('OVERSEER05 Hostile HTML payloads in AI trader & model catalog are escaped 
   const catHtml = renderAiModelCatalogPanel(STATIC_AI_MODELS);
   assert.match(catHtml, /AI catalog preview \(not attached\)/);
   assert.ok(STATIC_AI_TRADER.humanRole === 'OVERSEER_ONLY');
+});
+
+test('OVERSEER06 Disconnected Section 02 renders Connect live server action and auto-connect gate checks loopback/HTTPS tokens', () => {
+  const disconnectedHtml = renderAiOverseerPanel({ aiTrader: null, aiModels: null });
+  assert.match(disconnectedHtml, /data-connect-loopback="true"/);
+  assert.match(disconnectedHtml, />Connect live server<\/button>/);
+
+  const connectedHtml = renderAiOverseerPanel({
+    aiTrader: normalizeAiTrader(sampleTraderPayload()),
+    aiModels: normalizeAiModels(sampleModelsPayload()),
+  });
+  assert.equal(connectedHtml.includes('Connect live server'), false);
+
+  const tok = 'tok_' + 'a'.repeat(24);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'http:', hostname: '127.0.0.1' }, tok), true);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'http:', hostname: '[::1]' }, tok), true);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'https:', hostname: '52-33-1-177.sslip.io' }, tok), true);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'http:', hostname: '127.0.0.1' }, null), false);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'http:', hostname: '127.0.0.1' }, 'short'), false);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'file:', hostname: '' }, tok), false);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'http:', hostname: 'example.com' }, tok), false);
 });

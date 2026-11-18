@@ -7,7 +7,7 @@ import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decisio
 import { ScopedBridge, createAuthenticatedLoopbackBridge } from './bridge.mjs';
 import { ALL_WATCHLIST_MARKETS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts, releaseDetachedCanvases } from './chart.mjs';
 import { MAX_BROKER_ROUTING_BYTES, normalizeBrokerRouting } from './broker-routing.mjs';
-import { MAX_AI_PAYLOAD_BYTES, normalizeAiModels, normalizeAiTrader, normalizeIndexStream } from './ai-overseer.mjs';
+import { MAX_AI_PAYLOAD_BYTES, normalizeAiModels, normalizeAiTrader, normalizeIndexStream, shouldAutoConnectLiveFeed } from './ai-overseer.mjs';
 import { MAX_TREASURY_BYTES, mountAnalyticsCanvases, normalizeParallelTiers, normalizeTreasury } from './analytics.mjs';
 
 // Fixed same-origin assets. Only explicit trusted bootstrap may inject a scoped bridge.
@@ -758,7 +758,12 @@ try {
 
 // This entry point runs only when the UI document is explicitly opened.
 render();
-void loadFixture();
+void (async () => {
+  await loadFixture();
+  if (shouldAutoConnectLiveFeed(window.location, loopbackAuthToken)) {
+    await connectLoopbackLiveFeed().catch(() => {});
+  }
+})();
 
 // Age the held read only. Never add local elapsed time to the simulator clock.
 function updateObservationAge() {

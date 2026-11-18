@@ -306,6 +306,16 @@ export function normalizeIndexStream(doc) {
   });
 }
 
+export function shouldAutoConnectLiveFeed(loc, token) {
+  if (typeof token !== 'string' || token.trim().length < 16 || /[\r\n\0]/.test(token)) return false;
+  if (!loc || typeof loc !== 'object') return false;
+  const proto = String(loc.protocol ?? '').toLowerCase();
+  const host = String(loc.hostname ?? '').toLowerCase();
+  if (proto === 'https:' && host.length > 0) return true;
+  if (proto === 'http:' && (host === '127.0.0.1' || host === '[::1]' || host === '::1')) return true;
+  return false;
+}
+
 export function renderAiOverseerPanel(state) {
   const trader = state?.aiTrader ?? STATIC_AI_TRADER;
   const models = state?.aiModels ?? STATIC_AI_MODELS;
@@ -337,11 +347,15 @@ export function renderAiOverseerPanel(state) {
     : '';
 
   const issueNote = state?.aiIssue ? `<p class="quiet-note warning-text" role="alert">${esc(state.aiIssue)}</p>` : '';
+  const connectBtn = !trader.connected
+    ? '<button type="button" class="button button-small button-primary" data-connect-loopback="true">Connect live server</button>'
+    : '';
 
   return `<section class="panel ai-overseer-panel" aria-label="AI Autonomous Trader and Human Overseer">
     <div class="section-heading">
       <div><p class="eyebrow">HUMAN AS OVERSEER · ${esc(trader.marketsEvaluated)} MARKETS (${esc(trader.fastTickMs)}ms MT5 FAST-TICK)</p><h2>Autonomous AI Trader &amp; Daily Quota</h2></div>
       <div class="market-chart-badges">
+        ${connectBtn}
         <span class="tag${modeWarning ? ' tag-warning' : ''}" data-ai-status="${esc(trader.effectiveStatus)}"><span class="state-rule" aria-hidden="true"></span>${esc(trader.connected ? trader.effectiveStatus : 'AI standby (not attached)')}</span>
         <span class="tag"><span class="state-rule" aria-hidden="true"></span>${esc(trader.valveController)} · ${esc(trader.valveParameters)} params</span>
       </div>
