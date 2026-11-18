@@ -801,13 +801,13 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
         finally:
             srv1.stop()
 
-        # 2. Gemini Decision 1 HTTP 404 on :decide falls back to gemini-3.8-flash:generateContent;
-        #    and if both scout endpoints fail (503), AutonomousAiTrader marks SCOUT_DEGRADED and wakes primary model.
+        # 2. Gemini Decision 1 HTTP 404 on :decide falls back to ("gemini-2.5-flash", "gemini-3.8-flash"),
+        #    memoizes _decide_404 so :decide is not re-requested, and if scout fails, AutonomousAiTrader marks SCOUT_DEGRADED.
         seen_urls: list[str] = []
 
         def scout_404_then_flash_http(url: str, headers: dict, body: bytes, timeout: float, max_bytes: int):
             seen_urls.append(url)
-            if url.endswith(":decide"):
+            if url.endswith(":decide") or "gemini-2.5-flash:generateContent" in url:
                 return 404, b'{"error":"not found"}'
             if "gemini-3.8-flash:generateContent" in url:
                 return 200, json.dumps({
@@ -834,7 +834,11 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
         fb_out = reg_fb.scout_opportunities([{"market": "NAS100", "choices": ["WAIT", "opt-1"]}])
         self.assertTrue(fb_out["executed"])
         self.assertEqual(fb_out["best_market"], "NAS100")
+        self.assertTrue(any("gemini-2.5-flash:generateContent" in u for u in seen_urls))
         self.assertTrue(any("gemini-3.8-flash:generateContent" in u for u in seen_urls))
+        fb_out2 = reg_fb.scout_opportunities([{"market": "NAS100", "choices": ["WAIT", "opt-1"]}])
+        self.assertTrue(fb_out2["executed"])
+        self.assertEqual(sum(1 for u in seen_urls if u.endswith(":decide")), 1)
         g_spec, g_back, g_ver = reg_fb.build_backend("gemini-decision-1")
         from cas_forex_revamp.contracts import ActionIntent, ActionOption, DecisionFact, DecisionOrigin, DecisionRequest, EvidenceKind, EvidenceReference, RunScope, StateReference, canonical_bytes, content_digest
         g_scope = RunScope("acct-g", "run-g", 1, "b1", "p1", "s1", "adapter-g")
@@ -842,15 +846,29 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
         g_intent = ActionIntent(intent_id="g-ord-1", scope=g_scope, decision_id="dec-g1", opportunity_id="opp-g1", action_ref="opt-g", kind=ActionKind.OPEN, origin=DecisionOrigin.ACTUAL_MODEL, instrument_id="NAS100", source_state=g_st, created_at=T0, expires_at=T0 + timedelta(seconds=30), quantity=D("1"), side=Side.BUY, limit_price=D("20502.50"), stop_price=D("20475.00"), take_profit_price=D("20560.00"))
         g_fact = {"sym": "NAS100"}
         g_req = DecisionRequest(request_id="req-g1", opportunity_set_id="set-g1", state=g_st, options=(ActionOption("opt-g", "wait", "50ms", "WAIT", g_intent),), facts=(DecisionFact("fg1", "q", canonical_bytes(g_fact).decode("utf-8"), ("ev-g1",)),), evidence=(EvidenceReference("ev-g1", EvidenceKind.OBSERVATION, "test", content_digest(g_fact), T0),))
+        g2_urls: list[str] = []
         class _FakeGen404:
             def __call__(self, u, h, b, t, m):
-                if u.endswith(":decide"): return 404, b"{}"
+                g2_urls.append(u)
+                if u.endswith(":decide"):
+                    raise FrontierTransportError("frontier AI HTTP status 404")
                 ud = json.loads(json.loads(b.decode("utf-8"))["contents"][0]["parts"][0]["text"])
+                if "candidates" in ud:
+                    payload = {"decisions": [{"market": "EURUSD", "choice": "OPEN LONG", "probability": "0.88"}]}
+                    return 200, json.dumps({"candidates": [{"content": {"parts": [{"text": json.dumps(payload)}]}}], "usageMetadata": {"candidatesTokenCount": 16}}).encode("utf-8")
                 return 200, json.dumps({"candidates": [{"content": {"parts": [{"text": json.dumps({"request_id": ud["request_id"], "opportunity_set_id": ud["opportunity_set_id"], "source_state_id": ud["state"]["state_id"], "selected_action_ref": None, "reason": "ID=0wait_flash", "evidence_ids": ["ev-g1"]})}]}}], "usageMetadata": {"candidatesTokenCount": 20}}).encode("utf-8")
         reg_g2 = FrontierModelRegistry(environ={"CAS_FOREX_GEMINI_API_KEY": "test-placeholder-gem-alpha-01"}, clock=lambda: T0, http_post=_FakeGen404(), resolve_dns=lambda _h: None)
+        scout_exc_out = reg_g2.scout_opportunities([{"market": "EURUSD", "choice": "OPEN LONG", "question": "q"}])
+        self.assertTrue(scout_exc_out["executed"])
+        self.assertEqual(scout_exc_out["best_market"], "EURUSD")
+        self.assertEqual([d["market"] for d in scout_exc_out["decisions"] if d["admitted"]], ["EURUSD"])
+        self.assertTrue(any("gemini-2.5-flash:generateContent" in u for u in g2_urls))
         gs2, gb2, gv2 = reg_g2.build_backend("gemini-decision-1")
         g_res = ActualModelDecisionAdapter(adapter_id="test-g404", model=gs2, budget=InferenceBudget(max_calls=1, max_input_tokens_per_call=16_384, max_generated_tokens_per_call=512, max_seconds_per_call=10, max_total_seconds=10), backend=gb2, receipt_verifier=gv2, execution_gate=lambda _: None, clock=lambda: T0).decide(g_req)
         self.assertIsNone(g_res.selection.selected_action_ref)
+        g_req2 = DecisionRequest(request_id="req-g2", opportunity_set_id="set-g2", state=g_st, options=(ActionOption("opt-g", "wait", "50ms", "WAIT", g_intent),), facts=(DecisionFact("fg1", "q", canonical_bytes(g_fact).decode("utf-8"), ("ev-g1",)),), evidence=(EvidenceReference("ev-g1", EvidenceKind.OBSERVATION, "test", content_digest(g_fact), T0),))
+        ActualModelDecisionAdapter(adapter_id="test-g404-2", model=gs2, budget=InferenceBudget(max_calls=1, max_input_tokens_per_call=16_384, max_generated_tokens_per_call=512, max_seconds_per_call=10, max_total_seconds=10), backend=gb2, receipt_verifier=gv2, execution_gate=lambda _: None, clock=lambda: T0).decide(g_req2)
+        self.assertEqual(sum(1 for u in g2_urls if u.endswith(":decide")), 2)
 
         def scout_503_primary_ok_http(url: str, headers: dict, body: bytes, timeout: float, max_bytes: int):
             if "generativelanguage.googleapis.com" in url:

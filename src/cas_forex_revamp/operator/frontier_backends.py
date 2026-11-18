@@ -847,6 +847,7 @@ class FrontierChatBackend(ModelBackend):
         self._min_probability = min_probability
         self._seq = 0
         self._lock = Lock()
+        self._decide_404: bool = False
         self.last_decision_probability: Decimal | None = None
 
     def __repr__(self) -> str:
@@ -889,26 +890,47 @@ class FrontierChatBackend(ModelBackend):
             clean_slug = self._api_slug.removeprefix("models/")
             status = 404
             raw = b""
-            if clean_slug.startswith("gemini-decision"):
+            with self._lock:
+                skip_decide = self._decide_404
+            if clean_slug.startswith("gemini-decision") and not skip_decide:
                 url, headers, body = _build_provider_payload(self._entry, self._api_slug, invocation, self._secret)
                 try:
-                    status, raw = self._dispatch_http(url, headers, body, timeout_s)
+                    status, raw = self._dispatch_http(url, headers, body, min(timeout_s, 4.0))
+                except FrontierTransportError as exc:
+                    if "HTTP status 404" not in str(exc):
+                        raise
+                    status, raw = 404, b""
                 finally:
                     headers.clear()
+                if status == 404:
+                    with self._lock:
+                        self._decide_404 = True
             if status == 404 or not clean_slug.startswith("gemini-decision"):
-                fb_slug = "gemini-3.8-flash" if clean_slug == "gemini-decision-1" else clean_slug
-                fb_url, fb_hdrs, fb_body = _build_gemini_fast_json_payload(
-                    clean_slug=fb_slug,
-                    system_text=invocation.system_policy,
-                    user_text=invocation.packet_json,
-                    max_tokens=invocation.budget.max_generated_tokens_per_call,
-                    secret=self._secret,
-                    allowed_host=self._entry.allowed_host,
+                fb_candidates = (
+                    ("gemini-2.5-flash", "gemini-3.8-flash")
+                    if clean_slug == "gemini-decision-1"
+                    else (clean_slug,)
                 )
-                try:
-                    status, raw = self._dispatch_http(fb_url, fb_hdrs, fb_body, timeout_s)
-                finally:
-                    fb_hdrs.clear()
+                for idx_fb, fb_slug in enumerate(fb_candidates):
+                    fb_url, fb_hdrs, fb_body = _build_gemini_fast_json_payload(
+                        clean_slug=fb_slug,
+                        system_text=invocation.system_policy,
+                        user_text=invocation.packet_json,
+                        max_tokens=invocation.budget.max_generated_tokens_per_call,
+                        secret=self._secret,
+                        allowed_host=self._entry.allowed_host,
+                    )
+                    try:
+                        status, raw = self._dispatch_http(fb_url, fb_hdrs, fb_body, timeout_s)
+                    except FrontierTransportError as exc:
+                        if idx_fb + 1 < len(fb_candidates) and "HTTP status 404" in str(exc):
+                            status, raw = 404, b""
+                            continue
+                        raise
+                    finally:
+                        fb_hdrs.clear()
+                    if status != 404 or idx_fb + 1 == len(fb_candidates):
+                        break
                 extract_provider = "gemini"
         else:
             url, headers, body = _build_provider_payload(self._entry, self._api_slug, invocation, self._secret)
@@ -1021,6 +1043,7 @@ class FrontierModelRegistry:
             )
         self._thinking_depth: str = raw_depth
         self._thinking_depth_persist_cb: Any = None
+        self._decide_404: bool = False
         self._last_effective_effort: str = "low"
         self._last_latency_ms: int | None = None
 
@@ -1204,12 +1227,12 @@ class FrontierModelRegistry:
                 self._last_scout = summary
             return summary
 
-        def _post(u: str, h: dict[str, str], b: bytes) -> tuple[int, bytes]:
+        def _post(u: str, h: dict[str, str], b: bytes, timeout_s: float = 8.0) -> tuple[int, bytes]:
             try:
                 if self._http_post is not None:
-                    return self._http_post(u, dict(h), b, 5.0, MAX_PROVIDER_WIRE_BYTES)
+                    return self._http_post(u, dict(h), b, timeout_s, MAX_PROVIDER_WIRE_BYTES)
                 return default_frontier_https_post(
-                    u, dict(h), b, 5.0, MAX_PROVIDER_WIRE_BYTES,
+                    u, dict(h), b, timeout_s, MAX_PROVIDER_WIRE_BYTES,
                     expected_host=entry.allowed_host, resolve_dns=self._resolve_dns,
                 )
             finally:
@@ -1220,7 +1243,9 @@ class FrontierModelRegistry:
         status = 404
         raw = b""
         used_generate = False
-        if clean_slug.startswith("gemini-decision"):
+        with self._lock:
+            skip_decide = self._decide_404
+        if clean_slug.startswith("gemini-decision") and not skip_decide:
             url = _validate_frontier_https_url(entry.endpoint_template.format(slug=clean_slug), expected_host=entry.allowed_host)
             headers = {
                 "Accept": "application/json",
@@ -1232,24 +1257,45 @@ class FrontierModelRegistry:
                 "batch_questions": questions[:1000],
                 "zero_output_tokens": True,
             })
-            status, raw = _post(url, headers, body)
+            try:
+                status, raw = _post(url, headers, body, 4.0)
+            except FrontierTransportError as exc:
+                if "HTTP status 404" not in str(exc):
+                    raise
+                status, raw = 404, b""
+            if status == 404:
+                with self._lock:
+                    self._decide_404 = True
         if status == 404 or not clean_slug.startswith("gemini-decision"):
-            fb_slug = "gemini-3.8-flash" if clean_slug == "gemini-decision-1" else clean_slug
+            fb_candidates = (
+                ("gemini-2.5-flash", "gemini-3.8-flash")
+                if clean_slug == "gemini-decision-1"
+                else (clean_slug,)
+            )
             fb_sys = (
                 "Screen candidate forex/index setups quickly and respond ONLY with valid JSON: "
                 '{"decisions":[{"market":"SYMBOL","choice":"WAIT or exact choice","probability":"0.01-0.99"}]}.'
             )
             fb_user = canonical_bytes({"min_probability": decimal_text(gate_prob), "candidates": questions[:1000]}).decode("utf-8")
-            fb_url, fb_hdrs, fb_body = _build_gemini_fast_json_payload(
-                clean_slug=fb_slug,
-                system_text=fb_sys,
-                user_text=fb_user,
-                max_tokens=512,
-                secret=secret,
-                allowed_host=entry.allowed_host,
-            )
-            status, raw = _post(fb_url, fb_hdrs, fb_body)
-            used_generate = True
+            for idx_fb, fb_slug in enumerate(fb_candidates):
+                fb_url, fb_hdrs, fb_body = _build_gemini_fast_json_payload(
+                    clean_slug=fb_slug,
+                    system_text=fb_sys,
+                    user_text=fb_user,
+                    max_tokens=512,
+                    secret=secret,
+                    allowed_host=entry.allowed_host,
+                )
+                try:
+                    status, raw = _post(fb_url, fb_hdrs, fb_body, 8.0)
+                except FrontierTransportError as exc:
+                    if idx_fb + 1 < len(fb_candidates) and "HTTP status 404" in str(exc):
+                        status, raw = 404, b""
+                        continue
+                    raise
+                used_generate = True
+                if status != 404 or idx_fb + 1 == len(fb_candidates):
+                    break
 
         latency_ms = max(1, int((_utc_now() - t0).total_seconds() * 1000))
         if status < 200 or status >= 300:
