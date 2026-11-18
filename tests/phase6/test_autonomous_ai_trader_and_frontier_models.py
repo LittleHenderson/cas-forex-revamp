@@ -20,6 +20,7 @@ from cas_forex_revamp.composition.autonomous_trader import (
     GOVERNANCE_PAUSED_NEW_RISK,
     GOVERNANCE_STOPPED,
     AutonomousAiTrader,
+    compute_market_sessions_status,
 )
 from cas_forex_revamp.composition.live_cockpit_server import (
     LoopbackCockpitServer,
@@ -1002,6 +1003,83 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
                 self.assertEqual(srv_p7_b.auth_token, tok1)
             finally:
                 srv_p7_b.stop()
+
+
+    def test_pr13_market_sessions_working_focus_and_explainer_ask(self) -> None:
+        # Wednesday 14:45 UTC: Forex 24/5 OPEN, London & NY & Overlap OPEN, Wall Street Cash OPEN
+        wed_cash = datetime(2026, 11, 18, 14, 45, tzinfo=timezone.utc)
+        s_cash = compute_market_sessions_status(wed_cash, mt5_tick_fresh=True)
+        self.assertTrue(s_cash["forex_24_5_open"])
+        self.assertEqual(s_cash["forex_label"], "FOREX 24/5 OPEN")
+        self.assertEqual(s_cash["us_indices_status"], "CASH_OPEN")
+        by_id = {row["id"]: row for row in s_cash["sessions"]}
+        self.assertTrue(by_id["london"]["open"])
+        self.assertTrue(by_id["new_york"]["open"])
+        self.assertTrue(by_id["london_ny_overlap"]["open"])
+        self.assertFalse(by_id["tokyo"]["open"])
+
+        # Daily break 21:30 UTC
+        wed_break = datetime(2026, 11, 18, 21, 30, tzinfo=timezone.utc)
+        self.assertEqual(compute_market_sessions_status(wed_break)["us_indices_status"], "DAILY_BREAK")
+
+        # Saturday 15:00 UTC: Weekend Closed
+        sat = datetime(2026, 11, 21, 15, 0, tzinfo=timezone.utc)
+        s_sat = compute_market_sessions_status(sat)
+        self.assertFalse(s_sat["forex_24_5_open"])
+        self.assertEqual(s_sat["us_indices_status"], "WEEKEND_CLOSED")
+        self.assertTrue(all(not row["open"] for row in s_sat["sessions"]))
+
+        def fake_explainer_post(url, headers, body, timeout, max_bytes):
+            return 200, json.dumps({
+                "content": [{"type": "text", "text": json.dumps({"answer": "Read-only summary verified for NAS100."})}],
+                "usage": {"output_tokens": 12},
+            }).encode("utf-8")
+
+        reg_e = FrontierModelRegistry(
+            environ={"CAS_FOREX_ANTHROPIC_API_KEY": SYNTH_API_KEY},
+            clock=lambda: wed_cash,
+            http_post=fake_explainer_post,
+            resolve_dns=lambda _h: None,
+        )
+        ans_doc = reg_e.answer_explainer_question(
+            question="Which market is active right now?",
+            context_summary={"current_focus_status": "IN TRADE: NAS100 (BUY)", "execution_mode": "DEMO"},
+        )
+        self.assertEqual(ans_doc["read_only"], True)
+        self.assertEqual(ans_doc["source"], "FRONTIER_READ_ONLY")
+        self.assertIn("NAS100", ans_doc["answer"])
+
+        srv_e = LoopbackCockpitServer(
+            repo_root=Path(__file__).resolve().parents[2],
+            ai_model_registry=reg_e,
+        )
+        srv_e.start()
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", srv_e.bound_port, timeout=5)
+            try:
+                body_b = json.dumps({"question": "What session is open?"}).encode("utf-8")
+                c.request("POST", "/api/explainer-ask", body=body_b, headers={"Host": f"127.0.0.1:{srv_e.bound_port}", "Content-Type": "application/json"})
+                self.assertEqual(c.getresponse().status, 401)
+                c.request(
+                    "POST",
+                    "/api/explainer-ask",
+                    body=body_b,
+                    headers={
+                        "Host": f"127.0.0.1:{srv_e.bound_port}",
+                        "Origin": f"http://127.0.0.1:{srv_e.bound_port}",
+                        "Authorization": f"Bearer {srv_e.auth_token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                r_ok = c.getresponse()
+                raw_ok = json.loads(r_ok.read().decode("utf-8"))
+                self.assertEqual(r_ok.status, 200)
+                self.assertEqual(raw_ok["schema"], "cas-forex.explainer-answer/1")
+                self.assertTrue(raw_ok["read_only"])
+            finally:
+                c.close()
+        finally:
+            srv_e.stop()
 
 
 if __name__ == "__main__":

@@ -41,9 +41,58 @@ function transportStatus(transport) {
   return `<section class="transport-status" aria-label="Scoped request observations">${transport.issue ? `<p role="status">${e(transport.issue)}</p>` : ''}${controlHistory(transport)}${close ? `<div class="close-status"><strong>Reviewed Close / ${e(close.status)}</strong><p>${e(close.reason)}</p>${button('Inspect Close request', 'data-inspect-close="true"', 'button-small')}</div>` : ''}${transport.closeHistory?.length ? `<details><summary>Previous Close reviews / ${transport.closeHistory.length}</summary>${transport.closeHistory.map((entry) => `<dl class="metadata compact">${meta('Request', entry.input?.owner_request_id)}${meta('Status at replacement', entry.status)}${meta('Command', entry.preview?.command_id)}${meta('Reason', entry.reason)}</dl>`).join('')}</details>` : ''}</section>`;
 }
 
-function metrics(projection) {
+function addExactDecimals(values) {
+  let maxScale = 0;
+  const parts = [];
+  for (const raw of values) {
+    if (typeof raw !== 'string' || !/^-?[0-9]+(\.[0-9]+)?$/.test(raw)) continue;
+    const neg = raw.startsWith('-');
+    const clean = neg ? raw.slice(1) : raw;
+    const [intPart, fracPart = ''] = clean.split('.');
+    maxScale = Math.max(maxScale, fracPart.length);
+    parts.push({ neg, intPart, fracPart });
+  }
+  if (!parts.length) return '0';
+  let sum = 0n;
+  for (const { neg, intPart, fracPart } of parts) {
+    const padded = intPart + fracPart.padEnd(maxScale, '0');
+    const val = BigInt(padded);
+    sum += neg ? -val : val;
+  }
+  const sign = sum < 0n ? '-' : '';
+  const abs = (sum < 0n ? -sum : sum).toString().padStart(maxScale + 1, '0');
+  if (maxScale === 0) return `${sign}${abs}`;
+  const head = abs.slice(0, abs.length - maxScale);
+  const tail = abs.slice(abs.length - maxScale).replace(/0+$/, '');
+  return tail ? `${sign}${head}.${tail}` : `${sign}${head}`;
+}
+
+function metrics(projection, state) {
+  let eqVal = projection.equity;
+  let balVal = projection.balance;
+  let openVal = projection.open_pnl;
+  let realVal = projection.realized_pnl;
+
+  if (state?.liveStreamConnected === true && eqVal === null) {
+    const shieldEq = state.brokerRouting?.shield?.totalEquity;
+    const quotaEq = state.aiTrader?.dailyQuota?.startingEquityUsd;
+    const chosenEq = shieldEq ?? (typeof quotaEq === 'string' && /^[0-9]+(\.[0-9]+)?$/.test(quotaEq) && quotaEq !== '0' ? quotaEq : null);
+    if (chosenEq !== null) {
+      eqVal = Object.freeze({ amount: chosenEq, currency: 'USD' });
+      const posList = Array.isArray(state.aiTrader?.openPositions) ? state.aiTrader.openPositions : [];
+      const openSum = addExactDecimals(posList.map((p) => p.profit));
+      openVal = Object.freeze({ amount: openSum, currency: 'USD' });
+      const negOpen = openSum.startsWith('-') ? openSum.slice(1) : `-${openSum}`;
+      const balStr = addExactDecimals([chosenEq, negOpen]);
+      balVal = Object.freeze({ amount: balStr, currency: 'USD' });
+    }
+    if (realVal === null && state.aiTrader?.connected && typeof state.aiTrader.dailyQuota?.realizedNetPnlUsd === 'string') {
+      realVal = Object.freeze({ amount: state.aiTrader.dailyQuota.realizedNetPnlUsd, currency: 'USD' });
+    }
+  }
+
   return `<section class="metrics" aria-label="Account snapshot">${[
-    ['Equity', projection.equity], ['Balance', projection.balance], ['Open P/L', projection.open_pnl], ['Realized P/L', projection.realized_pnl],
+    ['Equity', eqVal], ['Balance', balVal], ['Open P/L', openVal], ['Realized P/L', realVal],
   ].map(([label, value]) => {
     const money = moneyLabel(value);
     return `<article class="metric"><h2>${label}</h2><div class="metric-value${value === null ? ' unknown' : ''}">${e(money.amount)}</div><span class="metric-unit">${e(money.unit)}</span></article>`;
@@ -94,7 +143,7 @@ function effects(projection) {
 }
 
 function operate(projection, state) {
-  return `<section class="workspace-intro" aria-label="Workspace introduction"><div><p class="eyebrow">PERSONAL FOREX / OBSERVATION FIRST</p><h2>Every decision, with its evidence.</h2></div><p>Inspect the account snapshot, oversee autonomous AI execution, monitor 5 parallel account tiers &amp; 50%/50% Bank Vault sweeps, and keep unobserved outcomes visible.</p></section>${renderAiTopSwitcherBar(state)}<div class="route-index">${sectionNumber('01')}<h2>Permissions &amp; control</h2></div><div class="context-grid">${permissions(projection, state.transport)}${controls(state.transport)}</div><div class="route-index">${sectionNumber('02')}<h2>Account snapshot</h2></div>${metrics(projection)}<p class="account-coverage">P/L period, fees and cashflow coverage are unavailable in this projection.</p>${renderAiOverseerPanel(state)}<div class="route-index">${sectionNumber('03')}<h2>Live market &amp; candlestick chart</h2></div>${renderMarketChartSection(projection, state)}${renderEquityAndAnalyticsSection(state)}${renderParallelTiersSection(state)}<div class="route-index">${sectionNumber('04')}<h2>Positions, proposals &amp; effects</h2></div><div class="operate-grid">${positions(projection)}${decision(projection)}${effects(projection)}</div>`;
+  return `<section class="workspace-intro" aria-label="Workspace introduction"><div><p class="eyebrow">PERSONAL FOREX / OBSERVATION FIRST</p><h2>Every decision, with its evidence.</h2></div><p>Inspect the account snapshot, oversee autonomous AI execution, monitor 5 parallel account tiers &amp; 50%/50% Bank Vault sweeps, and keep unobserved outcomes visible.</p></section>${renderAiTopSwitcherBar(state)}<div class="route-index">${sectionNumber('01')}<h2>Permissions &amp; control</h2></div><div class="context-grid">${permissions(projection, state.transport)}${controls(state.transport)}</div><div class="route-index">${sectionNumber('02')}<h2>Account snapshot</h2></div>${metrics(projection, state)}<p class="account-coverage">P/L period, fees and cashflow coverage are unavailable in this projection.</p>${renderAiOverseerPanel(state)}<div class="route-index">${sectionNumber('03')}<h2>Live market &amp; candlestick chart</h2></div>${renderMarketChartSection(projection, state)}${renderEquityAndAnalyticsSection(state)}${renderParallelTiersSection(state)}<div class="route-index">${sectionNumber('04')}<h2>Positions, proposals &amp; effects</h2></div><div class="operate-grid">${positions(projection)}${decision(projection)}${effects(projection)}</div>`;
 }
 
 function catalogInspection(read, source = null) {

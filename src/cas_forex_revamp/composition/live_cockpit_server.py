@@ -28,6 +28,7 @@ from pathlib import Path
 import secrets
 import tempfile
 import threading
+import time
 from typing import Any
 import urllib.parse
 
@@ -715,9 +716,10 @@ class LoopbackCockpitServer:
                         if idx_snap is None:
                             stream_fallback = outer._read_stream_payload()
                             if isinstance(stream_fallback, dict):
+                                from cas_forex_revamp.venue.live_market_stream import INDEX_INSTRUMENTS as _IDX_SYMS
                                 idx_rows = [
                                     m for m in (stream_fallback.get("markets") or [])
-                                    if isinstance(m, dict) and m.get("pair") in ("NAS100", "US30")
+                                    if isinstance(m, dict) and m.get("pair") in _IDX_SYMS
                                 ]
                                 if idx_rows:
                                     idx_snap = {
@@ -744,10 +746,21 @@ class LoopbackCockpitServer:
                             self.send_header("Connection", "keep-alive")
                             self.end_headers()
                             seen_ver = -1
+                            last_emit_mono = 0.0
+                            last_models_json = ""
+                            last_models_mono = 0.0
+                            last_treasury_json = ""
+                            last_treasury_mono = 0.0
                             try:
                                 while not outer._stop_event.is_set():
                                     if not outer._verify_commit_epoch(supplied_tok, initial_epoch):
                                         break
+                                    if last_emit_mono > 0.0:
+                                        since_emit = time.monotonic() - last_emit_mono
+                                        if since_emit < 0.25:
+                                            outer._stop_event.wait(0.25 - since_emit)
+                                            if outer._stop_event.is_set() or not outer._verify_commit_epoch(supplied_tok, initial_epoch):
+                                                break
                                     with outer._sse_cond:
                                         if outer._sse_version == seen_ver:
                                             outer._sse_cond.wait(timeout=1.5)
@@ -756,6 +769,7 @@ class LoopbackCockpitServer:
                                         break
                                     if cur_ver != seen_ver:
                                         seen_ver = cur_ver
+                                        now_mono = time.monotonic()
                                         snap = outer._read_stream_payload()
                                         if snap is not None:
                                             frame = f"event: market\ndata: {json.dumps(snap, sort_keys=False)}\n\n".encode("utf-8")
@@ -772,16 +786,25 @@ class LoopbackCockpitServer:
                                             self.wfile.write(tframe)
                                         if outer._ai_model_registry is not None:
                                             csnap = assert_safe_ai_catalog_payload(outer._ai_model_registry.catalog_snapshot())
-                                            cframe = f"event: ai_models\ndata: {json.dumps(csnap, sort_keys=False)}\n\n".encode("utf-8")
-                                            self.wfile.write(cframe)
+                                            cjson = json.dumps(csnap, sort_keys=False)
+                                            if not last_models_json or cjson != last_models_json or (now_mono - last_models_mono) >= 1.0:
+                                                last_models_json = cjson
+                                                last_models_mono = now_mono
+                                                cframe = f"event: ai_models\ndata: {cjson}\n\n".encode("utf-8")
+                                                self.wfile.write(cframe)
                                         if outer._profit_vault is not None:
                                             vsnap = assert_safe_ai_catalog_payload(outer._profit_vault.snapshot())
-                                            vframe = f"event: treasury\ndata: {json.dumps(vsnap, sort_keys=False)}\n\n".encode("utf-8")
-                                            self.wfile.write(vframe)
+                                            vjson = json.dumps(vsnap, sort_keys=False)
+                                            if not last_treasury_json or vjson != last_treasury_json or (now_mono - last_treasury_mono) >= 1.0:
+                                                last_treasury_json = vjson
+                                                last_treasury_mono = now_mono
+                                                vframe = f"event: treasury\ndata: {vjson}\n\n".encode("utf-8")
+                                                self.wfile.write(vframe)
                                         if outer._parallel_tiers is not None:
                                             ptsnap = assert_safe_ai_catalog_payload(outer._parallel_tiers.snapshot())
                                             ptframe = f"event: parallel_tiers\ndata: {json.dumps(ptsnap, sort_keys=False)}\n\n".encode("utf-8")
                                             self.wfile.write(ptframe)
+                                        last_emit_mono = now_mono
                                         self.wfile.flush()
                                     else:
                                         self.wfile.write(b": heartbeat\n\n")
@@ -977,6 +1000,43 @@ class LoopbackCockpitServer:
                     except Exception as exc:
                         code = HTTPStatus.FORBIDDEN if "OWNER_RECOVERY" in str(exc) else HTTPStatus.BAD_REQUEST
                         self._write_json(code, {"error": str(exc)})
+                    return
+                if route == "/api/explainer-ask":
+                    if outer._ai_model_registry is None:
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "AI model registry not configured"})
+                        return
+                    try:
+                        body = self._read_json_body()
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        if type(body) is not dict or not isinstance(body.get("question"), str):
+                            raise ContractError("question field required")
+                        ctx_summary: dict[str, Any] = {}
+                        if outer._broker_router_reader is not None:
+                            try:
+                                r_doc = outer._broker_router_reader()
+                                if isinstance(r_doc, Mapping):
+                                    ctx_summary["execution_mode"] = str(r_doc.get("execution_mode") or "DEMO")
+                                    ctx_summary["active_broker"] = str(r_doc.get("active_broker") or "HUGOSWAY_MT5")
+                            except Exception as exc_ctx:
+                                outer._last_routing_error = type(exc_ctx).__name__
+                        if outer._autonomous_trader is not None:
+                            try:
+                                t_doc = outer._autonomous_trader.status_snapshot()
+                                ctx_summary["current_focus_symbol"] = t_doc.get("current_focus_symbol")
+                                ctx_summary["current_focus_status"] = t_doc.get("current_focus_status")
+                                ctx_summary["cycle_count"] = t_doc.get("cycle_count")
+                                ctx_summary["market_sessions"] = t_doc.get("market_sessions")
+                            except Exception as exc_ctx:
+                                outer._last_routing_error = type(exc_ctx).__name__
+                        ans_doc = outer._ai_model_registry.answer_explainer_question(
+                            question=body["question"],
+                            context_summary=ctx_summary,
+                        )
+                        self._write_json(HTTPStatus.OK, ans_doc)
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
                 if route == "/api/ai-overseer-action":
                     try:

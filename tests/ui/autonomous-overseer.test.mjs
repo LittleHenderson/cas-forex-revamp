@@ -19,8 +19,11 @@ import {
   normalizeAiTrader,
   normalizeIndexStream,
   renderAiModelCatalogPanel,
+  computeMarketSessions,
   renderAiOverseerPanel,
+  shouldAutoConnectLiveFeed,
 } from '../../ui/src/ai-overseer.mjs';
+import { normalizeBrokerRouting } from '../../ui/src/broker-routing.mjs';
 import { renderApp } from '../../ui/src/render.mjs';
 import { displayState, fixture, samplePosition, time } from './helpers.mjs';
 
@@ -267,4 +270,92 @@ test('OVERSEER05 Hostile HTML payloads in AI trader & model catalog are escaped 
   const catHtml = renderAiModelCatalogPanel(STATIC_AI_MODELS);
   assert.match(catHtml, /AI catalog preview \(not attached\)/);
   assert.ok(STATIC_AI_TRADER.humanRole === 'OVERSEER_ONLY');
+});
+
+test('OVERSEER06 Disconnected Section 02 renders Connect live server action and auto-connect gate checks loopback/HTTPS tokens', () => {
+  const disconnectedHtml = renderAiOverseerPanel({ aiTrader: null, aiModels: null });
+  assert.match(disconnectedHtml, /data-connect-loopback="true"/);
+  assert.match(disconnectedHtml, />Connect live server<\/button>/);
+
+  const connectedHtml = renderAiOverseerPanel({
+    aiTrader: normalizeAiTrader(sampleTraderPayload()),
+    aiModels: normalizeAiModels(sampleModelsPayload()),
+  });
+  assert.equal(connectedHtml.includes('Connect live server'), false);
+
+  const tok = 'tok_' + 'a'.repeat(24);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'http:', hostname: '127.0.0.1' }, tok), true);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'http:', hostname: '[::1]' }, tok), true);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'https:', hostname: '52-33-1-177.sslip.io' }, tok), true);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'http:', hostname: '127.0.0.1' }, null), false);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'http:', hostname: '127.0.0.1' }, 'short'), false);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'file:', hostname: '' }, tok), false);
+  assert.equal(shouldAutoConnectLiveFeed({ protocol: 'http:', hostname: 'example.com' }, tok), false);
+});
+
+test('OVERSEER07 Market session pills, WORKING NOW focus strip, watchlist marker, and live Equity/Balance cards render accurately', () => {
+  // Wednesday 14:45 UTC: Wall Street Cash + London-NY overlap OPEN
+  const wedCash = computeMarketSessions(Date.parse('2026-11-18T14:45:00Z'), true);
+  assert.equal(wedCash.forex245Open, true);
+  assert.equal(wedCash.usIndicesStatus, 'CASH_OPEN');
+  assert.equal(wedCash.mt5TickFresh, true);
+  assert.equal(wedCash.sessions.find((s) => s.id === 'london_ny_overlap').open, true);
+
+  // Saturday 15:00 UTC: Weekend Closed
+  const sat = computeMarketSessions(Date.parse('2026-11-21T15:00:00Z'), false);
+  assert.equal(sat.forex245Open, false);
+  assert.equal(sat.usIndicesStatus, 'WEEKEND_CLOSED');
+  assert.equal(sat.sessions.every((s) => !s.open), true);
+
+  const fx = decodeMarketStream(marketFixtureRaw, marketSchema);
+  const state = displayState(fixture(), 'operate');
+  state.liveStreamConnected = true;
+  state.marketStream = fx;
+  state.indexStream = normalizeIndexStream(sampleIndexPayload());
+  state.aiModels = normalizeAiModels(sampleModelsPayload());
+  const traderDoc = sampleTraderPayload();
+  traderDoc.active_working_markets = ['NAS100'];
+  traderDoc.current_focus_symbol = 'NAS100';
+  traderDoc.current_focus_status = 'IN TRADE: NAS100 (BUY · BREAKEVEN_LOCKED)';
+  traderDoc.market_sessions = {
+    utc_time: '14:45 UTC',
+    forex_24_5_open: true,
+    forex_label: 'FOREX 24/5 OPEN',
+    us_indices_status: 'CASH_OPEN',
+    us_indices_label: 'Wall Street Cash OPEN 14:30-21:00 UTC',
+    mt5_tick_fresh: true,
+    sessions: [
+      { id: 'london', label: 'London', window_utc: '07:00-16:00 UTC', open: true },
+      { id: 'new_york', label: 'New York', window_utc: '12:00-21:00 UTC', open: true },
+    ],
+  };
+  state.aiTrader = normalizeAiTrader(traderDoc);
+  state.brokerRouting = normalizeBrokerRouting({
+    schema: 'cas-forex.broker-routing/2',
+    execution_mode: 'DEMO',
+    demo_only: true,
+    live_trading_locked: true,
+    primary_broker: 'HUGOSWAY_MT5',
+    active_broker: 'HUGOSWAY_MT5',
+    platform: 'MetaTrader 5',
+    transport_mode: 'SPOOL_BRIDGE',
+    valve: { controller: 'tks_meta_valve_controller', parameters: 161, threshold: '0.55' },
+    chain: [
+      { broker_id: 'HUGOSWAY_MT5', priority: 1, role: 'PRIMARY_MAIN', label: "Hugo's Way", platform: 'MetaTrader 5', server: 'Hugosway-Demo', max_leverage: '1:500', account_type: 'ECN demo', configured: true, status: 'ACTIVE' },
+    ],
+    dual_shield: { allocation: { total_equity: '300000' } },
+  });
+
+  const html = renderApp(state, Date.parse(time));
+  assert.match(html, /WORKING NOW: IN TRADE: NAS100/);
+  assert.match(html, /FOREX 24\/5 OPEN \(14:45 UTC\)/);
+  assert.match(html, /Wall Street Cash OPEN 14:30-21:00 UTC/);
+  assert.match(html, /watchlist-row[^"]*is-working/);
+  assert.match(html, /OPEN POS · WORKING/);
+  assert.match(html, /300,000/);
+  assert.equal(/\bstyle\s*=/.test(html), false);
+
+  // Offline/fixture state still preserves Unknown on null account metrics
+  const offlineHtml = renderApp(displayState(fixture(), 'operate'), Date.parse(time));
+  assert.match(offlineHtml, /metric-value unknown">Unknown/);
 });

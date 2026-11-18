@@ -7,7 +7,7 @@ import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decisio
 import { ScopedBridge, createAuthenticatedLoopbackBridge } from './bridge.mjs';
 import { ALL_WATCHLIST_MARKETS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts, releaseDetachedCanvases } from './chart.mjs';
 import { MAX_BROKER_ROUTING_BYTES, normalizeBrokerRouting } from './broker-routing.mjs';
-import { MAX_AI_PAYLOAD_BYTES, normalizeAiModels, normalizeAiTrader, normalizeIndexStream } from './ai-overseer.mjs';
+import { MAX_AI_PAYLOAD_BYTES, normalizeAiModels, normalizeAiTrader, normalizeIndexStream, shouldAutoConnectLiveFeed } from './ai-overseer.mjs';
 import { MAX_TREASURY_BYTES, mountAnalyticsCanvases, normalizeParallelTiers, normalizeTreasury } from './analytics.mjs';
 
 // Fixed same-origin assets. Only explicit trusted bootstrap may inject a scoped bridge.
@@ -33,6 +33,9 @@ let loadGeneration = 0;
 let reviewGeneration = 0;
 let dialogTrigger = null;
 let explainer = null;
+let activePointerPress = false;
+let streamRenderTimer = null;
+let deferredRenderPending = false;
 let loopbackAuthToken = null;
 try {
   const bootParams = new URLSearchParams(window.location.search);
@@ -77,6 +80,42 @@ let state = {
 function routeFromHash() {
   const route = window.location.hash.slice(1);
   return ['operate', 'review', 'setup'].includes(route) ? route : 'operate';
+}
+
+function isInteractiveFormActive() {
+  if (activePointerPress) return true;
+  const active = document.activeElement;
+  return Boolean(root.contains(active) && ['SELECT', 'INPUT', 'TEXTAREA'].includes(active?.tagName));
+}
+
+function flushDeferredRender() {
+  if (!deferredRenderPending || isInteractiveFormActive()) return;
+  deferredRenderPending = false;
+  render();
+}
+
+function scheduleStreamRender() {
+  if (isInteractiveFormActive()) {
+    deferredRenderPending = true;
+    return;
+  }
+  if (streamRenderTimer !== null) return;
+  streamRenderTimer = window.setTimeout(() => {
+    streamRenderTimer = null;
+    if (isInteractiveFormActive()) {
+      deferredRenderPending = true;
+      return;
+    }
+    const doPaint = () => {
+      if (isInteractiveFormActive()) {
+        deferredRenderPending = true;
+        return;
+      }
+      render();
+    };
+    if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(doPaint);
+    else doPaint();
+  }, 180);
 }
 
 function render(focusMain = false) {
@@ -226,34 +265,34 @@ function handleSseEvent(eventName, dataText) {
       state.marketStream = nextEnv;
       recordMicroTick(nextEnv);
       if (controller?.attached) void controller.refresh().catch(() => {});
-      else render();
+      else scheduleStreamRender();
     } catch { /* Ignore malformed frame. */ }
   } else if (eventName === 'index_stream') {
     try {
       const nextIdx = normalizeIndexStream(parseUniqueJSON(dataText, MAX_MARKET_STREAM_BYTES));
       state.indexStream = nextIdx;
       recordMicroTickItems(nextIdx.markets);
-      render();
+      scheduleStreamRender();
     } catch { /* Ignore malformed index_stream frame. */ }
   } else if (eventName === 'ai_trader') {
     try {
       state.aiTrader = normalizeAiTrader(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
-      render();
+      scheduleStreamRender();
     } catch { /* Ignore malformed ai_trader frame. */ }
   } else if (eventName === 'ai_models') {
     try {
       state.aiModels = normalizeAiModels(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
-      render();
+      scheduleStreamRender();
     } catch { /* Ignore malformed ai_models frame. */ }
   } else if (eventName === 'treasury') {
     try {
       state.treasury = normalizeTreasury(parseUniqueJSON(dataText, MAX_TREASURY_BYTES));
-      render();
+      scheduleStreamRender();
     } catch { /* Ignore malformed treasury frame. */ }
   } else if (eventName === 'parallel_tiers') {
     try {
       state.parallelTiers = normalizeParallelTiers(parseUniqueJSON(dataText, MAX_TREASURY_BYTES));
-      render();
+      scheduleStreamRender();
     } catch { /* Ignore malformed parallel_tiers frame. */ }
   }
 }
@@ -751,14 +790,53 @@ window.addEventListener('hashchange', () => {
   render(true);
 });
 
-// This local presentation helper has no transport, model client, or execution authority.
+root.addEventListener('pointerdown', () => { activePointerPress = true; });
+const releasePointer = () => { if (activePointerPress) { activePointerPress = false; flushDeferredRender(); } };
+window.addEventListener('pointerup', releasePointer);
+window.addEventListener('pointercancel', releasePointer);
+root.addEventListener('focusout', () => { window.setTimeout(flushDeferredRender, 0); });
+
+// This local presentation helper has no execution or order authority.
 try {
-  explainer = createExplainer({ getContext: () => ({ projection: state.projection, reviewEnvelope: state.reviewEnvelope, route: state.route, source: state.source }) });
+  explainer = createExplainer({
+    getContext: () => ({
+      projection: state.projection,
+      reviewEnvelope: state.reviewEnvelope,
+      route: state.route,
+      source: state.source,
+      aiConnected: Boolean(state.liveStreamConnected && state.aiModels?.connected),
+      activeModelLabel: state.aiModels?.activeDisplayName ?? null,
+      liveAccountLabel: state.brokerRouting?.connected ? `${state.brokerRouting.executionMode} (${state.brokerRouting.activeBroker})` : null,
+      liveRunLabel: state.aiTrader?.connected ? `${state.aiTrader.activeDisplayName} / ${state.aiTrader.thinkingDepth}` : null,
+      liveStateLabel: state.aiTrader?.connected ? `cycle-${state.aiTrader.cycleCount}` : null,
+    }),
+    askModel: async (question) => {
+      const headers = { Accept: 'application/json', 'Content-Type': 'application/json' };
+      if (loopbackAuthToken) headers.Authorization = `Bearer ${loopbackAuthToken}`;
+      const resp = await fetch(new URL('/api/explainer-ask', window.location.origin), {
+        method: 'POST',
+        credentials: 'omit',
+        cache: 'no-store',
+        redirect: 'error',
+        headers,
+        body: JSON.stringify({ question }),
+      });
+      const txt = await resp.text();
+      const doc = parseUniqueJSON(txt, MAX_AI_PAYLOAD_BYTES);
+      if (!resp.ok) throw new Error(doc?.error || `Explainer request failed (${resp.status}).`);
+      return doc;
+    },
+  });
 } catch { disableExplainer(); }
 
 // This entry point runs only when the UI document is explicitly opened.
 render();
-void loadFixture();
+void (async () => {
+  await loadFixture();
+  if (shouldAutoConnectLiveFeed(window.location, loopbackAuthToken)) {
+    await connectLoopbackLiveFeed().catch(() => {});
+  }
+})();
 
 // Age the held read only. Never add local elapsed time to the simulator clock.
 function updateObservationAge() {
