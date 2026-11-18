@@ -70,6 +70,6 @@ test('createAuthenticatedLoopbackBridge attaches Bearer header and rejects non-l
   const res = await client.prepareControl({ request_id: 'r1' });
   assert.equal(res.ok, 1);
   assert.equal(seen[0].auth, 'Bearer tok_' + 'x'.repeat(32));
-  assert.equal(seen[0].credentials, 'same-origin');
+  assert.equal(seen[0].credentials, 'omit');
   assert.equal(seen[0].method, 'POST');
 });

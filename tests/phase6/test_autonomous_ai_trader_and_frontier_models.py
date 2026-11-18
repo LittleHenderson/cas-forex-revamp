@@ -28,6 +28,8 @@ from cas_forex_revamp.composition.live_cockpit_server import (
     safe_broker_routing_payload,
 )
 from cas_forex_revamp.contracts import ActionKind, ContractError, Side
+from cas_forex_revamp.composition.state_store import OwnerRecoveryVerifier
+from cas_forex_revamp.operator.model import DurableModelExecutionGate
 from cas_forex_revamp.operator.frontier_backends import (
     FRONTIER_MODEL_CATALOG,
     FrontierConfigurationError,
@@ -469,11 +471,13 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
                 return 200, json.dumps({"content": [{"type": "text", "text": json.dumps(sel)}], "usage": {"output_tokens": 45}}).encode()
 
             reg = FrontierModelRegistry(environ=env, clock=rig.clock, http_post=open_choice_http, resolve_dns=lambda _h: None)
+            exec_gate = DurableModelExecutionGate(db_path=Path(tmp) / "model_gate.sqlite3")
             trader = AutonomousAiTrader(
                 router=router,
                 model_registry=reg,
                 valve_gate=gate,
                 quota_store=quota,
+                execution_gate=exec_gate,
                 fast_tick_ms=50,
                 clock=rig.clock,
             )
@@ -498,7 +502,8 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
             self.assertGreater(entry_pos.take_profit, entry_pos.price_open)
 
             # Slow 15s public feed must never trigger 50ms micro-scalp entries.
-            trader_slow = AutonomousAiTrader(router=router, model_registry=reg, valve_gate=gate, quota_store=quota, fast_tick_ms=50, clock=rig.clock)
+            m_gate_slow = DurableModelExecutionGate(Path(tmp) / 'm_gate_slow.sqlite3')
+            trader_slow = AutonomousAiTrader(router=router, model_registry=reg, valve_gate=gate, quota_store=quota, execution_gate=m_gate_slow, fast_tick_ms=50, clock=rig.clock)
             slow_res = trader_slow.run_fast_tick_cycle(mt5_quotes={"US30": QUOTES_18["US30"]}, feed_source="PUBLIC_15S_POLL")
             self.assertEqual(slow_res["action"], "VETOED")
 
@@ -579,7 +584,9 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
             ok_tripped, rsn_tripped, _ = store.evaluate_new_risk(ActionKind.OPEN, now=next_day)
             self.assertFalse(ok_tripped)
             self.assertIn("CIRCUIT", rsn_tripped)
-            unlocked = store.unlock_session(owner_request_id="owner-req-1", reason="Overseer verified", now=next_day)
+            rec_v = OwnerRecoveryVerifier(db_path=Path(tmp) / 'quota.sqlite3', clock=lambda: next_day)
+            tok = rec_v.mint_token(action_scope='UNLOCK_QUOTA_SESSION', now=next_day)
+            unlocked = store.unlock_session(owner_request_id="owner-req-1", reason="Overseer verified", recovery_verifier=rec_v, recovery_token=tok, now=next_day)
             self.assertEqual(unlocked["status"], "OPEN")
 
             # Percentage compounding mode test (e.g. 5% of $20,000 = $1,000 target).
@@ -721,7 +728,8 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
             gate = load_default_forex_valve_gate()
             reg = FrontierModelRegistry(environ=rig.env(CAS_FOREX_ANTHROPIC_API_KEY=SYNTH_API_KEY), http_post=_FakeFrontierHttp(), resolve_dns=lambda _h: None)
             quota = DailyQuotaGovernanceStore(path=Path(tmp) / "quota.sqlite3")
-            trader = AutonomousAiTrader(router=router, model_registry=reg, valve_gate=gate, quota_store=quota)
+            m_gate_w = DurableModelExecutionGate(Path(tmp) / 'm_gate_win.sqlite3')
+            trader = AutonomousAiTrader(router=router, model_registry=reg, valve_gate=gate, quota_store=quota, execution_gate=m_gate_w)
 
             srv = LoopbackCockpitServer(
                 repo_root=Path(__file__).resolve().parents[2],

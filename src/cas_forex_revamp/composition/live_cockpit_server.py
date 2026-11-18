@@ -20,12 +20,13 @@ from collections.abc import Callable, Mapping
 import os
 import hmac
 from http import HTTPStatus
-from http import cookies as http_cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import socket
 import ipaddress
 import json
 from pathlib import Path
 import secrets
+import tempfile
 import threading
 from typing import Any
 import urllib.parse
@@ -35,7 +36,6 @@ from cas_forex_revamp.operator.frontier_backends import assert_safe_ai_catalog_p
 
 MAX_HTTP_RPC_BYTES = 262_144
 MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
-AUTH_COOKIE_NAME = "cas_cockpit_auth"  # nosec B105: HTTP cookie name constant, not a secret value
 _FORBIDDEN_ROUTING_KEY_TOKENS: tuple[str, ...] = (
     "password",
     "passwd",
@@ -131,6 +131,9 @@ class LoopbackCockpitServer:
         ai_model_registry: Any | None = None,
         autonomous_trader: Any | None = None,
         index_stream_reader: Callable[[], dict[str, Any] | None] | None = None,
+        profit_vault: Any | None = None,
+        parallel_tiers: Any | None = None,
+        owner_recovery: Any | None = None,
     ) -> None:
         self._host = validate_loopback_host(host)
         if type(port) is not int or not (0 <= port <= 65535):
@@ -149,6 +152,11 @@ class LoopbackCockpitServer:
         self._ai_model_registry = ai_model_registry
         self._autonomous_trader = autonomous_trader
         self._index_stream_reader = index_stream_reader
+        self._profit_vault = profit_vault
+        self._parallel_tiers = parallel_tiers
+        self._owner_recovery = owner_recovery or (
+            getattr(autonomous_trader, "_owner_verifier", None) if autonomous_trader is not None else None
+        )
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -158,6 +166,11 @@ class LoopbackCockpitServer:
         self._auth_lock = threading.RLock()
         self._auth_secret: _CockpitSecret | None = None
         self._session_epoch: str | None = None
+        self._worker_sem = threading.BoundedSemaphore(16)
+        self._emergency_sem = threading.BoundedSemaphore(4)
+        self._sse_sem = threading.BoundedSemaphore(4)
+        self._sockets_lock = threading.Lock()
+        self._active_sockets: set[socket.socket] = set()
 
     def __repr__(self) -> str:
         return (
@@ -203,8 +216,40 @@ class LoopbackCockpitServer:
         """Loopback browser bootstrap URL exchanging `?token=` for an HttpOnly `/api` cookie."""
         return f"{self.base_url}/ui/index.html?token={self.auth_token}"
 
+    def _register_socket(self, sock: socket.socket) -> None:
+        with self._sockets_lock:
+            self._active_sockets.add(sock)
+
+    def _unregister_socket(self, sock: socket.socket) -> None:
+        with self._sockets_lock:
+            self._active_sockets.discard(sock)
+
+    def _close_active_sockets(self) -> None:
+        with self._sockets_lock:
+            socks = list(self._active_sockets)
+            self._active_sockets.clear()
+        for s in socks:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def _verify_commit_epoch(self, bearer_token: str | None, captured_epoch: str) -> bool:
+        if not bearer_token or not captured_epoch:
+            return False
+        with self._auth_lock:
+            if self._stop_event.is_set() or self._httpd is None:
+                return False
+            if self._auth_secret is None or self._session_epoch != captured_epoch:
+                return False
+            return hmac.compare_digest(bearer_token.encode("utf-8"), self._auth_secret.reveal().encode("utf-8"))
+
     def rotate_auth_token(self) -> str:
-        """Rotate per-launch bearer/cookie secret + session_epoch, invalidating prior prepared operations."""
+        """Rotate per-launch bearer secret + session_epoch, terminating prior connections."""
         with self._auth_lock:
             new_tok = _CockpitSecret(secrets.token_urlsafe(32))
             new_epoch = "epoch-" + secrets.token_hex(16)
@@ -213,6 +258,7 @@ class LoopbackCockpitServer:
             if self._ui_service is not None and callable(getattr(self._ui_service, "rotate_adapter_session", None)):
                 self._ui_service.rotate_adapter_session(new_epoch)
         self.notify_stream_updated()
+        self._close_active_sockets()
         return new_tok.reveal()
 
     def notify_stream_updated(self) -> None:
@@ -301,6 +347,7 @@ class LoopbackCockpitServer:
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
+                self.wfile.flush()
                 self.close_connection = True
 
             def _enforce_loopback_envelope(self) -> bool:
@@ -332,47 +379,46 @@ class LoopbackCockpitServer:
                     return False
                 return True
 
-            def _check_auth(self, *, is_post: bool) -> tuple[bool, bool, str]:
-                """Return (authenticated, credential_supplied, session_epoch) via constant-time comparison."""
+            def setup(self) -> None:
+                super().setup()
+                if isinstance(self.connection, socket.socket):
+                    self.connection.settimeout(5.0)
+                    outer._register_socket(self.connection)
+
+            def finish(self) -> None:
+                try:
+                    super().finish()
+                finally:
+                    if isinstance(self.connection, socket.socket):
+                        outer._unregister_socket(self.connection)
+
+            def _check_auth(self, *, is_post: bool) -> tuple[bool, bool, str, str]:
+                """Bearer-only constant-time check returning (authed, supplied, epoch, candidate_token)."""
                 with outer._auth_lock:
                     secret = outer._auth_secret
                     epoch = outer._session_epoch or ""
-                if secret is None:
-                    return False, False, ""
+                if secret is None or outer._stop_event.is_set():
+                    return False, False, "", ""
                 expected_bytes = secret.reveal().encode("utf-8")
 
                 auth_hdrs = self.headers.get_all("Authorization") or []
                 if len(auth_hdrs) > 1:
-                    return False, True, epoch
+                    return False, True, epoch, ""
                 if len(auth_hdrs) == 1:
                     raw_auth = auth_hdrs[0].strip()
                     if not raw_auth.startswith("Bearer "):
-                        return False, True, epoch
+                        return False, True, epoch, ""
                     candidate = raw_auth[7:].strip()
                     if not candidate:
-                        return False, True, epoch
+                        return False, True, epoch, ""
+                    if is_post:
+                        origins = self.headers.get_all("Origin") or []
+                        if len(origins) == 1 and origins[0].strip() != outer.base_url:
+                            return False, True, epoch, ""
                     ok = hmac.compare_digest(candidate.encode("utf-8"), expected_bytes)
-                    return ok, True, epoch
+                    return ok, True, epoch, candidate
 
-                cookie_hdrs = self.headers.get_all("Cookie") or []
-                if cookie_hdrs:
-                    jar = http_cookies.SimpleCookie()
-                    try:
-                        for raw_c in cookie_hdrs:
-                            jar.load(raw_c)
-                    except http_cookies.CookieError:
-                        return False, True, epoch
-                    morsel = jar.get(AUTH_COOKIE_NAME)
-                    if morsel is not None:
-                        cand_cookie = morsel.value
-                        if is_post:
-                            origins = self.headers.get_all("Origin") or []
-                            if len(origins) != 1 or origins[0].strip() != outer.base_url:
-                                return False, True, epoch
-                        ok = hmac.compare_digest(cand_cookie.encode("utf-8"), expected_bytes)
-                        return ok, True, epoch
-
-                return False, False, epoch
+                return False, bool(self.headers.get_all("Cookie")), epoch, "" 
 
             def _reject_unauthorized(self) -> None:
                 self._write_json(
@@ -394,13 +440,22 @@ class LoopbackCockpitServer:
                 return json.loads(data.decode("utf-8"))
 
             def do_GET(self) -> None:
+                if not outer._worker_sem.acquire(blocking=False):
+                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Cockpit worker capacity reached"})
+                    return
+                try:
+                    self._handle_get()
+                finally:
+                    outer._worker_sem.release()
+
+            def _handle_get(self) -> None:
                 if not self._enforce_loopback_envelope():
                     return
                 parsed = urllib.parse.urlsplit(self.path)
                 route = parsed.path
 
                 if route == "/api/health":
-                    authed, supplied, epoch = self._check_auth(is_post=False)
+                    authed, supplied, epoch, _ = self._check_auth(is_post=False)
                     if supplied and not authed:
                         self._reject_unauthorized()
                         return
@@ -418,7 +473,7 @@ class LoopbackCockpitServer:
                     return
 
                 if route == "/api" or route.startswith("/api/"):
-                    authed, _, initial_epoch = self._check_auth(is_post=False)
+                    authed, _, initial_epoch, supplied_tok = self._check_auth(is_post=False)
                     if not authed:
                         self._reject_unauthorized()
                         return
@@ -463,54 +518,95 @@ class LoopbackCockpitServer:
                             outer._last_routing_error = type(exc).__name__
                             self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Autonomous AI snapshot unavailable"})
                         return
+                    if route == "/api/treasury":
+                        if outer._profit_vault is None:
+                            self._write_json(HTTPStatus.NOT_FOUND, {"error": "Profit Sweep Vault not configured"})
+                        else:
+                            self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(outer._profit_vault.snapshot()))
+                        return
+                    if route == "/api/parallel-tiers":
+                        if outer._parallel_tiers is None:
+                            self._write_json(HTTPStatus.NOT_FOUND, {"error": "Parallel Tier Engine not configured"})
+                        else:
+                            self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(outer._parallel_tiers.snapshot()))
+                        return
                     if route == "/api/index-stream":
                         idx_snap = outer._index_stream_reader() if outer._index_stream_reader is not None else None
+                        if idx_snap is None:
+                            stream_fallback = outer._read_stream_payload()
+                            if isinstance(stream_fallback, dict):
+                                idx_rows = [
+                                    m for m in (stream_fallback.get("markets") or [])
+                                    if isinstance(m, dict) and m.get("pair") in ("NAS100", "US30")
+                                ]
+                                if idx_rows:
+                                    idx_snap = {
+                                        "schema": "cas-forex.index-stream/1",
+                                        "sequence": int(stream_fallback.get("sequence") or 1),
+                                        "observed_at": stream_fallback.get("observed_at"),
+                                        "feed_mode": "SYNTHESIZED_FROM_MARKET_STREAM",
+                                        "markets": idx_rows,
+                                    }
                         if idx_snap is None:
                             self._write_json(HTTPStatus.NOT_FOUND, {"error": "Index stream not configured"})
                         else:
                             self._write_json(HTTPStatus.OK, idx_snap)
                         return
                     if route == "/api/market-events":
-                        self.send_response(int(HTTPStatus.OK))
-                        self._send_security_headers("text/event-stream; charset=utf-8")
-                        self.send_header("Connection", "keep-alive")
-                        self.end_headers()
-                        seen_ver = -1
-                        try:
-                            while not outer._stop_event.is_set():
-                                with outer._auth_lock:
-                                    active_epoch = outer._session_epoch
-                                if active_epoch != initial_epoch:
-                                    break
-                                with outer._sse_cond:
-                                    if outer._sse_version == seen_ver:
-                                        outer._sse_cond.wait(timeout=2.0)
-                                    cur_ver = outer._sse_version
-                                if outer._stop_event.is_set():
-                                    break
-                                with outer._auth_lock:
-                                    if outer._session_epoch != initial_epoch:
-                                        break
-                                if cur_ver != seen_ver:
-                                    seen_ver = cur_ver
-                                    snap = outer._read_stream_payload()
-                                    if snap is not None:
-                                        frame = f"event: market\ndata: {json.dumps(snap, sort_keys=False)}\n\n".encode("utf-8")
-                                        self.wfile.write(frame)
-                                    if outer._autonomous_trader is not None:
-                                        tsnap = assert_safe_ai_catalog_payload(outer._autonomous_trader.status_snapshot())
-                                        tframe = f"event: ai_trader\ndata: {json.dumps(tsnap, sort_keys=False)}\n\n".encode("utf-8")
-                                        self.wfile.write(tframe)
-                                    if outer._ai_model_registry is not None:
-                                        csnap = assert_safe_ai_catalog_payload(outer._ai_model_registry.catalog_snapshot())
-                                        cframe = f"event: ai_models\ndata: {json.dumps(csnap, sort_keys=False)}\n\n".encode("utf-8")
-                                        self.wfile.write(cframe)
-                                    self.wfile.flush()
-                                else:
-                                    self.wfile.write(b": heartbeat\n\n")
-                                    self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError, OSError):
+                        if not outer._sse_sem.acquire(blocking=False):
+                            self._write_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "SSE subscriber limit reached"})
                             return
+                        outer._worker_sem.release()
+                        reacquire_worker = True
+                        try:
+                            self.send_response(int(HTTPStatus.OK))
+                            self._send_security_headers("text/event-stream; charset=utf-8")
+                            self.send_header("Connection", "keep-alive")
+                            self.end_headers()
+                            seen_ver = -1
+                            try:
+                                while not outer._stop_event.is_set():
+                                    if not outer._verify_commit_epoch(supplied_tok, initial_epoch):
+                                        break
+                                    with outer._sse_cond:
+                                        if outer._sse_version == seen_ver:
+                                            outer._sse_cond.wait(timeout=1.5)
+                                        cur_ver = outer._sse_version
+                                    if outer._stop_event.is_set() or not outer._verify_commit_epoch(supplied_tok, initial_epoch):
+                                        break
+                                    if cur_ver != seen_ver:
+                                        seen_ver = cur_ver
+                                        snap = outer._read_stream_payload()
+                                        if snap is not None:
+                                            frame = f"event: market\ndata: {json.dumps(snap, sort_keys=False)}\n\n".encode("utf-8")
+                                            self.wfile.write(frame)
+                                        if outer._autonomous_trader is not None:
+                                            tsnap = assert_safe_ai_catalog_payload(outer._autonomous_trader.status_snapshot())
+                                            tframe = f"event: ai_trader\ndata: {json.dumps(tsnap, sort_keys=False)}\n\n".encode("utf-8")
+                                            self.wfile.write(tframe)
+                                        if outer._ai_model_registry is not None:
+                                            csnap = assert_safe_ai_catalog_payload(outer._ai_model_registry.catalog_snapshot())
+                                            cframe = f"event: ai_models\ndata: {json.dumps(csnap, sort_keys=False)}\n\n".encode("utf-8")
+                                            self.wfile.write(cframe)
+                                        if outer._profit_vault is not None:
+                                            vsnap = assert_safe_ai_catalog_payload(outer._profit_vault.snapshot())
+                                            vframe = f"event: treasury\ndata: {json.dumps(vsnap, sort_keys=False)}\n\n".encode("utf-8")
+                                            self.wfile.write(vframe)
+                                        if outer._parallel_tiers is not None:
+                                            ptsnap = assert_safe_ai_catalog_payload(outer._parallel_tiers.snapshot())
+                                            ptframe = f"event: parallel_tiers\ndata: {json.dumps(ptsnap, sort_keys=False)}\n\n".encode("utf-8")
+                                            self.wfile.write(ptframe)
+                                        self.wfile.flush()
+                                    else:
+                                        self.wfile.write(b": heartbeat\n\n")
+                                        self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                pass
+                            self.close_connection = True
+                        finally:
+                            outer._sse_sem.release()
+                            if reacquire_worker:
+                                outer._worker_sem.acquire(blocking=True)
                         return
                     if route in ("/api/boot", "/api/cockpit", "/api/decision-read"):
                         if outer._ui_service is None:
@@ -530,7 +626,6 @@ class LoopbackCockpitServer:
                     self._write_json(HTTPStatus.NOT_FOUND, {"error": "Unknown API endpoint"})
                     return
 
-                extra_cookie_headers: list[tuple[str, str]] = []
                 if parsed.query:
                     qmap = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
                     if "token" in qmap:
@@ -545,8 +640,6 @@ class LoopbackCockpitServer:
                         ):
                             self._reject_unauthorized()
                             return
-                        cookie_val = f"{AUTH_COOKIE_NAME}={secret.reveal()}; HttpOnly; SameSite=Strict; Path=/api"
-                        extra_cookie_headers.append(("Set-Cookie", cookie_val))
 
                 static_file = outer._resolve_static_path(self.path)
                 if static_file is None:
@@ -555,38 +648,156 @@ class LoopbackCockpitServer:
                 raw = static_file.read_bytes()
                 ctype = _CONTENT_TYPES[static_file.suffix.lower()]
                 self.send_response(int(HTTPStatus.OK))
-                self._send_security_headers(ctype, len(raw), extra_headers=extra_cookie_headers)
+                self._send_security_headers(ctype, len(raw))
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(raw)
 
             def do_POST(self) -> None:
+                route = urllib.parse.urlsplit(self.path).path
+                is_emergency = route in ("/api/ai-overseer-action", "/api/request-control")
+                sem = outer._emergency_sem if is_emergency else outer._worker_sem
+                if not sem.acquire(blocking=False):
+                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Cockpit POST capacity reached"})
+                    return
+                try:
+                    self._handle_post(route)
+                finally:
+                    sem.release()
+
+            def _handle_post(self, route: str) -> None:
                 if not self._enforce_loopback_envelope():
                     return
-                authed, _, _ = self._check_auth(is_post=True)
+                authed, _, auth_epoch, supplied_tok = self._check_auth(is_post=True)
                 if not authed:
                     self._reject_unauthorized()
                     return
-                route = urllib.parse.urlsplit(self.path).path
                 if route == "/api/select-ai-model":
                     if outer._ai_model_registry is None:
                         self._write_json(HTTPStatus.NOT_FOUND, {"error": "AI model registry not configured"})
                         return
                     try:
                         body = self._read_json_body()
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
                         if type(body) is not dict or "model_id" not in body:
                             raise ContractError("model_id field required")
                         if "fast_scout_enabled" in body:
                             outer._ai_model_registry.set_fast_scout_enabled(bool(body["fast_scout_enabled"]))
+                        if "thinking_depth" in body and body["thinking_depth"] is not None:
+                            outer._ai_model_registry.set_thinking_depth(str(body["thinking_depth"]))
                         updated = assert_safe_ai_catalog_payload(outer._ai_model_registry.select_model(str(body["model_id"])))
                         outer.notify_stream_updated()
                         self._write_json(HTTPStatus.OK, updated)
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
+                if route == "/api/thinking-depth":
+                    if outer._ai_model_registry is None:
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "AI model registry not configured"})
+                        return
+                    try:
+                        body = self._read_json_body()
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        if type(body) is not dict or "thinking_depth" not in body:
+                            raise ContractError("thinking_depth field required")
+                        updated = assert_safe_ai_catalog_payload(
+                            outer._ai_model_registry.set_thinking_depth(str(body["thinking_depth"]))
+                        )
+                        outer.notify_stream_updated()
+                        self._write_json(HTTPStatus.OK, updated)
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                if route == "/api/treasury-config":
+                    if outer._profit_vault is None:
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "Profit Sweep Vault not configured"})
+                        return
+                    try:
+                        body = self._read_json_body()
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        if type(body) is not dict:
+                            raise ContractError("JSON object required")
+                        from decimal import Decimal as _Dec
+                        ratio_v = _Dec(str(body["sweep_ratio"])) if body.get("sweep_ratio") is not None else None
+                        auto_v = bool(body["auto_sweep_enabled"]) if "auto_sweep_enabled" in body else None
+                        rail_v = str(body["preferred_rail"]) if body.get("preferred_rail") is not None else None
+                        updated = assert_safe_ai_catalog_payload(
+                            outer._profit_vault.set_config(
+                                sweep_ratio=ratio_v, auto_sweep_enabled=auto_v, preferred_rail=rail_v
+                            )
+                        )
+                        outer.notify_stream_updated()
+                        self._write_json(HTTPStatus.OK, updated)
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                if route == "/api/treasury-action":
+                    if outer._profit_vault is None:
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "Profit Sweep Vault not configured"})
+                        return
+                    try:
+                        body = self._read_json_body()
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        if type(body) is not dict or "action" not in body:
+                            raise ContractError("action field required")
+                        if outer._owner_recovery is None:
+                            raise ContractError("OWNER_RECOVERY_VERIFIER_NOT_CONFIGURED")
+                        act = str(body["action"]).strip().upper()
+                        from decimal import Decimal as _Dec
+                        req_id = str(body.get("owner_request_id") or "treasury-op-1")
+                        reason = str(body.get("reason") or "Owner treasury disbursement")
+                        rec_tok = body.get("recovery_token") or body.get("owner_authorization")
+                        if act == "REQUEST_BROKER_2FA_WITHDRAWAL":
+                            res = outer._profit_vault.request_broker_2fa_withdrawal(
+                                broker_id=str(body.get("broker_id") or "HUGOSWAY_MT5"),
+                                amount_usd=_Dec(str(body["amount_usd"])),
+                                owner_request_id=req_id,
+                                reason=reason,
+                                verifier=outer._owner_recovery,
+                                recovery_token=str(rec_tok or ""),
+                            )
+                        elif act == "CONFIRM_BROKER_2FA_WITHDRAWAL":
+                            res = outer._profit_vault.confirm_broker_2fa_withdrawal(
+                                transfer_id=str(body["transfer_id"]),
+                                provider_tx_id=str(body["provider_tx_id"]),
+                            )
+                        elif act == "EXECUTE_OFFRAMP_ACH":
+                            from cas_forex_revamp.treasury.profit_sweep import CoinbaseOfframpClient, KrakenOfframpClient
+                            rail_name = str(body.get("rail") or "COINBASE_ACH").strip().upper()
+                            cb = CoinbaseOfframpClient.from_environ(os.environ) if rail_name == "COINBASE_ACH" else None
+                            krk = KrakenOfframpClient.from_environ(os.environ) if rail_name == "KRAKEN_ACH" else None
+                            res = outer._profit_vault.execute_offramp_ach_payout(
+                                rail=rail_name,
+                                amount_usd=_Dec(str(body["amount_usd"])),
+                                owner_request_id=req_id,
+                                reason=reason,
+                                verifier=outer._owner_recovery,
+                                recovery_token=str(rec_tok or ""),
+                                coinbase_client=cb,
+                                kraken_client=krk,
+                            )
+                        else:
+                            raise ContractError(f"unsupported treasury action {act!r}")
+                        outer.notify_stream_updated()
+                        self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(res))
+                    except Exception as exc:
+                        code = HTTPStatus.FORBIDDEN if "OWNER_RECOVERY" in str(exc) else HTTPStatus.BAD_REQUEST
+                        self._write_json(code, {"error": str(exc)})
+                    return
                 if route == "/api/ai-overseer-action":
                     try:
                         body = self._read_json_body()
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
                         if type(body) is not dict or not isinstance(body.get("action"), str):
                             raise ContractError("action field required")
                         act = body["action"].strip().upper()
@@ -610,15 +821,29 @@ class LoopbackCockpitServer:
                             res = outer._autonomous_trader.stop_automation(reason=reason)
                         elif act == "EMERGENCY_CLOSE_ALL":
                             res = outer._autonomous_trader.emergency_close_all(reason=reason)
-                        elif act == "REARM_DRAWDOWN":
+                        elif act in ("REARM_DRAWDOWN", "UNLOCK_QUOTA_SESSION"):
                             req_id = str(body.get("owner_request_id") or "overseer-unlock-1")
-                            res = outer._autonomous_trader.rearm_and_unlock(owner_request_id=req_id, reason=reason)
+                            rec_tok = body.get("recovery_token")
+                            new_pk = body.get("new_peak_equity")
+                            from decimal import Decimal as _Dec
+                            pk_val = _Dec(str(new_pk)) if new_pk is not None else None
+                            res = outer._autonomous_trader.rearm_and_unlock(
+                                owner_request_id=req_id,
+                                reason=reason,
+                                recovery_token=None if rec_tok is None else str(rec_tok),
+                                unlock_recovery_token=None if body.get("unlock_recovery_token") is None else str(body.get("unlock_recovery_token")),
+                                new_peak_equity=pk_val,
+                            )
                         elif act == "UPDATE_QUOTA_TARGETS":
+                            req_id = str(body.get("owner_request_id") or "overseer-quota-1")
+                            rec_tok = body.get("recovery_token")
                             res = outer._autonomous_trader.quota_store.update_targets(
                                 soft_quota_usd=body.get("soft_quota_usd"),
                                 hard_quota_usd=body.get("hard_quota_usd"),
                                 daily_quota_pct=body.get("daily_quota_pct"),
                                 quota_mode=body.get("quota_mode"),
+                                owner_request_id=req_id,
+                                recovery_token=None if rec_tok is None else str(rec_tok),
                             )
                             res = assert_safe_ai_catalog_payload(res)
                         else:
@@ -626,7 +851,8 @@ class LoopbackCockpitServer:
                         outer.notify_stream_updated()
                         self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(res))
                     except Exception as exc:
-                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        code = HTTPStatus.FORBIDDEN if "OWNER_RECOVERY" in str(exc) else HTTPStatus.BAD_REQUEST
+                        self._write_json(code, {"error": str(exc)})
                     return
                 if outer._ui_service is None:
                     self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "ScopedUIService not attached"})
@@ -646,6 +872,9 @@ class LoopbackCockpitServer:
                     return
                 try:
                     body = self._read_json_body()
+                    if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                        self._reject_unauthorized()
+                        return
                     result = fn(body)
                     self._write_json(HTTPStatus.OK, result)
                 except Exception as exc:
@@ -655,6 +884,7 @@ class LoopbackCockpitServer:
         self.rotate_auth_token()
         self._httpd = ThreadingHTTPServer((self._host, self._port), _Handler)
         self._httpd.daemon_threads = True
+        self._httpd.request_queue_size = 32
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="cas-forex-cockpit-http", daemon=True)
         self._thread.start()
         return self.base_url
@@ -668,6 +898,7 @@ class LoopbackCockpitServer:
                 self._ui_service.rotate_adapter_session()
         with self._sse_cond:
             self._sse_cond.notify_all()
+        self._close_active_sockets()
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
@@ -714,8 +945,14 @@ def run_cockpit_cli(
     ap.add_argument("--poll-seconds", type=int, default=15, help="Live 18-market poll interval in seconds (0=disable)")
     ap.add_argument("--fast-tick-ms", type=int, default=50, help="Direct MT5 fast-tick interval in ms for NAS100/US30 (0=disable)")
     ap.add_argument("--no-autonomous-ai", dest="autonomous_ai", action="store_false", default=True, help="Disable continuous autonomous AI trading loop")
+    ap.add_argument("--state-dir", type=Path, default=None, help="Owner-only (0o700) persistent SQLite WAL state directory")
     ap.add_argument("--activate-brokers", action="store_true", help="Attempt live/demo connection to configured brokers")
     ap.add_argument("--print-check-only", action="store_true", help="Validate config/routing/AI catalog, print JSON, and exit")
+    ap.add_argument("--mint-recovery-token", action="store_true", help="Mint a single-use OwnerRecoveryVerifier token and exit")
+    ap.add_argument("--recovery-scope", default="UNLOCK_QUOTA_SESSION", help="Scope for --mint-recovery-token")
+    ap.add_argument("--recovery-ttl-seconds", type=int, default=900, help="TTL for --mint-recovery-token (30..900s)")
+    ap.add_argument("--mint-live-auth-ticket", action="store_true", help="Mint signed LiveAuthorizationTicket bundle from env and exit")
+    ap.add_argument("--live-ticket-ttl-seconds", type=int, default=3600, help="TTL for --mint-live-auth-ticket (60..86400s)")
     args = ap.parse_args(argv)
     if args.poll_seconds < 0 or args.poll_seconds > 3600:
         raise ContractError("--poll-seconds must be in 0..3600")
@@ -728,18 +965,62 @@ def run_cockpit_cli(
         merged.update(load_dotenv_file(args.env_file))
 
     from cas_forex_revamp.composition.autonomous_trader import AutonomousAiTrader
+    from cas_forex_revamp.composition.state_store import initialize_shared_runtime_state
     from cas_forex_revamp.operator.frontier_backends import FrontierModelRegistry
-    from cas_forex_revamp.valve.daily_quota import DailyQuotaGovernanceStore
-    from cas_forex_revamp.valve.tks_meta_valve_controller import load_default_forex_valve_gate
     from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
     from cas_forex_revamp.venue.live_market_stream import (
         EXPANDED_MARKETS,
         ExpandedPublicLiveFxFeedClient,
         PublicUsIndexFeedClient,
     )
-    from cas_forex_revamp.venue.mt5_broker_bridge import resolve_mt5_spool_dir
+    from cas_forex_revamp.venue.mt5_broker_bridge import (
+        BROKER_HUGOSWAY_MT5,
+        BROKER_LHFX_MT5,
+        BROKER_OANDA_LIVE,
+        ENV_HUGOSWAY_MT5_LOGIN,
+        ENV_HUGOSWAY_MT5_SERVER,
+        ENV_LHFX_MT5_LOGIN,
+        ENV_LHFX_MT5_SERVER,
+        resolve_mt5_spool_dir,
+    )
 
-    gate = load_default_forex_valve_gate()
+    tmp_state_holder: tempfile.TemporaryDirectory[str] | None = None
+    explicit_sdir = args.state_dir
+    if explicit_sdir is None and not str(merged.get("CAS_FOREX_STATE_DIR", "")).strip() and args.print_check_only:
+        tmp_state_holder = tempfile.TemporaryDirectory(prefix="cas_fx_check_state_")
+        explicit_sdir = Path(tmp_state_holder.name)
+
+    runtime_state = initialize_shared_runtime_state(merged, explicit_state_dir=explicit_sdir)
+    if args.mint_recovery_token:
+        tok = runtime_state.owner_recovery.mint_token(
+            action_scope=args.recovery_scope,
+            ttl_seconds=args.recovery_ttl_seconds,
+        )
+        print(json.dumps({"status": "RECOVERY_TOKEN_MINTED", "scope": args.recovery_scope.upper(), "recovery_token": tok}))
+        return 0
+    if args.mint_live_auth_ticket:
+        from cas_forex_revamp.venue.live_auth_ticket import (
+            ENV_LIVE_AUTH_KEY_FILE,
+            ENV_LIVE_AUTH_TICKET_FILE,
+            mint_live_authorization_bundle,
+            provision_live_auth_key,
+        )
+        key_p = Path(merged.get(ENV_LIVE_AUTH_KEY_FILE) or (runtime_state.state_dir / ".live_auth.key"))
+        provision_live_auth_key(key_p)
+        targets: list[tuple[str, str | int, str]] = []
+        if merged.get(ENV_HUGOSWAY_MT5_LOGIN):
+            targets.append((BROKER_HUGOSWAY_MT5, merged[ENV_HUGOSWAY_MT5_LOGIN], merged.get(ENV_HUGOSWAY_MT5_SERVER, "Hugo PRO5")))
+        if merged.get(ENV_LHFX_MT5_LOGIN):
+            targets.append((BROKER_LHFX_MT5, merged[ENV_LHFX_MT5_LOGIN], merged.get(ENV_LHFX_MT5_SERVER, "LHFXSA-Trade")))
+        if merged.get("CAS_FOREX_OANDA_LIVE_ACCOUNT_ID"):
+            targets.append((BROKER_OANDA_LIVE, merged["CAS_FOREX_OANDA_LIVE_ACCOUNT_ID"], "api-fxtrade.oanda.com"))
+        bundle = mint_live_authorization_bundle(key_file=key_p, targets=targets, ttl_seconds=args.live_ticket_ttl_seconds)
+        t_out = Path(merged.get(ENV_LIVE_AUTH_TICKET_FILE) or (runtime_state.state_dir / "live_auth_bundle.json"))
+        t_out.write_text(json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(json.dumps({"status": "LIVE_TICKET_MINTED", "key_file": str(key_p), "ticket_file": str(t_out), "brokers": [t[0] for t in targets]}))
+        return 0
+
+    gate = runtime_state.valve_gate
     from cas_forex_revamp.contracts import parse_decimal as _parse_dec
     stream_lock = threading.Lock()
     latest_index_stream: list[dict[str, Any] | None] = [None]
@@ -757,15 +1038,35 @@ def run_cockpit_cli(
                 out[sym] = (_parse_dec(str(row["bid"])), _parse_dec(str(row["ask"])))
         return out
 
-    router = DualShieldBrokerRouter(environ=merged, valve_gate=gate, index_reference_source=_read_index_ref)
-    registry = FrontierModelRegistry(environ=merged)
-    quota_store = DailyQuotaGovernanceStore.from_environ(merged)
+    router = DualShieldBrokerRouter(
+        environ=merged,
+        valve_gate=gate,
+        peak_equity_store=runtime_state.peak_equity_store,
+        index_reference_source=_read_index_ref,
+    )
+    merged_ai = dict(merged)
+    if not str(merged_ai.get("CAS_FOREX_THINKING_DEPTH", "")).strip():
+        merged_ai["CAS_FOREX_THINKING_DEPTH"] = runtime_state.initial_thinking_depth
+    registry = FrontierModelRegistry(environ=merged_ai)
+
+    def _persist_thinking_depth(mode: str) -> None:
+        td_tmp = runtime_state.thinking_depth_path.with_suffix(".tmp")
+        td_tmp.write_text(json.dumps({"thinking_depth": mode}) + "\n", encoding="utf-8")
+        os.replace(td_tmp, runtime_state.thinking_depth_path)
+
+    registry.bind_thinking_depth_persister(_persist_thinking_depth)
+    quota_store = runtime_state.quota_store
     trader = AutonomousAiTrader(
         router=router,
         model_registry=registry,
         valve_gate=gate,
         quota_store=quota_store,
+        peak_equity_store=runtime_state.peak_equity_store,
+        owner_verifier=runtime_state.owner_recovery,
+        execution_gate=runtime_state.model_gate,
         fast_tick_ms=args.fast_tick_ms,
+        profit_vault=runtime_state.profit_vault,
+        parallel_tiers=runtime_state.parallel_tiers,
     )
     if not args.autonomous_ai:
         trader.stop_automation(reason="CLI launched with --no-autonomous-ai")
@@ -776,6 +1077,7 @@ def run_cockpit_cli(
     cat_snap = assert_safe_ai_catalog_payload(registry.catalog_snapshot())
     routing_summary.update({
         "markets_supported": len(EXPANDED_MARKETS),
+        "state_directory": str(runtime_state.state_dir),
         "portable_mt5_spool": resolve_mt5_spool_dir(merged),
         "ai_model_selected": cat_snap["active_model_id"],
         "ai_model_status": cat_snap["active_status"],
@@ -788,6 +1090,8 @@ def run_cockpit_cli(
     safe_broker_routing_payload(routing_summary)
     if args.print_check_only:
         print(json.dumps(routing_summary, indent=2))
+        if tmp_state_holder is not None:
+            tmp_state_holder.cleanup()
         return 0
 
     fixture_path = root / "docs" / "contracts" / "initial-market-stream.json"
@@ -825,6 +1129,9 @@ def run_cockpit_cli(
         ai_model_registry=registry,
         autonomous_trader=trader,
         index_stream_reader=_read_index_stream,
+        profit_vault=runtime_state.profit_vault,
+        parallel_tiers=runtime_state.parallel_tiers,
+        owner_recovery=runtime_state.owner_recovery,
     )
     srv.start()
     stop_flag = threading.Event()
@@ -869,7 +1176,38 @@ def run_cockpit_cli(
                             except (ContractError, OSError) as exc_sym:
                                 print(f"[ai-fast] Tick skipped for {sym}: {type(exc_sym).__name__}")
                 if mt5_q:
-                    trader.run_fast_tick_cycle(mt5_quotes=mt5_q)
+                    from cas_forex_revamp.contracts import decimal_text as _dec_txt
+                    idx_rows = []
+                    for sym_idx in ("NAS100", "US30"):
+                        if sym_idx in mt5_q:
+                            b_px, a_px = mt5_q[sym_idx]
+                            idx_rows.append({
+                                "pair": sym_idx,
+                                "display_pair": "NAS100 / USD" if sym_idx == "NAS100" else "US30 / USD",
+                                "category": "US_INDEX",
+                                "bid": _dec_txt(b_px),
+                                "ask": _dec_txt(a_px),
+                                "mid": _dec_txt((b_px + a_px) / 2),
+                                "feed_mode": "MT5_DIRECT_SPOOL_50MS",
+                            })
+                    if idx_rows:
+                        with stream_lock:
+                            if latest_index_stream[0] is None or latest_index_stream[0].get("feed_mode") == "MT5_DIRECT_SPOOL_50MS":
+                                latest_index_stream[0] = {
+                                    "schema": "cas-forex.index-stream/1",
+                                    "sequence": 1,
+                                    "feed_mode": "MT5_DIRECT_SPOOL_50MS",
+                                    "markets": idx_rows,
+                                }
+                    if trader._inference_lock.acquire(blocking=False):
+                        try:
+                            trader.run_fast_tick_cycle(mt5_quotes=mt5_q)
+                        finally:
+                            trader._inference_lock.release()
+                    else:
+                        # Non-blocking 50ms stop protection even during 3-8s deep-thinking HTTP inference
+                        trader.evaluate_fast_protection(quotes=mt5_q)
+                        runtime_state.parallel_tiers.process_tick(quotes=mt5_q, signal=None)
                     srv.notify_stream_updated()
             except Exception as exc_ft:
                 print(f"[ai-fast] Fast tick skipped ({type(exc_ft).__name__}).")

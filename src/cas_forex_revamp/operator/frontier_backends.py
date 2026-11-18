@@ -49,6 +49,8 @@ from .model import (
 ENV_AI_MODEL = "CAS_FOREX_AI_MODEL"
 ENV_GEMINI_DECISION_SCOUT = "CAS_FOREX_GEMINI_DECISION_SCOUT"
 ENV_DECISION_MIN_PROBABILITY = "CAS_FOREX_DECISION_MIN_PROBABILITY"
+ENV_THINKING_DEPTH = "CAS_FOREX_THINKING_DEPTH"
+VALID_THINKING_DEPTHS = ("AUTO", "LOW", "MEDIUM", "HIGH")
 
 ENV_ANTHROPIC_API_KEY = "CAS_FOREX_ANTHROPIC_API_KEY"
 ENV_GEMINI_API_KEY = "CAS_FOREX_GEMINI_API_KEY"
@@ -551,8 +553,16 @@ def _extract_provider_text_and_usage(
         blocks = doc.get("content")
         if type(blocks) is not list or not blocks:
             raise FrontierTransportError("Anthropic response missing content blocks")
-        first = blocks[0]
-        text = first.get("text") if type(first) is dict else None
+        text = None
+        for blk in blocks:
+            if type(blk) is dict and blk.get("type") == "text" and isinstance(blk.get("text"), str):
+                text = blk.get("text")
+                break
+        if text is None:
+            for blk in blocks:
+                if type(blk) is dict and isinstance(blk.get("text"), str):
+                    text = blk.get("text")
+                    break
         usage = doc.get("usage") if type(doc.get("usage")) is dict else {}
         out_tok = int(usage.get("output_tokens", max(1, len(str(text or "").encode("utf-8")) // 4)))
     elif provider == "gemini":
@@ -561,8 +571,17 @@ def _extract_provider_text_and_usage(
             raise FrontierTransportError("Gemini response missing candidates")
         content = cands[0].get("content") if type(cands[0]) is dict else None
         parts = content.get("parts") if type(content) is dict else None
-        first_part = parts[0] if type(parts) is list and parts else None
-        text = first_part.get("text") if type(first_part) is dict else None
+        text = None
+        if type(parts) is list:
+            for part in parts:
+                if type(part) is dict and not part.get("thought") and isinstance(part.get("text"), str):
+                    text = part.get("text")
+                    break
+            if text is None:
+                for part in reversed(parts):
+                    if type(part) is dict and isinstance(part.get("text"), str):
+                        text = part.get("text")
+                        break
         meta = doc.get("usageMetadata") if type(doc.get("usageMetadata")) is dict else {}
         out_tok = int(meta.get("candidatesTokenCount", max(1, len(str(text or "").encode("utf-8")) // 4)))
     elif provider in ("openai", "deepseek"):
@@ -595,19 +614,30 @@ def _build_provider_payload(
     user_content = invocation.packet_json
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
+    effort = str(getattr(invocation.model, "reasoning_effort", "low") or "low").strip().lower()
     if entry.provider == "anthropic":
         if secret is None:
             raise FrontierTransportError(f"{entry.display_name} requires {entry.credential_env}")
         url = _validate_frontier_https_url(entry.endpoint_template, expected_host=entry.allowed_host)
         headers["x-api-key"] = secret.reveal_for_header()
         headers["anthropic-version"] = "2023-06-01"
-        body_obj: dict[str, Any] = {
-            "model": api_slug,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "system": invocation.system_policy,
-            "messages": [{"role": "user", "content": user_content}],
-        }
+        if effort in ("medium", "high"):
+            think_budget = 2048 if effort == "medium" else 6144
+            body_obj: dict[str, Any] = {
+                "model": api_slug,
+                "max_tokens": max(max_tokens, think_budget + 1024),
+                "thinking": {"type": "enabled", "budget_tokens": think_budget},
+                "system": invocation.system_policy,
+                "messages": [{"role": "user", "content": user_content}],
+            }
+        else:
+            body_obj = {
+                "model": api_slug,
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "system": invocation.system_policy,
+                "messages": [{"role": "user", "content": user_content}],
+            }
         return url, headers, canonical_bytes(body_obj)
 
     if entry.provider == "gemini_decision":
@@ -634,14 +664,17 @@ def _build_provider_payload(
         raw_url = entry.endpoint_template.format(slug=clean_slug)
         url = _validate_frontier_https_url(raw_url, expected_host=entry.allowed_host)
         headers["x-goog-api-key"] = secret.reveal_for_header()
+        gen_cfg: dict[str, Any] = {
+            "temperature": 0,
+            "maxOutputTokens": max_tokens,
+            "responseMimeType": "application/json",
+        }
+        if effort in ("medium", "high"):
+            gen_cfg["thinkingConfig"] = {"thinkingBudget": 2048 if effort == "medium" else 6144}
         body_obj = {
             "systemInstruction": {"parts": [{"text": invocation.system_policy}]},
             "contents": [{"role": "user", "parts": [{"text": user_content}]}],
-            "generationConfig": {
-                "temperature": 0,
-                "maxOutputTokens": max_tokens,
-                "responseMimeType": "application/json",
-            },
+            "generationConfig": gen_cfg,
         }
         return url, headers, canonical_bytes(body_obj)
 
@@ -660,6 +693,8 @@ def _build_provider_payload(
                 {"role": "user", "content": user_content},
             ],
         }
+        if effort in ("medium", "high"):
+            body_obj["reasoning_effort"] = effort
         if invocation.seed is not None and entry.provider == "openai":
             body_obj["seed"] = invocation.seed
         return url, headers, canonical_bytes(body_obj)
@@ -875,6 +910,15 @@ class FrontierModelRegistry:
         else:
             self._explicit_selection = False
             self._active_model_id = self._pick_default_model_id()
+        raw_depth = str(self._env.get(ENV_THINKING_DEPTH, "AUTO") or "AUTO").strip().upper()
+        if raw_depth not in VALID_THINKING_DEPTHS:
+            raise FrontierConfigurationError(
+                f"{ENV_THINKING_DEPTH} must be one of {VALID_THINKING_DEPTHS}, got {raw_depth!r}"
+            )
+        self._thinking_depth: str = raw_depth
+        self._thinking_depth_persist_cb: Any = None
+        self._last_effective_effort: str = "low"
+        self._last_latency_ms: int | None = None
 
     def __repr__(self) -> str:
         with self._lock:
@@ -924,12 +968,73 @@ class FrontierModelRegistry:
             return False
         return self._is_entry_ready(_CATALOG_BY_ID[target_id])
 
-    def model_spec(self, model_id: str | None = None) -> ModelSpecification:
+    @property
+    def thinking_depth(self) -> str:
+        with self._lock:
+            return self._thinking_depth
+
+    def bind_thinking_depth_persister(self, callback: Callable[[str], None] | None) -> None:
+        with self._lock:
+            self._thinking_depth_persist_cb = callback
+
+    def set_thinking_depth(self, depth: str) -> dict[str, Any]:
+        if not isinstance(depth, str) or depth.strip().upper() not in VALID_THINKING_DEPTHS:
+            raise FrontierConfigurationError(
+                f"thinking_depth must be one of {VALID_THINKING_DEPTHS}, got {depth!r}"
+            )
+        clean = depth.strip().upper()
+        with self._lock:
+            self._thinking_depth = clean
+            cb = self._thinking_depth_persist_cb
+        if cb is not None:
+            cb(clean)
+        return self.catalog_snapshot()
+
+    def resolve_reasoning_effort(
+        self,
+        *,
+        model_id: str | None = None,
+        timeframe: str = "M1",
+        regime: str = "TREND_IGNITION",
+        symbol: str | None = None,
+        is_pyramid_add: bool = False,
+    ) -> str:
+        target_id = self.active_model_id if model_id is None else model_id
+        if target_id not in _CATALOG_BY_ID:
+            raise FrontierConfigurationError(f"unknown AI model {target_id!r}")
+        entry = _CATALOG_BY_ID[target_id]
+        if entry.is_fallback or entry.provider == "gemini_decision":
+            return "disabled" if entry.is_fallback else "low"
+        with self._lock:
+            mode = self._thinking_depth
+        if mode in ("LOW", "MEDIUM", "HIGH"):
+            return mode.lower()
+        # AUTO 2-Speed Brain rule
+        if is_pyramid_add or timeframe == "H1":
+            return "high"
+        if timeframe in ("50ms", "1s", "M1") and (symbol in ("NAS100", "US30") or regime == "TREND_IGNITION"):
+            return "low"
+        if timeframe in ("M5", "M15") or regime == "STRONG_TREND":
+            return "medium"
+        return "low"
+
+    def model_spec(
+        self,
+        model_id: str | None = None,
+        *,
+        reasoning_effort: str | None = None,
+    ) -> ModelSpecification:
         target_id = self.active_model_id if model_id is None else model_id
         if target_id not in _CATALOG_BY_ID:
             raise FrontierConfigurationError(f"unknown AI model {target_id!r}")
         entry = _CATALOG_BY_ID[target_id]
         slug = self._slugs[target_id]
+        if entry.is_fallback:
+            eff = "disabled"
+        elif reasoning_effort is not None and str(reasoning_effort).strip().lower() in ("disabled", "low", "medium", "high"):
+            eff = str(reasoning_effort).strip().lower()
+        else:
+            eff = self.resolve_reasoning_effort(model_id=target_id)
         artifact_sha = content_digest({
             "model_id": entry.model_id,
             "provider": entry.provider,
@@ -942,16 +1047,21 @@ class FrontierModelRegistry:
         return ModelSpecification(
             model_id=spec_id,
             artifact_sha256=artifact_sha,
-            reasoning_effort="disabled" if entry.is_fallback else "low",
+            reasoning_effort=eff,
             prompt_version="frontier-v2",
         )
 
-    def build_backend(self, model_id: str | None = None) -> tuple[ModelSpecification, FrontierChatBackend, FrontierReceiptVerifier]:
+    def build_backend(
+        self,
+        model_id: str | None = None,
+        *,
+        reasoning_effort: str | None = None,
+    ) -> tuple[ModelSpecification, FrontierChatBackend, FrontierReceiptVerifier]:
         target_id = self.active_model_id if model_id is None else model_id
         if target_id not in _CATALOG_BY_ID:
             raise FrontierConfigurationError(f"unknown AI model {target_id!r}")
         entry = _CATALOG_BY_ID[target_id]
-        spec = self.model_spec(target_id)
+        spec = self.model_spec(target_id, reasoning_effort=reasoning_effort)
         secret = self._secrets.get(entry.credential_env) if entry.credential_env else None
         transport = self._ollama_http_post if entry.provider == "ollama" else self._http_post
         backend = FrontierChatBackend(
@@ -1061,14 +1171,25 @@ class FrontierModelRegistry:
             self._last_scout = summary
         return summary
 
-    def record_call(self, model_id: str, *, latency_ms: int, status: str) -> None:
+    def record_call(
+        self,
+        model_id: str,
+        *,
+        latency_ms: int,
+        status: str,
+        reasoning_effort: str | None = None,
+    ) -> None:
         if model_id not in _CATALOG_BY_ID:
             return
+        clean_lat = max(0, int(latency_ms))
         with self._lock:
             st = self._stats[model_id]
             st["calls"] = int(st["calls"]) + 1
-            st["last_latency_ms"] = max(0, int(latency_ms))
+            st["last_latency_ms"] = clean_lat
             st["last_status"] = str(status)[:40]
+            self._last_latency_ms = clean_lat
+            if reasoning_effort is not None:
+                self._last_effective_effort = str(reasoning_effort).lower()
 
     def select_model(self, model_id: str) -> dict[str, Any]:
         if not isinstance(model_id, str) or model_id.strip() not in _CATALOG_BY_ID:
@@ -1130,6 +1251,10 @@ class FrontierModelRegistry:
             "frontier_ahead_of_qwen": True,
             "frontier_configured_count": frontier_ready_count,
             "offline_fallback_enabled": self._ollama_fallback_enabled,
+            "thinking_depth": self.thinking_depth,
+            "valid_thinking_depths": list(VALID_THINKING_DEPTHS),
+            "last_effective_effort": self._last_effective_effort,
+            "last_latency_ms": self._last_latency_ms,
             "fast_scout_enabled": scout_enabled,
             "fast_scout_model_id": "gemini-decision-1",
             "fast_scout_ready": self._is_entry_ready(_CATALOG_BY_ID["gemini-decision-1"]),

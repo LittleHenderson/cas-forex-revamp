@@ -1,46 +1,47 @@
 //+------------------------------------------------------------------+
 //|                                           CasForexMt5Bridge.mq5  |
-//|            CAS Forex Revamp - Phase 6 MetaTrader 5 spool bridge   |
+//|         CAS Forex Revamp - Phase 6 MetaTrader 5 Spool v2 Bridge  |
 //|                                                                  |
-//|  DUAL-MODE (DEMO DEFAULT + TWO-KEY LIVE). Protocol:              |
-//|  "cas-forex-mt5-spool/1" between Python and this terminal:       |
-//|    order_request_<id>.json  (Python -> EA, flat, string values)  |
-//|    order_receipt_<id>.json  (EA -> Python, flat, string values)  |
-//|    market_ticks.json        (EA -> Python, account/ticks/pos)    |
+//|  DUAL-MODE (DEMO DEFAULT + CRYPTO-TICKET LIVE). Protocol v2:     |
+//|  "cas-forex-mt5-spool/2" with RFC 2104 HMAC-SHA256 signatures,   |
+//|  strict TTL expiry, and persistent monotonic nonce replay check. |
 //|                                                                  |
 //|  DEMO (default): requires ACCOUNT_TRADE_MODE_DEMO + "demo" srv.  |
 //|  LIVE (opt-in): requires InpLiveExecutionMode=true AND exact     |
-//|  InpLiveArmPhrase="I_AUTHORIZE_LIVE_REAL_MONEY_TRADING" plus     |
-//|  ACCOUNT_TRADE_MODE_REAL on pinned live server (Hugo PRO5 /      |
-//|  LHFXSA-Live). Mode mismatches are always refused.               |
+//|  InpLiveArmPhrase + signed live_auth_ticket.json verified by     |
+//|  .live_auth.key + ACCOUNT_TRADE_MODE_REAL on pinned live server. |
 //+------------------------------------------------------------------+
 #property copyright   "CAS Forex Revamp"
-#property version     "1.10"
-#property description "Dual-mode file-spool bridge for CAS Forex Revamp (Demo default + Two-Key Live)."
+#property version     "2.00"
+#property description "Authenticated HMAC-SHA256 v2 file-spool bridge (Demo default + Crypto-Ticket Live)."
 #define LIVE_ARM_PHRASE "I_AUTHORIZE_LIVE_REAL_MONEY_TRADING"
 
 #include <Trade\Trade.mqh>
 
 //--- inputs
-input string InpSpoolFolder        = "cas_forex_spool";  // Spool root under MQL5\Files (or Common\Files)
-input string InpBrokerChannel      = "hugosway_mt5";     // hugosway_mt5 or lhfx_mt5 (matches Python broker id)
-input bool   InpUseCommonFolder    = true;               // true: Terminal\Common\Files; false: portable MQL5\Files junction
-input int    InpTimerMs            = 50;                 // Spool polling interval in ms (50ms fast-tick for NAS100/US30)
+input string InpSpoolFolder        = "cas_forex_spool";
+input string InpBrokerChannel      = "hugosway_mt5";
+input bool   InpUseCommonFolder    = true;
+input int    InpTimerMs            = 50;
 input string InpSymbols            = "NAS100,US30,EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,EURGBP,EURJPY,GBPJPY,EURCHF,EURAUD,EURCAD,AUDJPY,CHFJPY,CADJPY";
-input string InpNas100Symbol       = "NAS100";           // Broker Nasdaq-100 symbol name (e.g. NAS100, USTEC, US100)
-input string InpUs30Symbol         = "US30";             // Broker Dow Jones 30 symbol name (e.g. US30, DJ30, WS30)
-input string InpSymbolSuffix       = "";                 // Broker symbol suffix, e.g. ".ecn" (empty when none)
-input int    InpMaxDeviationPoints = 30;                 // Maximum slippage in points
-input double InpMaxVolumeLots      = 50.0;               // Hard per-order volume cap in lots
-input bool   InpLiveExecutionMode  = false;              // false=DEMO only, true=LIVE real-money
-input string InpLiveArmPhrase      = "";                 // Must be I_AUTHORIZE_LIVE_REAL_MONEY_TRADING when LIVE=true
+input string InpNas100Symbol       = "NAS100";
+input string InpUs30Symbol         = "US30";
+input string InpSymbolSuffix       = "";
+input int    InpMaxDeviationPoints = 30;
+input double InpMaxVolumeLots      = 50.0;
+input bool   InpLiveExecutionMode  = false;
+input string InpLiveArmPhrase      = "";
 
-#define SPOOL_PROTOCOL "cas-forex-mt5-spool/1"
+#define SPOOL_PROTOCOL "cas-forex-mt5-spool/2"
 
 CTrade   g_trade;
 string   g_symbols[];
 bool     g_mode_ok = false;
 datetime g_last_publish = 0;
+string   g_active_nonce = "0";
+ulong    g_last_monotonic_nonce = 0;
+uchar    g_hmac_key[];
+bool     g_hmac_key_loaded = false;
 
 //+------------------------------------------------------------------+
 //| Helpers                                                          |
@@ -60,12 +61,27 @@ string SpoolPath(const string name)
    return(SpoolDir() + "\\" + name);
   }
 
+string RootSpoolPath(const string name)
+  {
+   return(InpSpoolFolder + "\\" + name);
+  }
+
 string IsoNowUtc()
   {
-   string t = TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS);   // yyyy.mm.dd hh:mi:ss
+   string t = TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS);
    StringReplace(t, ".", "-");
    StringReplace(t, " ", "T");
    return(t + "Z");
+  }
+
+datetime ParseIsoUtc(const string iso)
+  {
+   if(StringLen(iso) < 19)
+      return(0);
+   string head = StringSubstr(iso, 0, 19);
+   StringReplace(head, "T", " ");
+   StringReplace(head, "-", ".");
+   return(StringToTime(head));
   }
 
 string SafeText(string text)
@@ -94,13 +110,242 @@ bool IsPinnedLiveServer(string server)
    StringToLower(server);
    StringTrimLeft(server);
    StringTrimRight(server);
-   if(StringFind(server, "demo") >= 0 || StringFind(server, "practice") >= 0)
+   if(StringFind(server, "demo") >= 0 || StringFind(server, "practice") >= 0 || StringFind(server, "trial") >= 0)
       return(false);
-   return(server == "hugo pro5" || server == "hugopro5" || server == "hugo-real" || server == "hugosway-live" ||
-          server == "lhfxsa-live" || server == "lhfx-live" || server == "lhfxsa-real" || server == "lhfxsa-trade");
+   if(InpBrokerChannel == "hugosway_mt5")
+      return(server == "hugo pro5" || server == "hugosway-real" || server == "hugosway-live");
+   if(InpBrokerChannel == "lhfx_mt5")
+      return(server == "lhfxsa-trade" || server == "lhfxsa-live" || server == "lhfxsa live");
+   return(false);
   }
 
-//--- Strict mode guard: DEMO by default; two-key REAL when explicitly armed.
+//--- Extract a string value from a FLAT JSON object whose values are all plain strings.
+string JsonGet(const string json, const string key)
+  {
+   string needle = "\"" + key + "\":\"";
+   int start = StringFind(json, needle);
+   if(start < 0)
+      return("");
+   start += StringLen(needle);
+   int stop = StringFind(json, "\"", start);
+   if(stop < 0)
+      return("");
+   return(StringSubstr(json, start, stop - start));
+  }
+
+string BytesToHex(const uchar &buf[])
+  {
+   string hex = "";
+   int sz = ArraySize(buf);
+   for(int i = 0; i < sz; i++)
+      hex += StringFormat("%02x", buf[i]);
+   return(hex);
+  }
+
+int HexNibble(const ushort ch)
+  {
+   if(ch >= '0' && ch <= '9')
+      return((int)(ch - '0'));
+   if(ch >= 'a' && ch <= 'f')
+      return((int)(ch - 'a' + 10));
+   if(ch >= 'A' && ch <= 'F')
+      return((int)(ch - 'A' + 10));
+   return(-1);
+  }
+
+bool DecodeHexKey(string hex_text, uchar &out_bytes[])
+  {
+   StringTrimLeft(hex_text);
+   StringTrimRight(hex_text);
+   StringReplace(hex_text, "\r", "");
+   StringReplace(hex_text, "\n", "");
+   int len = StringLen(hex_text);
+   if(len == 64)
+     {
+      ArrayResize(out_bytes, 32);
+      for(int i = 0; i < 32; i++)
+        {
+         int hi = HexNibble(StringGetCharacter(hex_text, i * 2));
+         int lo = HexNibble(StringGetCharacter(hex_text, i * 2 + 1));
+         if(hi < 0 || lo < 0)
+            return(false);
+         out_bytes[i] = (uchar)((hi << 4) | lo);
+        }
+      return(true);
+     }
+   if(len >= 32)
+     {
+      int n = StringToCharArray(hex_text, out_bytes, 0, len, CP_UTF8);
+      if(n < 32)
+         return(false);
+      ArrayResize(out_bytes, n);
+      return(true);
+     }
+   return(false);
+  }
+
+bool ConstTimeHexEquals(string a, string b)
+  {
+   StringToLower(a);
+   StringToLower(b);
+   int la = StringLen(a);
+   int lb = StringLen(b);
+   if(la != lb || la != 64)
+      return(false);
+   int diff = 0;
+   for(int i = 0; i < la; i++)
+      diff |= (StringGetCharacter(a, i) ^ StringGetCharacter(b, i));
+   return(diff == 0);
+  }
+
+string Sha256Hex(const string text)
+  {
+   uchar data[];
+   uchar key[];
+   uchar digest[];
+   int n = StringToCharArray(text, data, 0, StringLen(text), CP_UTF8);
+   if(n <= 0)
+      return("");
+   ArrayResize(data, n);
+   if(CryptEncode(CRYPT_HASH_SHA256, data, key, digest) <= 0)
+      return("");
+   return(BytesToHex(digest));
+  }
+
+string HmacSha256Hex(const uchar &key_bytes[], const string message)
+  {
+   int klen = ArraySize(key_bytes);
+   if(klen < 32)
+      return("");
+   uchar k_pad[64];
+   ArrayInitialize(k_pad, 0);
+   if(klen > 64)
+     {
+      uchar khash[];
+      uchar empty_k[];
+      if(CryptEncode(CRYPT_HASH_SHA256, key_bytes, empty_k, khash) <= 0)
+         return("");
+      for(int i = 0; i < ArraySize(khash) && i < 64; i++)
+         k_pad[i] = khash[i];
+     }
+   else
+     {
+      for(int i = 0; i < klen; i++)
+         k_pad[i] = key_bytes[i];
+     }
+
+   uchar msg[];
+   int mlen = StringToCharArray(message, msg, 0, StringLen(message), CP_UTF8);
+   if(mlen < 0)
+      mlen = 0;
+   ArrayResize(msg, mlen);
+
+   uchar inner_in[];
+   ArrayResize(inner_in, 64 + mlen);
+   for(int i = 0; i < 64; i++)
+      inner_in[i] = (uchar)(k_pad[i] ^ 0x36);
+   for(int i = 0; i < mlen; i++)
+      inner_in[64 + i] = msg[i];
+
+   uchar empty_key[];
+   uchar inner_hash[];
+   if(CryptEncode(CRYPT_HASH_SHA256, inner_in, empty_key, inner_hash) <= 0)
+      return("");
+
+   uchar outer_in[];
+   ArrayResize(outer_in, 64 + ArraySize(inner_hash));
+   for(int i = 0; i < 64; i++)
+      outer_in[i] = (uchar)(k_pad[i] ^ 0x5c);
+   for(int i = 0; i < ArraySize(inner_hash); i++)
+      outer_in[64 + i] = inner_hash[i];
+
+   uchar outer_hash[];
+   if(CryptEncode(CRYPT_HASH_SHA256, outer_in, empty_key, outer_hash) <= 0)
+      return("");
+   return(BytesToHex(outer_hash));
+  }
+
+string ReadText(const string path)
+  {
+   int h = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(h == INVALID_HANDLE)
+      return("");
+   string text = "";
+   while(!FileIsEnding(h))
+      text += FileReadString(h);
+   FileClose(h);
+   return(text);
+  }
+
+bool LoadSpoolHmacKey()
+  {
+   string raw = ReadText(RootSpoolPath(".spool_hmac.key"));
+   if(StringLen(raw) == 0)
+      raw = ReadText(SpoolPath(".spool_hmac.key"));
+   if(StringLen(raw) == 0)
+      return(false);
+   return(DecodeHexKey(raw, g_hmac_key));
+  }
+
+void LoadReplayNonceLedger()
+  {
+   string raw = ReadText(RootSpoolPath("." + InpBrokerChannel + ".ea_nonce.txt"));
+   StringTrimLeft(raw);
+   StringTrimRight(raw);
+   if(StringLen(raw) > 0)
+     {
+      ulong saved = (ulong)StringToInteger(raw);
+      if(saved > g_last_monotonic_nonce)
+         g_last_monotonic_nonce = saved;
+     }
+  }
+
+void SaveReplayNonceLedger(const ulong nonce_val)
+  {
+   string fname = RootSpoolPath("." + InpBrokerChannel + ".ea_nonce.txt");
+   int h = FileOpen(fname, FILE_WRITE | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(h != INVALID_HANDLE)
+     {
+      FileWriteString(h, IntegerToString((long)nonce_val));
+      FileFlush(h);
+      FileClose(h);
+     }
+  }
+
+bool VerifyLiveTicketGuard(const string server)
+  {
+   string key_txt = ReadText(RootSpoolPath(".live_auth.key"));
+   if(StringLen(key_txt) == 0)
+      key_txt = ReadText(SpoolPath(".live_auth.key"));
+   uchar live_key[];
+   if(!DecodeHexKey(key_txt, live_key))
+      return(false);
+   string ticket_json = ReadText(SpoolPath("live_auth_ticket.json"));
+   if(StringLen(ticket_json) == 0)
+      return(false);
+   if(JsonGet(ticket_json, "protocol") != "cas-forex-live-auth/1" || JsonGet(ticket_json, "execution_mode") != "LIVE")
+      return(false);
+   if(JsonGet(ticket_json, "broker_id") != (InpBrokerChannel == "hugosway_mt5" ? "HUGOSWAY_MT5" : "LHFX_MT5"))
+      return(false);
+   if(JsonGet(ticket_json, "account_login") != IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)))
+      return(false);
+   string t_srv = JsonGet(ticket_json, "server");
+   StringToLower(t_srv);
+   StringTrimLeft(t_srv);
+   StringTrimRight(t_srv);
+   if(t_srv != server)
+      return(false);
+   datetime exp_dt = ParseIsoUtc(JsonGet(ticket_json, "expires_at_utc"));
+   if(exp_dt == 0 || TimeGMT() > exp_dt)
+      return(false);
+   string canonical = JsonGet(ticket_json, "protocol") + "|" + JsonGet(ticket_json, "execution_mode") + "|" +
+                      JsonGet(ticket_json, "broker_id") + "|" + JsonGet(ticket_json, "account_login") + "|" +
+                      JsonGet(ticket_json, "server") + "|" + JsonGet(ticket_json, "issued_at_utc") + "|" +
+                      JsonGet(ticket_json, "expires_at_utc") + "|" + JsonGet(ticket_json, "nonce");
+   string expected_mac = HmacSha256Hex(live_key, canonical);
+   return(ConstTimeHexEquals(expected_mac, JsonGet(ticket_json, "hmac_sha256")));
+  }
+
 bool ModeGuard()
   {
    ENUM_ACCOUNT_TRADE_MODE m = (ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE);
@@ -122,50 +367,9 @@ bool ModeGuard()
       return(false);
    if(m != ACCOUNT_TRADE_MODE_REAL)
       return(false);
-   return(IsPinnedLiveServer(server));
-  }
-
-//--- Extract a string value from a FLAT JSON object whose values are all plain strings.
-string JsonGet(const string json, const string key)
-  {
-   string needle = "\"" + key + "\":\"";
-   int start = StringFind(json, needle);
-   if(start < 0)
-      return("");
-   start += StringLen(needle);
-   int stop = StringFind(json, "\"", start);
-   if(stop < 0)
-      return("");
-   return(StringSubstr(json, start, stop - start));
-  }
-
-string Sha256Hex(const string text)
-  {
-   uchar data[];
-   uchar key[];
-   uchar digest[];
-   int n = StringToCharArray(text, data, 0, StringLen(text), CP_UTF8);
-   if(n <= 0)
-      return("");
-   ArrayResize(data, n);
-   if(CryptEncode(CRYPT_HASH_SHA256, data, key, digest) <= 0)
-      return("");
-   string hex = "";
-   for(int i = 0; i < ArraySize(digest); i++)
-      hex += StringFormat("%02x", digest[i]);
-   return(hex);
-  }
-
-string ReadText(const string path)
-  {
-   int h = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
-   if(h == INVALID_HANDLE)
-      return("");
-   string text = "";
-   while(!FileIsEnding(h))
-      text += FileReadString(h);
-   FileClose(h);
-   return(text);
+   if(!IsPinnedLiveServer(server))
+      return(false);
+   return(VerifyLiveTicketGuard(server));
   }
 
 //--- Atomic write: write a dot-prefixed temp file, then move it over the final name.
@@ -216,19 +420,31 @@ string Price(const string broker_symbol, const double value)
   }
 
 //+------------------------------------------------------------------+
-//| Receipts                                                         |
+//| Receipts (exact 11 typed parameters preserved for v2 contracts)  |
 //+------------------------------------------------------------------+
 string ReceiptJson(const string request_id, const string request_sha, const string status, const uint retcode,
                    const string position_ticket, const string deal_ticket, const string volume,
                    const string price, const string sl, const string tp, const string message)
   {
-   string server = AccountInfoString(ACCOUNT_SERVER);
+   string server = SafeText(AccountInfoString(ACCOUNT_SERVER));
+   string trade_mode = AccountTradeModeLabel();
+   string obs_at = IsoNowUtc();
+   string safe_msg = SafeText(message);
+   string ret_str = StringFormat("%u", retcode);
+   string nonce_str = g_active_nonce;
+   string canonical = SPOOL_PROTOCOL + "|" + request_id + "|" + request_sha + "|" + nonce_str + "|" +
+                      status + "|" + ret_str + "|" + position_ticket + "|" + deal_ticket + "|" +
+                      volume + "|" + price + "|" + sl + "|" + tp + "|" +
+                      trade_mode + "|" + server + "|" + obs_at + "|" + safe_msg;
+   string mac_hex = g_hmac_key_loaded ? HmacSha256Hex(g_hmac_key, canonical) : "";
    return(StringFormat(
-      "{\"protocol\":\"%s\",\"request_id\":\"%s\",\"request_sha256\":\"%s\",\"status\":\"%s\",\"retcode\":\"%u\","
-      "\"position_ticket\":\"%s\",\"deal_ticket\":\"%s\",\"volume\":\"%s\",\"price\":\"%s\",\"sl\":\"%s\",\"tp\":\"%s\","
-      "\"server\":\"%s\",\"account_trade_mode\":\"%s\",\"observed_at\":\"%s\",\"message\":\"%s\"}",
-      SPOOL_PROTOCOL, request_id, request_sha, status, retcode, position_ticket, deal_ticket, volume, price, sl, tp,
-      SafeText(server), AccountTradeModeLabel(), IsoNowUtc(), SafeText(message)));
+      "{\"protocol\":\"%s\",\"request_id\":\"%s\",\"request_sha256\":\"%s\",\"monotonic_nonce\":\"%s\","
+      "\"status\":\"%s\",\"retcode\":\"%s\",\"position_ticket\":\"%s\",\"deal_ticket\":\"%s\","
+      "\"volume\":\"%s\",\"price\":\"%s\",\"sl\":\"%s\",\"tp\":\"%s\","
+      "\"server\":\"%s\",\"account_trade_mode\":\"%s\",\"observed_at\":\"%s\",\"message\":\"%s\","
+      "\"receipt_hmac_sha256\":\"%s\"}",
+      SPOOL_PROTOCOL, request_id, request_sha, nonce_str, status, ret_str, position_ticket, deal_ticket,
+      volume, price, sl, tp, server, trade_mode, obs_at, safe_msg, mac_hex));
   }
 
 void WriteReceipt(const string request_id, const string json)
@@ -251,17 +467,52 @@ string StatusFor(const uint retcode, const string action)
 void ExecuteRequest(const string request_id, const string text)
   {
    string request_sha = JsonGet(text, "request_sha256");
+   string request_mac = JsonGet(text, "request_hmac_sha256");
+   string nonce_s = JsonGet(text, "monotonic_nonce");
+   g_active_nonce = (StringLen(nonce_s) > 0) ? nonce_s : "0";
+
    string core = text;
    StringReplace(core, ",\"request_sha256\":\"" + request_sha + "\"", "");
+   StringReplace(core, ",\"request_hmac_sha256\":\"" + request_mac + "\"", "");
    StringTrimRight(core);
+
    if(JsonGet(text, "protocol") != SPOOL_PROTOCOL || StringLen(request_sha) != 64 || Sha256Hex(core) != request_sha)
      {
       WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "request hash mismatch"));
       return;
      }
-   if(!ModeGuard())
+
+   if(!g_hmac_key_loaded)
+      g_hmac_key_loaded = LoadSpoolHmacKey();
+   string hmac_msg = JsonGet(text, "protocol") + "|" + JsonGet(text, "request_id") + "|" + nonce_s + "|" +
+                     JsonGet(text, "issued_at") + "|" + JsonGet(text, "expires_at") + "|" +
+                     JsonGet(text, "broker_channel") + "|" + JsonGet(text, "account_login") + "|" +
+                     JsonGet(text, "server") + "|" + JsonGet(text, "execution_mode") + "|" +
+                     JsonGet(text, "valve_decision_sha256") + "|" + JsonGet(text, "action") + "|" +
+                     JsonGet(text, "symbol") + "|" + JsonGet(text, "side") + "|" + JsonGet(text, "volume") + "|" +
+                     JsonGet(text, "price") + "|" + JsonGet(text, "sl") + "|" + JsonGet(text, "tp") + "|" +
+                     JsonGet(text, "position_ticket") + "|" + JsonGet(text, "deviation_points") + "|" +
+                     JsonGet(text, "magic") + "|" + JsonGet(text, "comment");
+   string expected_mac = g_hmac_key_loaded ? HmacSha256Hex(g_hmac_key, hmac_msg) : "";
+   if(!g_hmac_key_loaded || !ConstTimeHexEquals(expected_mac, request_mac))
      {
-      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10017, "0", "0", "0", "0", "0", "0", "mode guard failed"));
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "request hmac mismatch"));
+      return;
+     }
+
+   ulong req_nonce = (ulong)StringToInteger(nonce_s);
+   datetime exp_dt = ParseIsoUtc(JsonGet(text, "expires_at"));
+   if(req_nonce == 0 || req_nonce <= g_last_monotonic_nonce || exp_dt == 0 || TimeGMT() > exp_dt)
+     {
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "expired or replayed nonce"));
+      return;
+     }
+   g_last_monotonic_nonce = req_nonce;
+   SaveReplayNonceLedger(req_nonce);
+
+   if(!ModeGuard() || JsonGet(text, "account_login") != IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)))
+     {
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10017, "0", "0", "0", "0", "0", "0", "mode guard or account binding failed"));
       return;
      }
 
@@ -355,8 +606,6 @@ void ExecuteRequest(const string request_id, const string text)
                                         deal_text, vol_text, px_text, sl_text, tp_text, g_trade.ResultRetcodeDescription()));
   }
 
-//--- Claim each request by renaming it to processing_<id>.json BEFORE executing, so a restart
-//--- can never execute the same request twice.
 void ProcessRequests()
   {
    string found;
@@ -391,7 +640,6 @@ void ProcessRequests()
      }
   }
 
-//--- After a restart, any processing_<id>.json means the outcome is UNKNOWN: report, never re-execute.
 void ReportInterruptedRequests()
   {
    string found;
@@ -402,6 +650,9 @@ void ReportInterruptedRequests()
      {
       string request_id = StringSubstr(found, StringLen("processing_"), StringLen(found) - StringLen("processing_") - StringLen(".json"));
       string text = ReadText(SpoolPath(found));
+      g_active_nonce = JsonGet(text, "monotonic_nonce");
+      if(StringLen(g_active_nonce) == 0)
+         g_active_nonce = "0";
       WriteReceipt(request_id, ReceiptJson(request_id, JsonGet(text, "request_sha256"), "UNKNOWN", (uint)0, "0", "0", "0", "0", "0", "0",
                                            "EA restarted mid-order; check terminal history"));
       FileDelete(SpoolPath(found), CommonFlag());
@@ -410,9 +661,6 @@ void ReportInterruptedRequests()
    FileFindClose(search);
   }
 
-//+------------------------------------------------------------------+
-//| Market snapshot publication                                      |
-//+------------------------------------------------------------------+
 void PublishMarket()
   {
    string json = StringFormat(
@@ -459,14 +707,11 @@ void PublishMarket()
    g_last_publish = TimeCurrent();
   }
 
-//+------------------------------------------------------------------+
-//| Expert lifecycle                                                 |
-//+------------------------------------------------------------------+
 int OnInit()
   {
    if(!ModeGuard())
      {
-      Print("CasForexMt5Bridge: REFUSED - account trade mode / server / two-key arm phrase mismatch.");
+      Print("CasForexMt5Bridge: REFUSED - account trade mode / server / live ticket mismatch.");
       return(INIT_FAILED);
      }
    if(InpBrokerChannel != "hugosway_mt5" && InpBrokerChannel != "lhfx_mt5")
@@ -487,11 +732,14 @@ int OnInit()
      }
    FolderCreate(InpSpoolFolder, CommonFlag());
    FolderCreate(SpoolDir(), CommonFlag());
+   g_hmac_key_loaded = LoadSpoolHmacKey();
+   LoadReplayNonceLedger();
    g_mode_ok = true;
    ReportInterruptedRequests();
    PublishMarket();
    EventSetMillisecondTimer(MathMax(50, InpTimerMs));
-   PrintFormat("CasForexMt5Bridge: running [%s] on server %s, spool %s", AccountTradeModeLabel(), AccountInfoString(ACCOUNT_SERVER), SpoolDir());
+   PrintFormat("CasForexMt5Bridge v2: running [%s] on server %s, spool %s (hmac_loaded=%s)",
+               AccountTradeModeLabel(), AccountInfoString(ACCOUNT_SERVER), SpoolDir(), g_hmac_key_loaded ? "true" : "false");
    return(INIT_SUCCEEDED);
   }
 
@@ -515,8 +763,6 @@ void OnTimer()
 
 void OnTick()
   {
-   // Ticks only refresh the market snapshot (at most once per second); orders run on the timer.
    if(g_mode_ok && TimeCurrent() != g_last_publish)
       PublishMarket();
   }
-//+------------------------------------------------------------------+

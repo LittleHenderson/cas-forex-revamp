@@ -14,6 +14,7 @@ from pathlib import Path
 import subprocess
 import sys
 from model_guest_boundary import config_contract, load, need, regular, verify_controller_evidence, verify_sources, verify_python
+from source_runtime.systemd_ceilings import STAGEB_UNIT_CEILINGS, verify_unit_effective_ceilings
 
 
 def launch_argv(cfg, config_path, config_sha, remaining):
@@ -33,13 +34,17 @@ def launch_argv(cfg, config_path, config_sha, remaining):
         'IPAddressDeny': 'any', 'IPAddressAllow': 'localhost',
         'InaccessiblePaths': '-/root -/home -/media -/mnt',
         'ReadOnlyPaths': base, 'StateDirectory': unit, 'StateDirectoryMode': '0700',
-        'MemoryMax': '12G', 'CPUQuota': '400%',
+        **STAGEB_UNIT_CEILINGS,
     }
     argv = ['systemd-run', '--unit='+unit, '--wait', '--pipe']
     argv.extend('--property='+key+'='+value for key, value in properties.items())
     argv.extend(['/usr/bin/python3', '-B', cfg['source_directory']+'/approved_model_driver.py',
                  '--guest-config', str(config_path), '--config-sha256', config_sha])
     return argv
+
+
+def verify_stageb_unit_ceilings(unit: str) -> dict[str, str]:
+    return verify_unit_effective_ceilings(unit, profile="stageb", runner=subprocess.run, fail_fn=need)
 
 
 def main():

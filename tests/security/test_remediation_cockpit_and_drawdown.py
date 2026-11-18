@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 
 from cas_forex_revamp.composition.continuous_driver import SyntheticClock, _admit, _assemble, _control, _propose
-from cas_forex_revamp.composition.live_cockpit_server import AUTH_COOKIE_NAME, LoopbackCockpitServer
+from cas_forex_revamp.composition.live_cockpit_server import LoopbackCockpitServer
 from cas_forex_revamp.composition.r6_runtime import CaseRuntime
 from cas_forex_revamp.composition.read_service import DecisionReadService
 from cas_forex_revamp.composition.synthetic_fixture import continuous_a_fixture
@@ -340,7 +340,7 @@ class DrawdownGateRemediationTests(unittest.TestCase):
 
 
 class LoopbackCockpitAuthRemediationTests(unittest.TestCase):
-    """Finding [9]: Per-launch bearer/cookie auth, pre-body Host/Origin checks, and session rotation."""
+    """Findings [1] & [9]: Per-launch Bearer-only auth (zero cookies), pre-body Host/Origin checks, and session rotation."""
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -476,48 +476,54 @@ class LoopbackCockpitAuthRemediationTests(unittest.TestCase):
             status, _, _ = self._raw_http("POST", "/api/prepare-control", headers=hdrs, body=b"")
             self.assertEqual(status, 403, msg=f"Expected pre-body 403 for headers={hdrs}")
 
-    def test_cookie_bootstrap_and_csrf_origin_requirement_on_post(self) -> None:
-        # Wrong bootstrap token is rejected
+    def test_bearer_only_bootstrap_emits_no_cookies_and_rejects_cookie_auth(self) -> None:
+        # Wrong bootstrap token is rejected and never emits Set-Cookie
         st_bad, hdr_bad, _ = self._raw_http("GET", "/ui/index.html?token=wrong-token")
         self.assertEqual(st_bad, 401)
         self.assertNotIn("set-cookie", hdr_bad)
 
-        # Valid bootstrap token sets HttpOnly; SameSite=Strict; Path=/api cookie
+        # Valid bootstrap token serves UI without setting any browser cookie ([1])
         st_ok, hdr_ok, _ = self._raw_http("GET", f"/ui/index.html?token={self.server.auth_token}")
         self.assertEqual(st_ok, 200)
-        set_cookie = hdr_ok.get("set-cookie", "")
-        self.assertIn(f"{AUTH_COOKIE_NAME}={self.server.auth_token}", set_cookie)
-        self.assertIn("HttpOnly", set_cookie)
-        self.assertIn("SameSite=Strict", set_cookie)
-        self.assertIn("Path=/api", set_cookie)
+        self.assertNotIn("set-cookie", hdr_ok)
 
-        cookie_hdr = f"{AUTH_COOKIE_NAME}={self.server.auth_token}"
-        # Cookie GET works on same-origin loopback
-        st_get, _, raw_boot = self._raw_http("GET", "/api/boot", headers={"Cookie": cookie_hdr})
+        # Cookie-only GET must be rejected (401) even if holding the server token
+        cookie_hdr = f"cas_forex_cockpit_token={self.server.auth_token}"
+        st_cookie, _, _ = self._raw_http("GET", "/api/boot", headers={"Cookie": cookie_hdr})
+        self.assertEqual(st_cookie, 401)
+
+        # Authorization: Bearer works on loopback
+        auth_hdr = f"Bearer {self.server.auth_token}"
+        st_get, _, raw_boot = self._raw_http("GET", "/api/boot", headers={"Authorization": auth_hdr})
         self.assertEqual(st_get, 200)
         boot = json.loads(raw_boot.decode("utf-8"))
 
-        # Cookie POST WITHOUT exact loopback Origin is rejected (401) to defeat form/browser CSRF
+        # Bearer POST with non-loopback Origin is rejected (403)
         prep_body = json.dumps({
-            "request_id": "cookie-pause-1",
+            "request_id": "bearer-pause-1",
             "scope": boot["scope"],
             "control": "PAUSE_NEW_RISK",
             "expected_generation": boot["fence_generation"],
         }).encode("utf-8")
-        st_no_origin, _, _ = self._raw_http(
+        st_bad_origin, _, _ = self._raw_http(
             "POST",
             "/api/prepare-control",
-            headers={"Cookie": cookie_hdr, "Content-Type": "application/json", "Content-Length": str(len(prep_body))},
+            headers={
+                "Authorization": auth_hdr,
+                "Origin": "https://evil.example",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(prep_body)),
+            },
             body=prep_body,
         )
-        self.assertEqual(st_no_origin, 401)
+        self.assertEqual(st_bad_origin, 403)
 
-        # Cookie POST WITH exact loopback Origin succeeds
+        # Bearer POST with exact loopback Origin succeeds
         st_with_origin, _, _ = self._raw_http(
             "POST",
             "/api/prepare-control",
             headers={
-                "Cookie": cookie_hdr,
+                "Authorization": auth_hdr,
                 "Origin": self.base_url,
                 "Content-Type": "application/json",
                 "Content-Length": str(len(prep_body)),

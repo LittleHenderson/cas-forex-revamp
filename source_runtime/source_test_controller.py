@@ -114,6 +114,11 @@ def ensure_reader_group(config,runtime,deadline,c,s):
     actual=grp.getgrnam(s.GROUP)
     c.need(actual.gr_gid==config['reader_group_gid'] and not actual.gr_mem,'Created group readback')
 
+_SOURCE_RUNTIME_DIR = str(Path(__file__).resolve().parent)
+if _SOURCE_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _SOURCE_RUNTIME_DIR)
+from systemd_ceilings import SOURCE_UNIT_CEILINGS  # noqa: E402
+
 def role_command(role,startup,seconds,runtime_directory,c):
     unit=unit_name(role)
     properties={'Description':'forex-source-role-'+startup['sha256'],'Type':'exec','Restart':'no',
@@ -131,7 +136,8 @@ def role_command(role,startup,seconds,runtime_directory,c):
         # exact writable mounts therefore cannot be created before the role.
         # The root IPC tree remains read-only; only these two children get RW.
         'ReadWritePaths':'-/var/lib/cas-fx-8e1a63c5-ipc/'+role+' -/var/lib/cas-fx-8e1a63c5-ipc/'+role+'-records',
-        'SupplementaryGroups':'cas-fx-8e1a63c5-read','Environment':'HOME=/tmp'}
+        'SupplementaryGroups':'cas-fx-8e1a63c5-read','Environment':'HOME=/tmp',
+        **SOURCE_UNIT_CEILINGS}
     return ['/usr/bin/systemd-run','--unit='+unit,'--wait','--pipe','--quiet']+[
         '--property='+k+'='+v for k,v in properties.items()]+[
         '/usr/bin/python3','-I','-B',runtime_directory+'/source_role_service.py',
@@ -356,6 +362,8 @@ def main(argv=None):
             mainpid=subprocess.run(['/usr/bin/systemctl','show',unit,'--property=MainPID','--value'],
                 check=True,capture_output=True,text=True,timeout=min(3,deadline.remaining(5))).stdout.strip()
             c.need(mainpid==str(who['pid']),'Role unit main process')
+            from source_test_launcher import verify_effective_cgroup_properties
+            verify_effective_cgroup_properties(unit,c,deadline)
             prepare=prepare_role_directories(role,who,gid,c,s)
             s.write_frame(proc.stdin.fileno(),prepare,deadline)
             prepared=s.read_frame(proc.stdout.fileno(),deadline,32768)

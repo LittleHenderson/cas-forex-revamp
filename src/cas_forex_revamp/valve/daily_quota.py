@@ -76,11 +76,13 @@ class DailyQuotaGovernanceStore:
         max_loss_usd: Decimal = Decimal("500.00"),
         max_loss_pct: Decimal | None = Decimal("0.03"),
         max_consecutive_losses: int = 3,
+        owner_verifier: Any | None = None,
     ) -> None:
         self._path = Path(path) if path is not None else None
         self._scope_id = identifier(scope_id, "scope_id")
         self._lock = RLock()
         self._initialized = False
+        self._owner_verifier = owner_verifier
         self._days: dict[str, dict[str, Any]] = {}
         self._soft_quota_usd = decimal_value(Decimal(soft_quota_usd), "soft_quota_usd", positive=True)
         self._hard_quota_usd = decimal_value(Decimal(hard_quota_usd), "hard_quota_usd", positive=True)
@@ -463,17 +465,59 @@ class DailyQuotaGovernanceStore:
             return True, None, Decimal("0.50")
         return True, None, Decimal("1")
 
+    def bind_owner_verifier(self, owner_verifier: Any) -> None:
+        with self._lock:
+            self._owner_verifier = owner_verifier
+
+    def _require_owner_recovery(
+        self,
+        *,
+        action_scope: str,
+        owner_request_id: str,
+        recovery_verifier: Any | None,
+        recovery_token: str | None,
+        now: datetime,
+    ) -> None:
+        verifier = recovery_verifier if recovery_verifier is not None else self._owner_verifier
+        if verifier is None:
+            raise ContractError("OWNER_RECOVERY_VERIFIER_REQUIRED: unlock/target changes require an OwnerRecoveryVerifier")
+        if not isinstance(recovery_token, str) or not recovery_token.strip():
+            raise ContractError("OWNER_RECOVERY_TOKEN_REQUIRED: single-use owner recovery token missing")
+        if hasattr(verifier, "verify_and_consume"):
+            verifier.verify_and_consume(
+                recovery_token,
+                expected_scope=action_scope,
+                target_ref=self._scope_id,
+                owner_request_id=owner_request_id,
+                now=now,
+            )
+            return
+        if callable(verifier):
+            if verifier(action_scope, owner_request_id, recovery_token, now) is not True:
+                raise ContractError("OWNER_RECOVERY_VERIFICATION_REFUSED")
+            return
+        raise ContractError("invalid recovery_verifier supplied to DailyQuotaGovernanceStore")
+
     def unlock_session(
         self,
         *,
         owner_request_id: str,
         reason: str,
+        recovery_verifier: Any | None = None,
+        recovery_token: str | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         identifier(owner_request_id, "owner_request_id")
         if not isinstance(reason, str) or not reason.strip():
             raise ContractError("unlock_session requires an explicit reason")
         ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        self._require_owner_recovery(
+            action_scope="UNLOCK_QUOTA_SESSION",
+            owner_request_id=owner_request_id,
+            recovery_verifier=recovery_verifier,
+            recovery_token=recovery_token,
+            now=ts,
+        )
         ts_str = ts.isoformat().replace("+00:00", "Z")
         sdate = session_date_for(ts)
         with self._lock:
@@ -509,8 +553,20 @@ class DailyQuotaGovernanceStore:
         hard_quota_usd: Decimal | None = None,
         daily_quota_pct: Decimal | None = None,
         quota_mode: str | None = None,
+        owner_request_id: str | None = None,
+        recovery_verifier: Any | None = None,
+        recovery_token: str | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
+        ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        req_id = identifier(owner_request_id or "quota-target-update", "owner_request_id")
+        self._require_owner_recovery(
+            action_scope="UPDATE_QUOTA_TARGETS",
+            owner_request_id=req_id,
+            recovery_verifier=recovery_verifier,
+            recovery_token=recovery_token,
+            now=ts,
+        )
         with self._lock:
             nxt_soft = self._soft_quota_usd if soft_quota_usd is None else decimal_value(Decimal(soft_quota_usd), "soft_quota_usd", positive=True)
             nxt_hard = self._hard_quota_usd if hard_quota_usd is None else decimal_value(Decimal(hard_quota_usd), "hard_quota_usd", positive=True)

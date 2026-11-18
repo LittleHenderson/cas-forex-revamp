@@ -10,6 +10,7 @@ import ast
 import json
 import os
 from pathlib import Path
+from typing import Any
 import py_compile
 import re
 import shutil
@@ -140,18 +141,42 @@ def main() -> int:
             actions.append({"pr": num, "action": "UPDATED_BEHIND_BRANCH"})
             continue
 
-        sha = pr["headRefOid"]
-        cr_doc = gh_json(["api", f"repos/{REPO_SLUG}/commits/{sha}/check-runs?per_page=100"])
-        check_runs = cr_doc.get("check_runs", [])
-        if check_runs:
+        required_jobs = {
+            "Secret & Strict-CSP Gate",
+            "Node UI Suite",
+            "Python Unit & Contract Suites",
+        }
+
+        def _evaluate_checks_fail_closed(commit_sha: str) -> tuple[bool, dict[str, Any]]:
+            cr_doc = gh_json(["api", f"repos/{REPO_SLUG}/commits/{commit_sha}/check-runs?per_page=100"])
+            check_runs = cr_doc.get("check_runs", [])
+            if not check_runs:
+                return False, {"action": "WAITING_CI_CHECKS_EMPTY", "reason": "zero check_runs recorded"}
+            latest_by_name: dict[str, dict[str, Any]] = {}
+            for cr in check_runs:
+                cname = cr.get("name", "")
+                if cname == "Periodically Verify & Merge Passing AI-Agent PRs":
+                    continue
+                prev = latest_by_name.get(cname)
+                if prev is None or int(cr.get("id", 0)) > int(prev.get("id", 0)):
+                    latest_by_name[cname] = cr
+            missing = sorted(required_jobs - set(latest_by_name.keys()))
+            if missing:
+                return False, {"action": "WAITING_REQUIRED_CI_JOBS", "missing": missing}
             bad = [
-                f"{c['name']}:{c.get('status')}/{c.get('conclusion')}"
-                for c in check_runs
-                if c.get("status") != "completed" or c.get("conclusion") not in ("success", "skipped", "neutral")
+                f"{cname}:{cr.get('status')}/{cr.get('conclusion')}"
+                for cname, cr in latest_by_name.items()
+                if cr.get("status") != "completed" or cr.get("conclusion") != "success"
             ]
             if bad:
-                actions.append({"pr": num, "action": "WAITING_CI_CHECKS", "pending_or_failed": bad})
-                continue
+                return False, {"action": "WAITING_CI_CHECKS", "pending_or_failed": bad}
+            return True, {}
+
+        sha = pr["headRefOid"]
+        checks_ok, check_fail_info = _evaluate_checks_fail_closed(sha)
+        if not checks_ok:
+            actions.append({"pr": num, **check_fail_info})
+            continue
 
         # Verify PR head in temporary worktree
         tmp_wt = Path(tempfile.mkdtemp(prefix=f"cas_pr_{num}_", dir=str(repo_root.parent)))
@@ -173,8 +198,27 @@ def main() -> int:
         )
         subprocess.run(["gh", "pr", "comment", str(num), "--repo", REPO_SLUG, "--body", comment_body], capture_output=True, text=True, timeout=60)
 
+        live_pr = gh_json([
+            "pr", "view", str(num), "--repo", REPO_SLUG,
+            "--json", "headRefOid,baseRefName,state,isDraft,labels",
+        ])
+        live_labels = {lb["name"] for lb in (live_pr.get("labels") or [])}
+        if (
+            live_pr.get("state") != "OPEN"
+            or live_pr.get("isDraft")
+            or live_pr.get("baseRefName") != "main"
+            or live_pr.get("headRefOid") != sha
+            or ("do-not-merge" in live_labels or "hold" in live_labels)
+        ):
+            actions.append({"pr": num, "action": "ABORTED_HEAD_OR_BASE_CHANGED", "expected_sha": sha, "live_pr": live_pr})
+            continue
+        rechecks_ok, recheck_fail_info = _evaluate_checks_fail_closed(sha)
+        if not rechecks_ok:
+            actions.append({"pr": num, "action": "ABORTED_PREMERGE_RECHECK", **recheck_fail_info})
+            continue
+
         m_res = subprocess.run(
-            ["gh", "pr", "merge", str(num), "--repo", REPO_SLUG, "--squash", "--delete-branch"],
+            ["gh", "pr", "merge", str(num), "--repo", REPO_SLUG, "--squash", "--delete-branch", "--match-head-commit", sha],
             capture_output=True, text=True, timeout=60,
         )
         if m_res.returncode == 0:

@@ -276,7 +276,7 @@ export class ScopedBridge {
 
 const LOOPBACK_HOSTS = Object.freeze(['127.0.0.1', '[::1]', '::1']);
 
-/** Create an authenticated loopback RPC adapter (Bearer header + same-origin cookie fallback). */
+/** Create an authenticated loopback RPC adapter using strict Bearer header isolation (no cookies). */
 export function createAuthenticatedLoopbackBridge({ baseUrl, authToken = null, fetchImpl = globalThis.fetch, maxBytes = 524288, maxReviewBytes = 1048576 }) {
   const rootUrl = new URL(baseUrl);
   require(['http:', 'https:'].includes(rootUrl.protocol) && LOOPBACK_HOSTS.includes(rootUrl.hostname), 'Loopback bridge requires a literal loopback origin.');
@@ -286,7 +286,7 @@ export function createAuthenticatedLoopbackBridge({ baseUrl, authToken = null, f
   const getText = async (path, limit = maxBytes) => {
     const target = new URL(path, rootUrl.origin);
     require(target.origin === rootUrl.origin, 'Cross-origin loopback RPC forbidden.');
-    const r = await fetchImpl(target, { method: 'GET', credentials: 'same-origin', cache: 'no-store', redirect: 'error', headers: authHeaders(), signal: AbortSignal.timeout(10000) });
+    const r = await fetchImpl(target, { method: 'GET', credentials: 'omit', cache: 'no-store', redirect: 'error', headers: authHeaders(), signal: AbortSignal.timeout(10000) });
     if (!r.ok) throw new Error(`Loopback GET ${path} failed (${r.status}).`);
     const raw = await r.text();
     require(new TextEncoder().encode(raw).byteLength <= limit, 'Loopback response exceeds byte cap.');
@@ -295,7 +295,7 @@ export function createAuthenticatedLoopbackBridge({ baseUrl, authToken = null, f
   const postJSON = async (path, body, limit = maxBytes) => {
     const target = new URL(path, rootUrl.origin);
     require(target.origin === rootUrl.origin, 'Cross-origin loopback RPC forbidden.');
-    const r = await fetchImpl(target, { method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(body), signal: AbortSignal.timeout(10000) });
+    const r = await fetchImpl(target, { method: 'POST', credentials: 'omit', cache: 'no-store', redirect: 'error', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(body), signal: AbortSignal.timeout(10000) });
     if (!r.ok) throw new Error(`Loopback RPC ${path} failed (${r.status}).`);
     const raw = await r.text();
     return parseUniqueJSON(raw, limit);

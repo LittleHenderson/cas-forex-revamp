@@ -16,6 +16,12 @@ from cas_forex_revamp.composition.live_cockpit_server import LoopbackCockpitServ
 from cas_forex_revamp.contracts import ActionKind, ContractError, Side
 from cas_forex_revamp.valve.tks_meta_valve_controller import load_default_forex_valve_gate
 from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter, OandaQuoteTruthOracle
+from cas_forex_revamp.venue.live_auth_ticket import (
+    ENV_LIVE_AUTH_KEY_FILE,
+    ENV_LIVE_AUTH_TICKET_FILE,
+    mint_live_authorization_bundle,
+    provision_live_auth_key,
+)
 from cas_forex_revamp.venue.external_paper_broker import (
     DEFAULT_OANDA_LIVE_BASE_URL,
     DEFAULT_OANDA_PRACTICE_BASE_URL,
@@ -198,13 +204,45 @@ class _FakeMt5Sdk:
         return SimpleNamespace(bid=1.09876, ask=1.09877, time_msc=1763294400000)
 
 
+_SHARED_LIVE_FIXTURE_DIR: str | None = None
+
+
+def _ensure_live_ticket_files(root_dir: str) -> tuple[str, str]:
+    r = Path(root_dir)
+    key_path = r / ".test_live_auth.key"
+    ticket_path = r / "live_auth_bundle.json"
+    provision_live_auth_key(key_path)
+    bundle = mint_live_authorization_bundle(
+        key_file=key_path,
+        targets=[
+            (BROKER_HUGOSWAY_MT5, "9001122", "Hugo PRO5"),
+            (BROKER_LHFX_MT5, "9003344", "LHFXSA-Live"),
+            (BROKER_OANDA_LIVE, "001-001-live-01", "api-fxtrade.oanda.com"),
+        ],
+        ttl_seconds=86400,
+    )
+    ticket_path.write_text(json.dumps(bundle), encoding="utf-8")
+    return str(key_path), str(ticket_path)
+
+
 def _live_env(tmp_dir: str | None = None, *, primary: str = BROKER_HUGOSWAY_MT5) -> dict[str, str]:
+    global _SHARED_LIVE_FIXTURE_DIR
+    if tmp_dir is None:
+        if _SHARED_LIVE_FIXTURE_DIR is None:
+            _SHARED_LIVE_FIXTURE_DIR = tempfile.mkdtemp(prefix="cas_live_auth_")
+        auth_dir = _SHARED_LIVE_FIXTURE_DIR
+    else:
+        auth_dir = tmp_dir
+    key_file, ticket_file = _ensure_live_ticket_files(auth_dir)
     o_tok_key = "CAS_FOREX_OANDA_LIVE_TOK" + "EN"
     h_pwd_key = "CAS_FOREX_HUGOSWAY_MT5_PASS" + "WORD"
     l_pwd_key = "CAS_FOREX_LHFX_MT5_PASS" + "WORD"
     env = {
         ENV_EXECUTION_MODE: EXECUTION_MODE_LIVE,
         ENV_LIVE_ARM_PHRASE: REQUIRED_LIVE_ARM_PHRASE,
+        ENV_LIVE_AUTH_KEY_FILE: key_file,
+        ENV_LIVE_AUTH_TICKET_FILE: ticket_file,
+        "CAS_FOREX_STATE_DIR": str(Path(auth_dir) / "state_dir"),
         "CAS_FOREX_PRIMARY_BROKER": primary,
         ENV_MT5_TRANSPORT_MODE: TRANSPORT_SPOOL_BRIDGE if tmp_dir else "AUTO",
         ENV_HUGOSWAY_MT5_LOGIN: "9001122",
@@ -273,13 +311,14 @@ class DualModeBrokerTests(unittest.TestCase):
             })
         with self.assertRaises(LiveBrokerEndpointForbiddenError):
             DualShieldBrokerRouter(environ={ENV_EXECUTION_MODE: EXECUTION_MODE_LIVE}, valve_gate=GATE)
-        self.assertEqual(
+        # Phrase-only WITHOUT cryptographic LIVE auth ticket & key fails closed!
+        with self.assertRaises(LiveBrokerEndpointForbiddenError):
             resolve_execution_mode({
                 ENV_EXECUTION_MODE: EXECUTION_MODE_LIVE,
                 ENV_LIVE_ARM_PHRASE: REQUIRED_LIVE_ARM_PHRASE,
-            }),
-            (EXECUTION_MODE_LIVE, True),
-        )
+            })
+        live_env = _live_env()
+        self.assertEqual(resolve_execution_mode(live_env), (EXECUTION_MODE_LIVE, True))
 
     def test_strict_isolation_prevents_mixing_demo_and_live_endpoints(self) -> None:
         live_env = _live_env()
@@ -511,16 +550,31 @@ class DualModeBrokerTests(unittest.TestCase):
             validate_mt5_server_name(BROKER_LHFX_MT5, "LHFXSA-Trade", execution_mode=EXECUTION_MODE_LIVE, live_armed=False)
         with self.assertRaises(ContractError):
             validate_mt5_server_name(BROKER_HUGOSWAY_MT5, "LHFXSA-Trade", execution_mode=EXECUTION_MODE_LIVE, live_armed=True)
-        live_creds = load_mt5_credentials(
-            BROKER_LHFX_MT5,
-            {
-                ENV_EXECUTION_MODE: EXECUTION_MODE_LIVE,
-                ENV_LIVE_ARM_PHRASE: REQUIRED_LIVE_ARM_PHRASE,
-                ENV_LHFX_MT5_LOGIN: "122590",
-                pwd_key: "live-lhfx-pass",
-                ENV_LHFX_MT5_SERVER: "LHFXSA-Trade",
-            },
-        )
+        with tempfile.TemporaryDirectory() as auth_td:
+            auth_key = provision_live_auth_key(Path(auth_td) / "live.key")
+            auth_ticket = Path(auth_td) / "live_ticket.json"
+            auth_ticket.write_text(
+                json.dumps(
+                    mint_live_authorization_bundle(
+                        key_file=auth_key,
+                        targets=[(BROKER_LHFX_MT5, "122590", "LHFXSA-Trade")],
+                        ttl_seconds=86400,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            live_creds = load_mt5_credentials(
+                BROKER_LHFX_MT5,
+                {
+                    ENV_EXECUTION_MODE: EXECUTION_MODE_LIVE,
+                    ENV_LIVE_ARM_PHRASE: REQUIRED_LIVE_ARM_PHRASE,
+                    ENV_LIVE_AUTH_KEY_FILE: str(auth_key),
+                    ENV_LIVE_AUTH_TICKET_FILE: str(auth_ticket),
+                    ENV_LHFX_MT5_LOGIN: "122590",
+                    pwd_key: "live-lhfx-pass",
+                    ENV_LHFX_MT5_SERVER: "LHFXSA-Trade",
+                },
+            )
         assert live_creds is not None
         nat_live_wrong = Mt5NativePythonTransport(mt5_module=_FakeMt5Sdk(server="LHFXSA-Trade", login=122590, trade_mode=0))
         with self.assertRaises(ContractError):

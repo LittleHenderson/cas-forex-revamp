@@ -63,6 +63,7 @@ from ceremony_generator import (
     CEREMONY_ROLES,
     Ed25519Keypair,
     _materialize_regular_tree,
+    provision_ceremony_key_vault,
     provision_or_load_ceremony_key_vault,
 )
 
@@ -75,7 +76,7 @@ class SecurityReviewNineFindingsTests(unittest.TestCase):
     def test_finding_01_deterministic_key_derivation_removed_and_distinct_role_vault_enforced(self) -> None:
         self.assertFalse(hasattr(Ed25519Keypair, "derive"))
         with tempfile.TemporaryDirectory() as tmp:
-            vault = provision_or_load_ceremony_key_vault(Path(tmp) / "vault", run_id="sec-f1-run")
+            vault = provision_ceremony_key_vault(Path(tmp) / "vault", run_id="sec-f1-run")
             self.assertEqual(set(vault.keys()), set(CEREMONY_ROLES))
             pub_set = {kp.public_bytes for kp in vault.values()}
             self.assertEqual(len(pub_set), len(CEREMONY_ROLES))

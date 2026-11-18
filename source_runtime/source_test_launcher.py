@@ -242,64 +242,29 @@ def verify_runtime(runtime,lock,c):
            and runtime['isolated_site_precedes_system_distribution'] is True,
            'Actual isolated import-path observation required')
 
-REQUIRED_CGROUP_PROPERTIES = {
-    'MemoryHigh': '1536M',
-    'MemoryMax': '2048M',
-    'MemorySwapMax': '0',
-    'CPUQuota': '200%',
-    'TasksMax': '256',
-    'LimitNPROC': '256',
-    'LimitNOFILE': '1024',
-    'OOMPolicy': 'kill',
-    'KillMode': 'control-group',
-}
-
-SYSTEMCTL_CGROUP_QUERY = (
-    'MemoryHigh,MemoryMax,MemorySwapMax,CPUQuotaPerSecUSec,CPUQuota,'
-    'TasksMax,LimitNPROC,LimitNOFILE,OOMPolicy,KillMode'
+_SOURCE_RUNTIME_DIR = str(Path(__file__).resolve().parent)
+if _SOURCE_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _SOURCE_RUNTIME_DIR)
+from systemd_ceilings import (  # noqa: E402
+    SOURCE_UNIT_CEILINGS,
+    SYSTEMCTL_CGROUP_QUERY,
+    parse_systemctl_show_output,
+    verify_unit_effective_ceilings,
 )
 
-_EFFECTIVE_EXACT_VALUES = {
-    'MemoryHigh': frozenset({'1610612736', '1536M'}),
-    'MemoryMax': frozenset({'2147483648', '2048M'}),
-    'MemorySwapMax': frozenset({'0', '0B'}),
-    'TasksMax': frozenset({'256'}),
-    'LimitNPROC': frozenset({'256'}),
-    'LimitNOFILE': frozenset({'1024'}),
-    'OOMPolicy': frozenset({'kill'}),
-    'KillMode': frozenset({'control-group'}),
-}
-
-_EFFECTIVE_CPU_QUOTA_USEC = frozenset({'2s', '2000ms', '2000000', '2000000us', '200%'})
+REQUIRED_CGROUP_PROPERTIES = dict(SOURCE_UNIT_CEILINGS)
 
 def parse_systemctl_properties(output,c):
-    c.need(type(output) is str and bool(output.strip()),'Empty systemctl cgroup property output')
-    parsed = {}
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        c.need('=' in line,'Malformed systemctl property line')
-        key,value = line.split('=',1)
-        key,value = key.strip(),value.strip()
-        c.need(bool(key) and key not in parsed,'Duplicate or empty systemctl property key')
-        parsed[key] = value
-    return parsed
+    return parse_systemctl_show_output(output, fail_fn=c.need)
 
 def verify_effective_cgroup_properties(unit,c,deadline):
-    result = subprocess.run(['/usr/bin/systemctl','show',unit,'--property='+SYSTEMCTL_CGROUP_QUERY],
-        check=True,capture_output=True,text=True,timeout=min(3,deadline.remaining(5)))
-    props = parse_systemctl_properties(result.stdout,c)
-    for key,allowed in _EFFECTIVE_EXACT_VALUES.items():
-        c.need(props.get(key) in allowed,'Effective unit property '+key+' missing or mismatched')
-    raw_quota = props.get('CPUQuota')
-    raw_usec = props.get('CPUQuotaPerSecUSec')
-    if raw_quota not in (None,'','[not set]'):
-        c.need(raw_quota == '200%','Effective unit CPUQuota mismatched')
-    if raw_usec not in (None,'','[not set]'):
-        c.need(raw_usec in _EFFECTIVE_CPU_QUOTA_USEC,'Effective unit CPUQuotaPerSecUSec mismatched')
-    c.need(raw_quota == '200%' or raw_usec in _EFFECTIVE_CPU_QUOTA_USEC,
-           'Effective unit CPUQuota ceiling missing')
+    return verify_unit_effective_ceilings(
+        unit,
+        profile='source',
+        timeout_seconds=min(3, deadline.remaining(5)),
+        runner=subprocess.run,
+        fail_fn=c.need,
+    )
 
 def systemd_command(plan,seconds,path,pin,c):
     properties = {'Description':'forex-source-tests-'+pin,'Type':'exec','Restart':'no','RuntimeMaxSec':str(seconds),'TimeoutStopSec':'1',
