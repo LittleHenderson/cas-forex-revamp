@@ -34,6 +34,56 @@ import urllib.parse
 from cas_forex_revamp.contracts import ContractError
 from cas_forex_revamp.operator.frontier_backends import assert_safe_ai_catalog_payload
 
+class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """Loopback HTTP server preventing duplicate-port SO_REUSEADDR hijacking."""
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def _build_mt5_index_snapshot_from_router(router: Any) -> tuple[dict[str, Any] | None, dict[str, tuple[Any, Any]]]:
+    """Read NAS100/US30 quotes from active MT5 bridge transports and format an index stream payload."""
+    from cas_forex_revamp.contracts import decimal_text as _dec_txt
+    from cas_forex_revamp.venue.live_market_stream import INDEX_INSTRUMENTS
+
+    mt5_q: dict[str, tuple[Any, Any]] = {}
+    for venue in router.venues.values():
+        if hasattr(venue, "_transport") and venue.account is not None:
+            for sym in INDEX_INSTRUMENTS:
+                try:
+                    tk = venue._transport.symbol_tick(sym)
+                    mt5_q[sym] = (tk.bid, tk.ask)
+                except (ContractError, OSError) as exc_sym:
+                    print(f"[ai-fast] Tick skipped for {sym}: {type(exc_sym).__name__}")
+    if not mt5_q:
+        return None, {}
+    idx_rows = []
+    for sym_idx in INDEX_INSTRUMENTS:
+        if sym_idx in mt5_q:
+            b_px, a_px = mt5_q[sym_idx]
+            idx_rows.append({
+                "pair": sym_idx,
+                "display_pair": "NAS100 / USD" if sym_idx == "NAS100" else f"{sym_idx} / USD",
+                "category": "US_INDEX",
+                "bid": _dec_txt(b_px),
+                "ask": _dec_txt(a_px),
+                "mid": _dec_txt((b_px + a_px) / 2),
+                "feed_mode": "MT5_DIRECT_SPOOL_50MS",
+            })
+    if not idx_rows:
+        return None, mt5_q
+    return {
+        "schema": "cas-forex.index-stream/1",
+        "sequence": 1,
+        "feed_mode": "MT5_DIRECT_SPOOL_50MS",
+        "markets": idx_rows,
+    }, mt5_q
+
+
 MAX_HTTP_RPC_BYTES = 262_144
 MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
 _FORBIDDEN_ROUTING_KEY_TOKENS: tuple[str, ...] = (
@@ -882,7 +932,7 @@ class LoopbackCockpitServer:
 
         self._stop_event.clear()
         self.rotate_auth_token()
-        self._httpd = ThreadingHTTPServer((self._host, self._port), _Handler)
+        self._httpd = _ExclusiveThreadingHTTPServer((self._host, self._port), _Handler)
         self._httpd.daemon_threads = True
         self._httpd.request_queue_size = 32
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="cas-forex-cockpit-http", daemon=True)
@@ -1106,7 +1156,10 @@ def run_cockpit_cli(
             latest_stream[0] = env_stream.to_wire_dict()
         except Exception as exc:
             print(f"[feed] Initial live quote fetch skipped ({type(exc).__name__}); using sealed fixture until next poll.")
-    if index_client is not None:
+    mt5_idx_init, _ = _build_mt5_index_snapshot_from_router(router)
+    if mt5_idx_init is not None:
+        latest_index_stream[0] = mt5_idx_init
+    elif index_client is not None:
         try:
             latest_index_stream[0] = index_client.fetch_index_stream()
         except Exception as exc:
@@ -1142,8 +1195,9 @@ def run_cockpit_cli(
                 break
             try:
                 env_stream = feed_client.fetch_market_stream().to_wire_dict()
-                idx_stream = latest_index_stream[0]
-                if index_client is not None:
+                mt5_idx_snap, _ = _build_mt5_index_snapshot_from_router(router)
+                idx_stream = mt5_idx_snap if mt5_idx_snap is not None else latest_index_stream[0]
+                if mt5_idx_snap is None and index_client is not None:
                     try:
                         idx_stream = index_client.fetch_index_stream()
                     except Exception as exc_idx:
@@ -1166,39 +1220,12 @@ def run_cockpit_cli(
             if not args.autonomous_ai:
                 continue
             try:
-                mt5_q: dict[str, tuple[Any, Any]] = {}
-                for v in router.venues.values():
-                    if hasattr(v, "_transport") and v.account is not None:
-                        for sym in EXPANDED_MARKETS[:2]:
-                            try:
-                                tk = v._transport.symbol_tick(sym)
-                                mt5_q[sym] = (tk.bid, tk.ask)
-                            except (ContractError, OSError) as exc_sym:
-                                print(f"[ai-fast] Tick skipped for {sym}: {type(exc_sym).__name__}")
+                mt5_idx_snap, mt5_q = _build_mt5_index_snapshot_from_router(router)
                 if mt5_q:
-                    from cas_forex_revamp.contracts import decimal_text as _dec_txt
-                    idx_rows = []
-                    for sym_idx in ("NAS100", "US30"):
-                        if sym_idx in mt5_q:
-                            b_px, a_px = mt5_q[sym_idx]
-                            idx_rows.append({
-                                "pair": sym_idx,
-                                "display_pair": "NAS100 / USD" if sym_idx == "NAS100" else "US30 / USD",
-                                "category": "US_INDEX",
-                                "bid": _dec_txt(b_px),
-                                "ask": _dec_txt(a_px),
-                                "mid": _dec_txt((b_px + a_px) / 2),
-                                "feed_mode": "MT5_DIRECT_SPOOL_50MS",
-                            })
-                    if idx_rows:
+                    if mt5_idx_snap is not None:
                         with stream_lock:
                             if latest_index_stream[0] is None or latest_index_stream[0].get("feed_mode") == "MT5_DIRECT_SPOOL_50MS":
-                                latest_index_stream[0] = {
-                                    "schema": "cas-forex.index-stream/1",
-                                    "sequence": 1,
-                                    "feed_mode": "MT5_DIRECT_SPOOL_50MS",
-                                    "markets": idx_rows,
-                                }
+                                latest_index_stream[0] = mt5_idx_snap
                     if trader._inference_lock.acquire(blocking=False):
                         try:
                             trader.run_fast_tick_cycle(mt5_quotes=mt5_q)

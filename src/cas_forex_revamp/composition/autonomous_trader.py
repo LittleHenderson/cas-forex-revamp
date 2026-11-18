@@ -1128,23 +1128,38 @@ class AutonomousAiTrader:
                     "setup": setup_note,
                     "choices": ["WAIT", action_ref],
                 }]
-                if hasattr(self._execution_gate, "admit_scout_call"):
-                    self._execution_gate.admit_scout_call(model_id="gemini-decision-1", request_id=cycle_id, now=ts)
-                else:
-                    scout_spec, _, _ = self._registry.build_backend("gemini-decision-1")
-                    scout_inv = ModelInvocation(
-                        request_sha256=content_digest(scout_q),
-                        model=scout_spec,
-                        session_id=f"scout-{cycle_id}",
-                        system_policy=SYSTEM_POLICY,
-                        packet_json=canonical_bytes({"scout": scout_q}).decode("utf-8"),
-                        budget=InferenceBudget(
-                            max_calls=1, max_input_tokens_per_call=4096, max_generated_tokens_per_call=64,
-                            max_seconds_per_call=10, max_total_seconds=10,
-                        ),
+                try:
+                    if hasattr(self._execution_gate, "admit_scout_call"):
+                        self._execution_gate.admit_scout_call(model_id="gemini-decision-1", request_id=cycle_id, now=ts)
+                    else:
+                        scout_spec, _, _ = self._registry.build_backend("gemini-decision-1")
+                        scout_inv = ModelInvocation(
+                            request_sha256=content_digest(scout_q),
+                            model=scout_spec,
+                            session_id=f"scout-{cycle_id}",
+                            system_policy=SYSTEM_POLICY,
+                            packet_json=canonical_bytes({"scout": scout_q}).decode("utf-8"),
+                            budget=InferenceBudget(
+                                max_calls=1, max_input_tokens_per_call=4096, max_generated_tokens_per_call=64,
+                                max_seconds_per_call=10, max_total_seconds=10,
+                            ),
+                        )
+                        self._execution_gate(scout_inv)
+                    scout = self._registry.scout_opportunities(scout_q)
+                except FrontierTransportError as scout_exc:
+                    self._registry.record_call(
+                        "gemini-decision-1",
+                        latency_ms=max(1, (time.monotonic_ns() - t0_ns) // 1_000_000),
+                        status="SCOUT_DEGRADED",
                     )
-                    self._execution_gate(scout_inv)
-                scout = self._registry.scout_opportunities(scout_q)
+                    scout = {
+                        "executed": False,
+                        "reason": f"SCOUT_DEGRADED:{type(scout_exc).__name__}",
+                        "wake_heavy_model": True,
+                        "best_market": None,
+                        "best_probability": None,
+                        "decisions": [],
+                    }
                 self._last_scout = scout
                 if scout.get("executed") and not scout.get("wake_heavy_model"):
                     self._last_action = "WAIT"
@@ -1202,7 +1217,7 @@ class AutonomousAiTrader:
                 facts=(DecisionFact(f"observed-{cycle_id}", "Observed market and barbell equity", canonical_bytes(fact_obj).decode("utf-8"), (ev_id,)),),
                 evidence=(EvidenceReference(ev_id, EvidenceKind.OBSERVATION, "autonomous-ai-trader", content_digest(fact_obj), ts),),
             )
-            max_gen = 8192 if eff_depth == "high" else (4096 if eff_depth == "medium" else 512)
+            max_gen = 12288 if eff_depth == "high" else (6144 if eff_depth == "medium" else 2048)
             spec, backend, verifier = self._registry.build_backend(active_id, reasoning_effort=eff_depth)
             adapter = ActualModelDecisionAdapter(
                 adapter_id=f"adapter-{active_id.replace(':', '-')}",

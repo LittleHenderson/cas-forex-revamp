@@ -300,10 +300,14 @@ class ProfitExpansionTests(unittest.TestCase):
             packet_json=canonical_bytes({"request_id": "r1", "opportunity_set_id": "o1", "choices": ["WAIT"]}).decode("utf-8"),
             budget=InferenceBudget(max_calls=1, max_input_tokens_per_call=16000, max_generated_tokens_per_call=8192, max_seconds_per_call=25, max_total_seconds=25),
         )
-        _, _, ant_body = _build_provider_payload(_CATALOG_BY_ID["claude-fable-5.2"], "claude-fable-5-2", inv_hi, None if False else reg._secrets["CAS_FOREX_ANTHROPIC_API_KEY"])
+        _, _, ant_body = _build_provider_payload(_CATALOG_BY_ID["claude-fable-5.2"], "claude-fable-5-2", inv_hi, reg._secrets["CAS_FOREX_ANTHROPIC_API_KEY"])
         ant_json = json.loads(ant_body.decode("utf-8"))
-        self.assertEqual(ant_json["thinking"], {"type": "enabled", "budget_tokens": 6144})
+        self.assertEqual(ant_json["thinking"], {"type": "adaptive"})
+        self.assertEqual(ant_json["output_config"], {"effort": "high"})
+        self.assertGreaterEqual(ant_json["max_tokens"], 8192)
         self.assertNotIn("temperature", ant_json)
+        _, _, ant4_body = _build_provider_payload(_CATALOG_BY_ID["claude-fable"], "claude-sonnet-4-5", inv_hi, reg._secrets["CAS_FOREX_ANTHROPIC_API_KEY"])
+        self.assertEqual(json.loads(ant4_body.decode("utf-8"))["thinking"], {"type": "enabled", "budget_tokens": 6144})
         txt_ant, _, _ = _extract_provider_text_and_usage(
             "anthropic",
             {"content": [{"type": "thinking", "thinking": "deep chain"}, {"type": "text", "text": '{"ok":1}'}], "usage": {"output_tokens": 20}},
@@ -320,10 +324,16 @@ class ProfitExpansionTests(unittest.TestCase):
         )
         self.assertEqual(txt_gem, '{"ok":2}')
 
-        _, _, oai_body = _build_provider_payload(_CATALOG_BY_ID["openai-astra"], "openai-astra", inv_hi, reg._secrets["CAS_FOREX_OPENAI_API_KEY"])
-        self.assertEqual(json.loads(oai_body.decode("utf-8"))["reasoning_effort"], "high")
-        _, _, ds_body = _build_provider_payload(_CATALOG_BY_ID["deepseek-flash-1017"], "deepseek-flash-1017", inv_hi, reg._secrets["CAS_FOREX_DEEPSEEK_API_KEY"])
-        self.assertEqual(json.loads(ds_body.decode("utf-8"))["reasoning_effort"], "high")
+        _, _, oai_body = _build_provider_payload(_CATALOG_BY_ID["openai-astra"], "gpt-5.5-2026-04-23", inv_hi, reg._secrets["CAS_FOREX_OPENAI_API_KEY"])
+        oai_json = json.loads(oai_body.decode("utf-8"))
+        self.assertEqual(oai_json["reasoning_effort"], "high")
+        self.assertIn("max_completion_tokens", oai_json)
+        self.assertNotIn("temperature", oai_json)
+        _, _, ds_body = _build_provider_payload(_CATALOG_BY_ID["deepseek-flash-1017"], "deepseek-flash", inv_hi, reg._secrets["CAS_FOREX_DEEPSEEK_API_KEY"])
+        ds_json = json.loads(ds_body.decode("utf-8"))
+        self.assertEqual(ds_json["reasoning_effort"], "high")
+        self.assertEqual(ds_json["temperature"], 0)
+        self.assertIn("max_tokens", ds_json)
 
         # Verify POST /api/thinking-depth & non-blocking 50ms evaluate_fast_protection() while HTTP sleeps
         with tempfile.TemporaryDirectory() as td:
