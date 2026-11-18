@@ -14,7 +14,8 @@
     "phase_6_autonomous_ai_and_live_broker": "VALIDATED",
     "phase_6_security14_pyramiding_treasury_2speed": "VALIDATED",
     "phase_6_claude5_adaptive_chart11_rolling_indices": "VALIDATED",
-    "phase_7_spx500_xauusd_mobile_pwa_cloud": "VALIDATED"
+    "phase_7_spx500_xauusd_mobile_pwa_cloud": "VALIDATED",
+    "phase_7_live_cockpit_sse_sessions_explainer_ux": "VALIDATED"
   },
   "stop_condition": "Keep merging passing AI-agent PRs continuously while revamp_completed is false. Set revamp_completed to true only after Lantern ameliorations and Phase 5+6 AWS end-to-end pilot validation pass.",
   "validation_receipts": {
@@ -225,6 +226,75 @@
       "combined_cost_usd_exact": "0.210199111111",
       "cumulative_pilot_billed_seconds": 80593,
       "cumulative_pilot_spend_usd_exact": "3.868464000000",
+      "zero_aws_residue": true
+    },
+    "phase_7_live_cockpit_sse_sessions_explainer_ux": {
+      "aws_run_id": "fx-b-b33a83198f144a55",
+      "aws_instance_id": "i-02dcae9a49aff00d7",
+      "volume_id": "vol-094b76a6b564c40da",
+      "ssm_execution_id": "6744d97e-ccc6-4b1c-8cc6-aff205940cbf",
+      "validated_source_commit_sha": "28c8a54a2bf9d35efb91771c96a3f70eeb1e5d4f",
+      "source_manifest_sha256": "d2eb23bf2bd4e2a679eddacc5b782d8334a09e719a081324df131adacacf702e",
+      "pr_number": 13,
+      "export_archive_bytes": 15298504,
+      "export_archive_sha256": "47772d9fc35d20104eb2d610d909480330564a7c33830bc96296a9e844348bc6",
+      "lantern_version": "0.11.0",
+      "lantern_preseal_score": 100,
+      "lantern_airgap_score": 100,
+      "lantern_critical_high_medium_findings": 0,
+      "pip_audit_vulns": 0,
+      "npm_audit_ok": true,
+      "bandit_src_findings": 0,
+      "pytest_junit_tests": 1433,
+      "pytest_passed": 1064,
+      "pytest_subtests_passed": 369,
+      "node_ui_passed": 131,
+      "suite18_groups_passed": 18,
+      "suite18_tests_passed": 1764,
+      "stageb_run_id": "fx-b-482fbcaaabbcc67b",
+      "stageb_calls_passed": 32,
+      "stageb_traps_blocked": 17,
+      "stageb_public_aggregate_status": "ACCEPT",
+      "unit3b_checks_passed": 30,
+      "unit3b_model_calls_passed": 11,
+      "ctt_rows_evaluated": 3634,
+      "valve_parameter_count": 161,
+      "ai_models_catalog_count": 9,
+      "markets_total": 20,
+      "billed_seconds": 4283,
+      "compute_cost_usd_exact": "0.205584000000",
+      "ipv4_cost_usd_exact": "0.005948611111",
+      "combined_cost_usd_exact": "0.211532611111",
+      "cumulative_pilot_billed_seconds": 87521,
+      "cumulative_pilot_spend_usd_exact": "4.201008000000",
+      "historical_failed_runs_not_licensed": [
+        {
+          "run_label": "run-08",
+          "aws_run_id": "fx-b-9563907fccdf4d0f",
+          "status": "NOT_LICENSED",
+          "billed_seconds": 2148,
+          "compute_cost_usd_exact": "0.103104000000",
+          "combined_cost_usd_exact": "0.106087333333"
+        },
+        {
+          "run_label": "run-10",
+          "aws_run_id": "fx-b-f29331792df74e31",
+          "aws_instance_id": "i-09d53c4f94d0ccf85",
+          "status": "NOT_LICENSED",
+          "billed_seconds": 4323,
+          "compute_cost_usd_exact": "0.207504000000",
+          "combined_cost_usd_exact": "0.213508166667"
+        },
+        {
+          "run_label": "run-13",
+          "aws_run_id": "fx-b-b7881756243a4f69",
+          "aws_instance_id": "i-0fdc6027bf82abb47",
+          "status": "NOT_LICENSED",
+          "billed_seconds": 2645,
+          "compute_cost_usd_exact": "0.126960000000",
+          "combined_cost_usd_exact": "0.130633611111"
+        }
+      ],
       "zero_aws_residue": true
     }
   }
