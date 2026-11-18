@@ -51,7 +51,7 @@ function localExplanation(topic, context) {
   return `${descriptions[route]}\n\nSource: ${scalar(context.source, 'No valid source')}. Run: ${scalar(p.scope?.run_id)}. State: ${scalar(p.state_id)}.\n\nThis is authored, deterministic UI guidance about the supplied read. It is not model output, a live venue observation or trading advice.`;
 }
 
-export function createExplainer({ getContext }) {
+export function createExplainer({ getContext, askModel = null }) {
   if (typeof getContext !== 'function') throw new TypeError('Explainer requires a read-only context getter.');
   if (document.querySelector('#forex-explainer')) throw new Error('Explainer already mounted.');
   const app = document.getElementById('app');
@@ -67,6 +67,10 @@ export function createExplainer({ getContext }) {
   let layout = readLayout();
   let open = false;
   let selectedTopic = 'overview';
+  let answerMode = 'local';
+  let askBusy = false;
+  let askAnswer = null;
+  let lastAskedQuestion = '';
   let pointer = null;
   let suppressClick = false;
   let destroyed = false;
@@ -89,7 +93,7 @@ export function createExplainer({ getContext }) {
     <aside id="forex-explainer-panel" class="forex-explainer-panel" aria-labelledby="forex-explainer-title" hidden>
       <header class="forex-explainer-heading">
         <span class="forex-explainer-small-mark" aria-hidden="true"><span></span><span></span></span>
-        <div><h2 id="forex-explainer-title">Explainer</h2><p>Local guide - no model</p></div>
+        <div><h2 id="forex-explainer-title">Explainer</h2><p data-guide-subtitle>Local guide - no model</p></div>
         <button type="button" class="forex-explainer-close" aria-label="Close Explainer">×</button>
       </header>
       <div class="forex-explainer-suggestions" role="group" aria-label="Local guide questions">
@@ -105,7 +109,7 @@ export function createExplainer({ getContext }) {
           <div><dt>Account</dt><dd data-guide-account></dd></div>
           <div><dt>Run</dt><dd data-guide-run></dd></div>
           <div><dt>State</dt><dd data-guide-state></dd></div>
-          <div><dt>Model</dt><dd>None — authored local guide</dd></div>
+          <div><dt>Model</dt><dd data-guide-model>None — authored local guide</dd></div>
         </dl>
         <details class="forex-explainer-record"><summary>Open the supplied record</summary><p>Inspection only. This is the currently supplied UI data, not an independent venue receipt.</p><pre tabindex="0" aria-label="Supplied JSON record"></pre></details>
         <details class="forex-explainer-layout"><summary>Position the Explainer</summary>
@@ -116,7 +120,7 @@ export function createExplainer({ getContext }) {
           <div class="forex-explainer-layout-actions"><button type="button" data-guide-collapse>Collapse to tab</button><button type="button" data-guide-reset>Reset position</button></div>
         </details>
       </div>
-      <footer class="forex-explainer-footer"><label for="forex-explainer-prompt">Ask a model</label><input id="forex-explainer-prompt" type="text" disabled placeholder="No AI provider attached" aria-describedby="forex-explainer-unavailable"><p id="forex-explainer-unavailable">AI explanations are unavailable. The local guide and all source records remain readable.</p></footer>
+      <footer class="forex-explainer-footer"><label for="forex-explainer-prompt">Ask a model</label><div class="forex-explainer-ask-row"><input id="forex-explainer-prompt" type="text" disabled placeholder="No AI provider attached" aria-describedby="forex-explainer-unavailable"><button type="button" class="button button-small button-primary" data-explainer-ask-submit hidden>Ask</button></div><p id="forex-explainer-unavailable">AI explanations are unavailable. The local guide and all source records remain readable.</p></footer>
     </aside>
     <div class="forex-explainer-sr-only" role="status" aria-live="polite" data-guide-announcement></div>`);
   const mark = host.querySelector('.forex-explainer-mark');
@@ -169,20 +173,75 @@ export function createExplainer({ getContext }) {
     document.body.dataset.forexExplainerSide = f.side;
     for (const button of host.querySelectorAll('[data-guide-dock]')) button.setAttribute('aria-pressed', String(button.dataset.guideDock === layout.edge));
   }
+  const promptInput = host.querySelector('#forex-explainer-prompt');
+  const askButton = host.querySelector('[data-explainer-ask-submit]');
+  const footerNote = host.querySelector('#forex-explainer-unavailable');
+  const modelField = host.querySelector('[data-guide-model]');
+  const subtitleField = host.querySelector('[data-guide-subtitle]');
+
   function updateContent() {
     const context = getContext() || {};
     const projection = context.projection;
     const selected = host.querySelector(`[data-explainer-topic="${selectedTopic}"]`);
-    host.querySelector('.forex-explainer-question').textContent = selected.textContent;
-    host.querySelector('.forex-explainer-answer').textContent = localExplanation(selectedTopic, context);
-    host.querySelector('[data-guide-source]').textContent = scalar(context.source, 'No valid source');
-    host.querySelector('[data-guide-account]').textContent = scalar(projection?.scope?.account_id);
-    host.querySelector('[data-guide-run]').textContent = scalar(projection?.scope?.run_id);
-    host.querySelector('[data-guide-state]').textContent = scalar(projection?.state_id);
+    if (answerMode === 'ask' && askAnswer) {
+      host.querySelector('.forex-explainer-question').textContent = lastAskedQuestion || 'Live AI explanation';
+      host.querySelector('.forex-explainer-answer').textContent = askAnswer;
+    } else {
+      host.querySelector('.forex-explainer-question').textContent = selected.textContent;
+      host.querySelector('.forex-explainer-answer').textContent = localExplanation(selectedTopic, context);
+    }
+    host.querySelector('[data-guide-source]').textContent = scalar(context.source, context.aiConnected ? 'Live server stream' : 'No valid source');
+    host.querySelector('[data-guide-account]').textContent = scalar(projection?.scope?.account_id ?? context.liveAccountLabel);
+    host.querySelector('[data-guide-run]').textContent = scalar(projection?.scope?.run_id ?? context.liveRunLabel);
+    host.querySelector('[data-guide-state]').textContent = scalar(projection?.state_id ?? context.liveStateLabel);
     const raw = { cockpit: projection ?? null, decision_read: context.reviewEnvelope ?? null };
     try { host.querySelector('.forex-explainer-record pre').textContent = JSON.stringify(raw, null, 2); }
     catch { host.querySelector('.forex-explainer-record pre').textContent = 'The supplied UI record could not be serialized. No substitute record is shown.'; }
-    for (const button of host.querySelectorAll('[data-explainer-topic]')) button.setAttribute('aria-pressed', String(button.dataset.explainerTopic === selectedTopic));
+    for (const button of host.querySelectorAll('[data-explainer-topic]')) button.setAttribute('aria-pressed', String(answerMode === 'local' && button.dataset.explainerTopic === selectedTopic));
+
+    const aiReady = Boolean(context.aiConnected && typeof askModel === 'function');
+    if (aiReady) {
+      const mName = scalar(context.activeModelLabel, 'Connected Frontier AI');
+      modelField.textContent = `${mName} (read-only Q&A)`;
+      subtitleField.textContent = `Live read-only guide · ${mName}`;
+      promptInput.disabled = askBusy;
+      promptInput.placeholder = 'Ask about markets, sessions, positions, or valve gates…';
+      askButton.hidden = false;
+      askButton.disabled = askBusy;
+      footerNote.textContent = askBusy ? 'Asking connected AI model…' : `Read-only live explanations (${mName}). Zero execution authority.`;
+    } else {
+      modelField.textContent = 'None — authored local guide';
+      subtitleField.textContent = 'Local guide - no model';
+      promptInput.disabled = true;
+      promptInput.placeholder = 'No AI provider attached';
+      askButton.hidden = true;
+      askButton.disabled = true;
+      footerNote.textContent = 'AI explanations are unavailable. The local guide and all source records remain readable.';
+    }
+  }
+
+  async function submitQuestion() {
+    const context = getContext() || {};
+    if (!context.aiConnected || typeof askModel !== 'function' || askBusy) return;
+    const q = String(promptInput.value ?? '').trim();
+    if (!q) return;
+    askBusy = true;
+    lastAskedQuestion = q;
+    updateContent();
+    try {
+      const reply = await askModel(q);
+      askAnswer = scalar(typeof reply === 'string' ? reply : reply?.answer, 'No answer text returned.');
+      answerMode = 'ask';
+      promptInput.value = '';
+      say('Live AI explanation updated (read-only).');
+    } catch (err) {
+      answerMode = 'ask';
+      askAnswer = err instanceof Error ? err.message : 'Unable to reach live Explainer endpoint.';
+      say('Live AI explanation request failed.');
+    } finally {
+      askBusy = false;
+      updateContent();
+    }
   }
   function setOpen(next, { focus = false } = {}) {
     if (next && !open && !wide.matches) returnScroll = { left: workspace.scrollLeft, top: workspace.scrollTop };
@@ -226,6 +285,7 @@ export function createExplainer({ getContext }) {
     if (corner) setOpen(false);
     savePosition(`Explainer docked ${edge}${corner ? ', collapsed to a tab' : ''}.`);
   }
+  promptInput.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); void submitQuestion(); } });
   mark.addEventListener('pointerdown', event => {
     if (!event.isPrimary || event.button !== 0) return;
     const box = mark.getBoundingClientRect();
@@ -286,7 +346,8 @@ export function createExplainer({ getContext }) {
   host.addEventListener('click', event => {
     const button = event.target.closest('button');
     if (!button || button.disabled) return;
-    if (button.dataset.explainerTopic) { selectedTopic = button.dataset.explainerTopic; updateContent(); say('Local guide answer updated. No model was called.'); }
+    if (button.dataset.explainerTopic) { selectedTopic = button.dataset.explainerTopic; answerMode = 'local'; updateContent(); say('Local guide answer updated. No model was called.'); }
+    if (button.hasAttribute('data-explainer-ask-submit')) { void submitQuestion(); }
     if (button.dataset.guideDock) { layout.edge = button.dataset.guideDock;layout.collapsed = false;savePosition(`Explainer docked ${layout.edge}.`); }
     if (button.hasAttribute('data-guide-collapse')) { setOpen(false, { focus: true });layout.collapsed = true;savePosition('Explainer collapsed to a tab.'); }
     if (button.hasAttribute('data-guide-reset')) { layout = { ...DEFAULT_LAYOUT };savePosition('Explainer position reset.'); }

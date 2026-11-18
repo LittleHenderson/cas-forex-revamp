@@ -157,6 +157,45 @@ def _compute_ema(values: list[Decimal], period: int) -> Decimal | None:
     return ema
 
 
+def compute_market_sessions_status(now_utc: datetime, *, mt5_tick_fresh: bool = False) -> dict[str, Any]:
+    """Compute UTC open/closed status for Forex 24/5, major sessions, and US Indices/Gold."""
+    ts = now_utc.astimezone(timezone.utc) if now_utc.tzinfo is not None else now_utc.replace(tzinfo=timezone.utc)
+    wd = ts.weekday()  # 0=Mon..6=Sun
+    hr = ts.hour
+    mn = ts.minute
+    forex_open = (wd in (0, 1, 2, 3)) or (wd == 6 and hr >= 22) or (wd == 4 and hr < 22)
+
+    sessions = [
+        {"id": "sydney", "label": "Sydney", "window_utc": "22:00-07:00 UTC", "open": bool(forex_open and (hr >= 22 or hr < 7))},
+        {"id": "tokyo", "label": "Tokyo", "window_utc": "00:00-09:00 UTC", "open": bool(forex_open and (0 <= hr < 9))},
+        {"id": "london", "label": "London", "window_utc": "07:00-16:00 UTC", "open": bool(forex_open and (7 <= hr < 16))},
+        {"id": "new_york", "label": "New York", "window_utc": "12:00-21:00 UTC", "open": bool(forex_open and (12 <= hr < 21))},
+        {"id": "london_ny_overlap", "label": "London-NY Overlap", "window_utc": "12:00-16:00 UTC", "open": bool(forex_open and (12 <= hr < 16))},
+    ]
+    if not forex_open:
+        us_status = "WEEKEND_CLOSED"
+        us_label = "Weekend Closed"
+    elif hr == 21:
+        us_status = "DAILY_BREAK"
+        us_label = "Daily Break 21:00-22:00 UTC"
+    elif (hr == 14 and mn >= 30) or (15 <= hr < 21):
+        us_status = "CASH_OPEN"
+        us_label = "Wall Street Cash OPEN 14:30-21:00 UTC"
+    else:
+        us_status = "EXTENDED_OPEN"
+        us_label = "Extended Hours OPEN"
+
+    return {
+        "utc_time": ts.strftime("%H:%M UTC"),
+        "forex_24_5_open": bool(forex_open),
+        "forex_label": "FOREX 24/5 OPEN" if forex_open else "WEEKEND CLOSED",
+        "us_indices_status": us_status,
+        "us_indices_label": us_label,
+        "mt5_tick_fresh": bool(mt5_tick_fresh),
+        "sessions": sessions,
+    }
+
+
 class AutonomousAiTrader:
     """Dual-cadence Valve-gated autonomous trading engine with Human-as-Overseer governance."""
 
@@ -229,6 +268,9 @@ class AutonomousAiTrader:
         self._last_reason = "Awaiting market cycle evaluation."
         self._last_action = "WAIT"
         self._last_symbol: str | None = None
+        self._last_evaluated_symbol: str | None = None
+        self._last_evaluated_regime: str | None = None
+        self._top_watch_symbol: str | None = None
         self._last_valve_score: str | None = None
         self._last_scout: dict[str, Any] | None = None
         self._last_error: str | None = None
@@ -778,6 +820,9 @@ class AutonomousAiTrader:
         """Scan watchlist with TrendRegimeDetector, House-Money ADD pyramiding, and correlation cap."""
         ordered_syms = list(INDEX_INSTRUMENTS) + [s for s in markets if s not in INDEX_INSTRUMENTS]
         open_meta_list = list(self._open_position_meta.values())
+        best_ratio = Decimal("-1")
+        best_sym: str | None = None
+        best_reg: str | None = None
         for sym in ordered_syms:
             info = markets.get(sym)
             if not info:
@@ -802,6 +847,11 @@ class AutonomousAiTrader:
                 spread=spread,
                 normal_sl_distance=params["sl_distance"],
             )
+            move_ratio = abs(mids[-1] - mids[0]) / max(spread, Decimal("0.000000001"))
+            if move_ratio > best_ratio:
+                best_ratio = move_ratio
+                best_sym = sym
+                best_reg = regime_res.regime
             if regime_res.regime in (REGIME_SPREAD_SPIKE, REGIME_CHOP_RANGE) or regime_res.direction is None:
                 # Preserve direct 3-tick fast-ignition burst detection when mids delta >= 3x spread
                 tail_mids = mids[-5:]
@@ -871,6 +921,9 @@ class AutonomousAiTrader:
                 )
                 if not pyr.allowed:
                     continue
+                self._last_evaluated_symbol = sym
+                self._last_evaluated_regime = regime_name
+                self._top_watch_symbol = best_sym or sym
                 return (
                     sym,
                     side,
@@ -895,7 +948,14 @@ class AutonomousAiTrader:
                 continue
             if fast_tick and sym not in INDEX_INSTRUMENTS and abs(mids[-1] - mids[-min(len(mids), 5)]) < spread * Decimal("4"):
                 continue
+            self._last_evaluated_symbol = sym
+            self._last_evaluated_regime = regime_name
+            self._top_watch_symbol = best_sym or sym
             return sym, side, bid, ask, setup_note, regime_name, False, None, 1
+        if best_sym is not None:
+            self._top_watch_symbol = best_sym
+            self._last_evaluated_symbol = best_sym
+            self._last_evaluated_regime = best_reg
         return None
 
     def record_closed_pnl(
@@ -970,7 +1030,7 @@ class AutonomousAiTrader:
         with self._lock:
             self._cycle_seq += 1
             cycle_id = f"cycle-{self._cycle_seq}"
-            self._last_cadence = f"{self._fast_tick_ms}ms_FAST_TICK" if fast_tick else "STANDARD_18_MARKETS"
+            self._last_cadence = f"{self._fast_tick_ms}ms_FAST_TICK" if fast_tick else f"STANDARD_{len(EXPANDED_MARKETS)}_MARKETS"
 
             prot_updates = self.evaluate_fast_protection(quotes=mt5_quotes, now=ts)
             markets = self._collect_market_quotes(stream_envelope, index_stream, mt5_quotes)
@@ -1619,7 +1679,35 @@ class AutonomousAiTrader:
                 "valve_threshold": decimal_text(Decimal(f"{self._valve_gate.controller.threshold:.2f}")),
                 "daily_quota": quota_snap,
                 "open_positions": [dict(v) for v in self._open_position_meta.values()],
+                "active_working_markets": sorted({
+                    str(v.get("symbol"))
+                    for v in self._open_position_meta.values()
+                    if v.get("symbol")
+                }),
                 "recent_actions": list(self._recent_actions),
                 "observed_at": _iso(ts),
             }
+            open_vals = list(self._open_position_meta.values())
+            if open_vals:
+                first_pos = open_vals[0]
+                focus_sym = str(first_pos.get("symbol") or "NAS100")
+                focus_side = str(first_pos.get("side") or "BUY")
+                focus_stage = str(first_pos.get("protection_stage") or "INITIAL_SL")
+                focus_status = f"IN TRADE: {focus_sym} ({focus_side} · {focus_stage})"
+            elif self._last_symbol is not None and self._last_action not in ("WAIT", "VETOED"):
+                focus_sym = str(self._last_symbol)
+                focus_status = f"AI EXECUTING: {focus_sym} ({self._last_action})"
+            elif self._last_evaluated_symbol is not None:
+                focus_sym = str(self._last_evaluated_symbol)
+                reg_lbl = str(self._last_evaluated_regime or self._last_regime or "SCANNING")
+                focus_status = f"AI EVALUATING: {focus_sym} ({reg_lbl})"
+            else:
+                focus_sym = str(self._top_watch_symbol or EXPANDED_MARKETS[0])
+                focus_status = f"SCANNING {len(EXPANDED_MARKETS)} MARKETS · Top Watch: {focus_sym}"
+            payload["current_focus_symbol"] = focus_sym
+            payload["current_focus_status"] = focus_status
+            payload["market_sessions"] = compute_market_sessions_status(
+                ts,
+                mt5_tick_fresh=bool(self._cycle_seq > 0 and self._last_cadence.endswith("FAST_TICK")),
+            )
             return assert_safe_ai_catalog_payload(payload)

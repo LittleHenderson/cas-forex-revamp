@@ -120,3 +120,5 @@ body.forex-explainer-ready[data-forex-explainer-edge="bottom"] .forex-explainer-
   body.forex-explainer-ready { overflow: visible; }
   .forex-explainer-workspace { position: static !important; inset: auto !important; overflow: visible !important; }
 }
+.forex-explainer-ask-row { display: flex; gap: 6px; align-items: stretch; margin: 6px 0; }
+.forex-explainer-ask-row input { flex: 1 1 auto; min-width: 0; }

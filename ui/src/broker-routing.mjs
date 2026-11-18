@@ -28,7 +28,7 @@ export const STATIC_BROKER_ROUTING = Object.freeze({
   shield: Object.freeze({
     reference: 'OANDA_PRACTICE', majorBps: '15', crossBps: '25', spreadMultiple: '3.0',
     reserveShare: '0.80', hugoswayShare: '0.12', lhfxShare: '0.08', maxStopRiskPct: '1.00',
-    safeHarbor: 'OANDA_PRACTICE', safeHarborLeverage: '1:50', degradations: '0', offsetPlanner: true,
+    safeHarbor: 'OANDA_PRACTICE', safeHarborLeverage: '1:50', degradations: '0', offsetPlanner: true, totalEquity: null,
   }),
 });
 
@@ -53,11 +53,14 @@ function normalizeShield(doc) {
   const barbell = shield.barbell ?? {};
   const harbor = shield.safe_harbor ?? {};
   const degradations = Array.isArray(harbor.recent_degradations) ? harbor.recent_degradations.length : 0;
+  const rawEq = shield.allocation?.total_equity;
+  const totalEquity = typeof rawEq === 'string' && /^-?[0-9]+(\.[0-9]+)?$/.test(rawEq) ? rawEq : null;
   return Object.freeze({
     reference: str(oracle.reference_source), majorBps: str(oracle.max_divergence_bps_major), crossBps: str(oracle.max_divergence_bps_cross),
     spreadMultiple: str(oracle.max_oanda_spread_multiple), reserveShare: str(barbell.oanda_reserve_share), hugoswayShare: str(barbell.hugosway_share),
     lhfxShare: str(barbell.lhfx_share), maxStopRiskPct: str(barbell.max_stop_loss_equity_risk_pct), safeHarbor: str(harbor.broker_id),
     safeHarborLeverage: str(harbor.leverage), degradations: String(degradations), offsetPlanner: Boolean(shield.offset_planner),
+    totalEquity,
   });
 }
 

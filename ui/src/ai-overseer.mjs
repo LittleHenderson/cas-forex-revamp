@@ -21,6 +21,45 @@ const QUOTA_STATUSES = Object.freeze(['OPEN', 'SOFT_QUOTA_REACHED', 'DAILY_QUOTA
 const PROTECTION_STAGES = Object.freeze(['INITIAL_SL', 'BREAKEVEN_LOCKED', 'TRAILING_ACTIVE']);
 const INDEX_PAIRS = Object.freeze(['NAS100', 'US30', 'SPX500', 'XAUUSD']);
 
+export function computeMarketSessions(nowMs = Date.now(), mt5TickFresh = false) {
+  const safeMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const d = new Date(safeMs);
+  const wd = d.getUTCDay(); // 0=Sun..6=Sat
+  const hr = d.getUTCHours();
+  const mn = d.getUTCMinutes();
+  const hh = String(hr).padStart(2, '0');
+  const mm = String(mn).padStart(2, '0');
+  const forex245Open = (wd >= 1 && wd <= 4) || (wd === 0 && hr >= 22) || (wd === 5 && hr < 22);
+  const sessions = Object.freeze([
+    Object.freeze({ id: 'sydney', label: 'Sydney', windowUtc: '22:00-07:00 UTC', open: Boolean(forex245Open && (hr >= 22 || hr < 7)) }),
+    Object.freeze({ id: 'tokyo', label: 'Tokyo', windowUtc: '00:00-09:00 UTC', open: Boolean(forex245Open && (hr >= 0 && hr < 9)) }),
+    Object.freeze({ id: 'london', label: 'London', windowUtc: '07:00-16:00 UTC', open: Boolean(forex245Open && (hr >= 7 && hr < 16)) }),
+    Object.freeze({ id: 'new_york', label: 'New York', windowUtc: '12:00-21:00 UTC', open: Boolean(forex245Open && (hr >= 12 && hr < 21)) }),
+    Object.freeze({ id: 'london_ny_overlap', label: 'London-NY Overlap', windowUtc: '12:00-16:00 UTC', open: Boolean(forex245Open && (hr >= 12 && hr < 16)) }),
+  ]);
+  let usIndicesStatus = 'EXTENDED_OPEN';
+  let usIndicesLabel = 'Extended Hours OPEN';
+  if (!forex245Open) {
+    usIndicesStatus = 'WEEKEND_CLOSED';
+    usIndicesLabel = 'Weekend Closed';
+  } else if (hr === 21) {
+    usIndicesStatus = 'DAILY_BREAK';
+    usIndicesLabel = 'Daily Break 21:00-22:00 UTC';
+  } else if ((hr === 14 && mn >= 30) || (hr >= 15 && hr < 21)) {
+    usIndicesStatus = 'CASH_OPEN';
+    usIndicesLabel = 'Wall Street Cash OPEN 14:30-21:00 UTC';
+  }
+  return Object.freeze({
+    utcTime: `${hh}:${mm} UTC`,
+    forex245Open,
+    forexLabel: forex245Open ? 'FOREX 24/5 OPEN' : 'WEEKEND CLOSED',
+    usIndicesStatus,
+    usIndicesLabel,
+    mt5TickFresh: Boolean(mt5TickFresh),
+    sessions,
+  });
+}
+
 const esc = (value) => String(value).replace(/[&<>"']/g, (ch) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
 ));
@@ -74,7 +113,11 @@ export const STATIC_AI_TRADER = Object.freeze({
   effectiveStatus: 'STANDBY',
   fastTickMs: '50',
   cadence: '50ms_FAST_TICK',
-  marketsEvaluated: '18',
+  marketsEvaluated: '20',
+  activeWorkingMarkets: Object.freeze([]),
+  currentFocusSymbol: 'NAS100',
+  currentFocusStatus: 'Standby preview (connect live server)',
+  marketSessions: null,
   activeModelId: 'claude-fable-5.2',
   activeDisplayName: 'Claude Fable 5.2',
   activeModelStatus: 'AWAITING_PROVIDER_KEY',
@@ -200,7 +243,28 @@ export function normalizeAiTrader(doc) {
     effectiveStatus: str(doc.effective_status, govMode),
     fastTickMs: numStr(doc.fast_tick_ms, '50'),
     cadence: str(doc.cadence, '50ms_FAST_TICK'),
-    marketsEvaluated: numStr(doc.markets_evaluated, '18'),
+    marketsEvaluated: numStr(doc.markets_evaluated, '20'),
+    activeWorkingMarkets: Object.freeze(
+      Array.isArray(doc.active_working_markets)
+        ? doc.active_working_markets.map((s) => str(s, '')).filter(Boolean)
+        : openPositions.map((p) => p.symbol).filter((v, idx, a) => v && a.indexOf(v) === idx)
+    ),
+    currentFocusSymbol: str(doc.current_focus_symbol, 'NAS100', 32),
+    currentFocusStatus: str(doc.current_focus_status, `SCANNING ${numStr(doc.markets_evaluated, '20')} MARKETS`, 180),
+    marketSessions: doc.market_sessions && typeof doc.market_sessions === 'object' ? Object.freeze({
+      utcTime: str(doc.market_sessions.utc_time, '00:00 UTC', 24),
+      forex245Open: Boolean(doc.market_sessions.forex_24_5_open),
+      forexLabel: str(doc.market_sessions.forex_label, 'FOREX 24/5 OPEN', 40),
+      usIndicesStatus: str(doc.market_sessions.us_indices_status, 'EXTENDED_OPEN', 32),
+      usIndicesLabel: str(doc.market_sessions.us_indices_label, 'Extended Hours OPEN', 64),
+      mt5TickFresh: Boolean(doc.market_sessions.mt5_tick_fresh),
+      sessions: Object.freeze(Array.isArray(doc.market_sessions.sessions) ? doc.market_sessions.sessions.map((s) => Object.freeze({
+        id: str(s.id, 'session', 32),
+        label: str(s.label, 'Session', 40),
+        windowUtc: str(s.window_utc, '', 32),
+        open: Boolean(s.open),
+      })) : []),
+    }) : null,
     activeModelId: str(doc.active_model_id, 'claude-fable-5.2'),
     activeDisplayName: str(doc.active_display_name, 'Claude Fable 5.2'),
     activeModelStatus: str(doc.active_model_status, 'AWAITING_PROVIDER_KEY'),
@@ -350,12 +414,14 @@ export function renderAiOverseerPanel(state) {
   const connectBtn = !trader.connected
     ? '<button type="button" class="button button-small button-primary" data-connect-loopback="true">Connect live server</button>'
     : '';
+  const workingPill = `<span class="working-now-pill" data-working-now="true">WORKING NOW: ${esc(trader.currentFocusStatus ?? (`SCANNING ${trader.marketsEvaluated} MARKETS`))}</span>`;
 
   return `<section class="panel ai-overseer-panel" aria-label="AI Autonomous Trader and Human Overseer">
     <div class="section-heading">
       <div><p class="eyebrow">HUMAN AS OVERSEER · ${esc(trader.marketsEvaluated)} MARKETS (${esc(trader.fastTickMs)}ms MT5 FAST-TICK)</p><h2>Autonomous AI Trader &amp; Daily Quota</h2></div>
       <div class="market-chart-badges">
         ${connectBtn}
+        ${workingPill}
         <span class="tag${modeWarning ? ' tag-warning' : ''}" data-ai-status="${esc(trader.effectiveStatus)}"><span class="state-rule" aria-hidden="true"></span>${esc(trader.connected ? trader.effectiveStatus : 'AI standby (not attached)')}</span>
         <span class="tag"><span class="state-rule" aria-hidden="true"></span>${esc(trader.valveController)} · ${esc(trader.valveParameters)} params</span>
       </div>

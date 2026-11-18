@@ -447,15 +447,20 @@ export function renderMarketChartSection(projection, state) {
     `<button type="button" class="button button-small ${cat === categoryFilter ? 'selected' : 'button-secondary'}" data-chart-cat="${e(cat)}" aria-pressed="${cat === categoryFilter}">${e(label)}</button>`
   )).join('');
 
+  const workingSet = new Set(Array.isArray(state?.aiTrader?.activeWorkingMarkets) ? state.aiTrader.activeWorkingMarkets : []);
+  const focusPair = typeof state?.aiTrader?.currentFocusSymbol === 'string' ? state.aiTrader.currentFocusSymbol : null;
   const watchlistItems = visibleStreams.map((item) => {
     const hasPos = matchPositionsForPair(projection, item.pair, brokerPositions).length > 0;
+    const inTrade = workingSet.has(item.pair) || hasPos;
+    const isWorking = inTrade || (focusPair === item.pair && Boolean(state?.aiTrader?.connected));
     const changeStr = typeof item.change_24h_pct === 'string' ? item.change_24h_pct : '0.00';
     const neg = changeStr.startsWith('-');
     const selected = item.pair === activeStream.pair;
-    return `<button type="button" class="watchlist-row${selected ? ' is-selected' : ''}" data-chart-pair="${e(item.pair)}" aria-pressed="${selected}">
+    const workTag = inTrade ? ' · OPEN POS · WORKING' : (isWorking ? ' · WORKING' : '');
+    return `<button type="button" class="watchlist-row${selected ? ' is-selected' : ''}${isWorking ? ' is-working' : ''}" data-chart-pair="${e(item.pair)}" aria-pressed="${selected}">
       <span class="watchlist-pair">
         <strong>${e(item.display_pair)}</strong>
-        <small>${e(item.category)}${hasPos ? ' · OPEN POS' : ''}</small>
+        <small>${e(item.category)}${workTag}</small>
       </span>
       <span class="watchlist-quotes numeric">
         <span>${e(item.bid)} / ${e(item.ask)}</span>

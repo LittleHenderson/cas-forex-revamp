@@ -3,6 +3,7 @@
  * 50%/50% Profit-Sweep Bank Vault & Prominent AI Switcher / 2-Speed Thinking Depth Bar.
  * Strict CSP compliant: zero inline style attributes, zero eval, safe HTML escaping.
  */
+import { computeMarketSessions } from './ai-overseer.mjs';
 const e = (value) => String(value ?? '')
   .replaceAll('&', '&amp;')
   .replaceAll('<', '&lt;')
@@ -145,6 +146,11 @@ export function renderAiTopSwitcherBar(state) {
   const latMs = models.lastLatencyMs ?? trader.lastLatencyMs;
   const regime = str(trader.lastRegime, 'TREND_IGNITION');
   const isPaused = trader.governanceMode && trader.governanceMode !== 'ACTIVE';
+  const focusStatus = str(trader.currentFocusStatus, `SCANNING ${str(trader.marketsEvaluated, '20')} MARKETS`);
+  const sessionsObj = trader.marketSessions ?? computeMarketSessions(Date.now(), Boolean(state?.liveStreamConnected && Number(trader.cycleCount) > 0));
+  const sessionPills = (sessionsObj.sessions ?? []).map((s) => (
+    `<span class="session-pill ${s.open ? 'session-open' : 'session-closed'}" title="${e(s.windowUtc)}">${e(s.label)}: ${s.open ? 'OPEN' : 'CLOSED'}</span>`
+  )).join('');
 
   const optionsHtml = modelList.map((m) => {
     const sel = m.modelId === models.activeModelId ? ' selected' : '';
@@ -171,10 +177,17 @@ export function renderAiTopSwitcherBar(state) {
         <span class="eyebrow">THINKING DEPTH MODE (NON-BLOCKING 50MS PROTECTION)</span>
         <div class="segmented" role="group" aria-label="Thinking depth selector">${depthPills}</div>
         <div class="ai-depth-badges">
+          <span class="working-now-pill" data-top-working-now="true">WORKING NOW: ${e(focusStatus)}</span>
           <span class="tag"><span class="state-rule" aria-hidden="true"></span>Depth: ${e(activeDepth)} → Effective ${e(effDepth)}${latMs !== null && latMs !== undefined ? ` (${e(String(latMs))}ms)` : ''}</span>
           <span class="tag"><span class="state-rule" aria-hidden="true"></span>Regime: ${e(regime)}</span>
         </div>
       </div>
+    </div>
+    <div class="session-strip" aria-label="Global Forex and US Indices market sessions">
+      <span class="session-pill ${sessionsObj.forex245Open ? 'session-open' : 'session-closed'}">${e(sessionsObj.forexLabel)} (${e(sessionsObj.utcTime)})</span>
+      ${sessionPills}
+      <span class="session-pill ${sessionsObj.usIndicesStatus === 'WEEKEND_CLOSED' || sessionsObj.usIndicesStatus === 'DAILY_BREAK' ? 'session-closed' : 'session-open'}">US Indices &amp; Gold: ${e(sessionsObj.usIndicesLabel)}</span>
+      <span class="session-pill ${sessionsObj.mt5TickFresh ? 'session-open' : 'session-closed'}">MT5 50ms Feed: ${sessionsObj.mt5TickFresh ? 'LIVE' : 'STANDBY'}</span>
     </div>
   </section>`;
 }

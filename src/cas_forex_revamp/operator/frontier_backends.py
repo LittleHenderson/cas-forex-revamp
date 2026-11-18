@@ -1368,6 +1368,116 @@ class FrontierModelRegistry:
             if reasoning_effort is not None:
                 self._last_effective_effort = str(reasoning_effort).lower()
 
+    def answer_explainer_question(
+        self,
+        *,
+        question: str,
+        context_summary: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Read-only Explainer helper answering operator questions with zero execution authority."""
+        if not isinstance(question, str):
+            raise FrontierConfigurationError("question must be a string")
+        clean_q = " ".join(ch for ch in question.replace("\r", " ").replace("\n", " ").strip().split())
+        if not clean_q or len(clean_q) > 500:
+            raise FrontierConfigurationError("question must be 1..500 characters")
+
+        summary_obj = dict(context_summary) if isinstance(context_summary, Mapping) else {}
+        chosen_entry = self.active_entry
+        if chosen_entry.provider == "gemini_decision" or not self.is_model_ready(chosen_entry.model_id):
+            fallback_entry = None
+            for cand in FRONTIER_MODEL_CATALOG:
+                if cand.provider != "gemini_decision" and not cand.is_fallback and self.is_model_ready(cand.model_id):
+                    fallback_entry = cand
+                    break
+            if fallback_entry is not None:
+                chosen_entry = fallback_entry
+
+        fallback_reason = "OFFLINE"
+        secret = self._secrets.get(chosen_entry.credential_env) if chosen_entry.credential_env else None
+        ready_for_call = (
+            self._is_entry_ready(chosen_entry)
+            and (chosen_entry.provider == "ollama" or secret is not None)
+            and chosen_entry.provider != "gemini_decision"
+        )
+
+        if ready_for_call:
+            api_slug = self._slugs[chosen_entry.model_id]
+            sys_prompt = (
+                "You are the read-only CAS Forex Explainer. "
+                "Explain live state, active market focus, sessions, broker routing, and valve gates in plain English "
+                "using only supplied facts. Never advise trades or emit execution commands. "
+                'Respond with compact JSON: {"answer": "<plain-English explanation under 120 words>"}.'
+            )
+            from types import SimpleNamespace
+
+            pkt = canonical_bytes({"question": clean_q, "cockpit": summary_obj}).decode("utf-8")
+            inv = SimpleNamespace(
+                model=SimpleNamespace(reasoning_effort="low"),
+                system_policy=sys_prompt,
+                packet_json=pkt,
+                budget=SimpleNamespace(max_generated_tokens_per_call=512),
+                seed=None,
+            )
+            url, headers, body = _build_provider_payload(chosen_entry, api_slug, inv, secret)
+            fallback_reason = "LOCAL_READ_ONLY_FALLBACK"
+            try:
+                if self._http_post is not None:
+                    status, raw = self._http_post(url, dict(headers), body, 10.0, MAX_PROVIDER_WIRE_BYTES)
+                elif chosen_entry.provider == "ollama":
+                    status, raw = default_ollama_loopback_post(url, dict(headers), body, 10.0, MAX_PROVIDER_WIRE_BYTES)
+                else:
+                    status, raw = default_frontier_https_post(
+                        url,
+                        dict(headers),
+                        body,
+                        10.0,
+                        MAX_PROVIDER_WIRE_BYTES,
+                        expected_host=chosen_entry.allowed_host,
+                        resolve_dns=self._resolve_dns,
+                    )
+                if 200 <= status < 300:
+                    doc = _decode_json_dict(raw, max_bytes=MAX_PROVIDER_WIRE_BYTES)
+                    txt, _, _ = _extract_provider_text_and_usage(
+                        chosen_entry.provider, doc, inv, min_probability=self._min_probability
+                    )
+                    ans_text = txt
+                    try:
+                        parsed_txt = json.loads(txt)
+                        if isinstance(parsed_txt, dict) and isinstance(parsed_txt.get("answer"), str):
+                            ans_text = parsed_txt["answer"]
+                    except (ValueError, TypeError):
+                        ans_text = txt
+                    ans_text = " ".join(str(ans_text).strip().split())[:2000]
+                    if ans_text:
+                        return assert_safe_ai_catalog_payload({
+                            "schema": "cas-forex.explainer-answer/1",
+                            "model_id": chosen_entry.model_id,
+                            "display_name": chosen_entry.display_name,
+                            "source": "FRONTIER_READ_ONLY",
+                            "read_only": True,
+                            "answer": ans_text,
+                        })
+            except Exception as exc_exp:
+                fallback_reason = type(exc_exp).__name__
+            finally:
+                headers.clear()
+
+        focus_txt = str(summary_obj.get("current_focus_status") or "Scanning all 20 markets under ForexMetaValveGate.")
+        mode_txt = str(summary_obj.get("execution_mode") or "DEMO")
+        broker_txt = str(summary_obj.get("active_broker") or "HUGOSWAY_MT5")
+        fallback_ans = (
+            f"Read-only status ({mode_txt} via {broker_txt}, model {chosen_entry.display_name}): "
+            f"{focus_txt} Question noted: {clean_q}"
+        )[:2000]
+        return assert_safe_ai_catalog_payload({
+            "schema": "cas-forex.explainer-answer/1",
+            "model_id": chosen_entry.model_id,
+            "display_name": chosen_entry.display_name,
+            "source": "LOCAL_READ_ONLY_FALLBACK" if not ready_for_call else f"LOCAL_READ_ONLY_FALLBACK ({fallback_reason})",
+            "read_only": True,
+            "answer": fallback_ans,
+        })
+
     def select_model(self, model_id: str) -> dict[str, Any]:
         if not isinstance(model_id, str) or model_id.strip() not in _CATALOG_BY_ID:
             raise FrontierConfigurationError(f"unsupported AI model selection {model_id!r}")
