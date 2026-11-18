@@ -45,8 +45,52 @@ class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
 
-def _build_mt5_index_snapshot_from_router(router: Any) -> tuple[dict[str, Any] | None, dict[str, tuple[Any, Any]]]:
+def _roll_mt5_index_bars(prev_bars: Any, bucket_iso: str, mid_px: Any, _dec_txt: Any, limit: int = 48) -> list[dict[str, Any]]:
+    """Append or update the latest OHLC candle bucket for MT5-driven index streams."""
+    from decimal import Decimal
+
+    bars: list[dict[str, Any]] = []
+    if isinstance(prev_bars, list):
+        for row in prev_bars:
+            if isinstance(row, Mapping) and all(k in row for k in ("t", "o", "h", "l", "c")):
+                bars.append({
+                    "t": str(row["t"]),
+                    "o": str(row["o"]),
+                    "h": str(row["h"]),
+                    "l": str(row["l"]),
+                    "c": str(row["c"]),
+                    "v": str(row.get("v", "1")),
+                    "n": int(row.get("n", 1)),
+                })
+    if bars and bars[-1].get("t") == bucket_iso:
+        last = bars[-1]
+        hi = max(Decimal(str(last["h"])), mid_px)
+        lo = min(Decimal(str(last["l"])), mid_px)
+        last["h"] = _dec_txt(hi)
+        last["l"] = _dec_txt(lo)
+        last["c"] = _dec_txt(mid_px)
+        last["v"] = _dec_txt(Decimal(str(last.get("v", "1"))) + Decimal("1"))
+        last["n"] = int(last.get("n", 1)) + 1
+    else:
+        o_dec = Decimal(str(bars[-1]["c"])) if bars else mid_px
+        bars.append({
+            "t": bucket_iso,
+            "o": _dec_txt(o_dec),
+            "h": _dec_txt(max(o_dec, mid_px)),
+            "l": _dec_txt(min(o_dec, mid_px)),
+            "c": _dec_txt(mid_px),
+            "v": "1",
+            "n": 1,
+        })
+    return bars[-limit:]
+
+
+def _build_mt5_index_snapshot_from_router(
+    router: Any,
+    prev_stream: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, tuple[Any, Any]]]:
     """Read NAS100/US30 quotes from active MT5 bridge transports and format an index stream payload."""
+    from datetime import datetime, timezone
     from cas_forex_revamp.contracts import decimal_text as _dec_txt
     from cas_forex_revamp.venue.live_market_stream import INDEX_INSTRUMENTS
 
@@ -61,25 +105,46 @@ def _build_mt5_index_snapshot_from_router(router: Any) -> tuple[dict[str, Any] |
                     print(f"[ai-fast] Tick skipped for {sym}: {type(exc_sym).__name__}")
     if not mt5_q:
         return None, {}
+    now_dt = datetime.now(timezone.utc)
+    obs_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    b_m1 = now_dt.strftime("%Y-%m-%dT%H:%M:00Z")
+    b_m5 = now_dt.replace(minute=(now_dt.minute // 5) * 5, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:00Z")
+    b_h1 = now_dt.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00:00Z")
+    prev_by_pair: dict[str, Mapping[str, Any]] = {}
+    if isinstance(prev_stream, Mapping) and isinstance(prev_stream.get("markets"), list):
+        for row in prev_stream["markets"]:
+            if isinstance(row, Mapping) and isinstance(row.get("pair"), str):
+                prev_by_pair[row["pair"]] = row
     idx_rows = []
     for sym_idx in INDEX_INSTRUMENTS:
         if sym_idx in mt5_q:
             b_px, a_px = mt5_q[sym_idx]
+            mid_px = (b_px + a_px) / 2
+            prev_row = prev_by_pair.get(sym_idx, {})
             idx_rows.append({
                 "pair": sym_idx,
-                "display_pair": "NAS100 / USD" if sym_idx == "NAS100" else f"{sym_idx} / USD",
+                "display_pair": "NAS100 / NDX" if sym_idx == "NAS100" else "US30 / DJIA",
                 "category": "US_INDEX",
+                "tick_size": "0.25",
                 "bid": _dec_txt(b_px),
                 "ask": _dec_txt(a_px),
-                "mid": _dec_txt((b_px + a_px) / 2),
+                "mid": _dec_txt(mid_px),
+                "spread_points": _dec_txt(a_px - b_px),
+                "observed_at": obs_iso,
                 "feed_mode": "MT5_DIRECT_SPOOL_50MS",
+                "candles_m1": _roll_mt5_index_bars(prev_row.get("candles_m1"), b_m1, mid_px, _dec_txt),
+                "candles_m5": _roll_mt5_index_bars(prev_row.get("candles_m5"), b_m5, mid_px, _dec_txt),
+                "candles_h1": _roll_mt5_index_bars(prev_row.get("candles_h1"), b_h1, mid_px, _dec_txt),
             })
     if not idx_rows:
         return None, mt5_q
+    prev_seq = int(prev_stream.get("sequence", 0)) if isinstance(prev_stream, Mapping) else 0
     return {
         "schema": "cas-forex.index-stream/1",
-        "sequence": 1,
+        "sequence": prev_seq + 1,
+        "observed_at": obs_iso,
         "feed_mode": "MT5_DIRECT_SPOOL_50MS",
+        "instruments": list(INDEX_INSTRUMENTS),
         "markets": idx_rows,
     }, mt5_q
 
@@ -630,6 +695,12 @@ class LoopbackCockpitServer:
                                         if snap is not None:
                                             frame = f"event: market\ndata: {json.dumps(snap, sort_keys=False)}\n\n".encode("utf-8")
                                             self.wfile.write(frame)
+                                        if outer._index_stream_reader is not None:
+                                            isnap = outer._index_stream_reader()
+                                            if isnap is not None:
+                                                safe_isnap = assert_safe_ai_catalog_payload(isnap)
+                                                iframe = f"event: index_stream\ndata: {json.dumps(safe_isnap, sort_keys=False)}\n\n".encode("utf-8")
+                                                self.wfile.write(iframe)
                                         if outer._autonomous_trader is not None:
                                             tsnap = assert_safe_ai_catalog_payload(outer._autonomous_trader.status_snapshot())
                                             tframe = f"event: ai_trader\ndata: {json.dumps(tsnap, sort_keys=False)}\n\n".encode("utf-8")
@@ -1156,14 +1227,14 @@ def run_cockpit_cli(
             latest_stream[0] = env_stream.to_wire_dict()
         except Exception as exc:
             print(f"[feed] Initial live quote fetch skipped ({type(exc).__name__}); using sealed fixture until next poll.")
-    mt5_idx_init, _ = _build_mt5_index_snapshot_from_router(router)
-    if mt5_idx_init is not None:
-        latest_index_stream[0] = mt5_idx_init
-    elif index_client is not None:
+    if index_client is not None:
         try:
             latest_index_stream[0] = index_client.fetch_index_stream()
         except Exception as exc:
             print(f"[feed] Initial index fetch skipped ({type(exc).__name__}); awaiting MT5 ticks.")
+    mt5_idx_init, _ = _build_mt5_index_snapshot_from_router(router, prev_stream=latest_index_stream[0])
+    if mt5_idx_init is not None:
+        latest_index_stream[0] = mt5_idx_init
 
     def _read_stream() -> dict[str, Any] | None:
         with stream_lock:
@@ -1195,8 +1266,10 @@ def run_cockpit_cli(
                 break
             try:
                 env_stream = feed_client.fetch_market_stream().to_wire_dict()
-                mt5_idx_snap, _ = _build_mt5_index_snapshot_from_router(router)
-                idx_stream = mt5_idx_snap if mt5_idx_snap is not None else latest_index_stream[0]
+                with stream_lock:
+                    prev_idx = latest_index_stream[0]
+                mt5_idx_snap, _ = _build_mt5_index_snapshot_from_router(router, prev_stream=prev_idx)
+                idx_stream = mt5_idx_snap if mt5_idx_snap is not None else prev_idx
                 if mt5_idx_snap is None and index_client is not None:
                     try:
                         idx_stream = index_client.fetch_index_stream()
@@ -1220,12 +1293,13 @@ def run_cockpit_cli(
             if not args.autonomous_ai:
                 continue
             try:
-                mt5_idx_snap, mt5_q = _build_mt5_index_snapshot_from_router(router)
+                with stream_lock:
+                    prev_idx = latest_index_stream[0]
+                mt5_idx_snap, mt5_q = _build_mt5_index_snapshot_from_router(router, prev_stream=prev_idx)
                 if mt5_q:
                     if mt5_idx_snap is not None:
                         with stream_lock:
-                            if latest_index_stream[0] is None or latest_index_stream[0].get("feed_mode") == "MT5_DIRECT_SPOOL_50MS":
-                                latest_index_stream[0] = mt5_idx_snap
+                            latest_index_stream[0] = mt5_idx_snap
                     if trader._inference_lock.acquire(blocking=False):
                         try:
                             trader.run_fast_tick_cycle(mt5_quotes=mt5_q)

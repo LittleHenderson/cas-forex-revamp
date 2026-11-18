@@ -898,6 +898,12 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
             self.assertEqual(idx_snap["feed_mode"], "MT5_DIRECT_SPOOL_50MS")
             self.assertEqual([m["pair"] for m in idx_snap["markets"]], ["NAS100", "US30"])
             self.assertIn("NAS100", mt5_q)
+            self.assertGreaterEqual(len(idx_snap["markets"][0]["candles_m1"]), 1)
+            self.assertGreaterEqual(len(idx_snap["markets"][0]["candles_m5"]), 1)
+            self.assertGreaterEqual(len(idx_snap["markets"][0]["candles_h1"]), 1)
+            idx_snap2, _ = _build_mt5_index_snapshot_from_router(router2, prev_stream=idx_snap)
+            self.assertEqual(idx_snap2["sequence"], 2)
+            self.assertGreaterEqual(len(idx_snap2["markets"][0]["candles_m5"]), 1)
 
             gate2 = load_default_forex_valve_gate()
             reg_res = FrontierModelRegistry(

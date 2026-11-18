@@ -195,17 +195,23 @@ async function readBridgeMarketStream() {
   } catch { /* Keep prior verified market stream or empty state. */ }
 }
 
-function recordMicroTick(envelope) {
+function recordMicroTickItems(items) {
+  if (!items) return;
   const nextMicro = { ...state.chartMicroBars };
-  for (const s of envelope.streams) {
+  for (const s of items) {
+    if (!s?.pair || !s?.mid) continue;
     const prev = Array.isArray(nextMicro[s.pair]) ? nextMicro[s.pair].slice(-47) : [];
     const lastClose = prev.length ? prev[prev.length - 1].c : s.mid;
     const hi = Number(s.mid) >= Number(lastClose) ? s.mid : lastClose;
     const lo = Number(s.mid) <= Number(lastClose) ? s.mid : lastClose;
-    prev.push(Object.freeze({ t: s.observed_at, o: lastClose, h: hi, l: lo, c: s.mid, v: '1.00', n: 1 }));
+    prev.push(Object.freeze({ t: s.observed_at || new Date().toISOString(), o: lastClose, h: hi, l: lo, c: s.mid, v: '1.00', n: 1 }));
     nextMicro[s.pair] = prev;
   }
   state.chartMicroBars = nextMicro;
+}
+
+function recordMicroTick(envelope) {
+  recordMicroTickItems(envelope?.streams ?? []);
 }
 
 function stopLoopbackStream() {
@@ -222,6 +228,13 @@ function handleSseEvent(eventName, dataText) {
       if (controller?.attached) void controller.refresh().catch(() => {});
       else render();
     } catch { /* Ignore malformed frame. */ }
+  } else if (eventName === 'index_stream') {
+    try {
+      const nextIdx = normalizeIndexStream(parseUniqueJSON(dataText, MAX_MARKET_STREAM_BYTES));
+      state.indexStream = nextIdx;
+      recordMicroTickItems(nextIdx.markets);
+      render();
+    } catch { /* Ignore malformed index_stream frame. */ }
   } else if (eventName === 'ai_trader') {
     try {
       state.aiTrader = normalizeAiTrader(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
@@ -341,6 +354,7 @@ async function readAiCockpitFeeds() {
   try {
     const rawIndex = await readStatic(new URL('/api/index-stream', window.location.origin), MAX_MARKET_STREAM_BYTES);
     state.indexStream = normalizeIndexStream(parseUniqueJSON(rawIndex, MAX_MARKET_STREAM_BYTES));
+    recordMicroTickItems(state.indexStream.markets);
   } catch { state.indexStream = null; }
   try {
     const rawTreas = await readStatic(new URL('/api/treasury', window.location.origin), MAX_TREASURY_BYTES);
