@@ -6,7 +6,7 @@ import { assertSchema, decimalCoefficient, freeze, parseUniqueJSON, SnapshotErro
 import { canonicalJSON } from './decision-read.mjs';
 
 export const MAX_MARKET_STREAM_BYTES = 1048576;
-export const CHART_TIMEFRAMES = Object.freeze(['1s', 'M1', 'M5', 'M15', 'H1']);
+export const CHART_TIMEFRAMES = Object.freeze(['50ms', '1s', 'M1', 'M5', 'M15', 'H1']);
 export const CHART_LAYOUTS = Object.freeze(['single', 'quad']);
 export const INDEX_INSTRUMENTS = Object.freeze(['NAS100', 'US30']);
 export const ALL_CHART_PAIRS = Object.freeze([
@@ -147,16 +147,17 @@ function rollupCandles(bars, groupSize) {
   return Object.freeze(out);
 }
 
-export function deriveTimeframeCandles(pairStream, timeframe = 'M5', microBars = []) {
+export function deriveTimeframeCandles(pairStream, timeframe = 'M5', microBars = [], zoomBars = 60) {
   if (!pairStream) return Object.freeze([]);
-  if (timeframe === '1s') {
-    if (Array.isArray(microBars) && microBars.length >= 2) return Object.freeze(microBars.slice(-48));
-    return Object.freeze(pairStream.candles_m1.slice(-24));
+  const lim = Math.max(20, Math.min(200, Number(zoomBars) || 60));
+  if (timeframe === '50ms' || timeframe === '1s') {
+    if (Array.isArray(microBars) && microBars.length >= 2) return Object.freeze(microBars.slice(-lim));
+    return Object.freeze(pairStream.candles_m1.slice(-Math.min(24, lim)));
   }
-  if (timeframe === 'M1') return Object.freeze(pairStream.candles_m1.slice());
-  if (timeframe === 'M15') return rollupCandles(pairStream.candles_m5, 3);
-  if (timeframe === 'H1') return Object.freeze(pairStream.candles_h1.slice());
-  return Object.freeze(pairStream.candles_m5.slice());
+  if (timeframe === 'M1') return Object.freeze(pairStream.candles_m1.slice(-lim));
+  if (timeframe === 'M15') return Object.freeze(rollupCandles(pairStream.candles_m5, 3).slice(-lim));
+  if (timeframe === 'H1') return Object.freeze(pairStream.candles_h1.slice(-lim));
+  return Object.freeze(pairStream.candles_m5.slice(-lim));
 }
 
 export function computeEMA(candles, period = 14) {
@@ -178,10 +179,11 @@ export function computeChartGeometry(pairStream, {
   brokerPositions = [],
   valveStatus = null,
   microBars = [],
+  zoomBars = 60,
   width = 860,
   height = 360,
 } = {}) {
-  const candles = deriveTimeframeCandles(pairStream, timeframe, microBars);
+  const candles = deriveTimeframeCandles(pairStream, timeframe, microBars, zoomBars);
   const padLeft = 14;
   const padRight = 84;
   const padTop = 18;
@@ -280,6 +282,15 @@ export function computeChartGeometry(pairStream, {
     y: priceToY(val),
     value: val,
   }));
+  const ema9Points = computeEMA(candles, 9).map((val, idx) => Object.freeze({
+    x: padLeft + stepX * (idx + 0.5), y: priceToY(val), value: val,
+  }));
+  const ema21Points = computeEMA(candles, 21).map((val, idx) => Object.freeze({
+    x: padLeft + stepX * (idx + 0.5), y: priceToY(val), value: val,
+  }));
+  const ema50Points = computeEMA(candles, 50).map((val, idx) => Object.freeze({
+    x: padLeft + stepX * (idx + 0.5), y: priceToY(val), value: val,
+  }));
 
   const positionLines = [];
   for (const pos of positions) {
@@ -342,6 +353,9 @@ export function computeChartGeometry(pairStream, {
     askY: priceToY(askNum),
     candles: Object.freeze(candleShapes),
     emaPoints: Object.freeze(emaPoints),
+    ema9Points: Object.freeze(ema9Points),
+    ema21Points: Object.freeze(ema21Points),
+    ema50Points: Object.freeze(ema50Points),
     positionLines: Object.freeze(positionLines),
     valveBadge: Object.freeze({
       gate_active: Boolean(effectiveValve.gate_active),
@@ -497,6 +511,11 @@ export function renderMarketChartSection(projection, state) {
       <div class="segmented" role="group" aria-label="Pair category">${catButtons}</div>
       <div class="segmented" role="group" aria-label="Candle timeframe">${tfButtons}</div>
       <div class="segmented" role="group" aria-label="Chart layout">${layoutButtons}</div>
+      <div class="segmented" role="group" aria-label="Chart zoom">
+        <button type="button" class="button button-small button-secondary" data-chart-zoom="in">+</button>
+        <button type="button" class="button button-small button-secondary" data-chart-zoom="reset">${e(String(state.chartZoomBars ?? 60))} bars</button>
+        <button type="button" class="button button-small button-secondary" data-chart-zoom="out">-</button>
+      </div>
     </div>
     <div class="market-workspace-grid">
       <aside class="market-watchlist" aria-label="Currency pair watchlist">${watchlistItems}</aside>
@@ -577,6 +596,7 @@ function drawSingleCanvas(canvas, pairStream, state, hoverX = null) {
     brokerPositions: state.aiTrader?.openPositions ?? [],
     valveStatus: state.marketStream?.valve_status ?? null,
     microBars: state.chartMicroBars?.[pairStream.pair] ?? [],
+    zoomBars: state.chartZoomBars ?? 60,
     width: cssW,
     height: cssH,
   });
@@ -624,16 +644,23 @@ function drawSingleCanvas(canvas, pairStream, state, hoverX = null) {
     ctx.fillRect(c.x, c.bodyTopY, c.width, c.bodyHeight);
   }
 
-  // 14-period EMA overlay
-  if (geom.emaPoints.length > 1) {
-    ctx.strokeStyle = pal.ema;
-    ctx.lineWidth = 1.6;
-    ctx.beginPath();
-    geom.emaPoints.forEach((pt, idx) => {
-      if (idx === 0) ctx.moveTo(pt.x, pt.y);
-      else ctx.lineTo(pt.x, pt.y);
-    });
-    ctx.stroke();
+  // EMA 9 / 21 / 50 + EMA-14 overlays
+  for (const [pts, col, lw] of [
+    [geom.emaPoints, pal.ema, 1.4],
+    [geom.ema9Points, '#10b981', 1.2],
+    [geom.ema21Points, '#f59e0b', 1.2],
+    [geom.ema50Points, '#8b5cf6', 1.2],
+  ]) {
+    if (Array.isArray(pts) && pts.length > 1) {
+      ctx.strokeStyle = col;
+      ctx.lineWidth = lw;
+      ctx.beginPath();
+      pts.forEach((pt, idx) => {
+        if (idx === 0) ctx.moveTo(pt.x, pt.y);
+        else ctx.lineTo(pt.x, pt.y);
+      });
+      ctx.stroke();
+    }
   }
 
   // Live Bid & Ask horizontal rays
@@ -718,6 +745,12 @@ export function mountMarketCharts(root, state) {
       canvas.addEventListener('pointerleave', () => {
         drawSingleCanvas(canvas, pairStream, state, null);
       });
+      canvas.addEventListener('wheel', (ev) => {
+        ev.preventDefault();
+        const cur = Number(state.chartZoomBars ?? 60);
+        state.chartZoomBars = Math.max(20, Math.min(200, cur + (ev.deltaY > 0 ? 12 : -12)));
+        drawSingleCanvas(canvas, pairStream, state, null);
+      }, { passive: false });
     }
   }
 }

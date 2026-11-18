@@ -8,6 +8,7 @@ import { ScopedBridge, createAuthenticatedLoopbackBridge } from './bridge.mjs';
 import { ALL_WATCHLIST_MARKETS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts } from './chart.mjs';
 import { MAX_BROKER_ROUTING_BYTES, normalizeBrokerRouting } from './broker-routing.mjs';
 import { MAX_AI_PAYLOAD_BYTES, normalizeAiModels, normalizeAiTrader, normalizeIndexStream } from './ai-overseer.mjs';
+import { MAX_TREASURY_BYTES, mountAnalyticsCanvases, normalizeParallelTiers, normalizeTreasury } from './analytics.mjs';
 
 // Fixed same-origin assets. Only explicit trusted bootstrap may inject a scoped bridge.
 const schemaURL = new URL('../docs/contracts/cockpit.schema.json', document.baseURI);
@@ -23,7 +24,8 @@ let sharedSchema = null;
 let reviewSchema = null;
 let rawReviewSchema = null;
 let marketSchema = null;
-let liveEventSource = null;
+const SESSION_TOKEN_KEY = 'cas_forex_bearer_token';
+let liveSseAbort = null;
 let controller = null;
 let dialogContext = null;
 let lastBridgeProjection = null;
@@ -37,18 +39,29 @@ try {
   const tok = bootParams.get('token');
   if (tok && tok.trim().length >= 16 && !/[\r\n\0]/.test(tok)) {
     loopbackAuthToken = tok.trim();
+    try { window.sessionStorage?.setItem?.(SESSION_TOKEN_KEY, loopbackAuthToken); } catch { /* Optional storage */ }
     bootParams.delete('token');
     const qs = bootParams.toString();
     const cleanPath = `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`;
     window.history?.replaceState?.(null, '', cleanPath);
+  } else {
+    const stored = window.sessionStorage?.getItem?.(SESSION_TOKEN_KEY);
+    if (stored && stored.trim().length >= 16 && !/[\r\n\0]/.test(stored)) {
+      loopbackAuthToken = stored.trim();
+    }
   }
 } catch { /* Static preview has no token query. */ }
 
-/** Explicitly set or clear the in-memory per-launch loopback bearer token (never stored in Web Storage). */
+/** Explicitly set or clear the origin-scoped loopback bearer token (sessionStorage + memory, zero cookies). */
 export function setLoopbackAuthToken(token) {
-  if (token === null) { loopbackAuthToken = null; return; }
+  if (token === null) {
+    loopbackAuthToken = null;
+    try { window.sessionStorage?.removeItem?.(SESSION_TOKEN_KEY); } catch { /* Ignore */ }
+    return;
+  }
   if (typeof token !== 'string' || token.trim().length < 16 || /[\r\n\0]/.test(token)) throw new Error('Invalid loopback auth token.');
   loopbackAuthToken = token.trim();
+  try { window.sessionStorage?.setItem?.(SESSION_TOKEN_KEY, loopbackAuthToken); } catch { /* Ignore */ }
 }
 let state = {
   projection: null, source: 'none', loadedAt: null, schemaReady: false,
@@ -58,6 +71,7 @@ let state = {
   marketStream: null, chartPair: 'EURUSD', chartTimeframe: 'M5', chartLayout: 'single', chartCategory: 'all',
   liveStreamConnected: false, chartMicroBars: {}, brokerRouting: null,
   aiModels: null, aiTrader: null, indexStream: null, aiActionBusy: false, aiIssue: null,
+  treasury: null, parallelTiers: null, chartZoomBars: 60, inspectedTradeIdx: 0,
 };
 
 function routeFromHash() {
@@ -70,7 +84,7 @@ function render(focusMain = false) {
   const identity = root.contains(active) && active?.tagName === 'BUTTON' ? JSON.stringify(active.dataset) : null;
   document.documentElement.dataset.theme = state.theme;
   replaceSafeHTML(root, renderApp(state));
-  try { mountMarketCharts(root, state); } catch { /* Chart canvas optional in headless environments. */ }
+  try { mountMarketCharts(root, state); mountAnalyticsCanvases(root, state); } catch { /* Chart canvas optional in headless environments. */ }
   try { explainer?.sync(); } catch { disableExplainer(); }
   document.title = `${state.route[0].toUpperCase() + state.route.slice(1)} / CAS Forex`;
   if (focusMain) document.querySelector('#main').focus({ preventScroll: true });
@@ -194,8 +208,79 @@ function recordMicroTick(envelope) {
 }
 
 function stopLoopbackStream() {
-  if (liveEventSource) { liveEventSource.close(); liveEventSource = null; }
+  if (liveSseAbort) { liveSseAbort.abort(); liveSseAbort = null; }
   state.liveStreamConnected = false;
+}
+
+function handleSseEvent(eventName, dataText) {
+  if (eventName === 'market') {
+    try {
+      const nextEnv = decodeMarketStream(dataText, marketSchema);
+      state.marketStream = nextEnv;
+      recordMicroTick(nextEnv);
+      if (controller?.attached) void controller.refresh().catch(() => {});
+      else render();
+    } catch { /* Ignore malformed frame. */ }
+  } else if (eventName === 'ai_trader') {
+    try {
+      state.aiTrader = normalizeAiTrader(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
+      render();
+    } catch { /* Ignore malformed ai_trader frame. */ }
+  } else if (eventName === 'ai_models') {
+    try {
+      state.aiModels = normalizeAiModels(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
+      render();
+    } catch { /* Ignore malformed ai_models frame. */ }
+  } else if (eventName === 'treasury') {
+    try {
+      state.treasury = normalizeTreasury(parseUniqueJSON(dataText, MAX_TREASURY_BYTES));
+      render();
+    } catch { /* Ignore malformed treasury frame. */ }
+  } else if (eventName === 'parallel_tiers') {
+    try {
+      state.parallelTiers = normalizeParallelTiers(parseUniqueJSON(dataText, MAX_TREASURY_BYTES));
+      render();
+    } catch { /* Ignore malformed parallel_tiers frame. */ }
+  }
+}
+
+async function startFetchSseStream(abortCtrl) {
+  const sseURL = new URL('/api/market-events', window.location.origin);
+  if (sseURL.origin !== window.location.origin) throw new Error('SSE requires same-origin loopback URL.');
+  const headers = { Accept: 'text/event-stream' };
+  if (loopbackAuthToken) headers.Authorization = `Bearer ${loopbackAuthToken}`;
+  const resp = await fetch(sseURL, {
+    method: 'GET',
+    credentials: 'omit',
+    cache: 'no-store',
+    redirect: 'error',
+    headers,
+    signal: abortCtrl.signal,
+  });
+  if (!resp.ok || !resp.body) throw new Error(`SSE stream failed (${resp.status}).`);
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder('utf-8', { fatal: false });
+  let buffer = '';
+  try {
+    while (!abortCtrl.signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() ?? '';
+      for (const blk of blocks) {
+        let evName = 'message';
+        const dataLines = [];
+        for (const line of blk.split(/\r?\n/)) {
+          if (line.startsWith('event:')) evName = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+        }
+        if (dataLines.length > 0) handleSseEvent(evName, dataLines.join('\n'));
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
 }
 
 async function connectLoopbackLiveFeed() {
@@ -206,31 +291,12 @@ async function connectLoopbackLiveFeed() {
   state.marketStream = decoded;
   recordMicroTick(decoded);
   stopLoopbackStream();
-  if (typeof window.EventSource === 'function') {
-    const es = new window.EventSource('/api/market-events');
-    es.addEventListener('market', (ev) => {
-      try {
-        const nextEnv = decodeMarketStream(ev.data, marketSchema);
-        state.marketStream = nextEnv;
-        recordMicroTick(nextEnv);
-        if (controller?.attached) void controller.refresh().catch(() => {});
-        else render();
-      } catch { /* Ignore malformed frame. */ }
+  if (loopbackAuthToken) {
+    const abortCtrl = new AbortController();
+    liveSseAbort = abortCtrl;
+    void startFetchSseStream(abortCtrl).catch(() => {
+      if (liveSseAbort === abortCtrl) { stopLoopbackStream(); render(); }
     });
-    es.addEventListener('ai_trader', (ev) => {
-      try {
-        state.aiTrader = normalizeAiTrader(parseUniqueJSON(ev.data, MAX_AI_PAYLOAD_BYTES));
-        render();
-      } catch { /* Ignore malformed ai_trader frame. */ }
-    });
-    es.addEventListener('ai_models', (ev) => {
-      try {
-        state.aiModels = normalizeAiModels(parseUniqueJSON(ev.data, MAX_AI_PAYLOAD_BYTES));
-        render();
-      } catch { /* Ignore malformed ai_models frame. */ }
-    });
-    es.onerror = () => { stopLoopbackStream(); render(); };
-    liveEventSource = es;
   }
   state.liveStreamConnected = true;
   if (!controller?.attached) {
@@ -275,6 +341,14 @@ async function readAiCockpitFeeds() {
     const rawIndex = await readStatic(new URL('/api/index-stream', window.location.origin), MAX_MARKET_STREAM_BYTES);
     state.indexStream = normalizeIndexStream(parseUniqueJSON(rawIndex, MAX_MARKET_STREAM_BYTES));
   } catch { state.indexStream = null; }
+  try {
+    const rawTreas = await readStatic(new URL('/api/treasury', window.location.origin), MAX_TREASURY_BYTES);
+    state.treasury = normalizeTreasury(parseUniqueJSON(rawTreas, MAX_TREASURY_BYTES));
+  } catch { state.treasury = null; }
+  try {
+    const rawTiers = await readStatic(new URL('/api/parallel-tiers', window.location.origin), MAX_TREASURY_BYTES);
+    state.parallelTiers = normalizeParallelTiers(parseUniqueJSON(rawTiers, MAX_TREASURY_BYTES));
+  } catch { state.parallelTiers = null; }
 }
 
 async function postLoopbackJson(pathname, payload) {
@@ -285,7 +359,7 @@ async function postLoopbackJson(pathname, payload) {
   const headers = { 'Content-Type': 'application/json' };
   if (loopbackAuthToken) headers.Authorization = `Bearer ${loopbackAuthToken}`;
   const response = await fetch(url, {
-    method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+    method: 'POST', credentials: 'omit', cache: 'no-store', redirect: 'error',
     headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000),
   });
   const raw = await response.text();
@@ -306,6 +380,43 @@ async function sendOverseerAction(action) {
     announce(`Overseer action ${action} applied.`);
   } catch (error) {
     state.aiIssue = error instanceof Error ? error.message : 'Overseer action failed.';
+    announce(state.aiIssue);
+  } finally {
+    state.aiActionBusy = false;
+    render();
+  }
+}
+
+async function setThinkingDepth(depth) {
+  if (state.aiActionBusy) return;
+  state.aiActionBusy = true;
+  state.aiIssue = null;
+  render();
+  try {
+    const res = await postLoopbackJson('/api/thinking-depth', { thinking_depth: depth });
+    state.aiModels = normalizeAiModels(res);
+    await readAiCockpitFeeds();
+    announce(`Thinking depth set to ${depth}.`);
+  } catch (error) {
+    state.aiIssue = error instanceof Error ? error.message : 'Thinking depth update failed.';
+    announce(state.aiIssue);
+  } finally {
+    state.aiActionBusy = false;
+    render();
+  }
+}
+
+async function updateTreasuryConfig(patch) {
+  if (state.aiActionBusy) return;
+  state.aiActionBusy = true;
+  state.aiIssue = null;
+  render();
+  try {
+    const res = await postLoopbackJson('/api/treasury-config', patch);
+    state.treasury = normalizeTreasury(res);
+    announce('Profit-Sweep Bank Vault configuration updated.');
+  } catch (error) {
+    state.aiIssue = error instanceof Error ? error.message : 'Treasury config update failed.';
     announce(state.aiIssue);
   } finally {
     state.aiActionBusy = false;
@@ -383,7 +494,7 @@ async function readStatic(url, maximumBytes = MAX_SNAPSHOT_BYTES) {
   if (url.origin !== window.location.origin || !['http:', 'https:'].includes(url.protocol)) throw new Error('Static assets require an approved same-origin HTTP preview. File-URL loading is unavailable.');
   const isApi = url.pathname === '/api' || url.pathname.startsWith('/api/');
   const headers = isApi && loopbackAuthToken ? { Authorization: `Bearer ${loopbackAuthToken}` } : {};
-  const response = await fetch(url, { method: 'GET', credentials: isApi ? 'same-origin' : 'omit', cache: 'no-store', redirect: 'error', headers, signal: AbortSignal.timeout(10000) });
+  const response = await fetch(url, { method: 'GET', credentials: 'omit', cache: 'no-store', redirect: 'error', headers, signal: AbortSignal.timeout(10000) });
   if (!response.ok) throw new Error(`Shared static asset unavailable (${response.status}).`);
   if (Number(response.headers.get('content-length')) > maximumBytes) throw new Error('Shared static asset exceeds the display size limit.');
   if (!response.body) throw new Error('Shared static asset has no readable body.');
@@ -477,6 +588,27 @@ root.addEventListener('click', (event) => {
   if (target.dataset.chartCat && ['all', 'US_INDEX', 'MAJOR', 'CROSS'].includes(target.dataset.chartCat)) {
     state.chartCategory = target.dataset.chartCat; render();
     root.querySelector(`[data-chart-cat="${state.chartCategory}"]`)?.focus(); return;
+  }
+  if (target.dataset.chartZoom) {
+    const z = target.dataset.chartZoom;
+    if (z === 'reset') state.chartZoomBars = 60;
+    else if (z === 'in') state.chartZoomBars = Math.max(20, (state.chartZoomBars ?? 60) - 15);
+    else if (z === 'out') state.chartZoomBars = Math.min(200, (state.chartZoomBars ?? 60) + 15);
+    render(); return;
+  }
+  if (target.dataset.thinkingDepth) {
+    void setThinkingDepth(target.dataset.thinkingDepth); return;
+  }
+  if (target.dataset.treasuryRail) {
+    void updateTreasuryConfig({ preferred_rail: target.dataset.treasuryRail }); return;
+  }
+  if (target.dataset.treasuryAction === 'TOGGLE_AUTO_SWEEP') {
+    const nextAuto = !(state.treasury?.autoSweepEnabled ?? true);
+    void updateTreasuryConfig({ auto_sweep_enabled: nextAuto }); return;
+  }
+  if (target.dataset.inspectTrade) {
+    state.inspectedTradeIdx = Math.max(0, Number(target.dataset.inspectTrade) || 0);
+    render(); return;
   }
   if (target.dataset.route) { window.location.hash = target.dataset.route; return; }
   if (target.dataset.control) { dialogContext = target.dataset.control; openDialog(renderControlDialog(target.dataset.control, state.transport), target); return; }

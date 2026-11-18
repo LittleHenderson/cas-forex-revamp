@@ -1028,6 +1028,7 @@ def provision_or_load_ceremony_key_vault(
     *,
     run_id: str,
     bundle_dir: Path | str | None = None,
+    allow_create: bool = False,
 ) -> dict[str, Ed25519Keypair]:
     vdir = Path(key_vault_dir)
     if bundle_dir is not None:
@@ -1043,6 +1044,11 @@ def provision_or_load_ceremony_key_vault(
         if len({kp.signer_sha256 for kp in loaded.values()}) != len(CEREMONY_ROLES):
             raise RuntimeError("DUPLICATE_ROLE_CUSTODY_FORBIDDEN: duplicate role keys in ceremony vault")
         return loaded
+    if not allow_create:
+        raise RuntimeError(
+            f"EXTERNAL_KEY_VAULT_REQUIRED: pre-provisioned ceremony key vault missing at {vdir}; "
+            "production paths never self-provision keys"
+        )
 
     is_root_posix = os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0
     vdir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1090,6 +1096,21 @@ def provision_or_load_ceremony_key_vault(
 
     apply_verified_directory_mode(vdir, 0o700)
     return keypairs
+
+
+def provision_ceremony_key_vault(
+    key_vault_dir: Path | str,
+    *,
+    run_id: str,
+    bundle_dir: Path | str | None = None,
+) -> dict[str, Ed25519Keypair]:
+    """Explicit out-of-band / rehearsal key-vault provisioning helper separated from production loaders."""
+    return provision_or_load_ceremony_key_vault(
+        key_vault_dir,
+        run_id=run_id,
+        bundle_dir=bundle_dir,
+        allow_create=True,
+    )
 
 
 def write_pinned_trust_roots(
@@ -1246,6 +1267,7 @@ def mint_owner_stageb_custody_bundle(
     key_vault_dir: Path | str | None = None,
     trust_roots_path: Path | str | None = None,
     trust_roots_gid: int | None = None,
+    allow_create_vault: bool = False,
 ) -> dict[str, Any]:
     if not re.fullmatch(r"fx-b-[a-f0-9]{16}", run_id):
         raise ValueError(f"Stage B run_id must match ^fx-b-[a-f0-9]{{16}}$, got {run_id!r}")
@@ -1270,7 +1292,7 @@ def mint_owner_stageb_custody_bundle(
     top_sha = topology_sha256 or sha256(f"topology|{ceremony_seed}|{run_id}".encode()).hexdigest()
     win_sha = original_window_sha256 or sha256(f"window|{not_before_utc}|{expires_at_utc}|{run_id}".encode()).hexdigest()
 
-    keypairs = provision_or_load_ceremony_key_vault(vdir, run_id=run_id, bundle_dir=out)
+    keypairs = provision_or_load_ceremony_key_vault(vdir, run_id=run_id, bundle_dir=out, allow_create=allow_create_vault)
     documents, r6_def = build_custody_documents(ceremony_seed=ceremony_seed)
     canonical_doc_digests = {name: canonical_sha256(doc) for name, doc in documents.items()}
 
@@ -1470,6 +1492,15 @@ def mint_owner_stageb_custody_bundle(
         "trust_roots_path": trust_roots_ref["path"],
         "trust_roots_sha256": trust_roots_ref["sha256"],
     }
+
+
+def mint_rehearsal_stageb_custody_bundle(
+    output_dir: Path | str,
+    **kwargs: object,
+) -> dict[str, Any]:
+    """Explicit test/rehearsal wrapper enabling external vault provisioning outside verification paths."""
+    kwargs.setdefault("allow_create_vault", True)
+    return mint_owner_stageb_custody_bundle(output_dir, **kwargs)  # type: ignore[arg-type]
 
 
 def verify_ceremony_authority_bundle(
@@ -1894,10 +1925,20 @@ def _is_executable_artifact(rel_path: Path, src_mode: int) -> bool:
     return False
 
 
+def _check_source_entry_safety(path: Path, st: os.stat_result, *, enforce_posix_modes: bool, is_file: bool) -> None:
+    if is_file and getattr(st, "st_nlink", 1) != 1:
+        raise RuntimeError(f"Refusing hardlinked file in Stage B source tree (st_nlink={st.st_nlink}): {path}")
+    if enforce_posix_modes and (st.st_mode & 0o022) != 0:
+        raise RuntimeError(f"Refusing group/world-writable Stage B source entry ({oct(stat.S_IMODE(st.st_mode))}): {path}")
+
+
 def _validate_regular_source_tree(
     src_dir: Path,
-) -> tuple[Path, tuple[int, int], dict[Path, tuple[int, int]], list[tuple[Path, int, int, bool]]]:
-    """Pre-scan source tree with followlinks=False + lstat, rejecting symlinks and non-regular files before any copy."""
+    *,
+    enforce_posix_modes: bool | None = None,
+) -> tuple[Path, tuple[int, int], dict[Path, tuple[int, int]], list[tuple[Path, int, int, int, int, int, bool]]]:
+    """Pre-scan source tree with followlinks=False + lstat, rejecting symlinks, hardlinks, unsafe modes, and non-regular files."""
+    enforce_modes = (os.name == "posix") if enforce_posix_modes is None else bool(enforce_posix_modes)
     if not os.path.lexists(src_dir):
         raise RuntimeError(f"Stage B source tree missing: {src_dir}")
     root_lstat = os.lstat(src_dir)
@@ -1905,6 +1946,7 @@ def _validate_regular_source_tree(
         raise RuntimeError(f"Refusing symlink source root: {src_dir}")
     if not stat.S_ISDIR(root_lstat.st_mode):
         raise RuntimeError(f"Stage B source root is not a directory: {src_dir}")
+    _check_source_entry_safety(src_dir, root_lstat, enforce_posix_modes=enforce_modes, is_file=False)
 
     canonical_src = src_dir.resolve(strict=True)
     canon_stat = canonical_src.stat()
@@ -1912,13 +1954,14 @@ def _validate_regular_source_tree(
         raise RuntimeError(f"Source root identity changed during canonical resolution: {src_dir}")
 
     dir_inodes: dict[Path, tuple[int, int]] = {Path("."): (root_lstat.st_dev, root_lstat.st_ino)}
-    file_entries: list[tuple[Path, int, int, bool]] = []
+    file_entries: list[tuple[Path, int, int, int, int, int, bool]] = []
 
     for root, dirs, files in os.walk(src_dir, topdown=True, followlinks=False, onerror=_raise_walk_error):
         rp = Path(root)
         r_st = os.lstat(rp)
         if _is_symlink_or_reparse(rp, r_st) or not stat.S_ISDIR(r_st.st_mode):
             raise RuntimeError(f"Refusing symlink or non-directory during walk: {rp}")
+        _check_source_entry_safety(rp, r_st, enforce_posix_modes=enforce_modes, is_file=False)
         r_res = rp.resolve(strict=True)
         if r_res != canonical_src and not r_res.is_relative_to(canonical_src):
             raise RuntimeError(f"Directory escaped Stage B source root: {rp}")
@@ -1936,6 +1979,7 @@ def _validate_regular_source_tree(
                 raise RuntimeError(f"Refusing directory symlink in Stage B source tree: {dp}")
             if not stat.S_ISDIR(d_st.st_mode):
                 raise RuntimeError(f"Refusing non-directory entry in Stage B source tree: {dp}")
+            _check_source_entry_safety(dp, d_st, enforce_posix_modes=enforce_modes, is_file=False)
             d_res = dp.resolve(strict=True)
             if not d_res.is_relative_to(canonical_src):
                 raise RuntimeError(f"Subdirectory escaped Stage B source root: {dp}")
@@ -1950,6 +1994,7 @@ def _validate_regular_source_tree(
                 raise RuntimeError(f"Refusing file symlink in Stage B source tree: {fp}")
             if not stat.S_ISREG(f_st.st_mode):
                 raise RuntimeError(f"Refusing non-regular file in Stage B source tree: {fp}")
+            _check_source_entry_safety(fp, f_st, enforce_posix_modes=enforce_modes, is_file=True)
             f_res = fp.resolve(strict=True)
             if not f_res.is_relative_to(canonical_src):
                 raise RuntimeError(f"File escaped Stage B source root: {fp}")
@@ -1959,7 +2004,15 @@ def _validate_regular_source_tree(
             rel_fp = fp.relative_to(src_dir)
             if ".." in rel_fp.parts:
                 raise RuntimeError(f"Forbidden parent traversal in file relative path: {rel_fp}")
-            file_entries.append((rel_fp, f_st.st_dev, f_st.st_ino, _is_executable_artifact(rel_fp, f_st.st_mode)))
+            file_entries.append((
+                rel_fp,
+                f_st.st_dev,
+                f_st.st_ino,
+                f_st.st_size,
+                getattr(f_st, "st_mtime_ns", 0),
+                getattr(f_st, "st_ctime_ns", 0),
+                _is_executable_artifact(rel_fp, f_st.st_mode),
+            ))
 
     return canonical_src, (root_lstat.st_dev, root_lstat.st_ino), dir_inodes, file_entries
 
@@ -1972,12 +2025,17 @@ def _open_nofollow_beneath(
     dir_inodes: dict[Path, tuple[int, int]],
     expected_dev: int,
     expected_ino: int,
+    expected_size: int | None = None,
+    expected_mtime_ns: int | None = None,
+    expected_ctime_ns: int | None = None,
+    enforce_posix_modes: bool = False,
 ) -> int:
-    """Open regular file strictly beneath canonical_src with O_NOFOLLOW and verify fstat (st_dev, st_ino) + S_ISREG."""
+    """Open regular file strictly beneath canonical_src with O_NOFOLLOW and verify hardlink/mode/fstat identity."""
     full_path = canonical_src / rel_path
     cur_lstat = os.lstat(full_path)
     if _is_symlink_or_reparse(full_path, cur_lstat) or not stat.S_ISREG(cur_lstat.st_mode):
         raise RuntimeError(f"Concurrent symlink or non-regular swap detected before open: {full_path}")
+    _check_source_entry_safety(full_path, cur_lstat, enforce_posix_modes=enforce_posix_modes, is_file=True)
     if (cur_lstat.st_dev, cur_lstat.st_ino) != (expected_dev, expected_ino):
         raise RuntimeError(f"Concurrent source inode swap detected before open: {full_path}")
 
@@ -2012,8 +2070,15 @@ def _open_nofollow_beneath(
         fd_st = os.fstat(fd)
         if not stat.S_ISREG(fd_st.st_mode) or stat.S_ISLNK(fd_st.st_mode):
             raise RuntimeError(f"Opened descriptor is not a regular file: {full_path}")
+        _check_source_entry_safety(full_path, fd_st, enforce_posix_modes=enforce_posix_modes, is_file=True)
         if (fd_st.st_dev, fd_st.st_ino) != (expected_dev, expected_ino):
             raise RuntimeError(f"Opened descriptor inode mismatch (concurrent swap): {full_path}")
+        if expected_size is not None and fd_st.st_size != expected_size:
+            raise RuntimeError(f"Opened descriptor size mismatch (concurrent modification): {full_path}")
+        if expected_mtime_ns is not None and getattr(fd_st, "st_mtime_ns", 0) != expected_mtime_ns:
+            raise RuntimeError(f"Opened descriptor mtime mismatch (concurrent modification): {full_path}")
+        if expected_ctime_ns is not None and getattr(fd_st, "st_ctime_ns", 0) != expected_ctime_ns:
+            raise RuntimeError(f"Opened descriptor ctime mismatch (concurrent modification): {full_path}")
         proc_fd_link = Path(f"/proc/self/fd/{fd}")
         if sys.platform == "linux" and proc_fd_link.exists():
             real_opened = Path(os.readlink(proc_fd_link))
@@ -2051,11 +2116,14 @@ def _materialize_regular_tree(
     dir_mode: int = 0o550,
     file_mode: int = 0o440,
     exec_file_mode: int = 0o550,
+    expected_sha256_map: dict[str, str] | None = None,
+    enforce_posix_modes: bool | None = None,
     _pre_open_hook: Callable[[Path], None] | None = None,
-) -> None:
-    """Materialize a verified symlink-free regular file tree with O_NOFOLLOW + fstat checks and least-privilege modes."""
+) -> dict[str, dict[str, Any]]:
+    """Materialize a verified symlink/hardlink-free tree with held-fd pre/post fstat + streamed SHA-256 checks."""
     if (dir_mode & 0o027) or (file_mode & 0o027) or (exec_file_mode & 0o027):
         raise ValueError("Stage B tree materialization forbids world-accessible or group-writable modes")
+    enforce_modes = (os.name == "posix") if enforce_posix_modes is None else bool(enforce_posix_modes)
     src_path = Path(src_dir)
     dst_path = Path(dst_dir)
     if os.path.lexists(dst_path):
@@ -2065,8 +2133,10 @@ def _materialize_regular_tree(
         if not stat.S_ISDIR(dst_st.st_mode) or any(dst_path.iterdir()):
             raise RuntimeError(f"Refusing pre-existing non-empty destination root: {dst_path}")
 
-    # Phase 1: Complete no-follow lstat + containment scan BEFORE creating any destination directory/file
-    canonical_src, root_ino, dir_inodes, file_entries = _validate_regular_source_tree(src_path)
+    # Phase 1: Complete no-follow lstat + containment + hardlink + mode scan BEFORE creating any destination entry
+    canonical_src, root_ino, dir_inodes, file_entries = _validate_regular_source_tree(
+        src_path, enforce_posix_modes=enforce_modes
+    )
 
     # Phase 2: Descriptor-verified copy with O_NOFOLLOW + fstat == lstat and atomic cleanup on error
     created_new_dst = not dst_path.exists()
@@ -2101,7 +2171,9 @@ def _materialize_regular_tree(
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_BINARY", 0)
         )
-        for rel_fp, exp_dev, exp_ino, is_exec in file_entries:
+        streamed_digests: dict[str, dict[str, Any]] = {}
+        for rel_fp, exp_dev, exp_ino, exp_size, exp_mtime_ns, exp_ctime_ns, is_exec in file_entries:
+            rel_posix = rel_fp.as_posix()
             if _pre_open_hook is not None:
                 _pre_open_hook(canonical_src / rel_fp)
             sfd = _open_nofollow_beneath(
@@ -2111,15 +2183,24 @@ def _materialize_regular_tree(
                 dir_inodes=dir_inodes,
                 expected_dev=exp_dev,
                 expected_ino=exp_ino,
+                expected_size=exp_size,
+                expected_mtime_ns=exp_mtime_ns,
+                expected_ctime_ns=exp_ctime_ns,
+                enforce_posix_modes=enforce_modes,
             )
             target_fp = dst_path / rel_fp
             try:
+                pre_st = os.fstat(sfd)
+                stream_hasher = sha256()
+                bytes_copied = 0
                 dfd = os.open(target_fp, wflags, 0o600)
                 try:
                     while True:
                         chunk = os.read(sfd, 1048576)
                         if not chunk:
                             break
+                        stream_hasher.update(chunk)
+                        bytes_copied += len(chunk)
                         view = memoryview(chunk)
                         written = 0
                         while written < len(view):
@@ -2127,6 +2208,25 @@ def _materialize_regular_tree(
                     os.fsync(dfd)
                 finally:
                     os.close(dfd)
+                post_st = os.fstat(sfd)
+                if (
+                    post_st.st_dev != pre_st.st_dev
+                    or post_st.st_ino != pre_st.st_ino
+                    or getattr(post_st, "st_nlink", 1) != 1
+                    or post_st.st_size != pre_st.st_size
+                    or getattr(post_st, "st_mtime_ns", 0) != getattr(pre_st, "st_mtime_ns", 0)
+                    or getattr(post_st, "st_ctime_ns", 0) != getattr(pre_st, "st_ctime_ns", 0)
+                    or bytes_copied != pre_st.st_size
+                ):
+                    raise RuntimeError(f"TOCTOU source descriptor mutation detected during copy: {canonical_src / rel_fp}")
+                streamed_hex = stream_hasher.hexdigest()
+                if _sha256_file(target_fp) != streamed_hex:
+                    raise RuntimeError(f"Destination digest diverged from held source fd stream: {target_fp}")
+                if expected_sha256_map is not None:
+                    expected_hex = expected_sha256_map.get(rel_posix)
+                    if expected_hex is None or streamed_hex != expected_hex:
+                        raise RuntimeError(f"Expected source manifest digest mismatch for {rel_posix}")
+                streamed_digests[rel_posix] = {"bytes": bytes_copied, "sha256": streamed_hex}
             finally:
                 os.close(sfd)
             apply_verified_regular_file_mode(target_fp, exec_file_mode if is_exec else file_mode)
@@ -2134,6 +2234,7 @@ def _materialize_regular_tree(
         for rel_dir in sorted(dir_inodes.keys(), key=lambda p: len(p.parts), reverse=True):
             td = dst_path if rel_dir == Path(".") else (dst_path / rel_dir)
             apply_verified_directory_mode(td, dir_mode)
+        return streamed_digests
     except BaseException:
         if created_new_dst:
             _cleanup_partial_tree(dst_path)
@@ -2151,6 +2252,7 @@ def prepare_guest_stageb_root(
     automation_execution_id: str = "auto-stageb-ceremony-0001",
     key_vault_dir: Path | str | None = None,
     trust_roots_path: Path | str | None = None,
+    allow_self_provision_vault: bool = False,
 ) -> dict[str, Any]:
     if sys.platform != "linux" or os.geteuid() != 0:
         raise RuntimeError("prepare_guest_stageb_root requires Linux guest root (uid 0)")
@@ -2183,8 +2285,9 @@ def prepare_guest_stageb_root(
 
     dst_base.mkdir(parents=True, exist_ok=False, mode=0o700)
     os.chown(dst_base, 0, stageb_gid)
+    streamed_trees: dict[str, dict[str, dict[str, Any]]] = {}
     for sub in ("source", "runtime", "models"):
-        _materialize_regular_tree(
+        streamed_trees[sub] = _materialize_regular_tree(
             src_base / sub,
             dst_base / sub,
             dir_mode=0o550,
@@ -2234,14 +2337,23 @@ def prepare_guest_stageb_root(
 
     src_dir = dst_base / "source"
     src_manifest_files, all_files = [], []
+    source_stream_map = streamed_trees["source"]
+    seen_src_rels: set[str] = set()
     for fp in sorted(src_dir.rglob("*")):
         if fp.is_file():
+            rel_posix = str(fp.relative_to(src_dir)).replace(os.sep, "/")
+            seen_src_rels.add(rel_posix)
             entry_full = {"path": str(fp), "bytes": fp.stat().st_size, "sha256": _sha256_file(fp)}
+            stream_row = source_stream_map.get(rel_posix)
+            if stream_row is None or stream_row["bytes"] != entry_full["bytes"] or stream_row["sha256"] != entry_full["sha256"]:
+                raise RuntimeError(f"Staged source manifest digest mismatch vs held descriptor: {rel_posix}")
             all_files.append(entry_full)
             src_manifest_files.append({
-                "path": str(fp.relative_to(src_dir)).replace(os.sep, "/"),
+                "path": rel_posix,
                 "bytes": entry_full["bytes"], "sha256": entry_full["sha256"],
             })
+    if seen_src_rels != set(source_stream_map.keys()):
+        raise RuntimeError("Staged source tree inventory mismatch against streamed descriptors")
 
     asset_files = []
     for folder in (dst_base / "runtime", dst_base / "models"):
@@ -2290,6 +2402,7 @@ def prepare_guest_stageb_root(
         key_vault_dir=resolved_vault,
         trust_roots_path=resolved_roots,
         trust_roots_gid=stageb_gid,
+        allow_create_vault=allow_self_provision_vault,
     )
 
     pin_doc = json.loads((src_dir / "docs/operator/stage-b-runtime-pin.json").read_text(encoding="utf-8"))
@@ -2414,6 +2527,10 @@ def main(argv: list[str] | None = None) -> int:
     p_ver.add_argument("--expected-config-sha256", default=None)
     p_ver.add_argument("--require-pinned-cryptography", action="store_true")
 
+    p_prov = sub.add_parser("provision-vault")
+    p_prov.add_argument("--run-id", default=DEFAULT_RUN_ID)
+    p_prov.add_argument("--key-vault-dir", type=Path, default=None)
+
     p_prep = sub.add_parser("prepare-guest")
     p_prep.add_argument("--existing-guest-root", type=Path, required=True)
     p_prep.add_argument("--run-id", default=DEFAULT_RUN_ID)
@@ -2424,10 +2541,16 @@ def main(argv: list[str] | None = None) -> int:
     p_prep.add_argument("--automation-execution-id", default="auto-stageb-ceremony-0001")
     p_prep.add_argument("--key-vault-dir", type=Path, default=None)
     p_prep.add_argument("--trust-roots", type=Path, default=None)
+    p_prep.add_argument("--allow-rehearsal-key-provisioning", action="store_true")
 
     args = parser.parse_args(argv)
+    if args.cmd == "provision-vault":
+        vpath = args.key_vault_dir if args.key_vault_dir is not None else default_linux_key_vault_dir(args.run_id)
+        kps = provision_ceremony_key_vault(vpath, run_id=args.run_id)
+        print(json.dumps({"status": "VAULT_PROVISIONED", "run_id": args.run_id, "key_vault_dir": str(vpath), "roles": sorted(kps.keys())}))
+        return 0
     if args.cmd == "mint":
-        res = mint_owner_stageb_custody_bundle(
+        res = mint_rehearsal_stageb_custody_bundle(
             args.output_dir, ceremony_seed=args.ceremony_seed,
             run_id=args.run_id, not_before_utc=args.not_before_utc,
             key_vault_dir=args.key_vault_dir, trust_roots_path=args.trust_roots)
@@ -2453,7 +2576,8 @@ def main(argv: list[str] | None = None) -> int:
             ceremony_seed=args.ceremony_seed, seed=args.seed,
             instance_id=args.instance_id, security_group_id=args.security_group_id,
             automation_execution_id=args.automation_execution_id,
-            key_vault_dir=args.key_vault_dir, trust_roots_path=args.trust_roots)))
+            key_vault_dir=args.key_vault_dir, trust_roots_path=args.trust_roots,
+            allow_self_provision_vault=args.allow_rehearsal_key_provisioning)))
         return 0
     return 1
 

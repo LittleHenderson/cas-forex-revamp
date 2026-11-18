@@ -40,7 +40,13 @@ from cas_forex_revamp.valve.tks_meta_valve_controller import (
     ValveDecision,
     compute_drawdown_pct,
 )
-from .external_paper_broker import EXECUTION_MODE_LIVE, EXPANDED_FX_PAIRS, OandaPracticePaperClient, assert_safe_json_numbers
+from .external_paper_broker import (
+    EXECUTION_MODE_LIVE,
+    EXPANDED_FX_PAIRS,
+    OandaOutcomeUnknownError,
+    OandaPracticePaperClient,
+    assert_safe_json_numbers,
+)
 from .live_market_stream import INDEX_INSTRUMENTS
 from .mt5_broker_bridge import (
     BROKER_HUGOSWAY_MT5,
@@ -1079,7 +1085,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                     quote_guard=oracle.guard(reference, verdicts),
                     margin_guard=margin_guard,
                 )
-            except Mt5OutcomeUnknownError:
+            except (Mt5OutcomeUnknownError, OandaOutcomeUnknownError):
                 self._record(trail, broker_id, "OUTCOME_UNKNOWN", "never re-routed")
                 raise
             except OffMarketBrokerQuoteError as exc:

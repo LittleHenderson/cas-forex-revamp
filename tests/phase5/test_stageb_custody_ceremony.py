@@ -52,6 +52,7 @@ from ceremony_generator import (
     audit_counterpart_traps_with_valve_gate,
     build_public_aggregate_bundle,
     build_semantic_reviews_for_attempts,
+    mint_rehearsal_stageb_custody_bundle,
     mint_owner_stageb_custody_bundle,
     rfc8032_pubkey,
     rfc8032_sign,
@@ -237,7 +238,7 @@ class StageBCustodyCeremonyTests(unittest.TestCase):
         cls.source_manifest_sha = "1" * 64
         cls.asset_manifest_sha = "2" * 64
         cls.guest_base = f"/opt/cas-forex/{cls.run_id}"
-        cls.minted = mint_owner_stageb_custody_bundle(
+        cls.minted = mint_rehearsal_stageb_custody_bundle(
             cls.bundle_dir,
             ceremony_seed=DEFAULT_CEREMONY_SEED,
             run_id=cls.run_id,

@@ -11,7 +11,8 @@
     "phase_4_airgapped_aws_pilot": "VALIDATED",
     "phase_5_external_broker_and_stageb_custody": "VALIDATED",
     "phase_6_16pair_live_chart_and_lantern_hardening": "VALIDATED",
-    "phase_6_autonomous_ai_and_live_broker": "VALIDATED"
+    "phase_6_autonomous_ai_and_live_broker": "VALIDATED",
+    "phase_6_security14_pyramiding_treasury_2speed": "VALIDATED"
   },
   "stop_condition": "Keep merging passing AI-agent PRs continuously while revamp_completed is false. Set revamp_completed to true only after Lantern ameliorations and Phase 5+6 AWS end-to-end pilot validation pass.",
   "validation_receipts": {
@@ -81,6 +82,47 @@
       "ai_models_catalog_count": 9,
       "markets_total": 18,
       "zero_aws_residue": true
+    },
+    "phase_6_security14_pyramiding_treasury_2speed": {
+      "aws_run_id": "fx-b-8196bd51657d49cf",
+      "aws_instance_id": "i-0d9575bb402b14eb7",
+      "validated_source_commit_sha": "cb775ea784dcb416fd000128f2e5efd51fdd2fa7",
+      "source_manifest_sha256": "163f58da5cfe3839f75cc450602eb32a1c590df9e6aab22d5c01212a0e5164f2",
+      "pr_number": 10,
+      "export_archive_bytes": 15191832,
+      "export_archive_sha256": "471a3b94434797dd48021c3ea3145cb4b59e42285b1d276be2db4972b54764c6",
+      "lantern_version": "0.11.0",
+      "lantern_preseal_score": 100,
+      "lantern_airgap_score": 100,
+      "lantern_critical_high_medium_findings": 0,
+      "pip_audit_vulns": 0,
+      "npm_audit_ok": true,
+      "bandit_src_findings": 0,
+      "pytest_junit_tests": 1430,
+      "node_ui_passed": 127,
+      "suite18_groups_passed": 18,
+      "suite18_tests_passed": 1757,
+      "stageb_run_id": "fx-b-296c86b68ad6bf66",
+      "stageb_calls_passed": 32,
+      "stageb_traps_blocked": 17,
+      "stageb_public_aggregate_status": "ACCEPT",
+      "unit3b_checks_passed": 30,
+      "unit3b_model_calls_passed": 11,
+      "ctt_rows_evaluated": 3634,
+      "valve_parameter_count": 161,
+      "ai_models_catalog_count": 9,
+      "markets_total": 18,
+      "parallel_account_tiers": 5,
+      "security_findings_remediated": 14,
+      "billed_seconds": 4352,
+      "compute_cost_usd_exact": "0.208896000000",
+      "ipv4_cost_usd_exact": "0.006044444444",
+      "combined_cost_usd_exact": "0.214940444444",
+      "cumulative_pilot_billed_seconds": 67761,
+      "cumulative_pilot_spend_usd_exact": "3.252528000000",
+      "zero_aws_residue": true,
+      "pytest_passed": 1061,
+      "pytest_subtests_passed": 369
     }
   }
 }

@@ -63,6 +63,17 @@ from cas_forex_revamp.valve.tks_meta_valve_controller import (
     ValveDecision,
     ValveRefusalError,
 )
+from cas_forex_revamp.composition.trend_regime import (
+    MAX_PYRAMID_LEGS,
+    PyramidLegSnapshot,
+    REGIME_CHOP_RANGE,
+    REGIME_SPREAD_SPIKE,
+    REGIME_STRONG_TREND,
+    REGIME_TREND_IGNITION,
+    TrendRegimeDetector,
+    evaluate_correlation_cap,
+    evaluate_house_money_pyramid_leg,
+)
 from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
 from cas_forex_revamp.venue.live_market_stream import EXPANDED_MARKETS, INDEX_INSTRUMENTS
 from cas_forex_revamp.venue.mt5_broker_bridge import (
@@ -164,6 +175,8 @@ class AutonomousAiTrader:
         clock: Callable[[], datetime] | None = None,
         execution_gate: Callable[[ModelInvocation], None] | None = None,
         protection_overrides: Mapping[str, Mapping[str, Decimal]] | None = None,
+        profit_vault: Any | None = None,
+        parallel_tiers: Any | None = None,
     ) -> None:
         if not isinstance(router, DualShieldBrokerRouter):
             raise ContractError("AutonomousAiTrader requires a DualShieldBrokerRouter")
@@ -182,7 +195,11 @@ class AutonomousAiTrader:
         self._owner_verifier = owner_verifier
         self._fast_tick_ms = fast_tick_ms
         self._clock = clock or _utc_now
-        self._execution_gate = execution_gate or (lambda _inv: None)
+        if execution_gate is None or not callable(execution_gate):
+            raise ContractError(
+                "AutonomousAiTrader requires an explicit execution_gate (DurableModelExecutionGate); no-op fallback is forbidden"
+            )
+        self._execution_gate = execution_gate
         self._journal_path = Path(journal_path) if journal_path is not None else None
         self._scope = scope or RunScope(
             account_id="dual-shield-barbell",
@@ -194,7 +211,14 @@ class AutonomousAiTrader:
             adapter_id="autonomous-ai-trader",
         )
         self._protection_overrides = {str(k): dict(v) for k, v in (protection_overrides or {}).items()}
+        self._profit_vault = profit_vault
+        self._parallel_tiers = parallel_tiers
         self._lock = RLock()
+        self._inference_lock = RLock()
+        self._trend_detector = TrendRegimeDetector()
+        self._last_regime = REGIME_TREND_IGNITION
+        self._last_effective_effort = "low"
+        self._last_pyramid_leg = False
         self._governance_mode = GOVERNANCE_ACTIVE
         self._governance_reason = "Autonomous AI loop initialized under ForexMetaValveGate."
         self._cycle_seq = 0
@@ -740,6 +764,140 @@ class AutonomousAiTrader:
             qty -= step_units
         return qty.normalize()
 
+    def _assess_setup_and_pyramid(
+        self,
+        markets: Mapping[str, Mapping[str, Any]],
+        *,
+        quotes_map: Mapping[str, tuple[Decimal, Decimal]],
+        total_eq: Decimal,
+        deployable_eq: Decimal,
+        risk_mult: Decimal,
+        fast_tick: bool,
+        allow_cold_open: bool,
+    ) -> tuple[str, Side, Decimal, Decimal, str, str, bool, str | None, int] | None:
+        """Scan watchlist with TrendRegimeDetector, House-Money ADD pyramiding, and correlation cap."""
+        ordered_syms = list(INDEX_INSTRUMENTS) + [s for s in markets if s not in INDEX_INSTRUMENTS]
+        open_meta_list = list(self._open_position_meta.values())
+        for sym in ordered_syms:
+            info = markets.get(sym)
+            if not info:
+                continue
+            try:
+                bid = Decimal(str(info["bid"]))
+                ask = Decimal(str(info["ask"]))
+            except (KeyError, ValueError, TypeError, ArithmeticError):
+                continue
+            if ask <= bid:
+                continue
+            spread = ask - bid
+            params = self._protection_cfg(sym, max(risk_mult, Decimal("0.50")))
+            hist = list(self._tick_history.get(sym, ()))
+            if len(hist) < 3:
+                if fast_tick and sym not in INDEX_INSTRUMENTS:
+                    continue
+                continue
+            mids = [(b + a) / Decimal("2") for b, a in hist[-50:]]
+            regime_res = self._trend_detector.classify(
+                mids=mids,
+                spread=spread,
+                normal_sl_distance=params["sl_distance"],
+            )
+            if regime_res.regime in (REGIME_SPREAD_SPIKE, REGIME_CHOP_RANGE) or regime_res.direction is None:
+                # Preserve direct 3-tick fast-ignition burst detection when mids delta >= 3x spread
+                tail_mids = mids[-5:]
+                burst = tail_mids[-1] - tail_mids[0]
+                exp_min = spread * Decimal("3") if sym in INDEX_INSTRUMENTS else spread * Decimal("4")
+                if not (abs(burst) >= exp_min and spread <= params["sl_distance"] * Decimal("0.25")):
+                    continue
+                side = Side.BUY if burst > Decimal("0") else Side.SELL
+                regime_name = REGIME_TREND_IGNITION
+                setup_note = f"50ms burst delta={decimal_text(burst)} > spread-gate={decimal_text(exp_min)}"
+            else:
+                side = regime_res.direction
+                regime_name = regime_res.regime
+                setup_note = regime_res.reason
+
+            matching = [
+                m for m in open_meta_list
+                if m.get("symbol") == sym and m.get("side") == side.value
+            ]
+            if matching:
+                if len(matching) >= MAX_PYRAMID_LEGS:
+                    continue
+                if regime_name not in (REGIME_STRONG_TREND, REGIME_TREND_IGNITION):
+                    continue
+                t_sz = _tick_size(sym)
+                entry_ref = ask if side is Side.BUY else bid
+                sl_px = (
+                    (bid - params["sl_distance"]).quantize(t_sz, rounding=ROUND_HALF_UP)
+                    if side is Side.BUY
+                    else (ask + params["sl_distance"]).quantize(t_sz, rounding=ROUND_HALF_UP)
+                )
+                cand_qty = self._compute_quantity(
+                    symbol=sym,
+                    side=side,
+                    bid=bid,
+                    ask=ask,
+                    sl_price=sl_px,
+                    total_equity=deployable_eq,
+                    risk_multiplier=risk_mult if risk_mult > Decimal("0") else Decimal("0.50"),
+                    quotes_map=quotes_map,
+                )
+                _, q_ccy = self._router.barbell._calc.split_symbol(sym)
+                conv = self._router.barbell._calc.conversion_rate(q_ccy, quotes_map) if quotes_map else Decimal("1")
+                legs = [
+                    PyramidLegSnapshot(
+                        ticket=str(m["ticket"]),
+                        symbol=sym,
+                        side=side,
+                        units=Decimal(str(m.get("volume_lots", "1"))) * (
+                            Decimal("1") if sym in INDEX_INSTRUMENTS else Decimal("100000")
+                        ),
+                        entry_price=Decimal(str(m["entry_price"])),
+                        stop_loss=Decimal(str(m["stop_loss"])) if m.get("stop_loss") else None,
+                        protection_stage=str(m.get("protection_stage", "INITIAL_SL")),
+                    )
+                    for m in matching
+                ]
+                pyr = evaluate_house_money_pyramid_leg(
+                    symbol=sym,
+                    side=side,
+                    regime=regime_name,
+                    existing_legs=legs,
+                    new_leg_entry=entry_ref,
+                    new_leg_stop=sl_px,
+                    new_leg_units=cand_qty,
+                    quote_to_usd=conv,
+                )
+                if not pyr.allowed:
+                    continue
+                return (
+                    sym,
+                    side,
+                    bid,
+                    ask,
+                    f"{setup_note} [{pyr.reason}]",
+                    regime_name,
+                    True,
+                    str(matching[0]["ticket"]),
+                    len(matching) + 1,
+                )
+
+            if not allow_cold_open:
+                continue
+            corr_ok, _ = evaluate_correlation_cap(
+                candidate_symbol=sym,
+                candidate_side=side,
+                open_positions=open_meta_list,
+                is_pyramid_add=False,
+            )
+            if not corr_ok:
+                continue
+            if fast_tick and sym not in INDEX_INSTRUMENTS and abs(mids[-1] - mids[-min(len(mids), 5)]) < spread * Decimal("4"):
+                continue
+            return sym, side, bid, ask, setup_note, regime_name, False, None, 1
+        return None
+
     def record_closed_pnl(
         self,
         pnl_usd: Decimal,
@@ -756,6 +914,14 @@ class AutonomousAiTrader:
             snap = self._quota.record_realized_trade(
                 pnl_usd, symbol=symbol, ticket=ticket, starting_equity=total_eq, now=ts
             )
+            if self._profit_vault is not None:
+                self._profit_vault.record_realized_close(
+                    trade_id=ticket,
+                    symbol=symbol,
+                    broker_id="DUAL_SHIELD",
+                    realized_net_usd=pnl_usd,
+                    occurred_at=ts,
+                )
             if not snap["new_risk_allowed"]:
                 self._governance_reason = str(snap["lock_reason"] or snap["status"])
         return snap
@@ -796,17 +962,17 @@ class AutonomousAiTrader:
         fast_tick: bool = False,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        """Run one deterministic + AI decision cycle behind ForexMetaValveGate & DailyQuotaLock."""
+        """Run one deterministic + AI decision cycle with non-blocking 50ms stop protection & 2-speed brain."""
         t0_ns = time.monotonic_ns()
         ts = self._now(now)
+
+        # Phase 1 (under self._lock): fast stop protection + market/setup/pyramid planning
         with self._lock:
             self._cycle_seq += 1
             cycle_id = f"cycle-{self._cycle_seq}"
             self._last_cadence = f"{self._fast_tick_ms}ms_FAST_TICK" if fast_tick else "STANDARD_18_MARKETS"
 
-            # 1) Always run instant snap-to-breakeven & trailing stop first
             prot_updates = self.evaluate_fast_protection(quotes=mt5_quotes, now=ts)
-
             markets = self._collect_market_quotes(stream_envelope, index_stream, mt5_quotes)
             quotes_map = {
                 s: (Decimal(str(m["bid"])), Decimal(str(m["ask"])))
@@ -816,22 +982,29 @@ class AutonomousAiTrader:
             equities = self._router.equities()
             total_eq = self._router.barbell.total_equity(equities)
             peak_eq = self._router.peak_equity() or total_eq
+            deployable_eq = self._profit_vault.deployable_equity(total_eq) if self._profit_vault is not None else total_eq
             self._quota.observe_day_start(total_eq, now=ts)
 
-            # 2) Governance & Daily Quota / Loss Circuit Gate before evaluating new OPENs
             allowed, quota_veto, risk_mult = self._quota.evaluate_new_risk(
                 ActionKind.OPEN, now=ts, starting_equity=total_eq
             )
-            if self._governance_mode != GOVERNANCE_ACTIVE or not allowed:
-                wait_reason = (
-                    quota_veto if not allowed else f"Overseer governance is {self._governance_mode}"
-                )
+            quota_status = self._quota.snapshot(now=ts, starting_equity=total_eq if total_eq > 0 else None)["status"]
+            strong_runner_eligible = (
+                self._governance_mode == GOVERNANCE_ACTIVE
+                and not allowed
+                and quota_status == QUOTA_STATUS_LOCKED
+            )
+
+            if self._governance_mode != GOVERNANCE_ACTIVE or (not allowed and not strong_runner_eligible):
+                wait_reason = quota_veto if not allowed else f"Overseer governance is {self._governance_mode}"
                 if not allowed:
                     self._veto_count += 1
                 self._last_action = "WAIT"
                 self._last_symbol = None
                 self._last_reason = str(wait_reason)
                 self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                if self._parallel_tiers is not None and quotes_map:
+                    self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
                 report = {
                     "schema": "cas-forex.ai-cycle/1",
                     "cycle_id": cycle_id,
@@ -847,13 +1020,26 @@ class AutonomousAiTrader:
                 self._append_journal_cycle(report)
                 return report
 
-            # 3) Check market opportunity setup across 18 markets
-            setup = self._detect_candidate_setup(markets, fast_tick=fast_tick)
+            setup = self._assess_setup_and_pyramid(
+                markets,
+                quotes_map=quotes_map,
+                total_eq=total_eq,
+                deployable_eq=deployable_eq,
+                risk_mult=Decimal("0.50") if strong_runner_eligible else risk_mult,
+                fast_tick=fast_tick,
+                allow_cold_open=allowed,
+            )
             if setup is None:
                 self._last_action = "WAIT"
                 self._last_symbol = None
-                self._last_reason = "No risk-compliant momentum or trend setup clears spread gate."
+                self._last_reason = (
+                    str(quota_veto)
+                    if strong_runner_eligible
+                    else "No risk-compliant momentum or trend setup clears spread/regime gate."
+                )
                 self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                if self._parallel_tiers is not None and quotes_map:
+                    self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
                 report = {
                     "schema": "cas-forex.ai-cycle/1",
                     "cycle_id": cycle_id,
@@ -869,8 +1055,9 @@ class AutonomousAiTrader:
                 self._append_journal_cycle(report)
                 return report
 
-            sym, side, bid, ask, setup_note = setup
-            params = self._protection_cfg(sym, risk_mult)
+            sym, side, bid, ask, setup_note, regime_name, is_pyramid_add, parent_ticket, leg_index = setup
+            eff_mult = Decimal("0.50") if strong_runner_eligible else risk_mult
+            params = self._protection_cfg(sym, eff_mult)
             t_sz = _tick_size(sym)
             entry_ref = ask if side is Side.BUY else bid
             if side is Side.BUY:
@@ -886,12 +1073,14 @@ class AutonomousAiTrader:
                 bid=bid,
                 ask=ask,
                 sl_price=sl_price,
-                total_equity=total_eq,
-                risk_multiplier=risk_mult,
+                total_equity=deployable_eq,
+                risk_multiplier=eff_mult,
                 quotes_map=quotes_map,
             )
             st_ref = self._build_state_ref(ts)
-            action_ref = f"ai-open-{sym.lower()}-{self._cycle_seq}"
+            act_prefix = "add" if is_pyramid_add else "open"
+            action_ref = f"ai-{act_prefix}-{sym.lower()}-{self._cycle_seq}"
+            req_kind = ActionKind.ADD if is_pyramid_add else ActionKind.OPEN
             intent = ActionIntent(
                 intent_id=f"intent-{action_ref}",
                 scope=self._scope,
@@ -899,24 +1088,38 @@ class AutonomousAiTrader:
                 opportunity_id=f"opp-{action_ref}",
                 action_ref=action_ref,
                 source_state=st_ref,
-                kind=ActionKind.OPEN,
+                kind=req_kind,
                 instrument_id=sym,
                 origin=DecisionOrigin.ACTUAL_MODEL,
                 created_at=ts,
                 expires_at=st_ref.valid_until,
                 quantity=qty,
                 side=side,
-                limit_price=entry_ref,
+                limit_price=None if is_pyramid_add else entry_ref,
                 stop_price=sl_price,
                 take_profit_price=tp_price,
+                target_id=parent_ticket if is_pyramid_add else None,
+                target_version=1 if is_pyramid_add else None,
             )
 
-            # 4) Optional Gemini Decision 1 Fast Scout gate before waking heavy models
             active_id = self._registry.active_model_id
+            req_timeframe = "H1" if is_pyramid_add else ("50ms" if fast_tick else ("M5" if regime_name == REGIME_STRONG_TREND else "M1"))
+            eff_depth = self._registry.resolve_reasoning_effort(
+                model_id=active_id,
+                timeframe=req_timeframe,
+                regime=regime_name,
+                symbol=sym,
+                is_pyramid_add=is_pyramid_add,
+            )
+            self._last_regime = regime_name
+            self._last_effective_effort = eff_depth
+            self._last_pyramid_leg = is_pyramid_add
+
             if (
                 self._registry.fast_scout_enabled
                 and active_id != "gemini-decision-1"
                 and self._registry.is_model_ready("gemini-decision-1")
+                and not is_pyramid_add
             ):
                 scout_q = [{
                     "market": sym,
@@ -925,6 +1128,22 @@ class AutonomousAiTrader:
                     "setup": setup_note,
                     "choices": ["WAIT", action_ref],
                 }]
+                if hasattr(self._execution_gate, "admit_scout_call"):
+                    self._execution_gate.admit_scout_call(model_id="gemini-decision-1", request_id=cycle_id, now=ts)
+                else:
+                    scout_spec, _, _ = self._registry.build_backend("gemini-decision-1")
+                    scout_inv = ModelInvocation(
+                        request_sha256=content_digest(scout_q),
+                        model=scout_spec,
+                        session_id=f"scout-{cycle_id}",
+                        system_policy=SYSTEM_POLICY,
+                        packet_json=canonical_bytes({"scout": scout_q}).decode("utf-8"),
+                        budget=InferenceBudget(
+                            max_calls=1, max_input_tokens_per_call=4096, max_generated_tokens_per_call=64,
+                            max_seconds_per_call=10, max_total_seconds=10,
+                        ),
+                    )
+                    self._execution_gate(scout_inv)
                 scout = self._registry.scout_opportunities(scout_q)
                 self._last_scout = scout
                 if scout.get("executed") and not scout.get("wake_heavy_model"):
@@ -932,12 +1151,16 @@ class AutonomousAiTrader:
                     self._last_symbol = sym
                     self._last_reason = f"Gemini Decision 1 Fast Scout held WAIT on {sym}"
                     self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                    if self._parallel_tiers is not None and quotes_map:
+                        self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
                     report = {
                         "schema": "cas-forex.ai-cycle/1",
                         "cycle_id": cycle_id,
                         "observed_at": _iso(ts),
-                        "model_id": "gemini-decision-1",
+                        "model_id": active_id,
                         "cadence": self._last_cadence,
+                        "thinking_depth": eff_depth,
+                        "regime": regime_name,
                         "action": "WAIT",
                         "symbol": sym,
                         "reason": self._last_reason,
@@ -947,16 +1170,19 @@ class AutonomousAiTrader:
                     self._append_journal_cycle(report)
                     return report
 
-            # 5) Invoke active Frontier (or last-resort offline fallback) model through ActualModelDecisionAdapter
             ev_id = f"ev-{cycle_id}-{sym.lower()}"
             fact_obj = {
                 "new_risk": True,
                 "management": True,
                 "equity": decimal_text(total_eq),
                 "peak_equity": decimal_text(peak_eq),
+                "deployable_equity": decimal_text(deployable_eq),
                 "bid": decimal_text(bid),
                 "ask": decimal_text(ask),
                 "signal": setup_note,
+                "regime": regime_name,
+                "pyramid_leg": leg_index,
+                "thinking_depth": eff_depth,
                 "sl": decimal_text(sl_price),
                 "tp": decimal_text(tp_price),
             }
@@ -964,19 +1190,27 @@ class AutonomousAiTrader:
                 request_id=f"req-{cycle_id}",
                 opportunity_set_id=f"set-{cycle_id}",
                 state=st_ref,
-                options=(ActionOption(action_ref, "ai-momentum-tp-sl", "50ms" if fast_tick else "M1", f"{side.value} {sym} {setup_note}"[:200], intent),),
+                options=(
+                    ActionOption(
+                        action_ref,
+                        "ai-pyramid-runner" if is_pyramid_add else "ai-momentum-tp-sl",
+                        req_timeframe,
+                        f"{req_kind.value} {side.value} {sym} {setup_note}"[:200],
+                        intent,
+                    ),
+                ),
                 facts=(DecisionFact(f"observed-{cycle_id}", "Observed market and barbell equity", canonical_bytes(fact_obj).decode("utf-8"), (ev_id,)),),
                 evidence=(EvidenceReference(ev_id, EvidenceKind.OBSERVATION, "autonomous-ai-trader", content_digest(fact_obj), ts),),
             )
-
-            spec, backend, verifier = self._registry.build_backend(active_id)
+            max_gen = 8192 if eff_depth == "high" else (4096 if eff_depth == "medium" else 512)
+            spec, backend, verifier = self._registry.build_backend(active_id, reasoning_effort=eff_depth)
             adapter = ActualModelDecisionAdapter(
                 adapter_id=f"adapter-{active_id.replace(':', '-')}",
                 model=spec,
                 budget=InferenceBudget(
                     max_calls=1,
                     max_input_tokens_per_call=16_384,
-                    max_generated_tokens_per_call=512,
+                    max_generated_tokens_per_call=max_gen,
                     max_seconds_per_call=25,
                     max_total_seconds=25,
                 ),
@@ -985,16 +1219,46 @@ class AutonomousAiTrader:
                 execution_gate=self._execution_gate,
                 clock=self._clock,
             )
+
+        # Phase 2 (OUTSIDE self._lock!): non-blocking 50ms stop protection remains free while AI thinks
+        with self._inference_lock:
             try:
                 dec_result = adapter.decide(req)
             except FrontierTransportError as exc:
-                self._veto_count += 1
-                self._last_error = str(exc)
-                self._registry.record_call(active_id, latency_ms=max(1, (time.monotonic_ns() - t0_ns) // 1_000_000), status="TRANSPORT_ERROR")
+                with self._lock:
+                    self._veto_count += 1
+                    self._last_error = str(exc)
+                    self._registry.record_call(
+                        active_id,
+                        latency_ms=max(1, (time.monotonic_ns() - t0_ns) // 1_000_000),
+                        status="TRANSPORT_ERROR",
+                        reasoning_effort=eff_depth,
+                    )
                 raise
 
-            call_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
-            self._registry.record_call(active_id, latency_ms=call_ms, status="OK")
+        # Phase 3 (re-acquire self._lock): verify governance still active -> Valve -> dual-shield execution
+        call_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+        with self._lock:
+            self._registry.record_call(active_id, latency_ms=call_ms, status="OK", reasoning_effort=eff_depth)
+            if self._governance_mode != GOVERNANCE_ACTIVE:
+                self._last_action = "WAIT"
+                self._last_symbol = sym
+                self._last_reason = f"Aborted post-inference: governance shifted to {self._governance_mode}"
+                self._last_cycle_ms = call_ms
+                return {
+                    "schema": "cas-forex.ai-cycle/1",
+                    "cycle_id": cycle_id,
+                    "observed_at": _iso(ts),
+                    "model_id": active_id,
+                    "cadence": self._last_cadence,
+                    "thinking_depth": eff_depth,
+                    "regime": regime_name,
+                    "action": "WAIT",
+                    "symbol": sym,
+                    "reason": self._last_reason,
+                    "valve_score": self._last_valve_score,
+                    "protection_updates": prot_updates,
+                }
 
             chosen_ref = dec_result.selection.selected_action_ref
             if chosen_ref is None:
@@ -1002,12 +1266,16 @@ class AutonomousAiTrader:
                 self._last_symbol = sym
                 self._last_reason = dec_result.selection.reason
                 self._last_cycle_ms = call_ms
+                if self._parallel_tiers is not None and quotes_map:
+                    self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
                 report = {
                     "schema": "cas-forex.ai-cycle/1",
                     "cycle_id": cycle_id,
                     "observed_at": _iso(ts),
                     "model_id": active_id,
                     "cadence": self._last_cadence,
+                    "thinking_depth": eff_depth,
+                    "regime": regime_name,
                     "action": "WAIT",
                     "symbol": sym,
                     "reason": self._last_reason,
@@ -1017,7 +1285,6 @@ class AutonomousAiTrader:
                 self._append_journal_cycle(report)
                 return report
 
-            # 6) Pass AI DecisionSelection through ForexMetaValveGate before router execution
             class _ModelProposal:
                 __slots__ = ("request", "result", "intent")
 
@@ -1026,6 +1293,9 @@ class AutonomousAiTrader:
                     self.result = d
                     self.intent = i
 
+            equities = self._router.equities()
+            total_eq = self._router.barbell.total_equity(equities)
+            peak_eq = self._router.peak_equity() or total_eq
             current_view = self._build_valve_view(
                 total_eq=total_eq,
                 peak_eq=peak_eq,
@@ -1040,11 +1310,22 @@ class AutonomousAiTrader:
                 self._veto_count += 1
                 self._last_action = "VALVE_VETOED"
                 self._last_symbol = sym
-                self._last_reason = f"ForexMetaValveGate vetoed {active_id} proposal on {sym}"
+                self._last_reason = f"ForexMetaValveGate vetoed {active_id} {req_kind.value} proposal on {sym}"
                 raise
 
-            order = OrderIntent.from_action_intent(intent, symbol=sym)
-            exec_res = self._router.execute_open(order, valve_decision=valve_dec)
+            # Execute protected broker leg via OrderIntent(OPEN) bound to ADD/OPEN ValveDecision
+            broker_order = OrderIntent(
+                order_id=str(intent.intent_id),
+                action_ref=str(intent.action_ref),
+                kind=ActionKind.OPEN,
+                symbol=sym,
+                quantity_units=qty,
+                side=side,
+                stop_price=sl_price,
+                limit_price=entry_ref,
+                take_profit_price=tp_price,
+            )
+            exec_res = self._router.execute_open(broker_order, valve_decision=valve_dec)
             ticket = (
                 exec_res.result.receipt.position_ticket
                 if exec_res.result.receipt is not None and exec_res.result.receipt.position_ticket
@@ -1066,16 +1347,37 @@ class AutonomousAiTrader:
                 "take_profit": decimal_text(tp_price),
                 "profit": "0",
                 "protection_stage": "INITIAL_SL",
+                "leg_index": leg_index,
+                "pyramid_parent_ticket": parent_ticket,
+                "regime": regime_name,
+                "thinking_depth": eff_depth,
             }
             self._peak_favorable[str(ticket)] = fill_px
             self._protection_stage[str(ticket)] = "INITIAL_SL"
 
             v_score_str = decimal_text(Decimal(f"{valve_dec.mlp_score:.8f}"))
             self._last_valve_score = v_score_str
-            self._last_action = f"OPEN_{side.value}"
+            self._last_action = f"{req_kind.value}_{side.value}"
             self._last_symbol = sym
-            self._last_reason = f"{dec_result.selection.reason} [exec={exec_res.executed_on} SL={decimal_text(sl_price)} TP={decimal_text(tp_price)}]"
+            self._last_reason = (
+                f"{dec_result.selection.reason} [exec={exec_res.executed_on} "
+                f"leg={leg_index} depth={eff_depth} SL={decimal_text(sl_price)} TP={decimal_text(tp_price)}]"
+            )
             self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+
+            if self._parallel_tiers is not None and quotes_map:
+                self._parallel_tiers.process_tick(
+                    quotes=quotes_map,
+                    signal={
+                        "symbol": sym,
+                        "side": side.value,
+                        "stop_price": decimal_text(sl_price),
+                        "take_profit_price": decimal_text(tp_price),
+                        "regime": regime_name,
+                    },
+                    now=ts,
+                )
+
             entry_log = {
                 "cycle_id": cycle_id,
                 "observed_at": _iso(ts),
@@ -1086,6 +1388,10 @@ class AutonomousAiTrader:
                 "ticket": str(ticket),
                 "stop_loss": decimal_text(sl_price),
                 "take_profit": decimal_text(tp_price),
+                "leg_index": leg_index,
+                "pyramid_parent_ticket": parent_ticket,
+                "regime": regime_name,
+                "thinking_depth": eff_depth,
                 "valve_score": v_score_str,
                 "reason": self._last_reason[:200],
             }
@@ -1190,6 +1496,8 @@ class AutonomousAiTrader:
         *,
         owner_request_id: str,
         reason: str,
+        recovery_token: str | None = None,
+        unlock_recovery_token: str | None = None,
         new_peak_equity: Decimal | None = None,
         owner_verifier: Any | None = None,
         fence_request: Any | None = None,
@@ -1198,15 +1506,50 @@ class AutonomousAiTrader:
         ts = self._now(now)
         with self._lock:
             verifier = owner_verifier or self._owner_verifier
-            if new_peak_equity is not None and verifier is not None:
-                self._router.rearm_drawdown(
-                    new_peak_equity=new_peak_equity,
-                    owner_verifier=verifier,
+            if verifier is None:
+                raise ContractError("OWNER_RECOVERY_VERIFIER_REQUIRED: rearm_and_unlock requires an OwnerRecoveryVerifier")
+            if new_peak_equity is not None:
+                if hasattr(verifier, "verify_and_consume") and fence_request is None:
+                    if not isinstance(recovery_token, str) or not recovery_token.strip():
+                        raise ContractError("OWNER_RECOVERY_TOKEN_REQUIRED: single-use token required to re-arm drawdown")
+                    verifier.verify_and_consume(
+                        recovery_token,
+                        expected_scope="REARM_DRAWDOWN",
+                        target_ref=self._router._drawdown_scope_id,
+                        owner_request_id=owner_request_id,
+                        now=ts,
+                    )
+                    self._router.rearm_drawdown(
+                        new_peak_equity=new_peak_equity,
+                        owner_verifier=lambda _req, _now: True,
+                        owner_request_id=owner_request_id,
+                        fence_request=fence_request,
+                        now=ts,
+                    )
+                else:
+                    self._router.rearm_drawdown(
+                        new_peak_equity=new_peak_equity,
+                        owner_verifier=verifier,
+                        owner_request_id=owner_request_id,
+                        fence_request=fence_request,
+                        now=ts,
+                    )
+                if unlock_recovery_token is not None:
+                    self._quota.unlock_session(
+                        owner_request_id=f"{owner_request_id}-q",
+                        reason=reason,
+                        recovery_verifier=verifier,
+                        recovery_token=unlock_recovery_token,
+                        now=ts,
+                    )
+            else:
+                self._quota.unlock_session(
                     owner_request_id=owner_request_id,
-                    fence_request=fence_request,
+                    reason=reason,
+                    recovery_verifier=verifier,
+                    recovery_token=recovery_token,
                     now=ts,
                 )
-            self._quota.unlock_session(owner_request_id=owner_request_id, reason=reason, now=ts)
             self._governance_mode = GOVERNANCE_ACTIVE
             self._governance_reason = f"Re-armed & unlocked ({owner_request_id})"
         return self.status_snapshot(now=ts)
@@ -1235,6 +1578,18 @@ class AutonomousAiTrader:
                 "active_model_id": cat_snap["active_model_id"],
                 "active_display_name": cat_snap["active_display_name"],
                 "active_model_status": cat_snap["active_status"],
+                "thinking_depth": cat_snap.get("thinking_depth", "AUTO"),
+                "valid_thinking_depths": cat_snap.get("valid_thinking_depths", ["AUTO", "LOW", "MEDIUM", "HIGH"]),
+                "last_effective_effort": self._last_effective_effort,
+                "last_latency_ms": cat_snap.get("last_latency_ms"),
+                "last_regime": self._last_regime,
+                "last_pyramid_leg": self._last_pyramid_leg,
+                "deployable_equity_usd": decimal_text(
+                    self._profit_vault.deployable_equity(total_eq) if self._profit_vault is not None else total_eq
+                ),
+                "bank_sweep_reserved_usd": (
+                    self._profit_vault.snapshot()["bank_sweep_reserved_usd"] if self._profit_vault is not None else "0"
+                ),
                 "fast_scout_enabled": cat_snap["fast_scout_enabled"],
                 "fast_scout_ready": cat_snap["fast_scout_ready"],
                 "cycle_count": int(self._cycle_seq),

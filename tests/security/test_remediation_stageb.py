@@ -44,6 +44,7 @@ from ceremony_generator import (
     build_semantic_reviews_for_attempts,
     canonical_json_bytes,
     canonical_sha256,
+    mint_rehearsal_stageb_custody_bundle,
     mint_owner_stageb_custody_bundle,
     render_stageb_selection_schema_bytes,
     sign_attestation_record,
@@ -85,7 +86,7 @@ class StageBSecurityRemediationTests(unittest.TestCase):
         cls.bundle_dir = cls.tmp_root / "valid_bundle"
         cls.vault_dir = cls.tmp_root / "external_vault"
         cls.trust_roots_path = cls.tmp_root / "pinned_trust_roots.json"
-        cls.minted = mint_owner_stageb_custody_bundle(
+        cls.minted = mint_rehearsal_stageb_custody_bundle(
             cls.bundle_dir,
             ceremony_seed=DEFAULT_CEREMONY_SEED,
             run_id=cls.run_id,
@@ -602,8 +603,14 @@ class StageBSecurityRemediationTests(unittest.TestCase):
         src_clean = self.tmp_root / "src_clean_tree"
         dst_clean = self.tmp_root / "dst_clean_tree"
         (src_clean / "nested").mkdir(parents=True, exist_ok=True)
+        if os.name == "posix":
+            os.chmod(src_clean, 0o755)  # nosec B103: intentional permissive source fixture to verify strict mode sanitization
+            os.chmod(src_clean / "nested", 0o755)  # nosec B103: intentional permissive source fixture to verify strict mode sanitization
         (src_clean / "nested/data.json").write_bytes(b'{"clean":true}')
         (src_clean / "nested/run.sh").write_bytes(b"#!/bin/sh\nexit 0\n")
+        if os.name == "posix":
+            os.chmod(src_clean / "nested/data.json", 0o644)
+            os.chmod(src_clean / "nested/run.sh", 0o755)  # nosec B103: intentional permissive source fixture to verify strict mode sanitization
 
         _materialize_regular_tree(src_clean, dst_clean, dir_mode=0o550, file_mode=0o440, exec_file_mode=0o550)
         try:

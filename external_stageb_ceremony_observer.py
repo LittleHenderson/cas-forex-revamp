@@ -26,6 +26,7 @@ import sys
 import time
 from typing import Any
 
+from source_runtime.systemd_ceilings import STAGEB_UNIT_CEILINGS, verify_unit_effective_ceilings
 from ceremony_generator import (
     Ed25519Keypair,
     PureRFC8032Verifier,
@@ -921,8 +922,7 @@ def build_ceremony_systemd_argv(
         "ReadOnlyPaths": base,
         "StateDirectory": unit,
         "StateDirectoryMode": "0700",
-        "MemoryMax": "12G",
-        "CPUQuota": "400%",
+        **STAGEB_UNIT_CEILINGS,
     }
     argv = ["systemd-run", "--unit=" + unit, "--wait", "--pipe"]
     argv.extend(f"--property={k}={v}" for k, v in properties.items())
@@ -1035,7 +1035,33 @@ def orchestrate_guest_ceremony(
         stderr=subprocess.PIPE,
         text=True,
     )
-    unit_proc = subprocess.run(unit_argv, env=clean_env, capture_output=True, text=True, check=False)
+    unit_name = "cas-forex-" + cfg["run_id"]
+    unit_handle = subprocess.Popen(unit_argv, env=clean_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    ceilings_verified = False
+    deadline_poll = time.monotonic() + 10.0
+    while unit_handle.poll() is None and time.monotonic() < deadline_poll:
+        state_res = subprocess.run(
+            ["/usr/bin/systemctl", "show", unit_name, "--property=ActiveState", "--value"],
+            capture_output=True, text=True, check=False, timeout=3,
+        )
+        if state_res.returncode == 0 and state_res.stdout.strip() in ("active", "activating"):
+            try:
+                verify_unit_effective_ceilings(unit_name, profile="stageb", timeout_seconds=3.0, runner=subprocess.run)
+            except Exception as exc:
+                subprocess.run(["/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=SIGKILL", unit_name], check=False, capture_output=True, timeout=3)
+                unit_handle.kill()
+                obs_proc.kill()
+                raise RuntimeError(f"STAGEB_CGROUP_CEILING_MISMATCH: {exc}") from exc
+            ceilings_verified = True
+            break
+        time.sleep(0.05)
+    if unit_handle.poll() is None and not ceilings_verified:
+        subprocess.run(["/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=SIGKILL", unit_name], check=False, capture_output=True, timeout=3)
+        unit_handle.kill()
+        obs_proc.kill()
+        raise RuntimeError(f"STAGEB_CGROUP_CEILING_UNVERIFIED: failed reading active ceilings for {unit_name}")
+    unit_out, unit_err = unit_handle.communicate()
+    unit_proc = subprocess.CompletedProcess(unit_argv, unit_handle.returncode, unit_out, unit_err)
     try:
         obs_out, obs_err = obs_proc.communicate(timeout=25)
     except subprocess.TimeoutExpired:

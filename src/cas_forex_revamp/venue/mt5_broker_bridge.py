@@ -52,7 +52,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation, localcontext
 from hashlib import sha256
 import importlib
@@ -63,12 +63,18 @@ import os
 from pathlib import Path
 import re
 import stat
+import hmac
+import secrets
 import time
 from typing import Any, Protocol
 
 from cas_forex_revamp.contracts import ActionKind, ContractError, Side, canonical_bytes, decimal_text, parse_decimal
 from cas_forex_revamp.contracts.primitives import decimal_value, identifier, utc_time
 from cas_forex_revamp.valve.tks_meta_valve_controller import ForexMetaValveGate, ValveDecision, ValveRefusalError
+from .live_auth_ticket import (
+    LiveAuthTicketError,
+    verify_live_environ_authorization,
+)
 from .external_paper_broker import (
     DEFAULT_OANDA_LIVE_BASE_URL,
     DEFAULT_OANDA_PRACTICE_BASE_URL,
@@ -148,7 +154,7 @@ logger = logging.getLogger(__name__)
 
 MT5_PLATFORM_CODE = "MT5"
 MT5_PLATFORM_NAME = "MetaTrader 5"
-MT5_SPOOL_PROTOCOL = "cas-forex-mt5-spool/1"
+MT5_SPOOL_PROTOCOL = "cas-forex-mt5-spool/2"
 MT5_CONTRACT_SIZE = Decimal("100000")
 MT5_INDEX_CONTRACT_SIZE = Decimal("1")
 MT5_VOLUME_STEP = Decimal("0.01")
@@ -375,6 +381,140 @@ def _sha256_flat(doc: Mapping[str, str]) -> str:
     return sha256(canonical_bytes(dict(doc))).hexdigest()
 
 
+def _canonical_spool_request_hmac_input(doc: Mapping[str, str]) -> str:
+    fields = (
+        "protocol",
+        "request_id",
+        "monotonic_nonce",
+        "issued_at",
+        "expires_at",
+        "broker_channel",
+        "account_login",
+        "server",
+        "execution_mode",
+        "valve_decision_sha256",
+        "action",
+        "symbol",
+        "side",
+        "volume",
+        "price",
+        "sl",
+        "tp",
+        "position_ticket",
+        "deviation_points",
+        "magic",
+        "comment",
+    )
+    return "|".join(str(doc.get(k, "")) for k in fields)
+
+
+def _canonical_spool_receipt_hmac_input(doc: Mapping[str, str]) -> str:
+    fields = (
+        "protocol",
+        "request_id",
+        "request_sha256",
+        "monotonic_nonce",
+        "status",
+        "retcode",
+        "position_ticket",
+        "deal_ticket",
+        "volume",
+        "price",
+        "sl",
+        "tp",
+        "account_trade_mode",
+        "server",
+        "observed_at",
+        "message",
+    )
+    return "|".join(str(doc.get(k, "")) for k in fields)
+
+
+def _spool_hmac_hex(key_bytes: bytes, message: str) -> str:
+    return hmac.new(key_bytes, message.encode("utf-8"), sha256).hexdigest()
+
+
+def _spool_meta_root(spool_dir: Path) -> Path:
+    if spool_dir.name.lower() in ("hugosway_mt5", "lhfx_mt5"):
+        return spool_dir.parent
+    return spool_dir
+
+
+def _spool_hmac_key_path(spool_dir: Path) -> Path:
+    return _spool_meta_root(spool_dir) / ".spool_hmac.key"
+
+
+def _load_or_create_spool_hmac_key(spool_dir: Path) -> bytes:
+    key_path = _spool_hmac_key_path(spool_dir)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(key_path):
+        st = os.lstat(key_path)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            raise Mt5TransportError("Refusing non-regular or symlink spool HMAC key file")
+        if os.name == "posix" and (st.st_mode & 0o077) != 0:
+            raise Mt5TransportError("Spool HMAC key file has unsafe group/world permissions")
+        raw = key_path.read_bytes().strip()
+        if len(raw) == 64:
+            return bytes.fromhex(raw.decode("ascii"))
+        if len(raw) >= 32:
+            return raw
+        raise Mt5TransportError("Spool HMAC key shorter than 32 bytes")
+    key_bytes = secrets.token_bytes(32)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    fd = os.open(key_path, flags, 0o600)
+    try:
+        os.write(fd, (key_bytes.hex() + "\n").encode("ascii"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if os.name == "posix":
+        os.chmod(key_path, 0o600)  # nosec B103: owner-only 0o600 MT5 spool HMAC key on verified regular fd
+    return key_bytes
+
+
+class _SpoolReplayLedger:
+    """Durable JSON replay & monotonic nonce ledger stored outside the terminal inbox directory."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def load(self) -> tuple[int, list[str]]:
+        if not os.path.lexists(self.path):
+            return 0, []
+        data = _read_spool_json(self.path, max_bytes=262_144)
+        if type(data) is not dict:
+            raise Mt5TransportError("corrupted MT5 spool replay ledger")
+        last_nonce = int(str(data.get("last_monotonic_nonce", "0")))
+        seen = [str(x) for x in (data.get("seen_request_ids") or ()) if isinstance(x, str)]
+        return last_nonce, seen[-512:]
+
+    def next_nonce(self) -> int:
+        last_nonce, seen = self.load()
+        nxt = last_nonce + 1
+        _atomic_write_json(
+            self.path,
+            {"last_monotonic_nonce": str(nxt), "seen_request_ids": seen[-512:]},
+        )
+        return nxt
+
+    def verify_and_record(self, *, request_id: str, nonce: int) -> None:
+        last_nonce, seen = self.load()
+        if nonce <= last_nonce or request_id in seen:
+            raise Mt5TransportError(f"MT5 spool replay detected (request_id={request_id}, nonce={nonce} <= {last_nonce})")
+        seen.append(request_id)
+        _atomic_write_json(
+            self.path,
+            {"last_monotonic_nonce": str(nonce), "seen_request_ids": seen[-512:]},
+        )
+
+
 def apply_verified_directory_mode(path: str | Path, dir_mode: int = 0o700) -> Path:
     """Apply a restrictive mode to an existing real directory (never a symlink or file).
 
@@ -412,17 +552,35 @@ def _atomic_write_json(path: Path, doc: Mapping[str, Any]) -> None:
 
 
 def _read_spool_json(path: Path, *, max_bytes: int = MAX_SPOOL_FILE_BYTES) -> Any:
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        raise
-    except OSError as exc:
-        raise Mt5TransportError(f"spool file {path.name} unreadable: {type(exc).__name__}") from None
-    if not stat.S_ISREG(st.st_mode):
-        raise Mt5TransportError(f"spool file {path.name} must be a regular file")
-    if st.st_size > max_bytes:
-        raise Mt5TransportError(f"spool file {path.name} exceeds {max_bytes} bytes")
-    raw = path.read_bytes()
+    last_perm_err: OSError | None = None
+    raw: bytes | None = None
+    for attempt in range(5):
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            raise
+        except PermissionError as exc:
+            last_perm_err = exc
+            time.sleep(0.005)
+            continue
+        except OSError as exc:
+            raise Mt5TransportError(f"spool file {path.name} unreadable: {type(exc).__name__}") from None
+        if not stat.S_ISREG(st.st_mode):
+            raise Mt5TransportError(f"spool file {path.name} must be a regular file")
+        if st.st_size > max_bytes:
+            raise Mt5TransportError(f"spool file {path.name} exceeds {max_bytes} bytes")
+        try:
+            raw = path.read_bytes()
+            break
+        except PermissionError as exc:
+            last_perm_err = exc
+            time.sleep(0.005)
+        except OSError as exc:
+            raise Mt5TransportError(f"spool file {path.name} unreadable: {type(exc).__name__}") from None
+    if raw is None:
+        raise Mt5TransportError(
+            f"spool file {path.name} unreadable after retry: {type(last_perm_err).__name__ if last_perm_err else 'OSError'}"
+        )
     if raw.startswith(b"\xef\xbb\xbf"):
         raw = raw[3:]
     try:
@@ -598,6 +756,7 @@ class Mt5Credentials:
     server: str
     password: _RedactedSecret | None = None
     execution_mode: str = EXECUTION_MODE_DEMO
+    live_auth_ticket_json: str | None = None
 
     def __post_init__(self) -> None:
         if self.broker_id not in (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
@@ -690,12 +849,25 @@ def load_mt5_credentials(
         raise Mt5NotConfiguredError(f"{spec.login_env} must be a numeric MT5 account login")
     if not password_raw and password_required:
         raise Mt5NotConfiguredError(f"{spec.login_env} and {spec.password_env} are required together")
+    live_ticket_json: str | None = None
+    if mode == EXECUTION_MODE_LIVE:
+        try:
+            ticket_obj = verify_live_environ_authorization(
+                environ,
+                expected_broker_id=broker_id,
+                expected_account_login=login_raw,
+                expected_server=str(server),
+            )
+            live_ticket_json = json.dumps(ticket_obj, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
+        except LiveAuthTicketError as exc:
+            raise LiveBrokerEndpointForbiddenError(f"{broker_id} LIVE ticket invalid: {exc}") from None
     return Mt5Credentials(
         broker_id=broker_id,
         login=int(login_raw),
         server=str(server),
         password=_RedactedSecret(password_raw) if password_raw else None,
         execution_mode=mode,
+        live_auth_ticket_json=live_ticket_json,
     )
 
 
@@ -1108,6 +1280,14 @@ class Mt5OrderRequest:
     comment: str
     created_at: datetime
     take_profit: Decimal | None = None
+    monotonic_nonce: int = 1
+    issued_at: datetime | None = None
+    expires_at: datetime | None = None
+    broker_channel: str = "hugosway_mt5"
+    account_login: str = "0"
+    server: str = ""
+    execution_mode: str = EXECUTION_MODE_DEMO
+    valve_decision_sha256: str = "" 
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_id, str) or not _SPOOL_ID_RE.fullmatch(self.request_id):
@@ -1136,9 +1316,19 @@ class Mt5OrderRequest:
         utc_time(self.created_at, "created_at")
 
     def _core_dict(self) -> dict[str, str]:
+        eff_issued = self.issued_at if self.issued_at is not None else self.created_at
+        eff_expires = self.expires_at if self.expires_at is not None else (eff_issued + timedelta(seconds=30))
         return {
             "protocol": MT5_SPOOL_PROTOCOL,
             "request_id": self.request_id,
+            "monotonic_nonce": str(self.monotonic_nonce),
+            "issued_at": _iso(eff_issued),
+            "expires_at": _iso(eff_expires),
+            "broker_channel": self.broker_channel,
+            "account_login": self.account_login,
+            "server": self.server,
+            "execution_mode": self.execution_mode,
+            "valve_decision_sha256": self.valve_decision_sha256,
             "action": self.action,
             "symbol": self.symbol,
             "side": self.side.value,
@@ -1576,13 +1766,17 @@ class Mt5SpoolBridgeTransport:
         self._max_leverage = max_leverage
         self._max_file_bytes = max_file_bytes
         self._credentials: Mt5Credentials | None = None
+        self._hmac_key: bytes | None = None
+        self._nonce_ledger = _SpoolReplayLedger(_spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.outbound_nonce.json")
 
     def __repr__(self) -> str:
         return f"Mt5SpoolBridgeTransport(spool_dir={self.spool_dir.name!r}, connected={self._credentials is not None})"
 
     def prepare_spool_directory(self) -> Path:
         self.spool_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        return apply_verified_directory_mode(self.spool_dir, 0o700)
+        apply_verified_directory_mode(self.spool_dir, 0o700)
+        self._hmac_key = _load_or_create_spool_hmac_key(self.spool_dir)
+        return self.spool_dir
 
     def connect(self, credentials: Mt5Credentials) -> Mt5AccountSnapshot:
         if not isinstance(credentials, Mt5Credentials):
@@ -1594,6 +1788,12 @@ class Mt5SpoolBridgeTransport:
             live_armed=(credentials.execution_mode == EXECUTION_MODE_LIVE),
         )
         self.prepare_spool_directory()
+        ticket_file = self.spool_dir / "live_auth_ticket.json"
+        if credentials.execution_mode == EXECUTION_MODE_DEMO:
+            if os.path.lexists(ticket_file):
+                ticket_file.unlink()
+        elif credentials.live_auth_ticket_json:
+            _atomic_write_bytes(ticket_file, credentials.live_auth_ticket_json.encode("ascii"))
         self._credentials = credentials
         try:
             snap = self.account_info()
@@ -1702,18 +1902,43 @@ class Mt5SpoolBridgeTransport:
             ))
         return tuple(out)
 
+    def prepare_request(self, request: Mt5OrderRequest) -> Mt5OrderRequest:
+        creds = self._require_connected()
+        if request.issued_at is not None and request.expires_at is not None and request.server == creds.server:
+            return request
+        mkt_doc = self._market_doc()
+        obs_raw = mkt_doc.get("observed_at")
+        term_now = _parse_iso(obs_raw, "observed_at") if isinstance(obs_raw, str) and obs_raw.strip() else _utc_now()
+        nonce_val = self._nonce_ledger.next_nonce()
+        eff_issued = request.issued_at if request.issued_at is not None else term_now
+        eff_expires = request.expires_at if request.expires_at is not None else (eff_issued + timedelta(seconds=30))
+        import dataclasses as _dc
+        return _dc.replace(
+            request,
+            monotonic_nonce=nonce_val,
+            issued_at=eff_issued,
+            expires_at=eff_expires,
+            broker_channel=creds.broker_id.lower(),
+            account_login=str(creds.login),
+            server=creds.server,
+            execution_mode=creds.execution_mode,
+        )
+
     def send_order(self, request: Mt5OrderRequest) -> Mt5OrderReceipt:
         creds = self._require_connected()
-        doc = request.to_spool_dict()
-        request_path = self.spool_dir / f"order_request_{request.request_id}.json"
-        receipt_path = self.spool_dir / f"order_receipt_{request.request_id}.json"
+        hmac_key = self._hmac_key if self._hmac_key is not None else _load_or_create_spool_hmac_key(self.spool_dir)
+        bound_req = self.prepare_request(request)
+        doc = bound_req.to_spool_dict()
+        doc["request_hmac_sha256"] = _spool_hmac_hex(hmac_key, _canonical_spool_request_hmac_input(doc))
+        request_path = self.spool_dir / f"order_request_{bound_req.request_id}.json"
+        receipt_path = self.spool_dir / f"order_receipt_{bound_req.request_id}.json"
         if request_path.exists() or receipt_path.exists():
-            raise Mt5TransportError(f"request_id {request.request_id} already present in spool; never resubmitted")
+            raise Mt5TransportError(f"request_id {bound_req.request_id} already present in spool; never resubmitted")
         _atomic_write_json(request_path, doc)
         deadline = self._monotonic() + self._timeout
         while True:
             if receipt_path.exists():
-                receipt = self._parse_receipt(receipt_path, request, creds)
+                receipt = self._parse_receipt(receipt_path, bound_req, creds, hmac_key=hmac_key)
                 try:
                     receipt_path.unlink()
                 except OSError as exc:
@@ -1725,7 +1950,14 @@ class Mt5SpoolBridgeTransport:
                 )
             self._sleep(self._poll)
 
-    def _parse_receipt(self, path: Path, request: Mt5OrderRequest, creds: Mt5Credentials) -> Mt5OrderReceipt:
+    def _parse_receipt(
+        self,
+        path: Path,
+        request: Mt5OrderRequest,
+        creds: Mt5Credentials,
+        *,
+        hmac_key: bytes | None = None,
+    ) -> Mt5OrderReceipt:
         doc = _read_spool_json(path, max_bytes=self._max_file_bytes)
         if type(doc) is not dict or doc.get("protocol") != MT5_SPOOL_PROTOCOL:
             raise Mt5TransportError("receipt protocol mismatch")
@@ -1733,6 +1965,13 @@ class Mt5SpoolBridgeTransport:
             raise Mt5TransportError("receipt values must all be strings")
         if doc.get("request_id") != request.request_id or doc.get("request_sha256") != request.request_sha256:
             raise Mt5TransportError("receipt does not bind the exact request_id/request_sha256")
+        if str(doc.get("monotonic_nonce", "")) != str(request.monotonic_nonce):
+            raise Mt5TransportError("receipt monotonic_nonce mismatch")
+        key = hmac_key if hmac_key is not None else _load_or_create_spool_hmac_key(self.spool_dir)
+        expected_mac = _spool_hmac_hex(key, _canonical_spool_receipt_hmac_input(doc))
+        actual_mac = str(doc.get("receipt_hmac_sha256", "")).lower()
+        if len(actual_mac) != 64 or not hmac.compare_digest(expected_mac, actual_mac):
+            raise Mt5TransportError("receipt HMAC-SHA256 verification failed")
         reported_mode = doc.get("account_trade_mode")
         if creds.execution_mode == EXECUTION_MODE_DEMO:
             if reported_mode != "DEMO":
@@ -1810,6 +2049,7 @@ class Mt5SpoolPaperTerminalEmulator:
         self._next_ticket = 500_000_001
         self._next_deal = 700_000_001
         self.processed: list[str] = []
+        self._replay_ledger = _SpoolReplayLedger(_spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.emu_replay.json")
 
     def set_quote(self, symbol: str, bid: Decimal, ask: Decimal) -> None:
         self.quotes[symbol] = (bid, ask)
@@ -1843,6 +2083,7 @@ class Mt5SpoolPaperTerminalEmulator:
 
     def publish_market(self) -> None:
         self.spool_dir.mkdir(parents=True, exist_ok=True)
+        _load_or_create_spool_hmac_key(self.spool_dir)
         floating = self._floating()
         used = self._used_margin()
         equity = self.balance + floating
@@ -1887,6 +2128,7 @@ class Mt5SpoolPaperTerminalEmulator:
             "protocol": MT5_SPOOL_PROTOCOL,
             "request_id": req["request_id"],
             "request_sha256": req["request_sha256"],
+            "monotonic_nonce": str(req.get("monotonic_nonce", "0")),
             "status": status,
             "retcode": str(retcode),
             "position_ticket": "0",
@@ -1901,6 +2143,8 @@ class Mt5SpoolPaperTerminalEmulator:
             "message": "",
         }
         out.update(extra)
+        hmac_key = _load_or_create_spool_hmac_key(self.spool_dir)
+        out["receipt_hmac_sha256"] = _spool_hmac_hex(hmac_key, _canonical_spool_receipt_hmac_input(out))
         return out
 
     def _deal_ticket(self) -> str:
@@ -1908,9 +2152,29 @@ class Mt5SpoolPaperTerminalEmulator:
         return str(self._next_deal)
 
     def _execute(self, req: Mapping[str, str]) -> dict[str, str]:
-        core = {k: v for k, v in req.items() if k != "request_sha256"}
+        core = {k: v for k, v in req.items() if k not in ("request_sha256", "request_hmac_sha256")}
         if req.get("protocol") != MT5_SPOOL_PROTOCOL or _sha256_flat(core) != req.get("request_sha256"):
             return self._receipt(req, "REJECTED", 10013, message="request hash mismatch")
+        hmac_key = _load_or_create_spool_hmac_key(self.spool_dir)
+        expected_mac = _spool_hmac_hex(hmac_key, _canonical_spool_request_hmac_input(req))
+        actual_mac = str(req.get("request_hmac_sha256", "")).lower()
+        if len(actual_mac) != 64 or not hmac.compare_digest(expected_mac, actual_mac):
+            return self._receipt(req, "REJECTED", 10013, message="request hmac mismatch")
+        try:
+            exp_dt = _parse_iso(req.get("expires_at"), "expires_at")
+            if self._clock() > exp_dt:
+                return self._receipt(req, "REJECTED", 10013, message="request expired")
+        except Exception:
+            return self._receipt(req, "REJECTED", 10013, message="invalid expires_at")
+        nonce_raw = str(req.get("monotonic_nonce", ""))
+        if not nonce_raw.isdigit() or int(nonce_raw) <= 0:
+            return self._receipt(req, "REJECTED", 10013, message="invalid monotonic_nonce")
+        try:
+            self._replay_ledger.verify_and_record(request_id=req["request_id"], nonce=int(nonce_raw))
+        except Mt5TransportError:
+            return self._receipt(req, "REJECTED", 10013, message="replayed nonce or request_id")
+        if str(req.get("account_login", "")) != str(self.login) or str(req.get("server", "")).casefold() != self.server.casefold():
+            return self._receipt(req, "REJECTED", 10017, message="account or server binding mismatch")
         action = req["action"]
         symbol = req["symbol"]
         if symbol not in self.quotes:
@@ -2242,6 +2506,11 @@ class Mt5PaperBrokerVenue:
         margin_check: Mt5MarginCheck | None = None
         request_id = self._next_request_id(order)
         comment = f"cas-{order.kind.value.lower()}"[:31]
+        valve_sha = sha256(canonical_bytes(decision.to_dict())).hexdigest()
+        v_channel = self.broker_id.lower()
+        v_login = str(self._credentials.login)
+        v_srv = self._credentials.server
+        v_mode = self._credentials.execution_mode
         if order.kind is ActionKind.OPEN:
             side = order.side
             units = order.quantity_units
@@ -2294,7 +2563,7 @@ class Mt5PaperBrokerVenue:
                 price=price, stop_loss=order.stop_price, position_ticket=None,
                 deviation_points=self._deviation, magic=self._magic, comment=comment, created_at=now,
                 take_profit=order.take_profit_price,
-            )
+            valve_decision_sha256=valve_sha, broker_channel=v_channel, account_login=v_login, server=v_srv, execution_mode=v_mode)
         else:
             ticket = str(order.position_ticket)
             pos = self._position(ticket)
@@ -2324,7 +2593,7 @@ class Mt5PaperBrokerVenue:
                     price=None, stop_loss=eff_stop, position_ticket=ticket,
                     deviation_points=self._deviation, magic=self._magic, comment=comment, created_at=now,
                     take_profit=eff_tp,
-                )
+                valve_decision_sha256=valve_sha, broker_channel=v_channel, account_login=v_login, server=v_srv, execution_mode=v_mode)
             else:
                 if order.kind is ActionKind.CLOSE:
                     lots = pos.volume_lots
@@ -2342,7 +2611,9 @@ class Mt5PaperBrokerVenue:
                     volume_lots=lots, price=tick.bid if closing_side is Side.SELL else tick.ask, stop_loss=None,
                     position_ticket=ticket, deviation_points=self._deviation, magic=self._magic,
                     comment=comment, created_at=now,
-                )
+                valve_decision_sha256=valve_sha, broker_channel=v_channel, account_login=v_login, server=v_srv, execution_mode=v_mode)
+        if hasattr(self._transport, "prepare_request"):
+            request = self._transport.prepare_request(request)
         try:
             receipt = self._transport.send_order(request)
         except Mt5OutcomeUnknownError:

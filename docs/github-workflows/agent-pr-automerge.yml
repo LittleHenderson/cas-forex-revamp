@@ -114,18 +114,30 @@ jobs:
                   print(f"PR #{num} ({title}): waiting for required CI jobs {missing}.")
                   continue
 
+              if not latest_by_name:
+                  print(f"PR #{num} ({title}): empty check_runs on {sha[:12]} — failing closed.")
+                  continue
               bad = [
                   f"{n}:{c.get('status')}/{c.get('conclusion')}"
                   for n, c in latest_by_name.items()
-                  if c.get("status") != "completed" or c.get("conclusion") not in ("success", "skipped", "neutral")
+                  if c.get("status") != "completed" or c.get("conclusion") != "success"
               ]
               if bad:
                   print(f"PR #{num} ({title}): checks not yet all green ({bad}) — waiting.")
                   continue
 
+              live_pr_res = subprocess.run(
+                  ["gh", "pr", "view", str(num), "--repo", repo, "--json", "headRefOid,baseRefName,state,isDraft"],
+                  capture_output=True, text=True, check=True,
+              )
+              live_pr = json.loads(live_pr_res.stdout)
+              if live_pr.get("headRefOid") != sha or live_pr.get("baseRefName") != "main" or live_pr.get("state") != "OPEN" or live_pr.get("isDraft"):
+                  print(f"PR #{num} ({title}): head/base/state changed before merge — aborting.")
+                  continue
+
               print(f"PR #{num} ({title}): all required CI checks PASSED on {sha[:12]} — merging now!")
               m_res = subprocess.run(
-                  ["gh", "pr", "merge", str(num), "--repo", repo, "--squash", "--delete-branch"],
+                  ["gh", "pr", "merge", str(num), "--repo", repo, "--squash", "--delete-branch", "--match-head-commit", sha],
                   capture_output=True, text=True,
               )
               print(m_res.stdout, m_res.stderr)

@@ -1,0 +1,817 @@
+"""Section B.5: 5-Tier Parallel Account Engine ($300, $1,000, $3,000, $6,000, $300,000).
+
+All 5 isolated account tiers subscribe to the single live 50ms market stream and single
+AI decision signal (zero extra AI API cost), enforcing exact bid/ask fills, realistic ECN
+commissions, 1:500 FX / 1:200 Index margin checks, ROUND_FLOOR 0.01 lot sizing with honest
+LOT_FLOOR_RISK_EXCEEDED vetoes when 0.01 lot exceeds 1.00% stop risk, independent
+ForexMetaValveGate admission, PeakEquityStore drawdown protection, DailyQuotaGovernanceStore,
+50%/50% ProfitSweepVault accumulation, and House-Money trend pyramiding.
+"""
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from contextlib import closing
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP, localcontext
+import json
+import os
+from pathlib import Path
+import sqlite3
+from threading import RLock
+from typing import Any
+import uuid
+
+from cas_forex_revamp.composition.trend_regime import (
+    PyramidLegSnapshot,
+    TrendRegimeDetector,
+    evaluate_house_money_pyramid_leg,
+)
+from datetime import timedelta
+from cas_forex_revamp.contracts import (
+    ActionKind,
+    ActionOption,
+    ContractError,
+    DecisionFact,
+    DecisionOrigin,
+    DecisionProvenance,
+    DecisionRequest,
+    DecisionResult,
+    DecisionSelection,
+    EvidenceKind,
+    EvidenceReference,
+    RunScope,
+    Side,
+    StateReference,
+    canonical_bytes,
+    content_digest,
+    decimal_text,
+)
+from cas_forex_revamp.contracts.commands import ActionIntent
+from cas_forex_revamp.contracts.primitives import decimal_value, utc_time
+from cas_forex_revamp.operator.decisions import DecisionProposal
+from cas_forex_revamp.treasury.profit_sweep import ProfitSweepVault
+from cas_forex_revamp.valve.daily_quota import DailyQuotaGovernanceStore
+from cas_forex_revamp.valve.tks_meta_valve_controller import (
+    DEFAULT_MAX_DRAWDOWN_PCT,
+    ForexMetaValveGate,
+    PeakEquityStore,
+)
+from cas_forex_revamp.venue.dual_shield_router import BarbellCapitalPolicy
+from cas_forex_revamp.venue.live_market_stream import INDEX_INSTRUMENTS
+from cas_forex_revamp.venue.mt5_broker_bridge import (
+    MT5_MIN_VOLUME,
+    MT5_VOLUME_STEP,
+    Mt5MarginCalculator,
+)
+
+
+@dataclass(frozen=True)
+class ParallelTierSpec:
+    tier_id: str
+    label: str
+    starting_capital_usd: Decimal
+    color_class: str
+
+
+DEFAULT_PARALLEL_TIER_SPECS: tuple[ParallelTierSpec, ...] = (
+    ParallelTierSpec("TIER_1_CURRENT", "Current Barbell ($300,000)", Decimal("300000.00"), "tier-300k"),
+    ParallelTierSpec("TIER_2_1000", "Tier $1,000 Starter", Decimal("1000.00"), "tier-1000"),
+    ParallelTierSpec("TIER_3_3000", "Tier $3,000 Growth", Decimal("3000.00"), "tier-3000"),
+    ParallelTierSpec("TIER_4_6000", "Tier $6,000 Accelerator", Decimal("6000.00"), "tier-6000"),
+    ParallelTierSpec("TIER_5_300", "Tier $300 Micro Challenge", Decimal("300.00"), "tier-300"),
+)
+
+ECN_FX_COMMISSION_PER_LOT_ROUND_TURN = Decimal("7.00")
+ECN_INDEX_COMMISSION_PER_CONTRACT_ROUND_TURN = Decimal("1.00")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(dt: datetime) -> str:
+    return utc_time(dt, "timestamp").isoformat().replace("+00:00", "Z")
+
+
+def _tick_size(symbol: str) -> Decimal:
+    if symbol in INDEX_INSTRUMENTS:
+        return Decimal("0.01")
+    if symbol.endswith("JPY"):
+        return Decimal("0.001")
+    return Decimal("0.00001")
+
+
+class _TierProposal:
+    """Typed CAS DecisionProposal wrapper presenting ``request``, ``result``, and ``intent`` to ForexMetaValveGate."""
+
+    def __init__(
+        self,
+        *,
+        scope: RunScope,
+        state_ref: StateReference,
+        req_id: str,
+        opp_set_id: str,
+        dec_id: str,
+        intent: ActionIntent,
+        view_facts: Mapping[str, Any],
+        observed_at: datetime,
+        reason: str,
+    ) -> None:
+        ev_id = f"ev-{req_id}"
+        self.intent = intent
+        ev = EvidenceReference(
+            evidence_id=ev_id,
+            kind=EvidenceKind.OBSERVATION,
+            producer_id="parallel-tier-engine",
+            content_sha256=content_digest(dict(view_facts)),
+            observed_at=observed_at,
+        )
+        fact = DecisionFact(
+            fact_id=f"fact-{req_id}",
+            label="Observed tier state",
+            value=canonical_bytes(dict(view_facts)).decode("utf-8"),
+            evidence_ids=(ev_id,),
+        )
+        opt = ActionOption(intent.action_ref, "parallel-tier-mirror", "50ms", f"{intent.kind.value} {intent.instrument_id}", intent)
+        self.request = DecisionRequest(
+            request_id=req_id,
+            opportunity_set_id=opp_set_id,
+            state=state_ref,
+            options=(opt,),
+            facts=(fact,),
+            evidence=(ev,),
+        )
+        sel = DecisionSelection(
+            request_id=req_id,
+            opportunity_set_id=opp_set_id,
+            source_state_id=state_ref.state_id,
+            selected_action_ref=intent.action_ref,
+            reason=reason[:240],
+            evidence_ids=(ev_id,),
+        )
+        self.result = DecisionResult(
+            decision_id=dec_id,
+            selection=sel,
+            provenance=DecisionProvenance(
+                origin=DecisionOrigin.ACTUAL_MODEL,
+                adapter_id="parallel-tier-mirror",
+                request_sha256=content_digest(self.request),
+                response_sha256=content_digest(sel),
+                prompt_version="frontier-v2",
+                started_at=observed_at,
+                completed_at=observed_at,
+                model_id="parallel-tier-mirror",
+                model_artifact_sha256=content_digest({"tier_mirror": scope.scenario_id}),
+                inference_receipt_id=f"rcpt-{req_id}",
+            ),
+        )
+
+
+class ParallelTierEngine:
+    """Simultaneous 5-tier parallel account simulator backed by SQLite WAL and ForexMetaValveGate."""
+
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        valve_gate: ForexMetaValveGate,
+        specs: Sequence[ParallelTierSpec] = DEFAULT_PARALLEL_TIER_SPECS,
+        barbell_policy: BarbellCapitalPolicy | None = None,
+        sweep_ratio: Decimal = Decimal("0.50"),
+        fx_min_lot: Decimal = MT5_MIN_VOLUME,
+        index_min_lot: Decimal = MT5_MIN_VOLUME,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not isinstance(db_path, Path):
+            db_path = Path(str(db_path))
+        if not isinstance(valve_gate, ForexMetaValveGate):
+            raise ContractError("valve_gate must be a ForexMetaValveGate")
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix":
+            os.chmod(db_path.parent, 0o700)  # nosec B103: owner-only 0o700 parallel-tier state directory
+        self.db_path = db_path
+        self._valve = valve_gate
+        self._specs = tuple(specs)
+        self._policy = barbell_policy or BarbellCapitalPolicy()
+        self._calc = Mt5MarginCalculator(leverage=500, index_leverage=200)
+        self._fx_min_lot = decimal_value(fx_min_lot, "fx_min_lot", positive=True)
+        self._index_min_lot = decimal_value(index_min_lot, "index_min_lot", positive=True)
+        self._clock = clock or _utc_now
+        self._lock = RLock()
+        self._regime = TrendRegimeDetector()
+        self._peak_store = PeakEquityStore(db_path)
+        self._quotas: dict[str, DailyQuotaGovernanceStore] = {}
+        self._vaults: dict[str, ProfitSweepVault] = {}
+        self._init_db(sweep_ratio=sweep_ratio)
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=5.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    def _init_db(self, *, sweep_ratio: Decimal) -> None:
+        with self._lock, closing(self._connect()) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS tier_accounts (
+                    tier_id TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    color_class TEXT NOT NULL,
+                    starting_capital_usd TEXT NOT NULL,
+                    balance_usd TEXT NOT NULL,
+                    equity_usd TEXT NOT NULL,
+                    peak_equity_usd TEXT NOT NULL,
+                    realized_net_usd TEXT NOT NULL,
+                    win_count INTEGER NOT NULL,
+                    loss_count INTEGER NOT NULL,
+                    gross_profit_usd TEXT NOT NULL,
+                    gross_loss_usd TEXT NOT NULL,
+                    last_skip_reason TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tier_positions (
+                    ticket TEXT PRIMARY KEY,
+                    tier_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    units TEXT NOT NULL,
+                    entry_price TEXT NOT NULL,
+                    stop_loss TEXT NOT NULL,
+                    take_profit TEXT,
+                    peak_favorable TEXT NOT NULL,
+                    protection_stage TEXT NOT NULL,
+                    entry_commission_usd TEXT NOT NULL,
+                    leg_index INTEGER NOT NULL,
+                    opened_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tier_closed_trades (
+                    trade_id TEXT PRIMARY KEY,
+                    tier_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    units TEXT NOT NULL,
+                    entry_price TEXT NOT NULL,
+                    exit_price TEXT NOT NULL,
+                    commission_usd TEXT NOT NULL,
+                    net_pnl_usd TEXT NOT NULL,
+                    close_reason TEXT NOT NULL,
+                    opened_at TEXT NOT NULL,
+                    closed_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tier_equity_history (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tier_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    equity_usd TEXT NOT NULL,
+                    growth_pct TEXT NOT NULL
+                );
+                """
+            )
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(tier_accounts)").fetchall()}
+            if "color_class" not in cols:
+                conn.execute("ALTER TABLE tier_accounts ADD COLUMN color_class TEXT NOT NULL DEFAULT 'tier-300k'")
+                if "color_token" in cols:
+                    conn.execute("UPDATE tier_accounts SET color_class = color_token")
+            ts = _iso(self._clock())
+            vault_db = self.db_path.parent / f"{self.db_path.stem}_vault.sqlite3"
+            for spec in self._specs:
+                row = conn.execute("SELECT tier_id FROM tier_accounts WHERE tier_id = ?", (spec.tier_id,)).fetchone()
+                if row is None:
+                    start_txt = decimal_text(spec.starting_capital_usd)
+                    conn.execute(
+                        """
+                        INSERT INTO tier_accounts(
+                            tier_id, label, color_class, starting_capital_usd, balance_usd,
+                            equity_usd, peak_equity_usd, realized_net_usd, win_count, loss_count,
+                            gross_profit_usd, gross_loss_usd, last_skip_reason, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, '0', 0, 0, '0', '0', NULL, ?)
+                        """,
+                        (spec.tier_id, spec.label, spec.color_class, start_txt, start_txt, start_txt, start_txt, ts),
+                    )
+                    conn.execute(
+                        "INSERT INTO tier_equity_history(tier_id, observed_at, equity_usd, growth_pct) VALUES (?, ?, ?, '0')",
+                        (spec.tier_id, ts, start_txt),
+                    )
+                scope = f"tier:{spec.tier_id}"
+                self._peak_store.observe_equity(
+                    scope,
+                    current_equity=spec.starting_capital_usd,
+                    opening_balance=spec.starting_capital_usd,
+                    now=self._clock(),
+                )
+                self._quotas[spec.tier_id] = DailyQuotaGovernanceStore(
+                    path=self.db_path,
+                    scope_id=scope,
+                    quota_mode="PCT",
+                    daily_quota_pct=Decimal("0.025"),
+                    soft_quota_usd=Decimal("500"),
+                    hard_quota_usd=Decimal("1000"),
+                    max_loss_pct=Decimal("0.03"),
+                )
+                self._vaults[spec.tier_id] = ProfitSweepVault(
+                    vault_db, scope_id=scope, sweep_ratio=sweep_ratio, clock=self._clock
+                )
+        if os.name == "posix" and self.db_path.exists():
+            os.chmod(self.db_path, 0o600)  # nosec B103: owner-only 0o600 parallel-tier SQLite DB
+
+    def _entry_commission(self, symbol: str, units: Decimal) -> Decimal:
+        csize = self._calc.contract_size_for(symbol)
+        with localcontext() as ctx:
+            ctx.prec = 40
+            lots = units / csize
+            rt = ECN_INDEX_COMMISSION_PER_CONTRACT_ROUND_TURN if symbol in INDEX_INSTRUMENTS else ECN_FX_COMMISSION_PER_LOT_ROUND_TURN
+            return (lots * rt * Decimal("0.5")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def _compute_tier_quantity(
+        self,
+        *,
+        tier_id: str,
+        symbol: str,
+        side: Side,
+        entry_price: Decimal,
+        stop_loss: Decimal,
+        deployable_equity: Decimal,
+        free_margin: Decimal,
+        quotes: Mapping[str, tuple[Decimal, Decimal]],
+        risk_multiplier: Decimal,
+    ) -> tuple[Decimal | None, str | None]:
+        stop_dist = abs(entry_price - stop_loss)
+        if stop_dist <= Decimal("0") or deployable_equity <= Decimal("0"):
+            return None, "ZERO_STOP_OR_EQUITY"
+
+        csize = self._calc.contract_size_for(symbol)
+        min_lot = self._index_min_lot if symbol in INDEX_INSTRUMENTS else self._fx_min_lot
+        min_units = csize * min_lot
+        step_units = csize * MT5_VOLUME_STEP
+        budget = self._policy.max_stop_risk_amount(deployable_equity) * risk_multiplier
+
+        _, quote_ccy = Mt5MarginCalculator.split_symbol(symbol)
+        rate = self._calc.conversion_rate(quote_ccy, quotes)
+
+        with localcontext() as ctx:
+            ctx.prec = 40
+            raw_units = budget / (stop_dist * rate)
+            one_step_margin = self._calc.required_margin(symbol, side, step_units, quotes)
+            if one_step_margin > Decimal("0"):
+                max_margin_units = ((free_margin * Decimal("0.90")) / one_step_margin) * step_units
+                raw_units = min(raw_units, max_margin_units)
+            steps = (raw_units / step_units).to_integral_value(rounding=ROUND_FLOOR)
+            candidate_units = steps * step_units
+
+        if candidate_units < min_units:
+            return None, "LOT_FLOOR_RISK_EXCEEDED"
+
+        # Double-check conservative stop risk on floored lot never exceeds 1.00% budget
+        exact_risk = self._policy.stop_loss_risk(
+            symbol=symbol, units=candidate_units, entry_price=entry_price, stop_price=stop_loss, quotes=quotes
+        )
+        if exact_risk > budget:
+            return None, "LOT_FLOOR_RISK_EXCEEDED"
+        return candidate_units.normalize(), None
+
+    def process_tick(
+        self,
+        *,
+        quotes: Mapping[str, tuple[Decimal, Decimal]],
+        signal: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Advance all 5 tiers over a single 50ms market snapshot and optional AI entry/pyramid signal."""
+        ts_dt = utc_time(now or self._clock(), "now")
+        ts = _iso(ts_dt)
+
+        with self._lock, closing(self._connect()) as conn:
+            for spec in self._specs:
+                tid = spec.tier_id
+                acct = conn.execute("SELECT * FROM tier_accounts WHERE tier_id = ?", (tid,)).fetchone()
+                if acct is None:
+                    continue
+                balance = Decimal(str(acct["balance_usd"]))
+                positions = conn.execute("SELECT * FROM tier_positions WHERE tier_id = ?", (tid,)).fetchall()
+                open_unrealized = Decimal("0")
+                used_margin = Decimal("0")
+
+                # 1. Mark-to-market, fast protection, and SL/TP exits on real bid/ask
+                for pos in positions:
+                    sym = str(pos["symbol"])
+                    if sym not in quotes:
+                        continue
+                    bid, ask = quotes[sym]
+                    side = Side(str(pos["side"]))
+                    units = Decimal(str(pos["units"]))
+                    entry_p = Decimal(str(pos["entry_price"]))
+                    sl_p = Decimal(str(pos["stop_loss"]))
+                    tp_p = Decimal(str(pos["take_profit"])) if pos["take_profit"] is not None else None
+                    exit_px = bid if side is Side.BUY else ask
+
+                    # Check resting SL/TP trigger first
+                    hit_reason: str | None = None
+                    fill_exit = exit_px
+                    if side is Side.BUY:
+                        if exit_px <= sl_p:
+                            hit_reason = "STOP_LOSS"
+                            fill_exit = min(exit_px, sl_p)
+                        elif tp_p is not None and ask >= tp_p:
+                            hit_reason = "TAKE_PROFIT"
+                            fill_exit = tp_p
+                    else:
+                        if exit_px >= sl_p:
+                            hit_reason = "STOP_LOSS"
+                            fill_exit = max(exit_px, sl_p)
+                        elif tp_p is not None and bid <= tp_p:
+                            hit_reason = "TAKE_PROFIT"
+                            fill_exit = tp_p
+
+                    _, q_ccy = Mt5MarginCalculator.split_symbol(sym)
+                    conv = self._calc.conversion_rate(q_ccy, quotes)
+
+                    if hit_reason is not None:
+                        with localcontext() as ctx:
+                            ctx.prec = 40
+                            raw_pnl = ((fill_exit - entry_p) if side is Side.BUY else (entry_p - fill_exit)) * units * conv
+                            exit_comm = self._entry_commission(sym, units)
+                            entry_comm = Decimal(str(pos["entry_commission_usd"]))
+                            total_comm = entry_comm + exit_comm
+                            net_pnl = (raw_pnl - exit_comm).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                        balance = balance + net_pnl
+                        conn.execute("DELETE FROM tier_positions WHERE ticket = ?", (str(pos["ticket"]),))
+                        conn.execute(
+                            """
+                            INSERT INTO tier_closed_trades(
+                                trade_id, tier_id, symbol, side, units, entry_price, exit_price,
+                                commission_usd, net_pnl_usd, close_reason, opened_at, closed_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                f"ttr-{uuid.uuid4().hex[:14]}",
+                                tid,
+                                sym,
+                                side.value,
+                                decimal_text(units),
+                                decimal_text(entry_p),
+                                decimal_text(fill_exit),
+                                decimal_text(total_comm),
+                                decimal_text(net_pnl),
+                                hit_reason,
+                                str(pos["opened_at"]),
+                                ts,
+                            ),
+                        )
+                        win_inc = 1 if net_pnl >= Decimal("0") else 0
+                        loss_inc = 0 if net_pnl >= Decimal("0") else 1
+                        gp = Decimal(str(acct["gross_profit_usd"])) + (net_pnl if net_pnl > 0 else Decimal("0"))
+                        gl = Decimal(str(acct["gross_loss_usd"])) + ((-net_pnl) if net_pnl < 0 else Decimal("0"))
+                        rl = Decimal(str(acct["realized_net_usd"])) + net_pnl
+                        conn.execute(
+                            """
+                            UPDATE tier_accounts SET balance_usd = ?, realized_net_usd = ?,
+                                win_count = win_count + ?, loss_count = loss_count + ?,
+                                gross_profit_usd = ?, gross_loss_usd = ?, updated_at = ?
+                            WHERE tier_id = ?
+                            """,
+                            (
+                                decimal_text(balance),
+                                decimal_text(rl),
+                                win_inc,
+                                loss_inc,
+                                decimal_text(gp),
+                                decimal_text(gl),
+                                ts,
+                                tid,
+                            ),
+                        )
+                        self._vaults[tid].record_realized_close(
+                            trade_id=f"{tid}:{pos['ticket']}",
+                            symbol=sym,
+                            broker_id=tid,
+                            realized_net_usd=net_pnl,
+                            occurred_at=ts_dt,
+                        )
+                        self._quotas[tid].record_realized_trade(
+                            net_pnl, symbol=sym, ticket=str(pos["ticket"]), starting_equity=balance, now=ts_dt
+                        )
+                        acct = conn.execute("SELECT * FROM tier_accounts WHERE tier_id = ?", (tid,)).fetchone()
+                        continue
+
+                    # Fast protection: Snap-to-Breakeven & Monotonic Trailing Stop
+                    prev_peak = Decimal(str(pos["peak_favorable"]))
+                    cur_px = bid if side is Side.BUY else ask
+                    peak = max(prev_peak, cur_px) if side is Side.BUY else min(prev_peak, cur_px)
+                    excursion = (peak - entry_p) if side is Side.BUY else (entry_p - peak)
+                    t_sz = _tick_size(sym)
+                    be_trig = Decimal("10.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("120")
+                    be_off = Decimal("1.50") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("10")
+                    trail_act = Decimal("22.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("220")
+                    trail_dist = Decimal("14.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("140")
+
+                    new_sl = sl_p
+                    new_stage = str(pos["protection_stage"])
+                    if excursion >= be_trig:
+                        cand_be = (entry_p + be_off if side is Side.BUY else entry_p - be_off).quantize(t_sz, rounding=ROUND_HALF_UP)
+                        if side is Side.BUY and cand_be < bid - t_sz and cand_be > new_sl:
+                            new_sl = cand_be
+                            new_stage = "BREAKEVEN_LOCKED"
+                        elif side is Side.SELL and cand_be > ask + t_sz and cand_be < new_sl:
+                            new_sl = cand_be
+                            new_stage = "BREAKEVEN_LOCKED"
+                    if excursion >= trail_act:
+                        cand_tr = (peak - trail_dist if side is Side.BUY else peak + trail_dist).quantize(t_sz, rounding=ROUND_HALF_UP)
+                        if side is Side.BUY and cand_tr < bid - t_sz and cand_tr > new_sl:
+                            new_sl = cand_tr
+                            new_stage = "TRAILING_PROFIT"
+                        elif side is Side.SELL and cand_tr > ask + t_sz and cand_tr < new_sl:
+                            new_sl = cand_tr
+                            new_stage = "TRAILING_PROFIT"
+                    if new_sl != sl_p or peak != prev_peak or new_stage != str(pos["protection_stage"]):
+                        conn.execute(
+                            "UPDATE tier_positions SET stop_loss = ?, peak_favorable = ?, protection_stage = ? WHERE ticket = ?",
+                            (decimal_text(new_sl), decimal_text(peak), new_stage, str(pos["ticket"])),
+                        )
+
+                    with localcontext() as ctx:
+                        ctx.prec = 40
+                        upnl = ((cur_px - entry_p) if side is Side.BUY else (entry_p - cur_px)) * units * conv
+                    open_unrealized += upnl
+                    used_margin += self._calc.required_margin(sym, side, units, quotes)
+
+                equity = balance + open_unrealized
+                pk_val = self._peak_store.observe_equity(
+                    f"tier:{tid}", current_equity=equity, opening_balance=spec.starting_capital_usd, now=ts_dt
+                )
+                deployable = self._vaults[tid].deployable_equity(equity)
+                free_margin = max(Decimal("0"), equity - used_margin)
+
+                # 2. Evaluate optional entry or House-Money ADD signal per tier independently
+                if signal is not None:
+                    sym = str(signal.get("symbol") or "")
+                    side = Side(str(signal.get("side") or "BUY"))
+                    if sym in quotes:
+                        bid, ask = quotes[sym]
+                        entry_px = ask if side is Side.BUY else bid
+                        sl_p = Decimal(str(signal["stop_price"]))
+                        tp_p = Decimal(str(signal["take_profit_price"])) if signal.get("take_profit_price") is not None else None
+                        regime = str(signal.get("regime") or "TREND_IGNITION")
+
+                        existing_rows = conn.execute(
+                            "SELECT * FROM tier_positions WHERE tier_id = ? AND symbol = ? AND side = ? ORDER BY leg_index ASC",
+                            (tid, sym, side.value),
+                        ).fetchall()
+                        is_add = len(existing_rows) > 0
+                        req_kind = ActionKind.ADD if is_add else ActionKind.OPEN
+
+                        allowed_q, q_reason, q_mult = self._quotas[tid].evaluate_new_risk(
+                            req_kind, now=ts_dt, starting_equity=equity
+                        )
+                        skip_reason: str | None = None
+                        # Strong-trend runner override on ADD if earlier legs are BREAKEVEN_LOCKED
+                        if not allowed_q and is_add and regime == "STRONG_TREND":
+                            allowed_q = True
+                            q_mult = Decimal("0.50")
+
+                        if not allowed_q:
+                            skip_reason = str(q_reason)
+                        else:
+                            qty, size_skip = self._compute_tier_quantity(
+                                tier_id=tid,
+                                symbol=sym,
+                                side=side,
+                                entry_price=entry_px,
+                                stop_loss=sl_p,
+                                deployable_equity=deployable,
+                                free_margin=free_margin,
+                                quotes=quotes,
+                                risk_multiplier=q_mult,
+                            )
+                            if qty is None:
+                                skip_reason = size_skip
+                            else:
+                                if is_add:
+                                    legs = [
+                                        PyramidLegSnapshot(
+                                            ticket=str(r["ticket"]),
+                                            symbol=str(r["symbol"]),
+                                            side=Side(str(r["side"])),
+                                            units=Decimal(str(r["units"])),
+                                            entry_price=Decimal(str(r["entry_price"])),
+                                            stop_loss=Decimal(str(r["stop_loss"])),
+                                            protection_stage=str(r["protection_stage"]),
+                                        )
+                                        for r in existing_rows
+                                    ]
+                                    _, q_ccy = Mt5MarginCalculator.split_symbol(sym)
+                                    conv = self._calc.conversion_rate(q_ccy, quotes)
+                                    pyr = evaluate_house_money_pyramid_leg(
+                                        symbol=sym,
+                                        side=side,
+                                        regime=regime,
+                                        existing_legs=legs,
+                                        new_leg_entry=entry_px,
+                                        new_leg_stop=sl_p,
+                                        new_leg_units=qty,
+                                        quote_to_usd=conv,
+                                    )
+                                    if not pyr.allowed:
+                                        skip_reason = pyr.reason
+                                if skip_reason is None:
+                                    # Evaluate independent ForexMetaValveGate per tier
+                                    inv_json = json.dumps([
+                                        {
+                                            "ticket": str(r["ticket"]),
+                                            "symbol": str(r["symbol"]),
+                                            "volume": str(r["units"]),
+                                        }
+                                        for r in conn.execute("SELECT * FROM tier_positions WHERE tier_id = ?", (tid,)).fetchall()
+                                    ])
+                                    t_view = {
+                                        "balance": decimal_text(balance),
+                                        "equity": decimal_text(equity),
+                                        "available_margin": decimal_text(free_margin),
+                                        "position_inventory": inv_json,
+                                        "peak_equity": decimal_text(pk_val),
+                                        "max_drawdown_pct": decimal_text(DEFAULT_MAX_DRAWDOWN_PCT),
+                                    }
+                                    uid = uuid.uuid4().hex[:10]
+                                    act_ref = f"tier-{tid.lower()}-{uid}"
+                                    req_id = f"tr-{uid}"
+                                    opp_set_id = f"topp-{uid}"
+                                    dec_id = f"tdec-{uid}"
+                                    t_scope = RunScope(
+                                        account_id=tid,
+                                        run_id="parallel-tiers",
+                                        epoch=1,
+                                        build_id="phase6-parallel-tiers-v1",
+                                        policy_id="barbell-1pct-valve-v1",
+                                        scenario_id="shadow-5tier",
+                                        adapter_id="parallel-tier-mirror",
+                                    )
+                                    st_ref = StateReference(
+                                        state_id=f"tstate-{uid}",
+                                        scope=t_scope,
+                                        version=1,
+                                        observed_at=ts_dt,
+                                        valid_until=ts_dt + timedelta(seconds=30),
+                                        venue_sequence=1,
+                                    )
+                                    parent_tkt = str(existing_rows[0]["ticket"]) if is_add else None
+                                    intent = ActionIntent(
+                                        intent_id=f"ti-{uid}",
+                                        scope=t_scope,
+                                        decision_id=dec_id,
+                                        opportunity_id=opp_set_id,
+                                        action_ref=act_ref,
+                                        source_state=st_ref,
+                                        kind=req_kind,
+                                        instrument_id=sym,
+                                        origin=DecisionOrigin.ACTUAL_MODEL,
+                                        created_at=ts_dt,
+                                        expires_at=st_ref.valid_until,
+                                        quantity=qty,
+                                        side=side,
+                                        limit_price=entry_px if not is_add else None,
+                                        stop_price=sl_p,
+                                        take_profit_price=tp_p,
+                                        target_id=parent_tkt,
+                                        target_version=1 if parent_tkt is not None else None,
+                                    )
+                                    prop = _TierProposal(
+                                        scope=t_scope,
+                                        state_ref=st_ref,
+                                        req_id=req_id,
+                                        opp_set_id=opp_set_id,
+                                        dec_id=dec_id,
+                                        intent=intent,
+                                        view_facts={"new_risk": True, "management": True, "equity": decimal_text(equity), "peak_equity": decimal_text(pk_val), "bid": decimal_text(bid), "ask": decimal_text(ask)},
+                                        observed_at=ts_dt,
+                                        reason=f"ID=0{act_ref} {regime}",
+                                    )
+                                    dec = self._valve.evaluate(prop, current_view=t_view, now=ts_dt)
+                                    if not dec.admitted:
+                                        skip_reason = f"VALVE_REFUSED ({dec.refusal_reason or dec.valve_mode})"
+                                    else:
+                                        entry_comm = self._entry_commission(sym, qty)
+                                        balance = balance - entry_comm
+                                        equity = balance + open_unrealized
+                                        new_ticket = f"{tid}-{uuid.uuid4().hex[:10]}"
+                                        conn.execute(
+                                            """
+                                            INSERT INTO tier_positions(
+                                                ticket, tier_id, symbol, side, units, entry_price,
+                                                stop_loss, take_profit, peak_favorable, protection_stage,
+                                                entry_commission_usd, leg_index, opened_at
+                                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'INITIAL_SL', ?, ?, ?)
+                                            """,
+                                            (
+                                                new_ticket,
+                                                tid,
+                                                sym,
+                                                side.value,
+                                                decimal_text(qty),
+                                                decimal_text(entry_px),
+                                                decimal_text(sl_p),
+                                                None if tp_p is None else decimal_text(tp_p),
+                                                decimal_text(entry_px),
+                                                decimal_text(entry_comm),
+                                                len(existing_rows) + 1,
+                                                ts,
+                                            ),
+                                        )
+                        conn.execute("UPDATE tier_accounts SET last_skip_reason = ? WHERE tier_id = ?", (skip_reason, tid))
+
+                with localcontext() as ctx:
+                    ctx.prec = 40
+                    growth_pct = (((equity - spec.starting_capital_usd) / spec.starting_capital_usd) * Decimal("100")).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+                conn.execute(
+                    "UPDATE tier_accounts SET balance_usd = ?, equity_usd = ?, peak_equity_usd = ?, updated_at = ? WHERE tier_id = ?",
+                    (decimal_text(balance), decimal_text(equity), decimal_text(pk_val), ts, tid),
+                )
+                last_h = conn.execute(
+                    "SELECT equity_usd FROM tier_equity_history WHERE tier_id = ? ORDER BY seq DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if last_h is None or Decimal(str(last_h["equity_usd"])) != equity:
+                    conn.execute(
+                        "INSERT INTO tier_equity_history(tier_id, observed_at, equity_usd, growth_pct) VALUES (?, ?, ?, ?)",
+                        (tid, ts, decimal_text(equity), decimal_text(growth_pct)),
+                    )
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock, closing(self._connect()) as conn:
+            tiers: list[dict[str, Any]] = []
+            series: dict[str, list[dict[str, Any]]] = {}
+            for spec in self._specs:
+                tid = spec.tier_id
+                acct = conn.execute("SELECT * FROM tier_accounts WHERE tier_id = ?", (tid,)).fetchone()
+                if acct is None:
+                    continue
+                start_v = Decimal(str(acct["starting_capital_usd"]))
+                eq_v = Decimal(str(acct["equity_usd"]))
+                pk_v = Decimal(str(acct["peak_equity_usd"]))
+                with localcontext() as ctx:
+                    ctx.prec = 40
+                    growth_pct = (((eq_v - start_v) / start_v) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    dd_pct = (
+                        (((pk_v - eq_v) / pk_v) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        if pk_v > Decimal("0") and eq_v < pk_v
+                        else Decimal("0.00")
+                    )
+                wins = int(acct["win_count"])
+                losses = int(acct["loss_count"])
+                total_tr = wins + losses
+                win_rate = (
+                    (Decimal(wins) / Decimal(total_tr) * Decimal("100")).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+                    if total_tr > 0
+                    else Decimal("0.0")
+                )
+                gp = Decimal(str(acct["gross_profit_usd"]))
+                gl = Decimal(str(acct["gross_loss_usd"]))
+                pf = "INF" if (gp > 0 and gl == 0) else (decimal_text((gp / gl).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if gl > 0 else "0.00")
+                open_cnt = int(conn.execute("SELECT COUNT(*) FROM tier_positions WHERE tier_id = ?", (tid,)).fetchone()[0])
+                v_snap = self._vaults[tid].snapshot()
+                tiers.append({
+                    "tier_id": tid,
+                    "label": str(acct["label"]),
+                    "color_class": str(acct["color_class"]),
+                    "starting_capital_usd": decimal_text(start_v),
+                    "balance_usd": str(acct["balance_usd"]),
+                    "equity_usd": decimal_text(eq_v),
+                    "net_gain_usd": decimal_text((eq_v - start_v).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+                    "growth_pct": decimal_text(growth_pct),
+                    "peak_equity_usd": decimal_text(pk_v),
+                    "drawdown_pct": decimal_text(dd_pct),
+                    "open_positions": open_cnt,
+                    "closed_trades": total_tr,
+                    "win_count": wins,
+                    "loss_count": losses,
+                    "win_rate_pct": decimal_text(win_rate),
+                    "profit_factor": pf,
+                    "bank_sweep_reserved_usd": v_snap["bank_sweep_reserved_usd"],
+                    "retained_trading_usd": v_snap["retained_trading_usd"],
+                    "last_skip_reason": acct["last_skip_reason"],
+                    "updated_at": str(acct["updated_at"]),
+                })
+                hist_rows = conn.execute(
+                    "SELECT observed_at, equity_usd, growth_pct FROM tier_equity_history WHERE tier_id = ? ORDER BY seq ASC",
+                    (tid,),
+                ).fetchall()
+                series[tid] = [
+                    {
+                        "observed_at": str(r["observed_at"]),
+                        "equity_usd": str(r["equity_usd"]),
+                        "growth_pct": str(r["growth_pct"]),
+                    }
+                    for r in hist_rows[-120:]
+                ]
+            return {
+                "schema": "cas-forex.parallel-tiers/1",
+                "tier_count": len(tiers),
+                "tiers": tiers,
+                "growth_series": series,
+            }

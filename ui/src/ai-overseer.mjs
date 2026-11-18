@@ -43,6 +43,10 @@ export const STATIC_AI_MODELS = Object.freeze({
   frontierAheadOfQwen: true,
   frontierConfiguredCount: '0',
   offlineFallbackEnabled: false,
+  thinkingDepth: 'AUTO',
+  validThinkingDepths: Object.freeze(['AUTO', 'LOW', 'MEDIUM', 'HIGH']),
+  lastEffectiveEffort: 'low',
+  lastLatencyMs: null,
   fastScoutEnabled: false,
   fastScoutModelId: 'gemini-decision-1',
   fastScoutReady: false,
@@ -142,6 +146,10 @@ export function normalizeAiModels(doc) {
     frontierAheadOfQwen: Boolean(doc.frontier_ahead_of_qwen),
     frontierConfiguredCount: numStr(doc.frontier_configured_count, '0'),
     offlineFallbackEnabled: Boolean(doc.offline_fallback_enabled),
+    thinkingDepth: str(doc.thinking_depth, 'AUTO').toUpperCase(),
+    validThinkingDepths: Object.freeze(Array.isArray(doc.valid_thinking_depths) ? doc.valid_thinking_depths.map((d) => str(d)) : ['AUTO', 'LOW', 'MEDIUM', 'HIGH']),
+    lastEffectiveEffort: str(doc.last_effective_effort, 'low').toLowerCase(),
+    lastLatencyMs: Number.isSafeInteger(doc.last_latency_ms) ? doc.last_latency_ms : null,
     fastScoutEnabled: Boolean(doc.fast_scout_enabled),
     fastScoutModelId: str(doc.fast_scout_model_id, 'gemini-decision-1'),
     fastScoutReady: Boolean(doc.fast_scout_ready),
@@ -200,6 +208,12 @@ export function normalizeAiTrader(doc) {
     fastScoutReady: Boolean(doc.fast_scout_ready),
     cycleCount: numStr(doc.cycle_count, '0'),
     lastCycleMs: numStr(doc.last_cycle_ms, '0'),
+    thinkingDepth: str(doc.thinking_depth, 'AUTO').toUpperCase(),
+    lastEffectiveEffort: str(doc.last_effective_effort, 'low').toLowerCase(),
+    lastLatencyMs: Number.isSafeInteger(doc.last_latency_ms) ? doc.last_latency_ms : null,
+    lastRegime: str(doc.last_regime, 'TREND_IGNITION'),
+    deployableEquityUsd: numStr(doc.deployable_equity_usd, '0'),
+    bankSweepReservedUsd: numStr(doc.bank_sweep_reserved_usd, '0'),
     lastAction: str(doc.last_action, 'WAIT'),
     lastSymbol: doc.last_symbol ? str(doc.last_symbol) : 'None',
     lastReason: str(doc.last_reason, 'None'),
@@ -341,7 +355,7 @@ export function renderAiOverseerPanel(state) {
           <select id="ai-model-select" class="ai-model-select" data-select-ai-model="true" ${!models.connected || busy ? 'disabled' : ''}>${modelOptions}</select>
           <button type="button" class="button button-small ${models.fastScoutEnabled ? 'selected' : 'button-secondary'}" data-ai-overseer-action="TOGGLE_FAST_SCOUT" aria-pressed="${models.fastScoutEnabled}" ${!models.connected || busy ? 'disabled' : ''}>${models.fastScoutEnabled ? 'Gemini Decision 1 Fast Scout: ON' : 'Gemini Decision 1 Fast Scout: OFF'}</button>
         </div>
-        <p class="quiet-note">Active: <strong>${esc(models.activeDisplayName)}</strong> (${esc(models.activeStatus)}) · Min prob ${esc(models.minDecisionProbability)} · Cycles ${esc(trader.cycleCount)} · Vetoes ${esc(trader.vetoCount)}</p>
+        <p class="quiet-note">Active: <strong>${esc(models.activeDisplayName)}</strong> (${esc(models.activeStatus)}) · Depth <strong>${esc(models.thinkingDepth)}</strong> (${esc(models.lastEffectiveEffort)}${models.lastLatencyMs !== null ? ` · ${esc(String(models.lastLatencyMs))}ms` : ''}) · Min prob ${esc(models.minDecisionProbability)} · Cycles ${esc(trader.cycleCount)} · Vetoes ${esc(trader.vetoCount)}</p>
       </div>
       <div class="ai-quota-block">
         <div class="quota-header">

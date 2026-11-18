@@ -552,7 +552,7 @@ class SpoolBridgeTransportTests(unittest.TestCase):
             self.assertEqual(r1.request.to_spool_dict()["protocol"], MT5_SPOOL_PROTOCOL)
             doc = r1.request.to_spool_dict()
             self.assertTrue(all(isinstance(v, str) for v in doc.values()))
-            core = {k: v for k, v in doc.items() if k != "request_sha256"}
+            core = {k: v for k, v in doc.items() if k not in ("request_sha256", "request_hmac_sha256")}
             self.assertEqual(sha256(canonical_bytes(core)).hexdigest(), doc["request_sha256"])
             ticket = r1.receipt.position_ticket
 
@@ -1215,8 +1215,8 @@ class Mql5BridgeSourceContractTests(unittest.TestCase):
     def test_cas_forex_mt5_bridge_all_receipt_json_calls_pass_11_typed_args(self) -> None:
         mq5_path = REPO_ROOT / "mt5" / "CasForexMt5Bridge.mq5"
         src = mq5_path.read_text(encoding="utf-8")
-        _, calls = self._assert_receipt_json_contract(src, expected_min_calls=9)
-        self.assertEqual(len(calls), 9)
+        _, calls = self._assert_receipt_json_contract(src, expected_min_calls=11)
+        self.assertEqual(len(calls), 11)
 
     def test_receipt_json_contract_catches_10_arg_and_untyped_number_regressions(self) -> None:
         sig_header = (

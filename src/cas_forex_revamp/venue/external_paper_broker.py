@@ -72,6 +72,12 @@ from cas_forex_revamp.operator.decisions import OperatorSession
 from .faults import FaultSchedule
 from .fixtures import VenueScenario
 from .sqlite_venue import JournalCheckpoint, PRICE_QUANTUM, SQLiteVenue, VenueStorageError
+from .live_auth_ticket import (
+    ENV_LIVE_AUTH_KEY_FILE,
+    ENV_LIVE_AUTH_TICKET_FILE,
+    LiveAuthTicketError,
+    verify_live_environ_authorization,
+)
 from .live_market_stream import (
     ALLOWED_PUBLIC_FEED_HOSTS,
     DEFAULT_MAX_REFERENCE_AGE_DAYS,
@@ -128,8 +134,12 @@ def resolve_execution_mode(
     *,
     execution_mode: str | None = None,
     live_arm_phrase: str | None = None,
+    expected_broker_id: str | None = None,
+    expected_account_login: str | int | None = None,
+    expected_server: str | None = None,
+    now: datetime | None = None,
 ) -> tuple[str, bool]:
-    """Resolve ``(execution_mode, live_armed)`` with strict fail-closed two-key LIVE authorization."""
+    """Resolve ``(execution_mode, live_armed)`` requiring cryptographic LIVE ticket + phrase."""
     raw_mode = execution_mode
     if raw_mode is None and environ is not None:
         raw_mode = environ.get(ENV_EXECUTION_MODE, "")
@@ -144,9 +154,19 @@ def resolve_execution_mode(
     phrase = "" if raw_phrase is None else str(raw_phrase).strip()
     if not hmac.compare_digest(phrase.encode("utf-8"), REQUIRED_LIVE_ARM_PHRASE.encode("utf-8")):
         raise LiveBrokerEndpointForbiddenError(
-            f"LIVE real-money mode requires two-key authorization: set {ENV_EXECUTION_MODE}=LIVE and "
-            f"{ENV_LIVE_ARM_PHRASE}={REQUIRED_LIVE_ARM_PHRASE}"
+            f"LIVE real-money mode requires {ENV_LIVE_ARM_PHRASE}={REQUIRED_LIVE_ARM_PHRASE} "
+            f"plus signed {ENV_LIVE_AUTH_TICKET_FILE}/{ENV_LIVE_AUTH_KEY_FILE}"
         )
+    try:
+        verify_live_environ_authorization(
+            environ,
+            expected_broker_id=expected_broker_id,
+            expected_account_login=expected_account_login,
+            expected_server=expected_server,
+            now=now,
+        )
+    except LiveAuthTicketError as exc:
+        raise LiveBrokerEndpointForbiddenError(f"CRYPTOGRAPHIC_LIVE_AUTH_REQUIRED: {exc}") from None
     return EXECUTION_MODE_LIVE, True
 
 SUPPORTED_FX_PAIRS: tuple[str, ...] = ("EURUSD", "GBPUSD", "USDJPY")
@@ -322,6 +342,187 @@ class PaperBrokerNotConfiguredError(ContractError):
 
 class PaperBrokerTransportError(ContractError):
     """Sanitized transport failure that strips all request/response headers and credentials."""
+
+
+class OandaOutcomeUnknownError(PaperBrokerTransportError):
+    """Raised when a pre-journaled OANDA mutation ends ambiguously after dispatch; blocks retries until reconciled."""
+
+
+class OandaMutationJournal:
+    """Durable SQLite WAL (or scoped in-memory) pre-dispatch mutation journal & UNKNOWN-outcome latch."""
+
+    def __init__(self, db_path: str | Path | None = None) -> None:
+        self._path = Path(db_path) if db_path is not None else None
+        self._memory: dict[str, dict[str, str | None]] = {}
+        self._initialized = False
+
+    def _connect(self) -> sqlite3.Connection:
+        if self._path is None:
+            raise ContractError("in-memory OandaMutationJournal has no SQLite path")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self._path), timeout=10.0, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        if not self._initialized:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS oanda_mutation_journal (
+                    client_ext_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    action_kind TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    transaction_id TEXT,
+                    error_detail TEXT,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL
+                )
+                """
+            )
+            self._initialized = True
+        return conn
+
+    def unknown_mutations(self, *, account_id: str | None = None, symbol: str | None = None) -> list[dict[str, str | None]]:
+        if self._path is None:
+            out = [dict(v) for v in self._memory.values() if v["status"] == "OUTCOME_UNKNOWN"]
+        elif not self._path.exists():
+            out = []
+        else:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT client_ext_id, account_id, symbol, action_kind, method, relative_path, status, transaction_id, error_detail, created_at_utc, updated_at_utc "
+                    "FROM oanda_mutation_journal WHERE status = 'OUTCOME_UNKNOWN' ORDER BY created_at_utc ASC"
+                ).fetchall()
+            finally:
+                conn.close()
+            out = [
+                {
+                    "client_ext_id": str(r[0]),
+                    "account_id": str(r[1]),
+                    "symbol": str(r[2]),
+                    "action_kind": str(r[3]),
+                    "method": str(r[4]),
+                    "relative_path": str(r[5]),
+                    "status": str(r[6]),
+                    "transaction_id": r[7],
+                    "error_detail": r[8],
+                    "created_at_utc": str(r[9]),
+                    "updated_at_utc": str(r[10]),
+                }
+                for r in rows
+            ]
+        return [
+            r
+            for r in out
+            if (account_id is None or r["account_id"] == account_id)
+            and (symbol is None or r["symbol"] == symbol)
+        ]
+
+    def require_clear(self, *, account_id: str, symbol: str | None = None) -> None:
+        frozen = self.unknown_mutations(account_id=account_id, symbol=symbol)
+        if frozen:
+            ids = ", ".join(str(x["client_ext_id"]) for x in frozen[:4])
+            raise OandaOutcomeUnknownError(
+                f"OANDA_OUTCOME_UNKNOWN_FREEZE: unresolved pre-dispatch mutation(s) [{ids}] must be reconciled before new dispatches"
+            )
+
+    def record_pending(
+        self,
+        *,
+        client_ext_id: str,
+        account_id: str,
+        symbol: str,
+        action_kind: str,
+        method: str,
+        relative_path: str,
+        now_utc: str,
+    ) -> None:
+        self.require_clear(account_id=account_id, symbol=symbol)
+        if self._path is None:
+            existing = self._memory.get(client_ext_id)
+            if existing is not None:
+                raise OandaOutcomeUnknownError(
+                    f"Duplicate OANDA clientExtensions.id={client_ext_id!r} (status={existing['status']}); never retried unverified"
+                )
+            self._memory[client_ext_id] = {
+                "client_ext_id": client_ext_id,
+                "account_id": account_id,
+                "symbol": symbol,
+                "action_kind": action_kind,
+                "method": method,
+                "relative_path": relative_path,
+                "status": "PENDING_DISPATCH",
+                "transaction_id": None,
+                "error_detail": None,
+                "created_at_utc": now_utc,
+                "updated_at_utc": now_utc,
+            }
+            return
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT status FROM oanda_mutation_journal WHERE client_ext_id = ?",
+                (client_ext_id,),
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                raise OandaOutcomeUnknownError(
+                    f"Duplicate OANDA clientExtensions.id={client_ext_id!r} (status={existing[0]}); never retried unverified"
+                )
+            conn.execute(
+                "INSERT INTO oanda_mutation_journal ("
+                "client_ext_id, account_id, symbol, action_kind, method, relative_path, "
+                "status, transaction_id, error_detail, created_at_utc, updated_at_utc"
+                ") VALUES (?, ?, ?, ?, ?, ?, 'PENDING_DISPATCH', NULL, NULL, ?, ?)",
+                (client_ext_id, account_id, symbol, action_kind, method, relative_path, now_utc, now_utc),
+            )
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def mark_outcome(
+        self,
+        *,
+        client_ext_id: str,
+        status: str,
+        now_utc: str,
+        transaction_id: str | None = None,
+        error_detail: str | None = None,
+    ) -> None:
+        if status not in ("CONFIRMED_FILLED", "CONFIRMED_ABSENT", "OUTCOME_UNKNOWN"):
+            raise ContractError(f"invalid OANDA journal status {status!r}")
+        if self._path is None:
+            row = self._memory.get(client_ext_id)
+            if row is not None:
+                row["status"] = status
+                row["transaction_id"] = transaction_id
+                row["error_detail"] = error_detail
+                row["updated_at_utc"] = now_utc
+            return
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE oanda_mutation_journal "
+                "SET status = ?, transaction_id = ?, error_detail = ?, updated_at_utc = ? "
+                "WHERE client_ext_id = ?",
+                (status, transaction_id, error_detail, now_utc, client_ext_id),
+            )
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 class LiveFeedVerificationError(ContractError):
@@ -1545,6 +1746,7 @@ class OandaPracticePaperClient:
         timeout_seconds: float = 10.0,
         max_wire_bytes: int = MAX_WIRE_RESPONSE_BYTES,
         transport: Callable[[str, str, dict[str, str], bytes | None, float, int], bytes] | None = None,
+        mutation_journal: OandaMutationJournal | None = None,
     ) -> None:
         if environ is not None and not isinstance(environ, Mapping):
             raise ContractError("environ must be a key-value Mapping (never a .env file path)")
@@ -1566,6 +1768,7 @@ class OandaPracticePaperClient:
 
         self._secret: _RedactedSecret | None = None
         self._account_id: str | None = None
+        self._mutation_journal = mutation_journal if mutation_journal is not None else OandaMutationJournal()
         if environ is not None:
             tok_env = ENV_OANDA_LIVE_TOKEN if self.execution_mode == EXECUTION_MODE_LIVE else ENV_OANDA_PRACTICE_TOKEN
             acct_env = (
@@ -1577,6 +1780,16 @@ class OandaPracticePaperClient:
                 raise PaperBrokerNotConfiguredError(f"both {tok_env} and {acct_env} are required together")
             if raw_tok and raw_acct:
                 identifier(raw_acct, "oanda_account_id")
+                if self.execution_mode == EXECUTION_MODE_LIVE:
+                    try:
+                        verify_live_environ_authorization(
+                            environ,
+                            expected_broker_id="OANDA_LIVE",
+                            expected_account_login=raw_acct,
+                            expected_server=ALLOWED_OANDA_LIVE_HOST,
+                        )
+                    except LiveAuthTicketError as exc:
+                        raise LiveBrokerEndpointForbiddenError(f"OANDA_LIVE_TICKET_MISMATCH: {exc}") from None
                 self._secret = _RedactedSecret(raw_tok)
                 self._account_id = raw_acct
 
@@ -1589,6 +1802,7 @@ class OandaPracticePaperClient:
         execution_mode: str | None = None,
         live_arm_phrase: str | None = None,
         transport: Callable[[str, str, dict[str, str], bytes | None, float, int], bytes] | None = None,
+        mutation_journal: OandaMutationJournal | None = None,
     ) -> "OandaPracticePaperClient":
         return cls(
             base_url=base_url,
@@ -1596,7 +1810,11 @@ class OandaPracticePaperClient:
             execution_mode=execution_mode,
             live_arm_phrase=live_arm_phrase,
             transport=transport,
+            mutation_journal=mutation_journal,
         )
+
+    def bind_mutation_journal(self, journal: OandaMutationJournal) -> None:
+        self._mutation_journal = journal
 
     @property
     def is_active(self) -> bool:
@@ -1836,10 +2054,41 @@ class OandaPracticePaperClient:
             order_spec["stopLossOnFill"] = {"price": decimal_text(sl_dec)}
         if tp_dec is not None:
             order_spec["takeProfitOnFill"] = {"price": decimal_text(tp_dec)}
-        _, raw = self._request("POST", f"accounts/{acct_id}/orders", body_obj={"order": order_spec})
-        doc = _parse_external_wire_json(raw, label="oanda_practice_order")
-        if type(doc) is not dict:
-            raise PaperBrokerTransportError("malformed OANDA practice order response")
+        ts_now = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        now_utc_str = _format_utc_micros(ts_now, "observed_at")
+        rel_path = f"accounts/{acct_id}/orders"
+        self._mutation_journal.record_pending(
+            client_ext_id=client_order_id,
+            account_id=acct_id,
+            symbol=norm,
+            action_kind="OPEN",
+            method="POST",
+            relative_path=rel_path,
+            now_utc=now_utc_str,
+        )
+        try:
+            _, raw = self._request("POST", rel_path, body_obj={"order": order_spec})
+            doc = _parse_external_wire_json(raw, label="oanda_practice_order")
+            if type(doc) is not dict:
+                raise PaperBrokerTransportError("malformed OANDA practice order response")
+        except LiveBrokerEndpointForbiddenError:
+            self._mutation_journal.mark_outcome(
+                client_ext_id=client_order_id, status="CONFIRMED_ABSENT", now_utc=now_utc_str, error_detail="LIVE_FORBIDDEN"
+            )
+            raise
+        except Exception as exc:
+            err_name = type(exc).__name__
+            if "HTTP error 400" in str(exc) or "HTTP error 404" in str(exc):
+                self._mutation_journal.mark_outcome(
+                    client_ext_id=client_order_id, status="CONFIRMED_ABSENT", now_utc=now_utc_str, error_detail=err_name
+                )
+                raise
+            self._mutation_journal.mark_outcome(
+                client_ext_id=client_order_id, status="OUTCOME_UNKNOWN", now_utc=now_utc_str, error_detail=err_name
+            )
+            raise OandaOutcomeUnknownError(
+                f"OANDA post-dispatch failure for clientExtensions.id={client_order_id} ({err_name}); account frozen until reconciled"
+            ) from None
         fill_tx = doc.get("orderFillTransaction")
         create_tx = doc.get("orderCreateTransaction")
         ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
@@ -1863,6 +2112,12 @@ class OandaPracticePaperClient:
             "observed_at": _format_utc_micros(ts, "observed_at"),
             "raw_wire_sha256": sha256(raw).hexdigest(),
         }
+        self._mutation_journal.mark_outcome(
+            client_ext_id=client_order_id,
+            status="CONFIRMED_FILLED",
+            now_utc=_format_utc_micros(ts, "observed_at"),
+            transaction_id=receipt.get("fill_transaction_id") or receipt.get("create_transaction_id"),
+        )
         assert_safe_json_numbers(receipt)
         return receipt
 
@@ -1886,11 +2141,43 @@ class OandaPracticePaperClient:
             body["stopLoss"] = {"price": decimal_text(sl_dec), "timeInForce": "GTC"}
         if tp_dec is not None:
             body["takeProfit"] = {"price": decimal_text(tp_dec), "timeInForce": "GTC"}
-        _, raw = self._request("PUT", f"accounts/{acct_id}/trades/{tid}/orders", body_obj=body)
-        doc = _parse_external_wire_json(raw, label="oanda_trade_amend")
-        if type(doc) is not dict:
-            raise PaperBrokerTransportError("malformed OANDA trade protection amend response")
-        ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        ts_now = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        now_utc_str = _format_utc_micros(ts_now, "observed_at")
+        ext_id = "casfx-" + sha256(f"AMEND|{acct_id}|{tid}|{sl_dec}|{tp_dec}|{now_utc_str}".encode("utf-8")).hexdigest()[:24]
+        if "stopLoss" in body:
+            body["stopLoss"]["clientExtensions"] = {"id": ext_id}
+        if "takeProfit" in body:
+            body["takeProfit"]["clientExtensions"] = {"id": f"{ext_id}-tp"[:32]}
+        rel_path = f"accounts/{acct_id}/trades/{tid}/orders"
+        self._mutation_journal.record_pending(
+            client_ext_id=ext_id,
+            account_id=acct_id,
+            symbol=f"TRADE_{tid}",
+            action_kind="AMEND_STOP",
+            method="PUT",
+            relative_path=rel_path,
+            now_utc=now_utc_str,
+        )
+        try:
+            _, raw = self._request("PUT", rel_path, body_obj=body)
+            doc = _parse_external_wire_json(raw, label="oanda_trade_amend")
+            if type(doc) is not dict:
+                raise PaperBrokerTransportError("malformed OANDA trade protection amend response")
+        except Exception as exc:
+            err_name = type(exc).__name__
+            self._mutation_journal.mark_outcome(
+                client_ext_id=ext_id, status="OUTCOME_UNKNOWN", now_utc=now_utc_str, error_detail=err_name
+            )
+            raise OandaOutcomeUnknownError(
+                f"OANDA post-dispatch amend failure for {ext_id} ({err_name}); frozen until reconciled"
+            ) from None
+        self._mutation_journal.mark_outcome(
+            client_ext_id=ext_id,
+            status="CONFIRMED_FILLED",
+            now_utc=now_utc_str,
+            transaction_id=str(doc.get("lastTransactionID", "0")),
+        )
+        ts = ts_now
         receipt = {
             "provider": self.provider_id,
             "trade_id": tid,
@@ -1904,6 +2191,56 @@ class OandaPracticePaperClient:
         assert_safe_json_numbers(receipt)
         return receipt
 
+
+
+    def reconcile_unknown_mutations(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """Query OANDA recent transactions/openTrades to deterministically clear OUTCOME_UNKNOWN freezes."""
+        _, acct_id = self._require_active()
+        ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        now_utc_str = _format_utc_micros(ts, "observed_at")
+        unknowns = self._mutation_journal.unknown_mutations(account_id=acct_id)
+        if not unknowns:
+            return {"account_id": acct_id, "checked": 0, "resolved": 0, "remaining_unknown": 0}
+        _, tx_raw = self._request("GET", f"accounts/{acct_id}/transactions?pageSize=200")
+        tx_doc = _parse_external_wire_json(tx_raw, label="oanda_transactions_reconcile")
+        tx_by_ext: dict[str, str] = {}
+        if isinstance(tx_doc, dict) and isinstance(tx_doc.get("transactions"), list):
+            for row in tx_doc["transactions"]:
+                if isinstance(row, dict):
+                    ext = (row.get("clientExtensions") or {}).get("id") if isinstance(row.get("clientExtensions"), dict) else None
+                    if not ext and isinstance(row.get("order"), dict):
+                        ext = ((row["order"].get("clientExtensions") or {}).get("id")
+                               if isinstance(row["order"].get("clientExtensions"), dict) else None)
+                    if isinstance(ext, str) and ext.strip():
+                        tx_by_ext[ext.strip()] = str(row.get("id", ""))
+        _, trades_raw = self._request("GET", f"accounts/{acct_id}/openTrades")
+        trades_doc = _parse_external_wire_json(trades_raw, label="oanda_open_trades_reconcile")
+        if isinstance(trades_doc, dict) and isinstance(trades_doc.get("trades"), list):
+            for tr in trades_doc["trades"]:
+                if isinstance(tr, dict) and isinstance(tr.get("clientExtensions"), dict):
+                    ext = tr["clientExtensions"].get("id")
+                    if isinstance(ext, str) and ext.strip() and ext.strip() not in tx_by_ext:
+                        tx_by_ext[ext.strip()] = str(tr.get("id", ""))
+        resolved = 0
+        for row in unknowns:
+            ext_id = str(row["client_ext_id"])
+            if ext_id in tx_by_ext:
+                self._mutation_journal.mark_outcome(
+                    client_ext_id=ext_id,
+                    status="CONFIRMED_FILLED",
+                    now_utc=now_utc_str,
+                    transaction_id=tx_by_ext[ext_id],
+                )
+            else:
+                self._mutation_journal.mark_outcome(
+                    client_ext_id=ext_id,
+                    status="CONFIRMED_ABSENT",
+                    now_utc=now_utc_str,
+                    error_detail="RECONCILED_ABSENT_ON_VENUE",
+                )
+            resolved += 1
+        remaining = len(self._mutation_journal.unknown_mutations(account_id=acct_id))
+        return {"account_id": acct_id, "checked": len(unknowns), "resolved": resolved, "remaining_unknown": remaining}
 
 OandaV20BrokerClient = OandaPracticePaperClient
 
