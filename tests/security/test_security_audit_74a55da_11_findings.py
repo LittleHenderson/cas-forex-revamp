@@ -102,7 +102,7 @@ def _admitted_decision(req_id: str, kind: ActionKind, qty: Decimal | None = Deci
     req = SimpleNamespace(
         request_id=req_id,
         facts=(),
-        evidence=(),
+        evidence=(SimpleNamespace(evidence_id="ev-1"),),
         state=SimpleNamespace(observed_at=T0, valid_until=T0 + timedelta(minutes=5)),
     )
     prop = SimpleNamespace(
