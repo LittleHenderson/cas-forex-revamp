@@ -448,7 +448,7 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
                 ORDER_TIME_GTC = 0
                 ORDER_FILLING_IOC = 1
                 def initialize(self, **_kw): return True
-                def login(self, **_kw): return True
+                def login(self, *_a, **_kw): return True
                 def shutdown(self): return None
                 def last_error(self): return (-10005, "IPC timeout after send")
                 def account_info(self):
@@ -550,8 +550,8 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
                 DurableModelExecutionGate(db, max_calls_per_day=10, max_daily_spend_usd=Decimal("NaN"))
             gate = DurableModelExecutionGate(db, max_calls_per_day=10, max_daily_spend_usd=Decimal("5.00"), clock=lambda: T0)
             with self.assertRaises(ContractError):
-                gate.admit_call(
-                    request_id="r1", model_id="claude-fable-5.2", invocation_sha256="a" * 64,
+                gate.admit_scout_call(
+                    model_id="claude-fable-5.2", request_id="r1",
                     estimated_cost_usd=Decimal("NaN"), now=T0,
                 )
 
@@ -751,7 +751,7 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
             self.assertTrue(dispatch_calls[0].get("client_reference_id"))
 
             # Missing provider transaction ID MUST fail closed as OUTCOME_UNKNOWN (never fabricated)
-            vault.record_realized_profit(
+            vault.record_realized_close(
                 trade_id="tr-ach-2", symbol="EURUSD", broker_id="HUGOSWAY_MT5",
                 realized_net_usd=Decimal("100.00"), occurred_at=T0,
             )  # +$50 reserve
