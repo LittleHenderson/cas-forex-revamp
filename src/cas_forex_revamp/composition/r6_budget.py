@@ -40,7 +40,7 @@ class SharedBudgetModelStore(AnchoredModelStore):
     def retain_window(self, *, now):
         return self.append('shared-model-window', 'MODEL_WINDOW', self.window.record(), now=now)
 
-    def begin_http(self, *, phase, operation, invocation_sha256, body_sha256, timeout_seconds, now):
+    def begin_http(self, *, phase, operation, invocation_sha256, body_sha256, timeout_seconds, now, observer_token=None):
         caps = {'probe': (2,60,600), 'acceptance': (30,120,5400)}
         need(phase in caps and operation in ('render','tokenize','generation'), 'unsupported model operation')
         limit, call_seconds, phase_seconds = caps[phase]
@@ -67,6 +67,6 @@ class SharedBudgetModelStore(AnchoredModelStore):
             payload = {'phase': phase, 'operation': operation, 'invocation_sha256': invocation_sha256,
                 'body_sha256': body_sha256, 'reserved_seconds': timeout_seconds if operation == 'generation' else 0,
                 'requested_timeout_seconds': timeout_seconds}
-            result = self._insert(db, records, receipt_id, 'MODEL_HTTP_ATTEMPT', payload, now)
+            result = self._insert(db, records, receipt_id, 'MODEL_HTTP_ATTEMPT', payload, now, observer_token=observer_token)
         self._anchor()  # any anchor failure propagates before transport
         return result

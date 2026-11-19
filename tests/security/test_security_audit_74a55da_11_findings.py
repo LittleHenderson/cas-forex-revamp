@@ -59,7 +59,6 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
     Mt5OutcomeUnknownError,
     Mt5PaperBrokerVenue,
     Mt5Position,
-    Mt5QuoteTick,
     Mt5SpoolBridgeTransport,
     Mt5SpoolPaperTerminalEmulator,
     OrderIntent,

@@ -252,10 +252,12 @@ class ModelEvidenceStore:
             return self._insert(db, records, receipt_id, "MODEL_HTTP_ATTEMPT", payload, now, observer_token=observer_token)
 
 
-class ObserverAuthorizedModelStore:
+class ObserverAuthorizedModelStore(ModelEvidenceStore):
     """Trusted controller-only write handle to ModelEvidenceStore carrying the private observer_key (Finding [4])."""
 
     def __init__(self, store: ModelEvidenceStore, observer_key: bytes) -> None:
+        if not isinstance(store, ModelEvidenceStore):
+            raise ContractError("explicit ModelEvidenceStore required")
         self._store = store
         self._observer_key = bytes(observer_key)
 
@@ -277,6 +279,10 @@ class ObserverAuthorizedModelStore:
 
     def records(self):
         return self._store.records()
+
+    def verified_records(self):
+        fn = getattr(self._store, "verified_records", None)
+        return fn() if callable(fn) else self._store.records()
 
     def resolve(self, receipt_id):
         return self._store.resolve(receipt_id)

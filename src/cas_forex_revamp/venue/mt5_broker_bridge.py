@@ -91,6 +91,7 @@ from .external_paper_broker import (
     REQUIRED_LIVE_ARM_PHRASE,
     BrokerAuditReceipt,
     LiveBrokerEndpointForbiddenError,
+    OandaMutationJournal,
     OandaPracticePaperClient,
     assert_safe_json_numbers,
     resolve_execution_mode,
@@ -2462,7 +2463,7 @@ class Mt5MutationJournal:
         return conn
 
     def recover_pending_as_unknown(self, *, now_utc: str | None = None) -> int:
-        ts_str = now_utc or _utc_iso(_utc_now())
+        ts_str = now_utc or _iso(_utc_now())
         if self._path is None:
             promoted = 0
             for row in self._memory.values():
@@ -2969,7 +2970,7 @@ class Mt5PaperBrokerVenue:
                 valve_decision_sha256=valve_sha, broker_channel=v_channel, account_login=v_login, server=v_srv, execution_mode=v_mode)
         if hasattr(self._transport, "prepare_request"):
             request = self._transport.prepare_request(request)
-        now_utc_str = _utc_iso(self._clock())
+        now_utc_str = _iso(self._clock())
         sem_key = (
             f"{order.kind.value}|{self.broker_id}|{self._credentials.login}|{self._credentials.server}|"
             f"{order.symbol}|{request.position_ticket or ''}"
@@ -2991,7 +2992,7 @@ class Mt5PaperBrokerVenue:
             self._mutation_journal.mark_outcome(
                 request_id=request.request_id,
                 status="OUTCOME_UNKNOWN",
-                now_utc=_utc_iso(self._clock()),
+                now_utc=_iso(self._clock()),
                 error_detail=str(exc)[:240],
             )
             self._audit.append("MT5_OUTCOME_UNKNOWN", self._clock(), {
@@ -3002,7 +3003,7 @@ class Mt5PaperBrokerVenue:
             self._mutation_journal.mark_outcome(
                 request_id=request.request_id,
                 status="OUTCOME_UNKNOWN",
-                now_utc=_utc_iso(self._clock()),
+                now_utc=_iso(self._clock()),
                 error_detail=type(exc).__name__,
             )
             self._audit.append("MT5_OUTCOME_UNKNOWN", self._clock(), {
@@ -3015,7 +3016,7 @@ class Mt5PaperBrokerVenue:
             self._mutation_journal.mark_outcome(
                 request_id=request.request_id,
                 status="OUTCOME_UNKNOWN",
-                now_utc=_utc_iso(self._clock()),
+                now_utc=_iso(self._clock()),
                 error_detail="RECEIPT_REQUEST_BINDING_MISMATCH",
             )
             raise Mt5OutcomeUnknownError("receipt does not bind the submitted request; outcome UNKNOWN")
@@ -3023,7 +3024,7 @@ class Mt5PaperBrokerVenue:
             self._mutation_journal.mark_outcome(
                 request_id=request.request_id,
                 status="OUTCOME_UNKNOWN",
-                now_utc=_utc_iso(self._clock()),
+                now_utc=_iso(self._clock()),
                 error_detail="EA_REPORTED_UNKNOWN",
             )
             self._audit.append("MT5_OUTCOME_UNKNOWN", self._clock(), {
@@ -3034,14 +3035,14 @@ class Mt5PaperBrokerVenue:
             self._mutation_journal.mark_outcome(
                 request_id=request.request_id,
                 status="CONFIRMED_REJECTED",
-                now_utc=_utc_iso(self._clock()),
+                now_utc=_iso(self._clock()),
                 error_detail=str(receipt.comment or receipt.retcode),
             )
         else:
             self._mutation_journal.mark_outcome(
                 request_id=request.request_id,
                 status="CONFIRMED_FILLED",
-                now_utc=_utc_iso(self._clock()),
+                now_utc=_iso(self._clock()),
                 order_ticket=None if receipt.order_ticket is None else str(receipt.order_ticket),
                 deal_ticket=None if receipt.deal_ticket is None else str(receipt.deal_ticket),
             )
@@ -3084,7 +3085,7 @@ class Mt5PaperBrokerVenue:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Reconcile MT5 OUTCOME_UNKNOWN / PENDING_DISPATCH latches strictly against verified terminal order/deal history."""
-        ts_str = _utc_iso(self._clock() if now is None else utc_time(now, "now"))
+        ts_str = _iso(self._clock() if now is None else utc_time(now, "now"))
         login = int(self._credentials.login)
         srv = self._credentials.server
         unknowns = self._mutation_journal.unknown_mutations(

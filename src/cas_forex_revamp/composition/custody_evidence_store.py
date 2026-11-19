@@ -8,7 +8,7 @@ does not increase any generation, token, time, retry or cost allowance.
 import json
 from ..contracts import ContractError, canonical_bytes, content_digest
 from ..contracts.primitives import identifier, utc_time
-from ..operator.model_evidence import ModelEvidenceStore
+from ..operator.model_evidence import ModelEvidenceStore, OBSERVER_ONLY_KINDS
 
 MAX_RECORDS=2048
 
@@ -32,9 +32,10 @@ class CustodyModelEvidenceStore(ModelEvidenceStore):
             previous = record["sha256"]
         return tuple(records)
 
-    def _insert(self, db, records, receipt_id, kind, payload, now):
+    def _insert(self, db, records, receipt_id, kind, payload, now, *, observer_token=None):
         identifier(receipt_id, "receipt_id")
         identifier(kind, "kind")
+        self._check_observer_write(kind, observer_token)
         utc_time(now, "now")
         if now >= self.deadline:
             raise ContractError("model evidence window expired")
@@ -54,4 +55,11 @@ class CustodyModelEvidenceStore(ModelEvidenceStore):
         if len(records) >= MAX_RECORDS or len(raw) > 4194304:
             raise ContractError("model evidence capacity exhausted")
         db.execute("INSERT INTO receipts VALUES (?,?,?)", (record["sequence"], receipt_id, raw.decode()))
+        if self._observer_key is not None and kind in OBSERVER_ONLY_KINDS:
+            self._ensure_attestation_table(db)
+            mac = self._compute_observer_mac(receipt_id, kind, record["sha256"])
+            db.execute(
+                "INSERT OR REPLACE INTO observer_attestations(receipt_id, kind, observer_mac) VALUES (?,?,?)",
+                (receipt_id, kind, mac),
+            )
         return record

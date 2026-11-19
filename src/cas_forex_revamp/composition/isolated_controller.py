@@ -74,8 +74,12 @@ class _ControllerGenerationClient(GenerationClient):
         self.owner = owner
         self.request_id = request_id
 
-    def pending_mode(self):
-        return 'CONTROLLER_DUE_ACK'
+    def record(self, suffix, kind, payload):
+        if kind == 'MODEL_TRANSPORT_REQUEST_SENT':
+            payload = dict(payload)
+            payload.pop('pending_events', None)
+            payload['pending_mode'] = 'CONTROLLER_DUE_ACK'
+        return super().record(suffix, kind, payload)
 
     def pending_changes(self, connection, deadline):
         sent = self.store.require_observer_provenance('generation-sent-' + self.key)

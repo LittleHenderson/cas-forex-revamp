@@ -479,7 +479,7 @@ def _load_or_create_recovery_key(key_path: Path, *, dir_fd: int | None = None) -
     opened_dir_fd: int | None = None
     use_fd = dir_fd
     if os.name == "posix" and use_fd is None:
-        _, opened_dir_fd = open_verified_directory_fd(parent, create=True, label="owner recovery key directory")
+        _, opened_dir_fd = open_verified_directory_fd(parent, create=True, label="owner recovery directory")
         use_fd = opened_dir_fd
     try:
         exists = False
@@ -493,7 +493,7 @@ def _load_or_create_recovery_key(key_path: Path, *, dir_fd: int | None = None) -
             exists = os.path.lexists(key_path)
         if exists:
             raw_bytes, _ = verify_and_read_owner_only_file(
-                parent, fname, dir_fd=use_fd, label="owner recovery key", max_bytes=4096
+                parent, fname, dir_fd=use_fd, label="owner recovery file", max_bytes=4096
             )
             raw = raw_bytes.strip()
             key = bytes.fromhex(raw.decode("ascii")) if len(raw) == 64 else raw
@@ -503,7 +503,7 @@ def _load_or_create_recovery_key(key_path: Path, *, dir_fd: int | None = None) -
         key = secrets.token_bytes(32)
         create_owner_only_file_atomic(
             parent, fname, (key.hex() + "\n").encode("ascii"),
-            dir_fd=use_fd, replace_existing=False, label="owner recovery key",
+            dir_fd=use_fd, replace_existing=False, label="owner recovery file",
         )
         return key
     finally:
@@ -854,6 +854,8 @@ def initialize_shared_runtime_state(
     else:
         init_td = "AUTO"
 
+    oanda_mutation_journal = OandaMutationJournal(db_path)
+    mt5_mutation_journal = Mt5MutationJournal(db_path)
     return SharedRuntimeState(
         state_dir=sdir,
         db_path=db_path,
@@ -866,4 +868,6 @@ def initialize_shared_runtime_state(
         parallel_tiers=parallel_tiers,
         thinking_depth_path=td_path,
         initial_thinking_depth=init_td,
+        oanda_mutation_journal=oanda_mutation_journal,
+        mt5_mutation_journal=mt5_mutation_journal,
     )

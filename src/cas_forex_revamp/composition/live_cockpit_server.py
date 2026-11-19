@@ -635,13 +635,13 @@ class LoopbackCockpitServer:
             self._token_file.name,
             (tok_value + "\n").encode("utf-8"),
             replace_existing=True,
-            label="cockpit token file",
+            label="cockpit file",
         )
 
     def _load_or_init_auth_token(self) -> None:
         if self._token_file is not None:
             parent_path, dir_fd = open_verified_directory_fd(
-                self._token_file.parent, create=True, label="cockpit token directory"
+                self._token_file.parent, create=True, label="cockpit directory"
             )
             try:
                 fname = self._token_file.name
@@ -656,7 +656,7 @@ class LoopbackCockpitServer:
                     exists = os.path.lexists(self._token_file)
                 if exists:
                     raw_bytes, _ = verify_and_read_owner_only_file(
-                        parent_path, fname, dir_fd=dir_fd, label="cockpit token file", max_bytes=256
+                        parent_path, fname, dir_fd=dir_fd, label="cockpit file", max_bytes=256
                     )
                     raw = raw_bytes.decode("utf-8").strip()
                     if not _is_valid_generated_cockpit_token(raw):
@@ -679,7 +679,7 @@ class LoopbackCockpitServer:
                     (new_tok.reveal() + "\n").encode("utf-8"),
                     dir_fd=dir_fd,
                     replace_existing=False,
-                    label="cockpit token file",
+                    label="cockpit file",
                 )
                 with self._auth_cond:
                     self._auth_secret = new_tok
