@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
 import sqlite3
@@ -245,13 +245,20 @@ class DurableModelExecutionGate:
     ) -> None:
         if not isinstance(db_path, (str, Path)) or not str(db_path).strip():
             raise ContractError("DurableModelExecutionGate requires a non-empty SQLite db_path")
-        if type(max_calls_per_day) is not int or max_calls_per_day <= 0:
-            raise ContractError("max_calls_per_day must be a positive integer")
+        if type(max_calls_per_day) is not int or max_calls_per_day <= 0 or max_calls_per_day > 100_000:
+            raise ContractError("max_calls_per_day must be a finite positive integer in 1..100000")
         self._max_calls_per_day = max_calls_per_day
-        self._max_daily_spend_usd = Decimal(str(max_daily_spend_usd))
-        self._default_call_cost_usd = Decimal(str(default_call_cost_usd))
-        if self._max_daily_spend_usd <= Decimal("0") or self._default_call_cost_usd < Decimal("0"):
-            raise ContractError("model gate spend ceiling must be > 0 and per-call cost >= 0")
+        try:
+            spend_cap = Decimal(str(max_daily_spend_usd))
+            call_cost = Decimal(str(default_call_cost_usd))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ContractError("model gate spend ceiling and per-call cost must be valid finite decimals") from exc
+        if not spend_cap.is_finite() or not call_cost.is_finite():
+            raise ContractError("model gate spend ceiling and per-call cost must be finite (no Infinity/NaN)")
+        if spend_cap <= Decimal("0") or spend_cap > Decimal("10000.00") or call_cost < Decimal("0"):
+            raise ContractError("model gate spend ceiling must be in (0, 10000.00] and per-call cost >= 0")
+        self._max_daily_spend_usd = spend_cap
+        self._default_call_cost_usd = call_cost
         self._allowed_models = frozenset(str(m).strip() for m in allowed_models if str(m).strip()) if allowed_models is not None else None
         self._expires_at = None if expires_at is None else utc_time(expires_at, "expires_at")
         self._scope_id = identifier(scope_id, "scope_id")
@@ -259,6 +266,14 @@ class DurableModelExecutionGate:
         self._path = Path(db_path)
         self._lock = RLock()
         self._initialized = False
+
+    @property
+    def max_calls_per_day(self) -> int:
+        return self._max_calls_per_day
+
+    @property
+    def max_daily_spend_usd(self) -> Decimal:
+        return self._max_daily_spend_usd
 
     def _connect(self) -> sqlite3.Connection:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,6 +319,13 @@ class DurableModelExecutionGate:
         estimated_cost_usd: Decimal,
         now: datetime | None = None,
     ) -> dict[str, str | int]:
+        if not isinstance(estimated_cost_usd, Decimal):
+            try:
+                estimated_cost_usd = Decimal(str(estimated_cost_usd))
+            except (InvalidOperation, ValueError, TypeError) as exc:
+                raise ContractError("estimated_cost_usd must be a finite non-negative Decimal") from exc
+        if not estimated_cost_usd.is_finite() or estimated_cost_usd < Decimal("0"):
+            raise ContractError("estimated_cost_usd must be finite and >= 0 (no Infinity/NaN/negative)")
         ts = utc_time(self._clock(), "clock") if now is None else utc_time(now, "now")
         if self._expires_at is not None and ts > self._expires_at:
             raise OperatorUnavailable("MODEL_EXECUTION_GATE_EXPIRED: durable model authorization expired")

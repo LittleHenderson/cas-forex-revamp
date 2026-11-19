@@ -65,6 +65,7 @@ import re
 import stat
 import hmac
 import secrets
+import sqlite3
 import time
 from typing import Any, Protocol
 
@@ -91,6 +92,7 @@ from .external_paper_broker import (
     REQUIRED_LIVE_ARM_PHRASE,
     BrokerAuditReceipt,
     LiveBrokerEndpointForbiddenError,
+    OandaMutationJournal,
     OandaPracticePaperClient,
     assert_safe_json_numbers,
     resolve_execution_mode,
@@ -564,16 +566,15 @@ def _atomic_write_json(path: Path, doc: Mapping[str, Any]) -> None:
 
 
 def _read_spool_json(path: Path, *, max_bytes: int = MAX_SPOOL_FILE_BYTES) -> Any:
-    last_perm_err: OSError | None = None
-    raw: bytes | None = None
+    last_err: Exception | None = None
     for attempt in range(5):
         try:
             st = os.lstat(path)
         except FileNotFoundError:
             raise
         except PermissionError as exc:
-            last_perm_err = exc
-            time.sleep(0.005)
+            last_err = exc
+            time.sleep(0.015)
             continue
         except OSError as exc:
             raise Mt5TransportError(f"spool file {path.name} unreadable: {type(exc).__name__}") from None
@@ -583,22 +584,25 @@ def _read_spool_json(path: Path, *, max_bytes: int = MAX_SPOOL_FILE_BYTES) -> An
             raise Mt5TransportError(f"spool file {path.name} exceeds {max_bytes} bytes")
         try:
             raw = path.read_bytes()
-            break
         except PermissionError as exc:
-            last_perm_err = exc
-            time.sleep(0.005)
+            last_err = exc
+            time.sleep(0.015)
+            continue
         except OSError as exc:
             raise Mt5TransportError(f"spool file {path.name} unreadable: {type(exc).__name__}") from None
-    if raw is None:
-        raise Mt5TransportError(
-            f"spool file {path.name} unreadable after retry: {type(last_perm_err).__name__ if last_perm_err else 'OSError'}"
-        )
-    if raw.startswith(b"\xef\xbb\xbf"):
-        raw = raw[3:]
-    try:
-        return strict_safe_json_loads(raw, max_bytes=max_bytes)
-    except ContractError as exc:
-        raise Mt5TransportError(f"spool file {path.name} is not strict safe JSON: {exc}") from None
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        try:
+            return strict_safe_json_loads(raw, max_bytes=max_bytes)
+        except ContractError as exc:
+            last_err = exc
+            if attempt < 4:
+                time.sleep(0.015)
+                continue
+            raise Mt5TransportError(f"spool file {path.name} is not strict safe JSON: {exc}") from None
+    raise Mt5TransportError(
+        f"spool file {path.name} unreadable after retry: {type(last_err).__name__ if last_err else 'OSError'}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2416,6 +2420,304 @@ class Mt5ExecutionResult:
         return self.oanda_receipt is not None and self.oanda_receipt.get("status") in ("FILLED", "CREATED")
 
 
+class Mt5MutationJournal:
+    """Durable SQLite WAL pre-dispatch intent & reconciliation latch for MT5 orders/amendments (Finding [5])."""
+
+    def __init__(self, db_path: str | Path | None = None, *, recover_on_open: bool = True) -> None:
+        self._path = Path(db_path) if db_path is not None else None
+        self._memory: dict[str, dict[str, str | None]] = {}
+        self._initialized = False
+        if self._path is not None and recover_on_open and self._path.exists():
+            self.recover_pending_as_unknown()
+
+    @property
+    def db_path(self) -> Path | None:
+        return self._path
+
+    def _connect(self) -> sqlite3.Connection:
+        if self._path is None:
+            raise ContractError("in-memory Mt5MutationJournal has no SQLite path")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self._path), timeout=10.0, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        if not self._initialized:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mt5_mutation_journal (
+                    request_id TEXT PRIMARY KEY,
+                    broker_id TEXT NOT NULL,
+                    account_login INTEGER NOT NULL,
+                    server TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    action_kind TEXT NOT NULL,
+                    position_ticket TEXT,
+                    semantic_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    order_ticket TEXT,
+                    deal_ticket TEXT,
+                    error_detail TEXT,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL
+                )
+                """
+            )
+            self._initialized = True
+        return conn
+
+    def recover_pending_as_unknown(self, *, now_utc: str | None = None) -> int:
+        ts_str = now_utc or _iso(_utc_now())
+        if self._path is None:
+            promoted = 0
+            for row in self._memory.values():
+                if row["status"] == "PENDING_DISPATCH":
+                    row["status"] = "OUTCOME_UNKNOWN"
+                    row["error_detail"] = row["error_detail"] or "RECOVERED_CRASH_LEFT_PENDING_DISPATCH"
+                    row["updated_at_utc"] = ts_str
+                    promoted += 1
+            return promoted
+        if not self._path.exists():
+            return 0
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE mt5_mutation_journal "
+                "SET status = 'OUTCOME_UNKNOWN', "
+                "    error_detail = COALESCE(error_detail, 'RECOVERED_CRASH_LEFT_PENDING_DISPATCH'), "
+                "    updated_at_utc = ? "
+                "WHERE status = 'PENDING_DISPATCH'",
+                (ts_str,),
+            )
+            promoted = int(cur.rowcount or 0)
+            conn.commit()
+            return promoted
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def unknown_mutations(
+        self,
+        *,
+        broker_id: str | None = None,
+        account_login: int | None = None,
+        server: str | None = None,
+        symbol: str | None = None,
+        position_ticket: str | None = None,
+        semantic_key: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if self._path is None:
+            out = [
+                dict(v)
+                for v in self._memory.values()
+                if v["status"] in ("OUTCOME_UNKNOWN", "PENDING_DISPATCH")
+            ]
+        elif not self._path.exists():
+            out = []
+        else:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT request_id, broker_id, account_login, server, symbol, action_kind, "
+                    "position_ticket, semantic_key, status, order_ticket, deal_ticket, error_detail, "
+                    "created_at_utc, updated_at_utc "
+                    "FROM mt5_mutation_journal "
+                    "WHERE status IN ('OUTCOME_UNKNOWN', 'PENDING_DISPATCH') "
+                    "ORDER BY created_at_utc ASC"
+                ).fetchall()
+            finally:
+                conn.close()
+            out = [
+                {
+                    "request_id": str(r[0]),
+                    "broker_id": str(r[1]),
+                    "account_login": int(r[2]),
+                    "server": str(r[3]),
+                    "symbol": str(r[4]),
+                    "action_kind": str(r[5]),
+                    "position_ticket": r[6],
+                    "semantic_key": str(r[7]),
+                    "status": str(r[8]),
+                    "order_ticket": r[9],
+                    "deal_ticket": r[10],
+                    "error_detail": r[11],
+                    "created_at_utc": str(r[12]),
+                    "updated_at_utc": str(r[13]),
+                }
+                for r in rows
+            ]
+        matched: list[dict[str, Any]] = []
+        for r in out:
+            if broker_id is not None and r["broker_id"] != broker_id:
+                continue
+            if account_login is not None and int(r["account_login"]) != int(account_login):
+                continue
+            if server is not None and r["server"] != server:
+                continue
+            if symbol is None and position_ticket is None and semantic_key is None:
+                matched.append(r)
+            elif (
+                (symbol is not None and r["symbol"] == symbol)
+                or (position_ticket is not None and r.get("position_ticket") == position_ticket)
+                or (semantic_key is not None and r.get("semantic_key") == semantic_key)
+            ):
+                matched.append(r)
+        return matched
+
+    def require_clear(
+        self,
+        *,
+        broker_id: str,
+        account_login: int,
+        server: str,
+        symbol: str | None = None,
+        position_ticket: str | None = None,
+        semantic_key: str | None = None,
+    ) -> None:
+        frozen = self.unknown_mutations(
+            broker_id=broker_id,
+            account_login=account_login,
+            server=server,
+            symbol=symbol,
+            position_ticket=position_ticket,
+            semantic_key=semantic_key,
+        )
+        if frozen:
+            ids = ", ".join(f"{x['request_id']}({x['status']})" for x in frozen[:4])
+            raise Mt5OutcomeUnknownError(
+                f"MT5_OUTCOME_UNKNOWN_FREEZE: unresolved {broker_id} ({account_login}@{server}) mutation(s) "
+                f"[{ids}] must be reconciled before new dispatches"
+            )
+
+    def record_pending(
+        self,
+        *,
+        request_id: str,
+        broker_id: str,
+        account_login: int,
+        server: str,
+        symbol: str,
+        action_kind: str,
+        position_ticket: str | None,
+        semantic_key: str,
+        now_utc: str,
+    ) -> None:
+        if self._path is None:
+            self.require_clear(
+                broker_id=broker_id,
+                account_login=account_login,
+                server=server,
+                symbol=symbol,
+                position_ticket=position_ticket,
+                semantic_key=semantic_key,
+            )
+            if request_id in self._memory:
+                raise Mt5OutcomeUnknownError(
+                    f"Duplicate MT5 request_id={request_id!r} (status={self._memory[request_id]['status']}); never resubmitted"
+                )
+            self._memory[request_id] = {
+                "request_id": request_id,
+                "broker_id": broker_id,
+                "account_login": int(account_login),
+                "server": server,
+                "symbol": symbol,
+                "action_kind": action_kind,
+                "position_ticket": position_ticket,
+                "semantic_key": semantic_key,
+                "status": "PENDING_DISPATCH",
+                "order_ticket": None,
+                "deal_ticket": None,
+                "error_detail": None,
+                "created_at_utc": now_utc,
+                "updated_at_utc": now_utc,
+            }
+            return
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            frozen = conn.execute(
+                "SELECT request_id, status FROM mt5_mutation_journal "
+                "WHERE broker_id = ? AND account_login = ? AND server = ? "
+                "AND status IN ('OUTCOME_UNKNOWN', 'PENDING_DISPATCH') "
+                "AND (symbol = ? OR semantic_key = ? OR (position_ticket IS NOT NULL AND position_ticket = ?))",
+                (broker_id, int(account_login), server, symbol, semantic_key, position_ticket or ""),
+            ).fetchall()
+            if frozen:
+                conn.rollback()
+                ids = ", ".join(f"{r[0]}({r[1]})" for r in frozen[:4])
+                raise Mt5OutcomeUnknownError(
+                    f"MT5_OUTCOME_UNKNOWN_FREEZE: unresolved {broker_id} ({account_login}@{server}) mutation(s) "
+                    f"[{ids}] must be reconciled before new dispatches"
+                )
+            existing = conn.execute(
+                "SELECT status FROM mt5_mutation_journal WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if existing is not None:
+                conn.rollback()
+                raise Mt5OutcomeUnknownError(
+                    f"Duplicate MT5 request_id={request_id!r} (status={existing[0]}); never resubmitted"
+                )
+            conn.execute(
+                "INSERT INTO mt5_mutation_journal ("
+                "request_id, broker_id, account_login, server, symbol, action_kind, position_ticket, "
+                "semantic_key, status, order_ticket, deal_ticket, error_detail, created_at_utc, updated_at_utc"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_DISPATCH', NULL, NULL, NULL, ?, ?)",
+                (
+                    request_id, broker_id, int(account_login), server, symbol, action_kind,
+                    position_ticket, semantic_key, now_utc, now_utc,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def mark_outcome(
+        self,
+        *,
+        request_id: str,
+        status: str,
+        now_utc: str,
+        order_ticket: str | None = None,
+        deal_ticket: str | None = None,
+        error_detail: str | None = None,
+    ) -> None:
+        if status not in ("CONFIRMED_FILLED", "CONFIRMED_REJECTED", "CONFIRMED_ABSENT", "OUTCOME_UNKNOWN"):
+            raise ContractError(f"invalid MT5 journal status {status!r}")
+        if self._path is None:
+            row = self._memory.get(request_id)
+            if row is not None:
+                row["status"] = status
+                row["order_ticket"] = order_ticket
+                row["deal_ticket"] = deal_ticket
+                row["error_detail"] = error_detail
+                row["updated_at_utc"] = now_utc
+            return
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE mt5_mutation_journal "
+                "SET status = ?, order_ticket = ?, deal_ticket = ?, error_detail = ?, updated_at_utc = ? "
+                "WHERE request_id = ?",
+                (status, order_ticket, deal_ticket, error_detail, now_utc, request_id),
+            )
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
 class Mt5PaperBrokerVenue:
     """Demo-only MT5 venue: translates OrderIntents into MT5 requests behind Valve + margin gates.
 
@@ -2437,6 +2739,7 @@ class Mt5PaperBrokerVenue:
         deviation_points: int = 20,
         magic: int = DEFAULT_MAGIC,
         clock: Callable[[], datetime] | None = None,
+        mutation_journal: Mt5MutationJournal | None = None,
     ) -> None:
         if broker_id not in (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
             raise ContractError("Mt5PaperBrokerVenue serves HUGOSWAY_MT5 or LHFX_MT5 only")
@@ -2456,6 +2759,11 @@ class Mt5PaperBrokerVenue:
         self._account: Mt5AccountSnapshot | None = None
         self._positions: tuple[Mt5Position, ...] = ()
         self._request_counter = 0
+        self._mutation_journal = mutation_journal if mutation_journal is not None else Mt5MutationJournal()
+        if self._credentials.execution_mode == EXECUTION_MODE_LIVE and self._mutation_journal.db_path is None:
+            raise ContractError(
+                "MT5_LIVE_REQUIRES_DURABLE_MUTATION_JOURNAL: LIVE MT5 execution requires a persistent SQLite Mt5MutationJournal"
+            )
 
     def __repr__(self) -> str:
         return (
@@ -2665,14 +2973,42 @@ class Mt5PaperBrokerVenue:
                 valve_decision_sha256=valve_sha, broker_channel=v_channel, account_login=v_login, server=v_srv, execution_mode=v_mode)
         if hasattr(self._transport, "prepare_request"):
             request = self._transport.prepare_request(request)
+        now_utc_str = _iso(self._clock())
+        sem_key = (
+            f"{order.kind.value}|{self.broker_id}|{self._credentials.login}|{self._credentials.server}|"
+            f"{order.symbol}|{request.position_ticket or ''}"
+        )
+        self._mutation_journal.record_pending(
+            request_id=request.request_id,
+            broker_id=self.broker_id,
+            account_login=int(self._credentials.login),
+            server=self._credentials.server,
+            symbol=order.symbol,
+            action_kind=order.kind.value,
+            position_ticket=request.position_ticket,
+            semantic_key=sem_key,
+            now_utc=now_utc_str,
+        )
         try:
             receipt = self._transport.send_order(request)
-        except Mt5OutcomeUnknownError:
+        except Mt5OutcomeUnknownError as exc:
+            self._mutation_journal.mark_outcome(
+                request_id=request.request_id,
+                status="OUTCOME_UNKNOWN",
+                now_utc=_iso(self._clock()),
+                error_detail=str(exc)[:240],
+            )
             self._audit.append("MT5_OUTCOME_UNKNOWN", self._clock(), {
                 "broker_id": self.broker_id, "order_id": order.order_id, "request": request.to_spool_dict(),
             })
             raise
         except (Mt5TransportError, OSError) as exc:
+            self._mutation_journal.mark_outcome(
+                request_id=request.request_id,
+                status="OUTCOME_UNKNOWN",
+                now_utc=_iso(self._clock()),
+                error_detail=type(exc).__name__,
+            )
             self._audit.append("MT5_OUTCOME_UNKNOWN", self._clock(), {
                 "broker_id": self.broker_id, "order_id": order.order_id, "request": request.to_spool_dict(),
             })
@@ -2680,12 +3016,39 @@ class Mt5PaperBrokerVenue:
                 f"{self.broker_id} send failed after dispatch ({type(exc).__name__}); outcome UNKNOWN, never resubmitted"
             ) from None
         if receipt.request_id != request.request_id or receipt.request_sha256 != request.request_sha256:
+            self._mutation_journal.mark_outcome(
+                request_id=request.request_id,
+                status="OUTCOME_UNKNOWN",
+                now_utc=_iso(self._clock()),
+                error_detail="RECEIPT_REQUEST_BINDING_MISMATCH",
+            )
             raise Mt5OutcomeUnknownError("receipt does not bind the submitted request; outcome UNKNOWN")
         if receipt.status == "UNKNOWN":
+            self._mutation_journal.mark_outcome(
+                request_id=request.request_id,
+                status="OUTCOME_UNKNOWN",
+                now_utc=_iso(self._clock()),
+                error_detail="EA_REPORTED_UNKNOWN",
+            )
             self._audit.append("MT5_OUTCOME_UNKNOWN", self._clock(), {
                 "broker_id": self.broker_id, "order_id": order.order_id, "receipt": receipt.to_wire_dict(),
             })
             raise Mt5OutcomeUnknownError(f"{self.broker_id} EA reported outcome UNKNOWN for {request.request_id}")
+        if receipt.status == "REJECTED" and receipt.position_ticket is None and receipt.deal_ticket is None:
+            self._mutation_journal.mark_outcome(
+                request_id=request.request_id,
+                status="CONFIRMED_REJECTED",
+                now_utc=_iso(self._clock()),
+                error_detail=str(receipt.message or receipt.retcode),
+            )
+        else:
+            self._mutation_journal.mark_outcome(
+                request_id=request.request_id,
+                status="CONFIRMED_FILLED",
+                now_utc=_iso(self._clock()),
+                order_ticket=None if receipt.position_ticket is None else str(receipt.position_ticket),
+                deal_ticket=None if receipt.deal_ticket is None else str(receipt.deal_ticket),
+            )
         self._account = self._transport.account_info()
         self._positions = self._transport.positions()
         record = self._audit.append("MT5_ORDER_RECEIPT", self._clock(), {
@@ -2713,6 +3076,107 @@ class Mt5PaperBrokerVenue:
             valve_mode=decision.valve_mode,
             audit_record=record,
         )
+
+    @property
+    def mutation_journal(self) -> Mt5MutationJournal:
+        return self._mutation_journal
+
+    def reconcile_unknown_mutations(
+        self,
+        *,
+        terminal_history_fn: Callable[[int, str], Mapping[str, Any]] | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Reconcile MT5 OUTCOME_UNKNOWN / PENDING_DISPATCH latches strictly against verified terminal order/deal history."""
+        ts_str = _iso(self._clock() if now is None else utc_time(now, "now"))
+        login = int(self._credentials.login)
+        srv = self._credentials.server
+        unknowns = self._mutation_journal.unknown_mutations(
+            broker_id=self.broker_id, account_login=login, server=srv
+        )
+        if not unknowns:
+            return {"broker_id": self.broker_id, "checked": 0, "resolved": 0, "remaining_unknown": 0, "complete": True}
+        hist_fn = terminal_history_fn or getattr(self._transport, "order_deal_history", None)
+        if not callable(hist_fn):
+            return {
+                "broker_id": self.broker_id,
+                "checked": len(unknowns),
+                "resolved": 0,
+                "remaining_unknown": len(unknowns),
+                "complete": False,
+                "reason": "NO_TERMINAL_HISTORY_SOURCE",
+            }
+        history = hist_fn(login, srv)
+        if not isinstance(history, Mapping):
+            return {
+                "broker_id": self.broker_id,
+                "checked": len(unknowns),
+                "resolved": 0,
+                "remaining_unknown": len(unknowns),
+                "complete": False,
+                "reason": "MALFORMED_TERMINAL_HISTORY",
+            }
+        exact_account_match = (
+            int(history.get("account_login", -1)) == login
+            and str(history.get("server", "")) == srv
+            and bool(history.get("complete") is True)
+            and isinstance(history.get("orders"), (list, tuple))
+            and isinstance(history.get("deals"), (list, tuple))
+        )
+        matched_by_req: dict[str, tuple[str | None, str | None]] = {}
+        if isinstance(history.get("orders"), (list, tuple)):
+            for o in history["orders"]:
+                if isinstance(o, Mapping):
+                    rid = str(o.get("request_id") or "").strip()
+                    if rid:
+                        matched_by_req[rid] = (
+                            None if o.get("order_ticket") is None else str(o["order_ticket"]),
+                            None if o.get("deal_ticket") is None else str(o["deal_ticket"]),
+                        )
+        if isinstance(history.get("deals"), (list, tuple)):
+            for d in history["deals"]:
+                if isinstance(d, Mapping):
+                    rid = str(d.get("request_id") or "").strip()
+                    if rid:
+                        prev = matched_by_req.get(rid, (None, None))
+                        matched_by_req[rid] = (
+                            prev[0] or (None if d.get("order_ticket") is None else str(d["order_ticket"])),
+                            None if d.get("deal_ticket") is None else str(d["deal_ticket"]),
+                        )
+        resolved = 0
+        for row in unknowns:
+            rid = str(row["request_id"])
+            if rid in matched_by_req and int(history.get("account_login", -1)) == login and str(history.get("server", "")) == srv:
+                ot, dt = matched_by_req[rid]
+                self._mutation_journal.mark_outcome(
+                    request_id=rid, status="CONFIRMED_FILLED", now_utc=ts_str, order_ticket=ot, deal_ticket=dt
+                )
+                resolved += 1
+            elif exact_account_match:
+                self._mutation_journal.mark_outcome(
+                    request_id=rid,
+                    status="CONFIRMED_ABSENT",
+                    now_utc=ts_str,
+                    error_detail="RECONCILED_ABSENT_IN_EXACT_MT5_HISTORY",
+                )
+                resolved += 1
+            else:
+                self._mutation_journal.mark_outcome(
+                    request_id=rid,
+                    status="OUTCOME_UNKNOWN",
+                    now_utc=ts_str,
+                    error_detail="RECONCILIATION_INCOMPLETE_OR_ACCOUNT_MISMATCH",
+                )
+        remaining = len(
+            self._mutation_journal.unknown_mutations(broker_id=self.broker_id, account_login=login, server=srv)
+        )
+        return {
+            "broker_id": self.broker_id,
+            "checked": len(unknowns),
+            "resolved": resolved,
+            "remaining_unknown": remaining,
+            "complete": exact_account_match,
+        }
 
     def shutdown(self) -> None:
         self._transport.shutdown()
@@ -2892,6 +3356,8 @@ class BrokerHierarchyRouter:
         live_arm_phrase: str | None = None,
         clock: Callable[[], datetime] | None = None,
         min_post_trade_margin_level_pct: Decimal = DEFAULT_MIN_POST_TRADE_MARGIN_LEVEL_PCT,
+        oanda_mutation_journal: OandaMutationJournal | None = None,
+        mt5_mutation_journal: Mt5MutationJournal | None = None,
     ) -> None:
         if not isinstance(environ, Mapping):
             raise ContractError("environ must be a key-value Mapping (never a .env file path)")
@@ -2920,6 +3386,18 @@ class BrokerHierarchyRouter:
         self._oanda_client_factory = oanda_client_factory
         self._clock = clock or _utc_now
         self._min_level = min_post_trade_margin_level_pct
+        state_dir_env = _env_get(self._env, "CAS_FOREX_STATE_DIR")
+        state_db = (Path(state_dir_env) / "cas_forex_state.sqlite3") if state_dir_env else None
+        self._oanda_mutation_journal = (
+            oanda_mutation_journal
+            if oanda_mutation_journal is not None
+            else (OandaMutationJournal(state_db) if state_db is not None else None)
+        )
+        self._mt5_mutation_journal = (
+            mt5_mutation_journal
+            if mt5_mutation_journal is not None
+            else (Mt5MutationJournal(state_db) if state_db is not None else None)
+        )
 
         base_chain = LIVE_BROKER_PRIORITY if self.execution_mode == EXECUTION_MODE_LIVE else BROKER_PRIORITY
         primary = _env_get(self._env, ENV_PRIMARY_BROKER).upper() or BROKER_HUGOSWAY_MT5
@@ -3002,6 +3480,7 @@ class BrokerHierarchyRouter:
                     base_url=self._oanda_base_url,
                     execution_mode=self.execution_mode,
                     live_arm_phrase=(REQUIRED_LIVE_ARM_PHRASE if self._live_armed else None),
+                    mutation_journal=self._oanda_mutation_journal,
                 )
             return OandaPracticeFallbackVenue(client=client, valve_gate=self._valve_gate, clock=self._clock)
         creds = self._credentials[broker_id]
@@ -3015,6 +3494,7 @@ class BrokerHierarchyRouter:
             valve_gate=self._valve_gate,
             clock=self._clock,
             min_post_trade_margin_level_pct=self._min_level,
+            mutation_journal=self._mt5_mutation_journal,
         )
 
     def activate(self) -> str:

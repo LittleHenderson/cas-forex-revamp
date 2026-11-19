@@ -351,10 +351,17 @@ class OandaOutcomeUnknownError(PaperBrokerTransportError):
 class OandaMutationJournal:
     """Durable SQLite WAL (or scoped in-memory) pre-dispatch mutation journal & UNKNOWN-outcome latch."""
 
-    def __init__(self, db_path: str | Path | None = None) -> None:
+    def __init__(self, db_path: str | Path | None = None, *, recover_on_open: bool = True) -> None:
         self._path = Path(db_path) if db_path is not None else None
         self._memory: dict[str, dict[str, str | None]] = {}
         self._initialized = False
+        self._recovered_on_open = False
+        if self._path is not None and recover_on_open and self._path.exists():
+            self.recover_pending_as_unknown()
+
+    @property
+    def db_path(self) -> Path | None:
+        return self._path
 
     def _connect(self) -> sqlite3.Connection:
         if self._path is None:
@@ -377,24 +384,84 @@ class OandaMutationJournal:
                     transaction_id TEXT,
                     error_detail TEXT,
                     created_at_utc TEXT NOT NULL,
-                    updated_at_utc TEXT NOT NULL
+                    updated_at_utc TEXT NOT NULL,
+                    semantic_key TEXT,
+                    pre_dispatch_last_tx_id TEXT,
+                    trade_id TEXT
                 )
                 """
             )
+            existing_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(oanda_mutation_journal)").fetchall()}
+            for col in ("semantic_key", "pre_dispatch_last_tx_id", "trade_id"):
+                if col not in existing_cols:
+                    conn.execute(f"ALTER TABLE oanda_mutation_journal ADD COLUMN {col} TEXT")
             self._initialized = True
         return conn
 
-    def unknown_mutations(self, *, account_id: str | None = None, symbol: str | None = None) -> list[dict[str, str | None]]:
+    def recover_pending_as_unknown(self, *, now_utc: str | None = None) -> int:
+        """Promote any crash-left PENDING_DISPATCH rows to OUTCOME_UNKNOWN on startup."""
+        ts_str = now_utc or _format_utc_micros(datetime.now(timezone.utc), "observed_at")
         if self._path is None:
-            out = [dict(v) for v in self._memory.values() if v["status"] == "OUTCOME_UNKNOWN"]
+            promoted = 0
+            for row in self._memory.values():
+                if row["status"] == "PENDING_DISPATCH":
+                    row["status"] = "OUTCOME_UNKNOWN"
+                    row["error_detail"] = row["error_detail"] or "RECOVERED_CRASH_LEFT_PENDING_DISPATCH"
+                    row["updated_at_utc"] = ts_str
+                    promoted += 1
+            self._recovered_on_open = True
+            return promoted
+        if not self._path.exists():
+            self._recovered_on_open = True
+            return 0
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE oanda_mutation_journal "
+                "SET status = 'OUTCOME_UNKNOWN', "
+                "    error_detail = COALESCE(error_detail, 'RECOVERED_CRASH_LEFT_PENDING_DISPATCH'), "
+                "    updated_at_utc = ? "
+                "WHERE status = 'PENDING_DISPATCH'",
+                (ts_str,),
+            )
+            promoted = int(cur.rowcount or 0)
+            conn.commit()
+            self._recovered_on_open = True
+            return promoted
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def unknown_mutations(
+        self,
+        *,
+        account_id: str | None = None,
+        symbol: str | None = None,
+        semantic_key: str | None = None,
+    ) -> list[dict[str, str | None]]:
+        """Enumerate BOTH OUTCOME_UNKNOWN and unresolved PENDING_DISPATCH mutations."""
+        if self._path is None:
+            out = [
+                dict(v)
+                for v in self._memory.values()
+                if v["status"] in ("OUTCOME_UNKNOWN", "PENDING_DISPATCH")
+            ]
         elif not self._path.exists():
             out = []
         else:
             conn = self._connect()
             try:
                 rows = conn.execute(
-                    "SELECT client_ext_id, account_id, symbol, action_kind, method, relative_path, status, transaction_id, error_detail, created_at_utc, updated_at_utc "
-                    "FROM oanda_mutation_journal WHERE status = 'OUTCOME_UNKNOWN' ORDER BY created_at_utc ASC"
+                    "SELECT client_ext_id, account_id, symbol, action_kind, method, relative_path, "
+                    "status, transaction_id, error_detail, created_at_utc, updated_at_utc, "
+                    "semantic_key, pre_dispatch_last_tx_id, trade_id "
+                    "FROM oanda_mutation_journal "
+                    "WHERE status IN ('OUTCOME_UNKNOWN', 'PENDING_DISPATCH') "
+                    "ORDER BY created_at_utc ASC"
                 ).fetchall()
             finally:
                 conn.close()
@@ -411,20 +478,34 @@ class OandaMutationJournal:
                     "error_detail": r[8],
                     "created_at_utc": str(r[9]),
                     "updated_at_utc": str(r[10]),
+                    "semantic_key": r[11],
+                    "pre_dispatch_last_tx_id": r[12],
+                    "trade_id": r[13],
                 }
                 for r in rows
             ]
-        return [
-            r
-            for r in out
-            if (account_id is None or r["account_id"] == account_id)
-            and (symbol is None or r["symbol"] == symbol)
-        ]
+        matched: list[dict[str, str | None]] = []
+        for r in out:
+            if account_id is not None and r["account_id"] != account_id:
+                continue
+            if symbol is None and semantic_key is None:
+                matched.append(r)
+            elif (symbol is not None and r["symbol"] == symbol) or (
+                semantic_key is not None and r.get("semantic_key") == semantic_key
+            ):
+                matched.append(r)
+        return matched
 
-    def require_clear(self, *, account_id: str, symbol: str | None = None) -> None:
-        frozen = self.unknown_mutations(account_id=account_id, symbol=symbol)
+    def require_clear(
+        self,
+        *,
+        account_id: str,
+        symbol: str | None = None,
+        semantic_key: str | None = None,
+    ) -> None:
+        frozen = self.unknown_mutations(account_id=account_id, symbol=symbol, semantic_key=semantic_key)
         if frozen:
-            ids = ", ".join(str(x["client_ext_id"]) for x in frozen[:4])
+            ids = ", ".join(f"{x['client_ext_id']}({x['status']})" for x in frozen[:4])
             raise OandaOutcomeUnknownError(
                 f"OANDA_OUTCOME_UNKNOWN_FREEZE: unresolved pre-dispatch mutation(s) [{ids}] must be reconciled before new dispatches"
             )
@@ -439,9 +520,13 @@ class OandaMutationJournal:
         method: str,
         relative_path: str,
         now_utc: str,
+        semantic_key: str | None = None,
+        pre_dispatch_last_tx_id: str | None = None,
+        trade_id: str | None = None,
     ) -> None:
-        self.require_clear(account_id=account_id, symbol=symbol)
+        eff_sem = semantic_key or f"{account_id}|{symbol}|{action_kind}"
         if self._path is None:
+            self.require_clear(account_id=account_id, symbol=symbol, semantic_key=eff_sem)
             existing = self._memory.get(client_ext_id)
             if existing is not None:
                 raise OandaOutcomeUnknownError(
@@ -459,11 +544,26 @@ class OandaMutationJournal:
                 "error_detail": None,
                 "created_at_utc": now_utc,
                 "updated_at_utc": now_utc,
+                "semantic_key": eff_sem,
+                "pre_dispatch_last_tx_id": pre_dispatch_last_tx_id,
+                "trade_id": trade_id,
             }
             return
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            frozen = conn.execute(
+                "SELECT client_ext_id, status FROM oanda_mutation_journal "
+                "WHERE account_id = ? AND status IN ('OUTCOME_UNKNOWN', 'PENDING_DISPATCH') "
+                "AND (symbol = ? OR semantic_key = ?)",
+                (account_id, symbol, eff_sem),
+            ).fetchall()
+            if frozen:
+                conn.rollback()
+                ids = ", ".join(f"{r[0]}({r[1]})" for r in frozen[:4])
+                raise OandaOutcomeUnknownError(
+                    f"OANDA_OUTCOME_UNKNOWN_FREEZE: unresolved pre-dispatch mutation(s) [{ids}] must be reconciled before new dispatches"
+                )
             existing = conn.execute(
                 "SELECT status FROM oanda_mutation_journal WHERE client_ext_id = ?",
                 (client_ext_id,),
@@ -476,9 +576,13 @@ class OandaMutationJournal:
             conn.execute(
                 "INSERT INTO oanda_mutation_journal ("
                 "client_ext_id, account_id, symbol, action_kind, method, relative_path, "
-                "status, transaction_id, error_detail, created_at_utc, updated_at_utc"
-                ") VALUES (?, ?, ?, ?, ?, ?, 'PENDING_DISPATCH', NULL, NULL, ?, ?)",
-                (client_ext_id, account_id, symbol, action_kind, method, relative_path, now_utc, now_utc),
+                "status, transaction_id, error_detail, created_at_utc, updated_at_utc, "
+                "semantic_key, pre_dispatch_last_tx_id, trade_id"
+                ") VALUES (?, ?, ?, ?, ?, ?, 'PENDING_DISPATCH', NULL, NULL, ?, ?, ?, ?, ?)",
+                (
+                    client_ext_id, account_id, symbol, action_kind, method, relative_path,
+                    now_utc, now_utc, eff_sem, pre_dispatch_last_tx_id, trade_id,
+                ),
             )
             conn.commit()
         except Exception:
@@ -1768,7 +1872,23 @@ class OandaPracticePaperClient:
 
         self._secret: _RedactedSecret | None = None
         self._account_id: str | None = None
-        self._mutation_journal = mutation_journal if mutation_journal is not None else OandaMutationJournal()
+        self._last_transaction_id: str | None = None
+        if mutation_journal is not None:
+            self._mutation_journal = mutation_journal
+        else:
+            state_dir_env = str(environ.get("CAS_FOREX_STATE_DIR", "")).strip() if environ is not None else ""
+            if state_dir_env:
+                self._mutation_journal = OandaMutationJournal(Path(state_dir_env) / "cas_forex_state.sqlite3")
+            elif self.execution_mode == EXECUTION_MODE_LIVE:
+                raise ContractError(
+                    "OANDA_LIVE_REQUIRES_DURABLE_MUTATION_JOURNAL: LIVE OANDA execution requires a persistent SQLite OandaMutationJournal (pass mutation_journal or set CAS_FOREX_STATE_DIR)"
+                )
+            else:
+                self._mutation_journal = OandaMutationJournal()
+        if self.execution_mode == EXECUTION_MODE_LIVE and self._mutation_journal.db_path is None:
+            raise ContractError(
+                "OANDA_LIVE_REQUIRES_DURABLE_MUTATION_JOURNAL: memory-only OandaMutationJournal is forbidden in LIVE mode"
+            )
         if environ is not None:
             tok_env = ENV_OANDA_LIVE_TOKEN if self.execution_mode == EXECUTION_MODE_LIVE else ENV_OANDA_PRACTICE_TOKEN
             acct_env = (
@@ -1992,6 +2112,8 @@ class OandaPracticePaperClient:
         _, acct_id = self._require_active()
         _, raw = self._request("GET", f"accounts/{acct_id}/summary")
         doc = _parse_external_wire_json(raw, label="oanda_practice_summary")
+        if isinstance(doc.get("lastTransactionID"), (str, int)) and str(doc["lastTransactionID"]).isdigit():
+            self._last_transaction_id = str(doc["lastTransactionID"])
         acct = doc.get("account") if type(doc) is dict else None
         if type(acct) is not dict:
             raise PaperBrokerTransportError("OANDA practice summary missing account object")
@@ -2057,6 +2179,7 @@ class OandaPracticePaperClient:
         ts_now = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
         now_utc_str = _format_utc_micros(ts_now, "observed_at")
         rel_path = f"accounts/{acct_id}/orders"
+        pre_cursor = self._last_transaction_id
         self._mutation_journal.record_pending(
             client_ext_id=client_order_id,
             account_id=acct_id,
@@ -2065,6 +2188,8 @@ class OandaPracticePaperClient:
             method="POST",
             relative_path=rel_path,
             now_utc=now_utc_str,
+            semantic_key=f"OPEN|{acct_id}|{norm}|{side.value}",
+            pre_dispatch_last_tx_id=pre_cursor,
         )
         try:
             _, raw = self._request("POST", rel_path, body_obj={"order": order_spec})
@@ -2112,6 +2237,8 @@ class OandaPracticePaperClient:
             "observed_at": _format_utc_micros(ts, "observed_at"),
             "raw_wire_sha256": sha256(raw).hexdigest(),
         }
+        if isinstance(doc.get("lastTransactionID"), (str, int)) and str(doc["lastTransactionID"]).isdigit():
+            self._last_transaction_id = str(doc["lastTransactionID"])
         self._mutation_journal.mark_outcome(
             client_ext_id=client_order_id,
             status="CONFIRMED_FILLED",
@@ -2149,6 +2276,7 @@ class OandaPracticePaperClient:
         if "takeProfit" in body:
             body["takeProfit"]["clientExtensions"] = {"id": f"{ext_id}-tp"[:32]}
         rel_path = f"accounts/{acct_id}/trades/{tid}/orders"
+        pre_cursor = self._last_transaction_id
         self._mutation_journal.record_pending(
             client_ext_id=ext_id,
             account_id=acct_id,
@@ -2157,6 +2285,9 @@ class OandaPracticePaperClient:
             method="PUT",
             relative_path=rel_path,
             now_utc=now_utc_str,
+            semantic_key=f"AMEND_STOP|{acct_id}|{tid}",
+            pre_dispatch_last_tx_id=pre_cursor,
+            trade_id=tid,
         )
         try:
             _, raw = self._request("PUT", rel_path, body_obj=body)
@@ -2171,6 +2302,8 @@ class OandaPracticePaperClient:
             raise OandaOutcomeUnknownError(
                 f"OANDA post-dispatch amend failure for {ext_id} ({err_name}); frozen until reconciled"
             ) from None
+        if isinstance(doc.get("lastTransactionID"), (str, int)) and str(doc["lastTransactionID"]).isdigit():
+            self._last_transaction_id = str(doc["lastTransactionID"])
         self._mutation_journal.mark_outcome(
             client_ext_id=ext_id,
             status="CONFIRMED_FILLED",
@@ -2193,34 +2326,167 @@ class OandaPracticePaperClient:
 
 
 
-    def reconcile_unknown_mutations(self, *, now: datetime | None = None) -> dict[str, Any]:
-        """Query OANDA recent transactions/openTrades to deterministically clear OUTCOME_UNKNOWN freezes."""
+    @staticmethod
+    def _extract_ext_ids_from_tx(row: dict[str, Any]) -> list[tuple[str, str]]:
+        hits: list[tuple[str, str]] = []
+        tx_id = str(row.get("id", ""))
+        for field in ("clientExtensions", "tradeClientExtensions", "stopLossOnFill", "takeProfitOnFill", "order"):
+            sub = row.get(field)
+            if isinstance(sub, dict):
+                ce = sub.get("clientExtensions") if "clientExtensions" in sub else sub
+                if isinstance(ce, dict) and isinstance(ce.get("id"), str) and ce["id"].strip():
+                    hits.append((ce["id"].strip(), tx_id))
+        return hits
+
+    @staticmethod
+    def _extract_ext_ids_from_trade(tr: dict[str, Any]) -> list[tuple[str, str]]:
+        hits: list[tuple[str, str]] = []
+        tr_id = str(tr.get("id", ""))
+        for field in ("clientExtensions", "stopLossOrder", "takeProfitOrder", "trailingStopLossOrder"):
+            sub = tr.get(field)
+            if isinstance(sub, dict):
+                ce = sub.get("clientExtensions") if "clientExtensions" in sub else sub
+                if isinstance(ce, dict) and isinstance(ce.get("id"), str) and ce["id"].strip():
+                    hits.append((ce["id"].strip(), tr_id))
+        return hits
+
+    def _relative_from_pinned_page_url(self, page_url: str) -> str | None:
+        parsed_base = urllib.parse.urlsplit(self.base_url)
+        parsed_page = urllib.parse.urlsplit(str(page_url).strip())
+        if parsed_page.scheme and parsed_page.netloc:
+            if parsed_page.scheme != parsed_base.scheme or parsed_page.netloc.lower() != parsed_base.netloc.lower():
+                return None
+            base_prefix = parsed_base.path.rstrip("/") + "/"
+            if not parsed_page.path.startswith(base_prefix):
+                return None
+            rel = parsed_page.path[len(base_prefix):]
+            return f"{rel}?{parsed_page.query}" if parsed_page.query else rel
+        rel_clean = str(page_url).strip().lstrip("/")
+        return rel_clean or None
+
+    def reconcile_unknown_mutations(self, *, now: datetime | None = None, max_pages: int = 50) -> dict[str, Any]:
+        """Exhaustively reconcile OUTCOME_UNKNOWN / PENDING_DISPATCH freezes; never clear on partial evidence."""
         _, acct_id = self._require_active()
         ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
         now_utc_str = _format_utc_micros(ts, "observed_at")
         unknowns = self._mutation_journal.unknown_mutations(account_id=acct_id)
         if not unknowns:
-            return {"account_id": acct_id, "checked": 0, "resolved": 0, "remaining_unknown": 0}
-        _, tx_raw = self._request("GET", f"accounts/{acct_id}/transactions?pageSize=200")
-        tx_doc = _parse_external_wire_json(tx_raw, label="oanda_transactions_reconcile")
+            return {"account_id": acct_id, "checked": 0, "resolved": 0, "remaining_unknown": 0, "exhaustive": True}
+
+        # 1. Fetch authoritative account summary for current lastTransactionID
+        _, sum_raw = self._request("GET", f"accounts/{acct_id}/summary")
+        sum_doc = _parse_external_wire_json(sum_raw, label="oanda_summary_reconcile")
+        raw_head_tx = sum_doc.get("lastTransactionID") if isinstance(sum_doc, dict) else None
+        current_head_id = int(raw_head_tx) if isinstance(raw_head_tx, (str, int)) and str(raw_head_tx).isdigit() else None
+        if current_head_id is not None:
+            self._last_transaction_id = str(current_head_id)
+
         tx_by_ext: dict[str, str] = {}
-        if isinstance(tx_doc, dict) and isinstance(tx_doc.get("transactions"), list):
-            for row in tx_doc["transactions"]:
-                if isinstance(row, dict):
-                    ext = (row.get("clientExtensions") or {}).get("id") if isinstance(row.get("clientExtensions"), dict) else None
-                    if not ext and isinstance(row.get("order"), dict):
-                        ext = ((row["order"].get("clientExtensions") or {}).get("id")
-                               if isinstance(row["order"].get("clientExtensions"), dict) else None)
-                    if isinstance(ext, str) and ext.strip():
-                        tx_by_ext[ext.strip()] = str(row.get("id", ""))
-        _, trades_raw = self._request("GET", f"accounts/{acct_id}/openTrades")
-        trades_doc = _parse_external_wire_json(trades_raw, label="oanda_open_trades_reconcile")
-        if isinstance(trades_doc, dict) and isinstance(trades_doc.get("trades"), list):
+        seen_tx_ids: set[int] = set()
+        tx_history_complete = True
+        incompleteness_reasons: list[str] = []
+
+        # Determine earliest pre-dispatch cursor across unresolved mutations
+        valid_cursors = [
+            int(str(r["pre_dispatch_last_tx_id"]))
+            for r in unknowns
+            if r.get("pre_dispatch_last_tx_id") is not None and str(r["pre_dispatch_last_tx_id"]).isdigit()
+        ]
+        all_have_cursors = len(valid_cursors) == len(unknowns)
+        if not all_have_cursors:
+            tx_history_complete = False
+            incompleteness_reasons.append("missing_pre_dispatch_transaction_cursor")
+        if current_head_id is None:
+            tx_history_complete = False
+            incompleteness_reasons.append("missing_authoritative_lastTransactionID")
+
+        # 2. Query complete transaction idrange from min(pre_dispatch_last_tx_id)+1 .. current_head_id
+        if all_have_cursors and current_head_id is not None:
+            min_cursor = min(valid_cursors)
+            if current_head_id < min_cursor:
+                tx_history_complete = False
+                incompleteness_reasons.append("head_transaction_id_below_pre_dispatch_cursor")
+            elif current_head_id > min_cursor:
+                cursor_from = min_cursor + 1
+                pages_fetched = 0
+                while cursor_from <= current_head_id:
+                    if pages_fetched >= max_pages:
+                        tx_history_complete = False
+                        incompleteness_reasons.append("pagination_page_limit_exceeded")
+                        break
+                    chunk_to = min(current_head_id, cursor_from + 999)
+                    _, idr_raw = self._request(
+                        "GET", f"accounts/{acct_id}/transactions/idrange?from={cursor_from}&to={chunk_to}"
+                    )
+                    idr_doc = _parse_external_wire_json(idr_raw, label="oanda_transactions_idrange_reconcile")
+                    pages_fetched += 1
+                    if not isinstance(idr_doc, dict) or not isinstance(idr_doc.get("transactions"), list):
+                        tx_history_complete = False
+                        incompleteness_reasons.append("missing_transactions_list_in_idrange")
+                        break
+                    chunk_ids: set[int] = set()
+                    for tx_row in idr_doc["transactions"]:
+                        if not isinstance(tx_row, dict):
+                            tx_history_complete = False
+                            incompleteness_reasons.append("malformed_transaction_row")
+                            continue
+                        raw_tid = tx_row.get("id")
+                        if isinstance(raw_tid, (str, int)) and str(raw_tid).isdigit():
+                            tid_int = int(raw_tid)
+                            seen_tx_ids.add(tid_int)
+                            chunk_ids.add(tid_int)
+                        for ext_hit, tid_str in self._extract_ext_ids_from_tx(tx_row):
+                            tx_by_ext[ext_hit] = tid_str
+                    # Verify every single transaction ID in [cursor_from, chunk_to] was accounted for
+                    expected_ids = set(range(cursor_from, chunk_to + 1))
+                    if not expected_ids.issubset(chunk_ids):
+                        tx_history_complete = False
+                        incompleteness_reasons.append(f"transaction_id_gap_in_{cursor_from}_{chunk_to}")
+                        break
+                    cursor_from = chunk_to + 1
+        else:
+            # Even without complete cursor, paginate recent transactions to catch CONFIRMED_FILLED matches!
+            _, tx_raw = self._request("GET", f"accounts/{acct_id}/transactions?pageSize=200")
+            tx_doc = _parse_external_wire_json(tx_raw, label="oanda_transactions_reconcile")
+            pages_to_scan: list[str] = []
+            if isinstance(tx_doc, dict):
+                if isinstance(tx_doc.get("transactions"), list):
+                    for tx_row in tx_doc["transactions"]:
+                        if isinstance(tx_row, dict):
+                            for ext_hit, tid_str in self._extract_ext_ids_from_tx(tx_row):
+                                tx_by_ext[ext_hit] = tid_str
+                if isinstance(tx_doc.get("pages"), list):
+                    for p_url in tx_doc["pages"][:max_pages]:
+                        if isinstance(p_url, str):
+                            rel = self._relative_from_pinned_page_url(p_url)
+                            if rel is not None:
+                                pages_to_scan.append(rel)
+            for rel in pages_to_scan:
+                _, p_raw = self._request("GET", rel)
+                p_doc = _parse_external_wire_json(p_raw, label="oanda_transactions_page_reconcile")
+                if isinstance(p_doc, dict) and isinstance(p_doc.get("transactions"), list):
+                    for tx_row in p_doc["transactions"]:
+                        if isinstance(tx_row, dict):
+                            for ext_hit, tid_str in self._extract_ext_ids_from_tx(tx_row):
+                                tx_by_ext[ext_hit] = tid_str
+
+        # 3. Consult ALL trades (open + closed) so already-closed trades and stop amendments are verified
+        _, trades_raw = self._request("GET", f"accounts/{acct_id}/trades?state=ALL&count=500")
+        trades_doc = _parse_external_wire_json(trades_raw, label="oanda_all_trades_reconcile")
+        trades_complete = isinstance(trades_doc, dict) and isinstance(trades_doc.get("trades"), list)
+        if not trades_complete:
+            incompleteness_reasons.append("missing_or_malformed_trades_list")
+        else:
+            if len(trades_doc["trades"]) >= 500:
+                trades_complete = False
+                incompleteness_reasons.append("trades_list_truncated_at_500")
             for tr in trades_doc["trades"]:
-                if isinstance(tr, dict) and isinstance(tr.get("clientExtensions"), dict):
-                    ext = tr["clientExtensions"].get("id")
-                    if isinstance(ext, str) and ext.strip() and ext.strip() not in tx_by_ext:
-                        tx_by_ext[ext.strip()] = str(tr.get("id", ""))
+                if isinstance(tr, dict):
+                    for ext_hit, tid_str in self._extract_ext_ids_from_trade(tr):
+                        if ext_hit not in tx_by_ext:
+                            tx_by_ext[ext_hit] = tid_str
+
+        exhaustive_absence_proven = tx_history_complete and trades_complete
         resolved = 0
         for row in unknowns:
             ext_id = str(row["client_ext_id"])
@@ -2231,16 +2497,33 @@ class OandaPracticePaperClient:
                     now_utc=now_utc_str,
                     transaction_id=tx_by_ext[ext_id],
                 )
-            else:
+                resolved += 1
+            elif exhaustive_absence_proven:
                 self._mutation_journal.mark_outcome(
                     client_ext_id=ext_id,
                     status="CONFIRMED_ABSENT",
                     now_utc=now_utc_str,
-                    error_detail="RECONCILED_ABSENT_ON_VENUE",
+                    error_detail="RECONCILED_EXHAUSTIVELY_ABSENT_ON_VENUE",
                 )
-            resolved += 1
+                resolved += 1
+            else:
+                # Fail closed: NEVER clear ambiguity from bounded, partial, or unverified snapshots!
+                reason_str = ",".join(incompleteness_reasons) or "INCOMPLETE_RECONCILIATION_EVIDENCE"
+                self._mutation_journal.mark_outcome(
+                    client_ext_id=ext_id,
+                    status="OUTCOME_UNKNOWN",
+                    now_utc=now_utc_str,
+                    error_detail=f"RECONCILIATION_INCOMPLETE_REQUIRES_OWNER_REVIEW:{reason_str[:180]}",
+                )
         remaining = len(self._mutation_journal.unknown_mutations(account_id=acct_id))
-        return {"account_id": acct_id, "checked": len(unknowns), "resolved": resolved, "remaining_unknown": remaining}
+        return {
+            "account_id": acct_id,
+            "checked": len(unknowns),
+            "resolved": resolved,
+            "remaining_unknown": remaining,
+            "exhaustive": exhaustive_absence_proven,
+            "incompleteness_reasons": incompleteness_reasons,
+        }
 
 OandaV20BrokerClient = OandaPracticePaperClient
 

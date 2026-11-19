@@ -77,6 +77,7 @@ from cas_forex_revamp.composition.trend_regime import (
 from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
 from cas_forex_revamp.venue.live_market_stream import EXPANDED_MARKETS, INDEX_INSTRUMENTS
 from cas_forex_revamp.venue.mt5_broker_bridge import (
+    MT5_MAX_VOLUME_DEFAULT,
     MT5_MIN_VOLUME,
     MT5_VOLUME_STEP,
     Mt5PaperBrokerVenue,
@@ -770,20 +771,29 @@ class AutonomousAiTrader:
         stop_dist = abs(entry - sl_price)
         if stop_dist <= Decimal("0") or total_equity <= Decimal("0"):
             raise ContractError("non-positive stop distance or equity for sizing")
-        budget = self._router.barbell.max_stop_risk_amount(total_equity) * risk_multiplier
-        csize = Decimal("1") if symbol in INDEX_INSTRUMENTS else Decimal("100000")
+        eff_eq = (
+            self._router.barbell.effective_total_equity(self._router.equities())
+            if hasattr(self._router.barbell, "effective_total_equity")
+            else total_equity
+        )
+        sizing_equity = min(total_equity, eff_eq) if eff_eq > Decimal("0") else total_equity
+        budget = self._router.barbell.max_stop_risk_amount(sizing_equity) * risk_multiplier
+        csize = Decimal("100") if symbol == "XAUUSD" else (Decimal("1") if symbol in INDEX_INSTRUMENTS else Decimal("100000"))
         step_units = csize * MT5_VOLUME_STEP
+        max_units_cap = csize * MT5_MAX_VOLUME_DEFAULT
         with localcontext() as ctx:
             ctx.prec = 40
-            raw_units = budget / stop_dist
-            # Also honor the active MT5 venue's post-trade margin level floor (>= 1000%) & barbell sleeve cap.
+            raw_units = min(budget / stop_dist, max_units_cap)
+            # Also honor the active MT5 venue's max_lots cap, margin level floor (>= 1000%), & barbell sleeve cap.
             for bid_id in self._router.priority_order:
                 venue = self._router.venues.get(bid_id)
                 if isinstance(venue, Mt5PaperBrokerVenue) and venue.account is not None and symbol in quotes_map:
                     acct = venue.account
+                    v_max_lots = getattr(venue, "_max_lots", MT5_MAX_VOLUME_DEFAULT)
+                    raw_units = min(raw_units, v_max_lots * csize)
                     min_ml = getattr(venue, "min_margin_level_pct", Decimal("1000"))
                     max_used_ml = (acct.equity * Decimal("100")) / max(min_ml, Decimal("100"))
-                    sleeve_lim = self._router.barbell.share_for(bid_id) * total_equity
+                    sleeve_lim = self._router.barbell.share_for(bid_id) * sizing_equity
                     rem_margin = min(
                         max(Decimal("0"), max_used_ml - acct.margin),
                         max(Decimal("0"), sleeve_lim - acct.margin),
@@ -1174,6 +1184,35 @@ class AutonomousAiTrader:
             self._last_regime = regime_name
             self._last_effective_effort = eff_depth
             self._last_pyramid_leg = is_pyramid_add
+
+            if hasattr(self._router, "check_open_eligibility"):
+                elig_ok, elig_reason = self._router.check_open_eligibility(
+                    sym, equities=equities, peak_equity=peak_eq
+                )
+                if not elig_ok:
+                    self._veto_count += 1
+                    self._last_action = "WAIT"
+                    self._last_symbol = sym
+                    self._last_reason = f"PRE_INFERENCE_ELIGIBILITY_BLOCKED: {elig_reason}"
+                    self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                    if self._parallel_tiers is not None and quotes_map:
+                        self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
+                    report = {
+                        "schema": "cas-forex.ai-cycle/1",
+                        "cycle_id": cycle_id,
+                        "observed_at": _iso(ts),
+                        "model_id": active_id,
+                        "cadence": self._last_cadence,
+                        "thinking_depth": eff_depth,
+                        "regime": regime_name,
+                        "action": "WAIT",
+                        "symbol": sym,
+                        "reason": self._last_reason,
+                        "valve_score": self._last_valve_score,
+                        "protection_updates": prot_updates,
+                    }
+                    self._append_journal_cycle(report)
+                    return report
 
             if (
                 self._registry.fast_scout_enabled

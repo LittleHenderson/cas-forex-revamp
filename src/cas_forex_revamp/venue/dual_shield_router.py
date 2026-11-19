@@ -96,6 +96,7 @@ ENV_BARBELL_HUGOSWAY_SHARE = "CAS_FOREX_BARBELL_HUGOSWAY_SHARE"
 ENV_BARBELL_LHFX_SHARE = "CAS_FOREX_BARBELL_LHFX_SHARE"
 ENV_BARBELL_MAX_STOP_RISK_PCT = "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT"
 ENV_BARBELL_MAX_DRAWDOWN_PCT = "CAS_FOREX_MAX_DRAWDOWN_PCT"
+ENV_DEMO_BARBELL_VIRTUAL_SLEEVE = "CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE"
 
 OANDA_SAFE_HARBOR_LEVERAGE = 50
 MAJOR_FX_PAIRS: tuple[str, ...] = tuple(p for p in EXPANDED_FX_PAIRS if "USD" in p)
@@ -440,6 +441,7 @@ class BarbellCapitalPolicy:
         max_drawdown_pct: Decimal = DEFAULT_MAX_DRAWDOWN_PCT,
         allocation_tolerance_share: Decimal = Decimal("0.02"),
         account_currency: str = "USD",
+        demo_virtual_sleeve: bool = False,
     ) -> None:
         self.shares: dict[str, Decimal] = {
             BROKER_OANDA_PRACTICE: _share(oanda_reserve_share, "oanda_reserve_share"),
@@ -459,6 +461,7 @@ class BarbellCapitalPolicy:
         if self.max_drawdown_pct >= Decimal("1"):
             raise ContractError("max_drawdown_pct must be strictly below 1 (100%)")
         self.tolerance = _share(allocation_tolerance_share, "allocation_tolerance_share")
+        self.demo_virtual_sleeve = bool(demo_virtual_sleeve)
         self._calc = Mt5MarginCalculator(account_currency=account_currency)
 
     @classmethod
@@ -468,12 +471,15 @@ class BarbellCapitalPolicy:
             raw = raw.strip() if isinstance(raw, str) else ""
             return parse_decimal(raw or default, name)
 
+        raw_vs = str(environ.get(ENV_DEMO_BARBELL_VIRTUAL_SLEEVE, "")).strip().lower()
+        vs_flag = kwargs.pop("demo_virtual_sleeve", raw_vs in ("1", "true", "yes", "on"))
         return cls(
             oanda_reserve_share=pick(ENV_BARBELL_OANDA_RESERVE_SHARE, "0.80"),
             hugosway_share=pick(ENV_BARBELL_HUGOSWAY_SHARE, "0.12"),
             lhfx_share=pick(ENV_BARBELL_LHFX_SHARE, "0.08"),
             max_stop_loss_equity_risk_pct=pick(ENV_BARBELL_MAX_STOP_RISK_PCT, "1.00"),
             max_drawdown_pct=pick(ENV_BARBELL_MAX_DRAWDOWN_PCT, "0.10"),
+            demo_virtual_sleeve=bool(vs_flag),
             **kwargs,
         )
 
@@ -547,8 +553,22 @@ class BarbellCapitalPolicy:
             )
         return dd_pct
 
+    def effective_total_equity(self, equities: Mapping[str, Decimal]) -> Decimal:
+        actual = self.total_equity(equities)
+        if not self.demo_virtual_sleeve:
+            return actual
+        oanda_eq = self._oanda_equity(equities)
+        if oanda_eq <= Decimal("0"):
+            return actual
+        with localcontext() as ctx:
+            ctx.prec = 40
+            virtual_total = (oanda_eq / self.shares[BROKER_OANDA_PRACTICE]).quantize(
+                Decimal("0.01"), rounding=ROUND_FLOOR
+            )
+        return min(actual, virtual_total)
+
     def require_stop_risk(self, risk: Decimal, equities: Mapping[str, Decimal]) -> Decimal:
-        total = self.total_equity(equities)
+        total = self.effective_total_equity(equities)
         if total <= 0:
             raise BarbellPolicyRefusalError("barbell total equity is not positive", "NON_POSITIVE_TOTAL_EQUITY")
         cap = self.max_stop_risk_amount(total)
@@ -561,7 +581,7 @@ class BarbellCapitalPolicy:
         return cap
 
     def require_sleeve(self, broker_id: str, *, equities: Mapping[str, Decimal], used_margin_after: Decimal) -> dict[str, str]:
-        total = self.total_equity(equities)
+        total = self.effective_total_equity(equities)
         if total <= 0:
             raise BarbellPolicyRefusalError("barbell total equity is not positive", "NON_POSITIVE_TOTAL_EQUITY")
         share = self.share_for(broker_id)
@@ -570,18 +590,26 @@ class BarbellCapitalPolicy:
             ctx.prec = 40
             sleeve_cap = (share * total).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
             if broker_id not in (BROKER_OANDA_PRACTICE, BROKER_OANDA_LIVE):
-                reserve_floor = (self.shares[BROKER_OANDA_PRACTICE] - self.tolerance) * total
-                if self._oanda_equity(equities) < reserve_floor:
-                    raise BarbellPolicyRefusalError(
-                        "regulated OANDA reserve is below its barbell floor; high-leverage MT5 risk refused",
-                        "RESERVE_UNDERFUNDED",
-                    )
-                custody_cap = (share + self.tolerance) * total
-                if equities.get(broker_id, Decimal("0")) > custody_cap:
-                    raise BarbellPolicyRefusalError(
-                        f"{broker_id} custody exceeds its barbell share; sweep profits to the OANDA reserve",
-                        "VENUE_CUSTODY_OVER_ALLOCATED",
-                    )
+                oanda_eq = self._oanda_equity(equities)
+                if self.demo_virtual_sleeve:
+                    if oanda_eq <= Decimal("0"):
+                        raise BarbellPolicyRefusalError(
+                            "regulated OANDA demo reserve must be positive for virtual barbell sleeve",
+                            "RESERVE_UNDERFUNDED",
+                        )
+                else:
+                    reserve_floor = (self.shares[BROKER_OANDA_PRACTICE] - self.tolerance) * total
+                    if oanda_eq < reserve_floor:
+                        raise BarbellPolicyRefusalError(
+                            "regulated OANDA reserve is below its barbell floor; high-leverage MT5 risk refused",
+                            "RESERVE_UNDERFUNDED",
+                        )
+                    custody_cap = (share + self.tolerance) * total
+                    if equities.get(broker_id, Decimal("0")) > custody_cap:
+                        raise BarbellPolicyRefusalError(
+                            f"{broker_id} custody exceeds its barbell share; sweep profits to the OANDA reserve",
+                            "VENUE_CUSTODY_OVER_ALLOCATED",
+                        )
         if used_margin_after > sleeve_cap:
             raise BarbellPolicyRefusalError(
                 f"{broker_id} margin after trade {decimal_text(used_margin_after)} exceeds its "
@@ -616,6 +644,7 @@ class BarbellCapitalPolicy:
             "max_stop_loss_equity_risk_pct": decimal_text(self.max_stop_loss_equity_risk_pct),
             "max_drawdown_pct": decimal_text(self.max_drawdown_pct),
             "allocation_tolerance_share": decimal_text(self.tolerance),
+            "demo_virtual_sleeve": self.demo_virtual_sleeve,
         }
 
 
@@ -859,6 +888,8 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         self._oracle_cache: OandaQuoteTruthOracle | None = None
         self._index_reference_source = index_reference_source
         self.barbell = barbell or BarbellCapitalPolicy.from_environ(self._env)
+        if self.barbell.demo_virtual_sleeve and self.execution_mode != EXECUTION_MODE_DEMO:
+            raise ContractError("CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE is strictly forbidden in LIVE execution mode")
         self.offset_planner = offset_planner or OandaProtectiveOffsetPlanner(venue_id=self._oanda_broker_id)
         self._attestations = dict(equity_attestations or {})
         for key, value in self._attestations.items():
@@ -1031,6 +1062,53 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             self._degradations.append(entry)
             del self._degradations[:-_MAX_TRAIL]
 
+    def check_open_eligibility(
+        self,
+        symbol: str,
+        *,
+        equities: Mapping[str, Decimal] | None = None,
+        peak_equity: Decimal | None = None,
+    ) -> tuple[bool, str]:
+        """Fast deterministic zero-API-cost guard before paid LLM inference."""
+        eq = dict(equities) if equities is not None else self.equities()
+        total_eq = self.barbell.total_equity(eq)
+        pk = peak_equity if peak_equity is not None else self.peak_equity()
+        try:
+            self.barbell.require_drawdown(current_equity=total_eq, peak_equity=pk)
+        except BarbellPolicyRefusalError as exc:
+            return False, f"DRAWDOWN_BLOCKED:{exc.reason}"
+        reasons: list[str] = []
+        for broker_id in self._offshore_route():
+            venue = self._venues.get(broker_id)
+            if not isinstance(venue, Mt5PaperBrokerVenue):
+                reasons.append(f"{broker_id}=NOT_CONNECTED")
+                continue
+            used_m = venue.account.margin if venue.account is not None else Decimal("0")
+            try:
+                self.barbell.require_sleeve(broker_id, equities=eq, used_margin_after=used_m)
+                return True, f"ELIGIBLE:{broker_id}"
+            except BarbellPolicyRefusalError as exc:
+                reasons.append(f"{broker_id}={exc.reason}")
+        allow_oanda_idx = str(self._env.get("CAS_FOREX_OANDA_ALLOW_INDEX_CFD", "")).strip().lower() in ("1", "true", "yes")
+        if symbol in INDEX_INSTRUMENTS and not allow_oanda_idx:
+            reasons.append(f"{self._oanda_broker_id}=INDEX_CFD_RESTRICTED")
+            return False, "; ".join(reasons)
+        oanda = self._venues.get(self._oanda_broker_id)
+        if not isinstance(oanda, OandaPracticeFallbackVenue):
+            reasons.append(f"{self._oanda_broker_id}=NOT_CONNECTED")
+            return False, "; ".join(reasons)
+        avail = oanda.margin_available
+        nav = oanda.nav
+        if avail is None or nav is None or avail <= Decimal("0"):
+            reasons.append(f"{self._oanda_broker_id}=MARGIN_UNAVAILABLE")
+            return False, "; ".join(reasons)
+        try:
+            self.barbell.require_sleeve(self._oanda_broker_id, equities=eq, used_margin_after=max(Decimal("0"), nav - avail))
+            return True, f"ELIGIBLE:{self._oanda_broker_id}"
+        except BarbellPolicyRefusalError as exc:
+            reasons.append(f"{self._oanda_broker_id}={exc.reason}")
+            return False, "; ".join(reasons)
+
     def execute_open(self, order: OrderIntent, *, valve_decision: ValveDecision) -> DualShieldExecution:
         if not isinstance(order, OrderIntent) or order.kind is not ActionKind.OPEN:
             raise ContractError("execute_open requires an OPEN OrderIntent; use execute_management otherwise")
@@ -1069,6 +1147,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 continue
             try:
                 venue.probe()
+                self._status[broker_id] = "ACTIVE"
             except (Mt5TransportError, OSError) as exc:
                 self._status[broker_id] = "DISCONNECTED"
                 self._record(trail, broker_id, "DISCONNECTED", type(exc).__name__)

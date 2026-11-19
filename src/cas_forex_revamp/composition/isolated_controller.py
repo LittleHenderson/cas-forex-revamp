@@ -18,7 +18,11 @@ from ..operator.model import InferenceReply
 from ..operator.ollama_backend import OllamaRuntimePin
 from ..operator.runtime_observer import LinuxRuntimeObserver, SupervisorSpec
 from .custody_protocol import envelope, validate_message, ReleaseLedger
-from .generation_transport import need, verify_generation_transport, pending_ordering
+from dataclasses import replace
+import time
+from ..operator.model_evidence import ObserverAuthorizedModelStore
+from ..operator.ollama_backend import ENDPOINT
+from .generation_transport import GenerationClient, need, verify_generation_transport, pending_ordering
 from .model_evidence_bridge import ModelDecisionReader
 from .observed_model_ports import ObservedModelPorts
 from .remote_pending import ControllerDueEvents
@@ -26,11 +30,156 @@ from .role_channel import RoleChannel
 
 _logger = logging.getLogger(__name__)
 
-RUNNER_KINDS={
-    'MODEL_HTTP_RESPONSE','MODEL_HTTP_ERROR','MODEL_TOKEN_PREFLIGHT','MODEL_RUNTIME_OBSERVATION',
-    'MODEL_INFERENCE_RECEIPT','MODEL_TRANSPORT_REQUEST_SENT','MODEL_TRANSPORT_RESPONSE_CAPTURE',
-    'MODEL_TRANSPORT_PENDING_WINDOW',
-}
+# Finding [4]: DECISION_RUNNER worker may NEVER author model, runtime, or transport observation evidence.
+RUNNER_KINDS = frozenset()
+REQUIRED_OBSERVER_RECEIPT_PREFIXES = (
+    'token-proof-',
+    'runtime-before-',
+    'runtime-after-',
+    'generation-attempt-',
+    'generation-sent-',
+    'generation-capture-',
+    'generation-http-',
+    'inference-',
+)
+
+
+def _runner_alive(pid: int) -> bool:
+    try:
+        status = Path('/proc', str(pid), 'status').read_text()
+    except FileNotFoundError:
+        return False
+    return 'State:	Z' not in status
+
+
+def _runner_in_children(ollama_pid: int, pid: int, proc_root: Path) -> bool:
+    try:
+        for task in (proc_root / str(ollama_pid) / 'task').iterdir():
+            try:
+                if str(pid) in (task / 'children').read_text().split():
+                    return True
+            except FileNotFoundError as exc:
+                _missing_task = str(exc)
+                continue
+    except FileNotFoundError:
+        return False
+    return False
+
+
+class _ControllerGenerationClient(GenerationClient):
+    """Controller-owned loopback generation socket executing inside the trusted observer boundary (Finding [4])."""
+
+    def __init__(self, *, owner, request_id, **kwargs):
+        super().__init__(**kwargs)
+        self.owner = owner
+        self.request_id = request_id
+
+    def record(self, suffix, kind, payload):
+        if kind == 'MODEL_TRANSPORT_REQUEST_SENT':
+            payload = dict(payload)
+            payload.pop('pending_events', None)
+            payload['pending_mode'] = 'CONTROLLER_DUE_ACK'
+        return super().record(suffix, kind, payload)
+
+    def pending_changes(self, connection, deadline):
+        sent = self.store.require_observer_provenance('generation-sent-' + self.key)
+        attempt = self.store.require_observer_provenance('generation-attempt-' + self.key)
+        token = self.store.require_observer_provenance('token-proof-' + self.key)
+        base = {
+            'generation_attempt_id': attempt['receipt_id'],
+            'generation_http_id': 'generation-http-' + self.key,
+            'invocation_sha256': self.key,
+            'generation_body_sha256': sent['payload']['body_sha256'],
+            'transport_sent_receipt_sha256': sent['sha256'],
+        }
+        submitted_payload = {
+            **base,
+            'transport_capture_binding_sha256': content_digest({'clock_id': self.clock_id, 'invocation_sha256': self.key}),
+            'preflight_receipt_sha256': token['sha256'],
+            'clock_binding_sha256': content_digest({'clock_id': self.clock_id, 'run_id': self.store.run_id}),
+        }
+        submitted = envelope(
+            'GENERATION_SUBMITTED',
+            submitted_payload,
+            binding=self.owner.binding,
+            request_id=self.request_id,
+            sequence=self.owner.next_sequence(),
+            now=self.clock(),
+        )
+        need(self.owner.due.submitted(submitted) is True, 'complete-send receipt was not retained')
+        for index in range(9):
+            need(self.monotonic() < deadline, 'pending RPC window expired')
+            readable, _, failed = self.select([connection], [], [connection], 0)
+            before_ready = bool(readable or failed)
+            start = self.stamp()
+            ack, error = None, None
+            try:
+                ack = self.owner.due.due({
+                    'submitted_sha256': content_digest(submitted),
+                    'index': index,
+                    'before_response_ready': before_ready,
+                    'started': start,
+                })
+            except Exception as exc:
+                error = type(exc).__name__
+            completed = self.stamp()
+            readable, _, failed = self.select([connection], [], [connection], 0)
+            after_ready = bool(readable or failed)
+            checked = self.stamp()
+            if ack is not None and ack['status'] == 'NO_DUE_EVENT':
+                break
+            row = self.record(
+                'pending-' + str(index),
+                'MODEL_TRANSPORT_PENDING_WINDOW',
+                {
+                    'index': index,
+                    'before_response_ready': before_ready,
+                    'after_response_ready': after_ready,
+                    'started': start,
+                    'completed': completed,
+                    'after_check': checked,
+                    'controller_ack_sha256': ack['ack_sha256'] if ack and ack['status'] == 'APPLIED' else None,
+                    'error_type': error,
+                },
+            )
+            self.owner.due.window(row)
+            if before_ready or after_ready or error is not None or not ack or ack['status'] != 'APPLIED':
+                break
+
+
+class _ControllerObservedPorts(ObservedModelPorts):
+    """Controller-owned preflight/generation port bound to the private observer_key (Finding [4])."""
+
+    def __init__(self, *, owner, **kwargs):
+        super().__init__(**kwargs)
+        self.owner = owner
+
+    def count(self, invocation, request, pin):
+        key = content_digest(invocation)
+        need(key not in self._deadlines, 'preflight is one-shot')
+        deadline = min(self.store.deadline, request.absolute_deadline, self.owner._invocation_deadline)
+        self._deadlines[key] = deadline
+        return self.preflight.count(invocation, replace(request, absolute_deadline=deadline), pin)
+
+    def post(self, request):
+        need(self._active is not None, 'generation lacks preflight binding')
+        invocation, expected = self._active
+        self._active = None
+        need(request == expected and request.endpoint == ENDPOINT, 'generation request changed')
+        self.runtime.require_same(self._token(invocation)['runtime'])
+        key = content_digest(invocation)
+        bounded = replace(request, absolute_deadline=min(request.absolute_deadline, self._deadlines[key]))
+        client = _ControllerGenerationClient(
+            owner=self.owner,
+            request_id=json.loads(invocation.packet_json)['request_id'],
+            store=self.store,
+            phase=self.phase,
+            invocation_sha256=key,
+            request_sha256=invocation.request_sha256,
+            clock=self.clock,
+        )
+        response, _ = self.exchange.post(invocation, bounded, operation='generation', client=client)
+        return response
 
 
 class IsolatedController:
@@ -38,7 +187,15 @@ class IsolatedController:
         self.cfg,self.out,self.window,self.store=cfg,Path(out).resolve(),window,store
         self.journal,self.scope,self.plans,self.clock=journal,scope,pending_changes,clock
         self.child=self.channel=None;self.active=None;self.sequence=0;self.source_binding=None
-        self.spent_requests=set();self.gates={};self.readers={};self.verifiers={}
+        self.spent_requests=set();self.gates={};self.readers={};self.verifiers={};self.executors={}
+        self._observer_key = os.urandom(32)
+        if callable(getattr(self.store, 'bind_observer_key', None)):
+            self.store.bind_observer_key(self._observer_key)
+        self._observer_store = ObserverAuthorizedModelStore(self.store, self._observer_key)
+        self._previous_runner = None
+        self._invocation_deadline = self.window.end
+        self._preflight_done_key = None
+        self._generate_allowed_key = None
 
     def next_sequence(self):
         self.sequence+=1;return self.sequence
@@ -154,14 +311,35 @@ class IsolatedController:
     def adapter_backend(self, phase, gate):
         self.gates[phase]=gate
         def deny(_):raise RuntimeError('controller verifier cannot issue model HTTP')
-        ports=ObservedModelPorts(store=self.store,phase=phase,runtime=self.runtime,clock=self.clock,execution_gate=deny)
         from model_guest_boundary import PHASES
         schema_rel=self.cfg.get('selection_schema_path','docs/contracts/decision-selection.schema.json')
-        ports.backend(pin=self.pin,selection_schema_bytes=(Path(self.cfg['source_directory'])/schema_rel).read_bytes(),
+        schema_bytes=(Path(self.cfg['source_directory'])/schema_rel).read_bytes()
+        ports=ObservedModelPorts(store=self.store,phase=phase,runtime=self.runtime,clock=self.clock,execution_gate=deny)
+        ports.backend(pin=self.pin,selection_schema_bytes=schema_bytes,
                       max_calls=PHASES[phase][0],max_total_seconds=PHASES[phase][4])
+        exec_ports=_ControllerObservedPorts(
+            owner=self,store=self._observer_store,phase=phase,runtime=self.runtime,
+            clock=self.clock,execution_gate=gate,
+        )
+        self.executors[phase]=exec_ports.backend(
+            pin=self.pin,selection_schema_bytes=schema_bytes,
+            max_calls=PHASES[phase][0],max_total_seconds=PHASES[phase][4],
+        )
         self.verifiers[phase]=ports
         self.readers[phase]=ModelDecisionReader(self.store,ports,expected_adapter_id='ollama-'+phase,require_transport=True)
         return ControllerBackend(self,phase),ports
+
+    def _retire_previous_runner(self):
+        if self._previous_runner is None:
+            return
+        expiry = min(self._invocation_deadline, self.clock() + timedelta(seconds=10))
+        while _runner_alive(self._previous_runner['pid']) and self.clock() < expiry:
+            time.sleep(0.05)
+        need(not _runner_alive(self._previous_runner['pid']), 'previous model runner not unloaded')
+        reap_expiry = min(self._invocation_deadline, self.clock() + timedelta(seconds=2))
+        ollama_pid = getattr(self.runtime, 'ollama_pid', self.runtime.spec.ollama_pid)
+        while _runner_in_children(ollama_pid, self._previous_runner['pid'], self.runtime.proc_root) and self.clock() < reap_expiry:
+            time.sleep(0.02)
 
     def _handle(self, method, value):
         self.guard_roles();inv=self.active;need(inv is not None,'no current invocation')
@@ -176,29 +354,26 @@ class IsolatedController:
             need(allowed(row),'runner cannot resolve another request or controller record');return row
         if method=='STORE_CHECKPOINT':
             need(value=={},'unknown checkpoint query');return self.store.checkpoint()
-        if method=='STORE_BEGIN':
-            need(set(value)=={'phase','operation','invocation_sha256','body_sha256','timeout_seconds','now'}
-                 and value['invocation_sha256']==key and value['phase']==self.phase,'reservation identity differs')
-            now=datetime.fromisoformat(value['now'].replace('Z','+00:00'))
-            need(self.frame_started<=now<=self.clock(),'reservation outside current frame')
-            return self.store.begin_http(**{**value,'now':now})
-        if method=='STORE_APPEND':
-            need(set(value)=={'receipt_id','kind','payload','now'} and value['kind'] in RUNNER_KINDS
-                 and type(value['receipt_id']) is str and value['receipt_id'].endswith('-'+key),'runner append outside current evidence')
-            now=datetime.fromisoformat(value['now'].replace('Z','+00:00'))
-            need(self.frame_started<=now<=self.clock(),'receipt outside current frame')
-            row=self.store.append(value['receipt_id'],value['kind'],value['payload'],now=now)
-            if row['kind']=='MODEL_TRANSPORT_PENDING_WINDOW':self.due.window(row)
-            return row
-        if method=='GENERATION_SUBMITTED':
-            validate_message(value,binding=self.binding,now=self.clock())
-            need(value['kind']=='GENERATION_SUBMITTED' and value['sequence']==self.sequence+1
-                 and value['request_id']==json.loads(inv.packet_json)['request_id'],'complete-send channel identity differs')
-            self.sequence=value['sequence']
-            return self.due.submitted(value)
-        if method=='DUE_EVENT':return self.due.due(value)
-        if method=='VERIFY_TRANSPORT':
-            need(value=={'invocation_sha256':key},'transport query differs');verify_generation_transport(self.store,key);return True
+        if method in ('STORE_BEGIN', 'STORE_APPEND', 'GENERATION_SUBMITTED', 'DUE_EVENT', 'VERIFY_TRANSPORT'):
+            need(False, 'worker cannot author model/runtime/transport observation evidence or completed-send proofs')
+        if method=='OBSERVED_PREFLIGHT':
+            need(value=={'invocation_sha256':key} and self._preflight_done_key!=key,'exact one-shot controller preflight required')
+            self._retire_previous_runner()
+            counted=self.executors[self.phase].count_input_tokens(inv)
+            self._preflight_done_key=key
+            return {'input_tokens':int(counted)}
+        if method=='OBSERVED_GENERATE':
+            need(value=={'invocation_sha256':key} and self._preflight_done_key==key and self._generate_allowed_key==key,
+                 'explicit controller-authorized generation required')
+            self._generate_allowed_key=None
+            reply=self.executors[self.phase].infer(inv)
+            self._previous_runner=self.store.resolve('token-proof-'+key)['payload']['runtime']['runner']
+            return {
+                'receipt_id':reply.receipt_id,
+                'raw_selection_json':reply.raw_selection_json,
+                'input_tokens':int(reply.input_tokens),
+                'generated_tokens':int(reply.generated_tokens),
+            }
         if method=='OUTCOME':return self.outcome(value)
         raise RuntimeError('unknown runner operation')
 
@@ -229,6 +404,9 @@ class IsolatedController:
         status=value['status']
         if status=='COMPLETE':
             need(inference and value['receipt_id']==inference['receipt_id'] and response and capture,'completed source missing')
+            if getattr(self.store, 'has_observer_key', False) and callable(getattr(self.store, 'require_observer_provenance', None)):
+                for _pfx in REQUIRED_OBSERVER_RECEIPT_PREFIXES:
+                    self.store.require_observer_provenance(_pfx + key)
             p=inference['payload']
             reply=decode(canonical_bytes(dict(raw_selection_json=p['raw_selection_json'],receipt_id=inference['receipt_id'],
                 invocation_sha256=key,model=p['requested_model'],started_at=p['started_at'],completed_at=p['completed_at'],
@@ -300,6 +478,8 @@ class ControllerBackend:
         invocation_deadline=min(o.window.end,
             datetime.fromisoformat(o.binding['expires_at_utc'].replace('Z','+00:00')),
             o.frame_started+timedelta(seconds=invocation.budget.max_seconds_per_call))
+        o._invocation_deadline=invocation_deadline
+        o._preflight_done_key=None;o._generate_allowed_key=None
         o.delivery_id='delivery-'+content_digest(invocation)
         o.channel.begin_invocation(o.delivery_id,invocation_deadline)
         o.due.begin(invocation,body=o.verifiers[self.phase]._backend._request(invocation).body)
@@ -324,6 +504,7 @@ class ControllerBackend:
 
     def infer(self, invocation):
         o=self.owner;need(o.active==invocation,'generation differs from current preflight')
+        o._generate_allowed_key=content_digest(invocation)
         o.channel.send('GENERATE',{'invocation_sha256':content_digest(invocation)})
         _,value=o.exchange_until({'DECISION_RESULT'})
         validate_message(value,binding=o.binding,now=o.clock())
