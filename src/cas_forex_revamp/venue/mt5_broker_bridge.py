@@ -65,6 +65,7 @@ import re
 import stat
 import hmac
 import secrets
+import sqlite3
 import time
 from typing import Any, Protocol
 
@@ -565,16 +566,15 @@ def _atomic_write_json(path: Path, doc: Mapping[str, Any]) -> None:
 
 
 def _read_spool_json(path: Path, *, max_bytes: int = MAX_SPOOL_FILE_BYTES) -> Any:
-    last_perm_err: OSError | None = None
-    raw: bytes | None = None
+    last_err: Exception | None = None
     for attempt in range(5):
         try:
             st = os.lstat(path)
         except FileNotFoundError:
             raise
         except PermissionError as exc:
-            last_perm_err = exc
-            time.sleep(0.005)
+            last_err = exc
+            time.sleep(0.015)
             continue
         except OSError as exc:
             raise Mt5TransportError(f"spool file {path.name} unreadable: {type(exc).__name__}") from None
@@ -584,22 +584,25 @@ def _read_spool_json(path: Path, *, max_bytes: int = MAX_SPOOL_FILE_BYTES) -> An
             raise Mt5TransportError(f"spool file {path.name} exceeds {max_bytes} bytes")
         try:
             raw = path.read_bytes()
-            break
         except PermissionError as exc:
-            last_perm_err = exc
-            time.sleep(0.005)
+            last_err = exc
+            time.sleep(0.015)
+            continue
         except OSError as exc:
             raise Mt5TransportError(f"spool file {path.name} unreadable: {type(exc).__name__}") from None
-    if raw is None:
-        raise Mt5TransportError(
-            f"spool file {path.name} unreadable after retry: {type(last_perm_err).__name__ if last_perm_err else 'OSError'}"
-        )
-    if raw.startswith(b"\xef\xbb\xbf"):
-        raw = raw[3:]
-    try:
-        return strict_safe_json_loads(raw, max_bytes=max_bytes)
-    except ContractError as exc:
-        raise Mt5TransportError(f"spool file {path.name} is not strict safe JSON: {exc}") from None
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        try:
+            return strict_safe_json_loads(raw, max_bytes=max_bytes)
+        except ContractError as exc:
+            last_err = exc
+            if attempt < 4:
+                time.sleep(0.015)
+                continue
+            raise Mt5TransportError(f"spool file {path.name} is not strict safe JSON: {exc}") from None
+    raise Mt5TransportError(
+        f"spool file {path.name} unreadable after retry: {type(last_err).__name__ if last_err else 'OSError'}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3031,19 +3034,19 @@ class Mt5PaperBrokerVenue:
                 "broker_id": self.broker_id, "order_id": order.order_id, "receipt": receipt.to_wire_dict(),
             })
             raise Mt5OutcomeUnknownError(f"{self.broker_id} EA reported outcome UNKNOWN for {request.request_id}")
-        if receipt.status == "REJECTED" and receipt.order_ticket is None and receipt.deal_ticket is None:
+        if receipt.status == "REJECTED" and receipt.position_ticket is None and receipt.deal_ticket is None:
             self._mutation_journal.mark_outcome(
                 request_id=request.request_id,
                 status="CONFIRMED_REJECTED",
                 now_utc=_iso(self._clock()),
-                error_detail=str(receipt.comment or receipt.retcode),
+                error_detail=str(receipt.message or receipt.retcode),
             )
         else:
             self._mutation_journal.mark_outcome(
                 request_id=request.request_id,
                 status="CONFIRMED_FILLED",
                 now_utc=_iso(self._clock()),
-                order_ticket=None if receipt.order_ticket is None else str(receipt.order_ticket),
+                order_ticket=None if receipt.position_ticket is None else str(receipt.position_ticket),
                 deal_ticket=None if receipt.deal_ticket is None else str(receipt.deal_ticket),
             )
         self._account = self._transport.account_info()

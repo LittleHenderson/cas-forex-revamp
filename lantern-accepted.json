@@ -12,6 +12,26 @@
    "date": "2026-11-19"
   },
   {
+   "id": "244262852cef",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "tests/phase6/test_live_and_demo_broker_modes.py",
+   "line": 254,
+   "reason": "False positive: placeholder dummy string fixture-oanda-val-03 in unit test verifying env-file redaction, not a real credential.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
+   "id": "28a9d7520e9b",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "tests/phase6/test_live_and_demo_broker_modes.py",
+   "line": 249,
+   "reason": "False positive: placeholder dummy string fixture-hugo-val-01 in unit test verifying env-file redaction, not a real credential.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
    "id": "2ac0bcf296c3",
    "tool": "gitleaks",
    "rule": "generic-api-key",
@@ -42,6 +62,16 @@
    "date": "2026-11-19"
   },
   {
+   "id": "5b629f6714a4",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "tests/phase6/test_live_and_demo_broker_modes.py",
+   "line": 252,
+   "reason": "False positive: placeholder dummy string fixture-lhfx-val-02 in unit test verifying env-file redaction, not a real credential.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
    "id": "5b9436bb36c9",
    "tool": "gitleaks",
    "rule": "generic-api-key",
@@ -68,6 +98,26 @@
    "file": "shared-interface/accepted-contracts/examples/role-release-evidence.json",
    "line": 1355,
    "reason": "False positive: checkpoint_access_selection_sha256 is a public SHA-256 contract digest in a canonical example fixture, not an API key or secret.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
+   "id": "d350cac2f94f",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "tests/phase6/test_live_and_demo_broker_modes.py",
+   "line": 522,
+   "reason": "False positive: environment variable name constant string in synthetic unit test fixture, not a credential or secret.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
+   "id": "d89bc71158e4",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "tests/phase6/test_live_and_demo_broker_modes.py",
+   "line": 239,
+   "reason": "False positive: environment variable name constant string in synthetic unit test fixture, not a credential or secret.",
    "by": "cas-forex-security-review",
    "date": "2026-11-19"
   },

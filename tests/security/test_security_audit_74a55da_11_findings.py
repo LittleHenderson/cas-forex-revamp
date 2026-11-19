@@ -48,7 +48,15 @@ from cas_forex_revamp.venue.external_paper_broker import (
     OandaPracticePaperClient,
     REQUIRED_LIVE_ARM_PHRASE,
 )
+from dataclasses import dataclass
+from cas_forex_revamp.venue.dual_shield_router import (
+    BarbellCapitalPolicy,
+    BarbellPolicyRefusalError,
+    DualShieldBrokerRouter,
+    ENV_DEMO_BARBELL_VIRTUAL_SLEEVE,
+)
 from cas_forex_revamp.venue.mt5_broker_bridge import (
+    _RedactedSecret,
     BROKER_HUGOSWAY_MT5,
     Mt5AccountSnapshot,
     Mt5Credentials,
@@ -414,7 +422,12 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
                 current_state=lambda: {},
                 next_sequence=lambda: 1,
             )
-            due.begin(SimpleNamespace(request_sha256="b" * 64, packet_json="{}"), body=b"{}")
+            @dataclass(frozen=True)
+            class _FakeInv:
+                request_sha256: str
+                packet_json: str
+
+            due.begin(_FakeInv(request_sha256="b" * 64, packet_json="{}"), body=b"{}")
             due.key = key
             with self.assertRaises(ContractError):
                 due.submitted({"payload": {}})
@@ -449,7 +462,7 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
 
             creds = Mt5Credentials(
                 broker_id=BROKER_HUGOSWAY_MT5, login=1002903, server="Hugosway-Demo",
-                password="demo-pass-1", execution_mode=EXECUTION_MODE_DEMO,
+                password=_RedactedSecret("demo-pass-1"), execution_mode=EXECUTION_MODE_DEMO,
             )
             venue = Mt5PaperBrokerVenue(
                 broker_id=BROKER_HUGOSWAY_MT5,
@@ -494,7 +507,7 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
             # LIVE MT5 without durable journal MUST fail closed
             live_creds = Mt5Credentials(
                 broker_id=BROKER_HUGOSWAY_MT5, login=9001122, server="Hugo PRO5",
-                password="live-pass-1", execution_mode=EXECUTION_MODE_LIVE,
+                password=_RedactedSecret("live-pass-1"), execution_mode=EXECUTION_MODE_LIVE,
             )
             with self.assertRaises(ContractError):
                 Mt5PaperBrokerVenue(
@@ -676,7 +689,7 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             vault = ProfitSweepVault(Path(td) / "vault.sqlite3", clock=lambda: T0)
-            vault.record_realized_profit(
+            vault.record_realized_close(
                 trade_id="tr-ach-1", symbol="EURUSD", broker_id="HUGOSWAY_MT5",
                 realized_net_usd=Decimal("200.00"), occurred_at=T0,
             )  # $100.00 bank sweep reserve
@@ -838,7 +851,7 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
             st = initialize_shared_runtime_state({}, explicit_state_dir=td, clock=lambda: T0)
             vault = st.profit_vault
             rec = st.owner_recovery
-            vault.record_realized_profit(
+            vault.record_realized_close(
                 trade_id="tr-2fa-1", symbol="EURUSD", broker_id="HUGOSWAY_MT5",
                 realized_net_usd=Decimal("400.00"), occurred_at=T0,
             )  # $200 pending sweep reserve
@@ -948,6 +961,46 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
             self.assertEqual(ok["status"], "SETTLED")
             self.assertEqual(ok["vault"]["pending_disbursement_usd"], "0")
 
+
+    # ------------------------------------------------------------------
+    # Live Cloud Trading Regression Guards (DEMO virtual sleeve + XAUUSD 100oz + 50-lot cap + pre-check)
+    # ------------------------------------------------------------------
+    def test_demo_virtual_sleeve_forbids_live_and_enforces_risk_caps(self) -> None:
+        eq_equal = {
+            "OANDA_PRACTICE": Decimal("100000"),
+            "HUGOSWAY_MT5": Decimal("100000"),
+            "LHFX_MT5": Decimal("100000"),
+        }
+        # Default strict policy refuses equal $100k/$100k/$100k custody on MT5
+        strict = BarbellCapitalPolicy()
+        with self.assertRaises(BarbellPolicyRefusalError):
+            strict.require_sleeve("HUGOSWAY_MT5", equities=eq_equal, used_margin_after=Decimal("500"))
+        # DEMO virtual sleeve normalizes total to $100k / 0.80 = $125k ($15k Hugo / $10k LHFX margin sleeves)
+        vs = BarbellCapitalPolicy.from_environ({ENV_DEMO_BARBELL_VIRTUAL_SLEEVE: "1"})
+        self.assertTrue(vs.demo_virtual_sleeve)
+        self.assertEqual(vs.effective_total_equity(eq_equal), Decimal("125000.00"))
+        res = vs.require_sleeve("HUGOSWAY_MT5", equities=eq_equal, used_margin_after=Decimal("500"))
+        self.assertEqual(res["sleeve_cap"], "15000")
+        with self.assertRaises(BarbellPolicyRefusalError):
+            vs.require_sleeve("HUGOSWAY_MT5", equities=eq_equal, used_margin_after=Decimal("15000.01"))
+        with self.assertRaises(BarbellPolicyRefusalError):
+            vs.require_stop_risk(Decimal("1250.01"), eq_equal)
+        # LIVE mode MUST hard-reject demo_virtual_sleeve
+        from cas_forex_revamp.venue.external_paper_broker import REQUIRED_LIVE_ARM_PHRASE
+        with self.assertRaises(ContractError):
+            DualShieldBrokerRouter(
+                environ={
+                    "CAS_FOREX_EXECUTION_MODE": "LIVE",
+                    "CAS_FOREX_LIVE_ARM_PHRASE": REQUIRED_LIVE_ARM_PHRASE,
+                    ENV_DEMO_BARBELL_VIRTUAL_SLEEVE: "1",
+                },
+                valve_gate=GATE,
+            )
+        # Verify XAUUSD (100 oz/lot) & NAS100 (<= 50 lots) contract math parity
+        from cas_forex_revamp.venue.mt5_broker_bridge import Mt5MarginCalculator
+        calc = Mt5MarginCalculator()
+        self.assertEqual(calc.units_to_lots(Decimal("83"), symbol="XAUUSD"), Decimal("0.83"))
+        self.assertEqual(calc.units_to_lots(Decimal("50"), symbol="NAS100"), Decimal("50.00"))
 
 if __name__ == "__main__":
     unittest.main()

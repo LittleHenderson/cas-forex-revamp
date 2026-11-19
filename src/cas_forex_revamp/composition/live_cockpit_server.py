@@ -264,14 +264,18 @@ def _build_mt5_index_snapshot_from_router(
     from cas_forex_revamp.venue.live_market_stream import INDEX_INSTRUMENTS
 
     mt5_q: dict[str, tuple[Any, Any]] = {}
-    for venue in router.venues.values():
+    for broker_id, venue in router.venues.items():
         if hasattr(venue, "_transport") and venue.account is not None:
+            got_tick = False
             for sym in INDEX_INSTRUMENTS:
                 try:
                     tk = venue._transport.symbol_tick(sym)
                     mt5_q[sym] = (tk.bid, tk.ask)
+                    got_tick = True
                 except (ContractError, OSError) as exc_sym:
                     print(f"[ai-fast] Tick skipped for {sym}: {type(exc_sym).__name__}")
+            if got_tick and hasattr(router, "_status") and router._status.get(broker_id) == "DISCONNECTED":
+                router._status[broker_id] = "ACTIVE"
     if not mt5_q:
         return None, {}
     now_dt = datetime.now(timezone.utc)
@@ -1771,7 +1775,8 @@ def run_cockpit_cli(
                     try:
                         trader.run_cycle(env_stream, index_stream=idx_stream)
                     except Exception as exc_ai:
-                        print(f"[ai] Standard cycle skipped ({type(exc_ai).__name__}).")
+                        msg_ai = " ".join(str(exc_ai).split())[:140]
+                        print(f"[ai] Standard cycle skipped ({type(exc_ai).__name__}: {msg_ai}).")
                 srv.notify_stream_updated()
             except Exception as exc:
                 print(f"[feed] Poll skipped ({type(exc).__name__}); keeping last verified snapshot.")
@@ -1800,7 +1805,8 @@ def run_cockpit_cli(
                         runtime_state.parallel_tiers.process_tick(quotes=mt5_q, signal=None)
                     srv.notify_stream_updated()
             except Exception as exc_ft:
-                print(f"[ai-fast] Fast tick skipped ({type(exc_ft).__name__}).")
+                msg_ft = " ".join(str(exc_ft).split())[:140]
+                print(f"[ai-fast] Fast tick skipped ({type(exc_ft).__name__}: {msg_ft}).")
 
     poller = threading.Thread(target=_poll_loop, name="cas-forex-feed-poll", daemon=True)
     fast_poller = threading.Thread(target=_fast_tick_loop, name="cas-forex-mt5-50ms", daemon=True)
