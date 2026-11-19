@@ -134,6 +134,8 @@ __all__ = [
     "Mt5Transport",
     "Mt5TransportError",
     "DEFAULT_WINDOWS_PORTABLE_SPOOL_DIR",
+    "ENV_INDEX_CONTRACT_SIZE",
+    "ENV_INDEX_LEVERAGE",
     "EXPANDED_MARKETS",
     "INDEX_INSTRUMENTS",
     "Mt5ValveClearanceError",
@@ -166,6 +168,7 @@ MT5_MAX_VOLUME_DEFAULT = Decimal("50")
 MAX_DEMO_LEVERAGE = 500
 DEFAULT_MT5_INDEX_LEVERAGE = 200
 ENV_INDEX_LEVERAGE = "CAS_FOREX_INDEX_LEVERAGE"
+ENV_INDEX_CONTRACT_SIZE = "CAS_FOREX_INDEX_CONTRACT_SIZE"
 DEFAULT_WINDOWS_PORTABLE_SPOOL_DIR = Path(r"D:\MetaTrader5\cas_forex_spool")
 _INDEX_SYMBOL_ALIASES: dict[str, str] = {
     "NAS100": "NAS100",
@@ -2788,6 +2791,14 @@ class Mt5PaperBrokerVenue:
         return self._positions
 
     @property
+    def margin_calculator(self) -> Mt5MarginCalculator:
+        return self._calc
+
+    @property
+    def min_margin_level_pct(self) -> Decimal:
+        return self._min_level
+
+    @property
     def audit_chain(self) -> tuple[BrokerAuditReceipt, ...]:
         return self._audit.records
 
@@ -2804,7 +2815,14 @@ class Mt5PaperBrokerVenue:
         if snap.leverage > BROKER_SPECS[self.broker_id].max_leverage:
             raise Mt5MarginRefusalError("MT5 account leverage exceeds the 1:500 cap")
         if snap.currency != self._calc.account_currency:
-            self._calc = Mt5MarginCalculator(leverage=self._calc.leverage, account_currency=snap.currency)
+            self._calc = Mt5MarginCalculator(
+                leverage=self._calc.leverage,
+                account_currency=snap.currency,
+                contract_size=self._calc.contract_size,
+                index_leverage=self._calc.index_leverage,
+                index_contract_size=self._calc.index_contract_size,
+                gold_contract_size=self._calc.gold_contract_size,
+            )
         self._account = snap
         self._positions = self._transport.positions()
         self._audit.append("MT5_CONNECTED", self._clock(), {
@@ -3487,11 +3505,31 @@ class BrokerHierarchyRouter:
         if creds is None:
             raise Mt5NotConfiguredError(f"{broker_id} has no runtime credentials")
         transport = self._transport_factory(broker_id, self.transport_mode, self._spool_root)
+        raw_idx_lev = str(self._env.get(ENV_INDEX_LEVERAGE, "")).strip()
+        if raw_idx_lev:
+            try:
+                idx_lev = int(raw_idx_lev)
+            except ValueError as exc:
+                raise ContractError(f"{ENV_INDEX_LEVERAGE} must be an integer in 1..{MAX_DEMO_LEVERAGE}") from exc
+        else:
+            idx_lev = DEFAULT_MT5_INDEX_LEVERAGE
+        raw_idx_csize = str(self._env.get(ENV_INDEX_CONTRACT_SIZE, "")).strip()
+        idx_csize = (
+            decimal_value(parse_decimal(raw_idx_csize, ENV_INDEX_CONTRACT_SIZE), ENV_INDEX_CONTRACT_SIZE, positive=True)
+            if raw_idx_csize
+            else MT5_INDEX_CONTRACT_SIZE
+        )
+        calc = Mt5MarginCalculator(
+            leverage=BROKER_SPECS[broker_id].max_leverage,
+            index_leverage=idx_lev,
+            index_contract_size=idx_csize,
+        )
         return Mt5PaperBrokerVenue(
             broker_id=broker_id,
             credentials=creds,
             transport=transport,
             valve_gate=self._valve_gate,
+            margin_calculator=calc,
             clock=self._clock,
             min_post_trade_margin_level_pct=self._min_level,
             mutation_journal=self._mt5_mutation_journal,

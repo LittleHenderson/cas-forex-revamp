@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal, localcontext
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal, localcontext
 from hashlib import sha256
 import json
 import logging
@@ -78,9 +78,13 @@ from cas_forex_revamp.composition.trend_regime import (
 from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
 from cas_forex_revamp.venue.live_market_stream import EXPANDED_MARKETS, INDEX_INSTRUMENTS
 from cas_forex_revamp.venue.mt5_broker_bridge import (
+    MT5_CONTRACT_SIZE,
+    MT5_GOLD_CONTRACT_SIZE,
+    MT5_INDEX_CONTRACT_SIZE,
     MT5_MAX_VOLUME_DEFAULT,
     MT5_MIN_VOLUME,
     MT5_VOLUME_STEP,
+    Mt5BridgeError,
     Mt5PaperBrokerVenue,
     OandaPracticeFallbackVenue,
     OrderIntent,
@@ -140,7 +144,11 @@ def resolve_adaptive_risk_and_quota(
         raise ContractError(f"owner_gear_mode must be one of {VALID_RISK_GEAR_MODES}")
     max_risk = decimal_value(owner_max_risk_pct, "owner_max_risk_pct", positive=True)
     max_dd = decimal_value(owner_max_drawdown_pct, "owner_max_drawdown_pct", positive=True)
-    dd = decimal_value(drawdown_pct, "drawdown_pct")
+    if isinstance(drawdown_pct, bool) or not isinstance(drawdown_pct, Decimal) or not drawdown_pct.is_finite():
+        raise ContractError("drawdown_pct must be a finite Decimal")
+    if drawdown_pct < Decimal("0"):
+        raise ContractError("drawdown_pct must be non-negative")
+    dd = decimal_value(drawdown_pct.quantize(Decimal("0.0000000001"), rounding=ROUND_CEILING), "drawdown_pct")
     hard_cap = decimal_value(owner_hard_quota_usd, "owner_hard_quota_usd", positive=True)
     soft_cap = decimal_value(owner_soft_quota_usd, "owner_soft_quota_usd", positive=True)
     consec = max(0, int(consecutive_losses))
@@ -164,8 +172,9 @@ def resolve_adaptive_risk_and_quota(
             target_risk = Decimal("1.00")
             target_soft = Decimal("500")
             target_hard = Decimal("1000")
+            dd_pct_disp = (dd * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
             reason = (
-                f"Auto-downshifted to Conservative Gear (drawdown {decimal_text(dd * Decimal('100'))}% >= 10% soft floor)."
+                f"Auto-downshifted to Conservative Gear (drawdown {decimal_text(dd_pct_disp)}% >= 10% soft floor)."
             )
         elif consec >= 1:
             active_gear = ACTIVE_GEAR_CONSERVATIVE
@@ -980,20 +989,37 @@ class AutonomousAiTrader:
         )
         sizing_equity = min(total_equity, eff_eq) if eff_eq > Decimal("0") else total_equity
         budget = self._router.barbell.max_stop_risk_amount(sizing_equity) * risk_multiplier
-        csize = Decimal("100") if symbol == "XAUUSD" else (Decimal("1") if symbol in INDEX_INSTRUMENTS else Decimal("100000"))
+        active_mt5: tuple[str, Mt5PaperBrokerVenue] | None = None
+        first_mt5: Mt5PaperBrokerVenue | None = None
+        for bid_id in self._router.priority_order:
+            venue = self._router.venues.get(bid_id)
+            if isinstance(venue, Mt5PaperBrokerVenue):
+                if first_mt5 is None:
+                    first_mt5 = venue
+                if venue.account is not None and active_mt5 is None:
+                    active_mt5 = (bid_id, venue)
+        calc_venue = active_mt5[1] if active_mt5 is not None else first_mt5
+        if calc_venue is not None:
+            csize = calc_venue.margin_calculator.contract_size_for(symbol)
+        else:
+            csize = (
+                MT5_GOLD_CONTRACT_SIZE
+                if symbol == "XAUUSD"
+                else (MT5_INDEX_CONTRACT_SIZE if symbol in INDEX_INSTRUMENTS else MT5_CONTRACT_SIZE)
+            )
         step_units = csize * MT5_VOLUME_STEP
         max_units_cap = csize * MT5_MAX_VOLUME_DEFAULT
         with localcontext() as ctx:
             ctx.prec = 40
             raw_units = min(budget / stop_dist, max_units_cap)
             # Also honor the active MT5 venue's max_lots cap, margin level floor (>= 1000%), & barbell sleeve cap.
-            for bid_id in self._router.priority_order:
-                venue = self._router.venues.get(bid_id)
-                if isinstance(venue, Mt5PaperBrokerVenue) and venue.account is not None and symbol in quotes_map:
-                    acct = venue.account
+            if active_mt5 is not None and symbol in quotes_map:
+                bid_id, venue = active_mt5
+                acct = venue.account
+                if acct is not None:
                     v_max_lots = getattr(venue, "_max_lots", MT5_MAX_VOLUME_DEFAULT)
                     raw_units = min(raw_units, v_max_lots * csize)
-                    min_ml = getattr(venue, "min_margin_level_pct", Decimal("1000"))
+                    min_ml = venue.min_margin_level_pct
                     max_used_ml = (acct.equity * Decimal("100")) / max(min_ml, Decimal("100"))
                     sleeve_lim = self._router.barbell.share_for(bid_id) * sizing_equity
                     rem_margin = min(
@@ -1001,11 +1027,10 @@ class AutonomousAiTrader:
                         max(Decimal("0"), sleeve_lim - acct.margin),
                         max(Decimal("0"), acct.margin_free),
                     ) * Decimal("0.95")
-                    one_step_margin = venue._calc.required_margin(symbol, side, step_units, quotes_map)
+                    one_step_margin = venue.margin_calculator.required_margin(symbol, side, step_units, quotes_map)
                     if one_step_margin > Decimal("0"):
                         max_margin_units = (rem_margin / one_step_margin) * step_units
                         raw_units = min(raw_units, max_margin_units)
-                    break
             steps = (raw_units / step_units).to_integral_value(rounding=ROUND_FLOOR)
         qty = max(csize * MT5_MIN_VOLUME, steps * step_units)
         # Verify exact Barbell stop risk never breaches 1.00% cap
@@ -1362,6 +1387,7 @@ class AutonomousAiTrader:
             eff_mult = max(Decimal("0.05"), (base_mult * gear_scale).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR))
             params = self._protection_cfg(sym, eff_mult)
             t_sz = _tick_size(sym)
+            spread = max(t_sz, ask - bid)
             entry_ref = ask if side is Side.BUY else bid
             if side is Side.BUY:
                 sl_price = (bid - params["sl_distance"]).quantize(t_sz, rounding=ROUND_HALF_UP)
@@ -1369,12 +1395,26 @@ class AutonomousAiTrader:
             else:
                 sl_price = (ask + params["sl_distance"]).quantize(t_sz, rounding=ROUND_HALF_UP)
                 tp_price = (bid - params["tp_distance"]).quantize(t_sz, rounding=ROUND_HALF_UP)
+            # Bounded slippage collar so normal 2-5s tick movement during LLM reasoning does not
+            # abort valid setups while capping worst-case fill slippage & stop-loss dollar risk.
+            slip_collar = min(
+                abs(entry_ref - sl_price) * Decimal("0.25"),
+                max(spread * Decimal("3"), entry_ref * Decimal("0.0010")),
+            )
+            if side is Side.BUY:
+                limit_ref = (entry_ref + slip_collar).quantize(t_sz, rounding=ROUND_HALF_UP)
+                if limit_ref >= tp_price:
+                    limit_ref = entry_ref
+            else:
+                limit_ref = max(t_sz, (entry_ref - slip_collar).quantize(t_sz, rounding=ROUND_HALF_UP))
+                if limit_ref <= tp_price:
+                    limit_ref = entry_ref
 
             qty = self._compute_quantity(
                 symbol=sym,
                 side=side,
-                bid=bid,
-                ask=ask,
+                bid=limit_ref if side is Side.SELL else bid,
+                ask=limit_ref if side is Side.BUY else ask,
                 sl_price=sl_price,
                 total_equity=deployable_eq,
                 risk_multiplier=eff_mult,
@@ -1398,7 +1438,7 @@ class AutonomousAiTrader:
                 expires_at=st_ref.valid_until,
                 quantity=qty,
                 side=side,
-                limit_price=None if is_pyramid_add else entry_ref,
+                limit_price=None if is_pyramid_add else limit_ref,
                 stop_price=sl_price,
                 take_profit_price=tp_price,
                 target_id=parent_ticket if is_pyramid_add else None,
@@ -1669,10 +1709,15 @@ class AutonomousAiTrader:
                 quantity_units=qty,
                 side=side,
                 stop_price=sl_price,
-                limit_price=entry_ref,
+                limit_price=limit_ref,
                 take_profit_price=tp_price,
             )
             exec_res = self._router.execute_open(broker_order, valve_decision=valve_dec)
+            if exec_res.result.receipt is not None and not exec_res.result.receipt.accepted:
+                raise Mt5BridgeError(
+                    f"{exec_res.executed_on} rejected OPEN {sym} "
+                    f"(retcode={exec_res.result.receipt.retcode}: {exec_res.result.receipt.message})"
+                )
             ticket = (
                 exec_res.result.receipt.position_ticket
                 if exec_res.result.receipt is not None and exec_res.result.receipt.position_ticket

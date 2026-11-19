@@ -548,8 +548,9 @@ class BarbellCapitalPolicy:
             )
         dd_pct = compute_drawdown_pct(current_equity, peak_equity)
         if dd_pct >= self.max_drawdown_pct:
+            dd_disp = dd_pct.quantize(Decimal("0.00000001"), rounding=ROUND_CEILING)
             raise BarbellPolicyRefusalError(
-                f"barbell drawdown {decimal_text(dd_pct)} >= max_drawdown_pct {decimal_text(self.max_drawdown_pct)}",
+                f"barbell drawdown {decimal_text(dd_disp)} >= max_drawdown_pct {decimal_text(self.max_drawdown_pct)}",
                 "MAX_DRAWDOWN_EXCEEDED",
             )
         return dd_pct
@@ -1180,6 +1181,10 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             except Mt5TransportError as exc:
                 self._status[broker_id] = "DISCONNECTED"
                 self._record(trail, broker_id, "DISCONNECTED", type(exc).__name__)
+                continue
+            if result.receipt is not None and not result.receipt.accepted:
+                rej_msg = f"retcode={result.receipt.retcode}: {result.receipt.message}"[:120]
+                self._record(trail, broker_id, "BROKER_REJECTED", rej_msg)
                 continue
             self._record(trail, broker_id, "EXECUTED", None)
             return DualShieldExecution(
