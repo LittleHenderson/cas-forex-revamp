@@ -161,7 +161,7 @@ export function createDefaultMoneyFlowState() {
 }
 
 export function resolveLiveAccountBalanceUsd(state) {
-  const allocTotal = Number(state?.brokerRouting?.dualShield?.allocation?.totalEquity ?? state?.brokerRouting?.allocation?.total_equity);
+  const allocTotal = Number(state?.brokerRouting?.shield?.totalEquity ?? state?.brokerRouting?.dualShield?.allocation?.totalEquity ?? state?.brokerRouting?.allocation?.total_equity);
   if (Number.isFinite(allocTotal) && allocTotal >= 50) return clampCapitalUsd(allocTotal);
   const deployable = Number(state?.aiTrader?.deployableEquityUsd);
   if (Number.isFinite(deployable) && deployable >= 50) return clampCapitalUsd(deployable);
@@ -430,7 +430,7 @@ export function renderMoneyFlowSection(state) {
     </article>`;
   }).join('');
 
-  return `<section class="panel money-flow-panel" aria-label="Interactive Money Movement Flowchart and Lot Scenario Explorer">
+  return `<section class="panel money-flow-panel" id="money-flow-section" aria-label="Interactive Money Movement Flowchart and Lot Scenario Explorer">
     <div class="section-heading">
       <div>
         <p class="eyebrow">LIVE MONEY MOVEMENT &amp; LOT EXPLORER · EXACT CENT MATH</p>

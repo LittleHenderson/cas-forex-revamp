@@ -14,9 +14,16 @@ import {
   clampLotHundredths,
   createDefaultMoneyFlowState,
   mountMoneyFlowWidget,
+  renderMoneyFlowSection,
   resolveLiveAccountBalanceUsd,
   stepMoneyFlowSimulation,
 } from './money-flow.mjs';
+import {
+  clampLiveCapitalUsd,
+  createDefaultLiveFundingState,
+  evaluateLiveArmingPreflight,
+  renderLiveFundingPanel,
+} from './live-funding.mjs';
 
 // Fixed same-origin assets. Only explicit trusted bootstrap may inject a scoped bridge.
 const schemaURL = new URL('../docs/contracts/cockpit.schema.json', document.baseURI);
@@ -84,6 +91,7 @@ let state = {
   aiModels: null, aiTrader: null, indexStream: null, aiActionBusy: false, aiIssue: null,
   treasury: null, parallelTiers: null, chartZoomBars: 60, inspectedTradeIdx: 0,
   moneyFlow: createDefaultMoneyFlowState(),
+  liveFunding: createDefaultLiveFundingState(),
 };
 
 function routeFromHash() {
@@ -127,20 +135,61 @@ function scheduleStreamRender() {
   }, 180);
 }
 
+function rerenderMoneyFlowInPlace(focusSelector = null) {
+  const sx = window.scrollX || 0;
+  const sy = window.scrollY || 0;
+  const currentSec = root.querySelector('#money-flow-section');
+  if (!currentSec) {
+    render();
+    return;
+  }
+  const nextSec = new DOMParser().parseFromString(renderMoneyFlowSection(state), 'text/html').body.firstElementChild;
+  if (nextSec) {
+    currentSec.replaceWith(nextSec);
+    try { mountMoneyFlowWidget(root, state); } catch { /* SVG optional in headless environments. */ }
+    if (focusSelector) {
+      nextSec.querySelector(focusSelector)?.focus({ preventScroll: true });
+    }
+  }
+  if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
+}
+
+function rerenderLiveFundingInPlace(focusSelector = null) {
+  const sx = window.scrollX || 0;
+  const sy = window.scrollY || 0;
+  const currentSec = root.querySelector('#live-funding-section');
+  if (!currentSec) {
+    render();
+    return;
+  }
+  const nextSec = new DOMParser().parseFromString(renderLiveFundingPanel(state), 'text/html').body.firstElementChild;
+  if (nextSec) {
+    currentSec.replaceWith(nextSec);
+    if (focusSelector) {
+      nextSec.querySelector(focusSelector)?.focus({ preventScroll: true });
+    }
+  }
+  if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
+}
+
 function render(focusMain = false) {
+  const prevScrollX = window.scrollX || 0;
+  const prevScrollY = window.scrollY || 0;
   const active = document.activeElement;
   const identity = root.contains(active) && active?.tagName === 'BUTTON' ? JSON.stringify(active.dataset) : null;
   document.documentElement.dataset.theme = state.theme;
   try { releaseDetachedCanvases(root); } catch { /* Best-effort buffer release. */ }
   replaceSafeHTML(root, renderApp(state));
   try { mountMarketCharts(root, state); mountAnalyticsCanvases(root, state); mountMoneyFlowWidget(root, state); } catch { /* Chart/SVG optional in headless environments. */ }
+  if (!focusMain && typeof window.scrollTo === 'function') window.scrollTo(prevScrollX, prevScrollY);
   try { explainer?.sync(); } catch { disableExplainer(); }
   document.title = `${state.route[0].toUpperCase() + state.route.slice(1)} / CAS Forex`;
-  if (focusMain) document.querySelector('#main').focus({ preventScroll: true });
+  if (focusMain) document.querySelector('#main')?.focus({ preventScroll: true });
   else if (identity) {
     const replacement = [...root.querySelectorAll('button')].find((item) => !item.disabled && JSON.stringify(item.dataset) === identity);
-    (replacement ?? document.querySelector('#main')).focus({ preventScroll: true });
+    (replacement ?? document.querySelector('#main'))?.focus({ preventScroll: true });
   }
+  if (!focusMain && typeof window.scrollTo === 'function') window.scrollTo(prevScrollX, prevScrollY);
 }
 
 function announce(message) { announcer.textContent = message; }
@@ -185,7 +234,7 @@ function updateDialog() {
   const identity = active?.tagName === 'BUTTON' ? JSON.stringify(active.dataset) : null;
   replaceSafeHTML(dialog, dialogContext === 'prepared' ? renderPreparedClose(state.transport) : renderControlDialog(dialogContext, state.transport));
   const matching = [...dialog.querySelectorAll('button')].find((item) => !item.disabled && JSON.stringify(item.dataset) === identity);
-  (matching ?? dialog.querySelector('[data-dialog-close]'))?.focus();
+  (matching ?? dialog.querySelector('[data-dialog-close]'))?.focus({ preventScroll: true });
 }
 
 async function loadSchemas() {
@@ -645,7 +694,7 @@ function openDialog(html, trigger) {
   dialogTrigger = trigger;
   replaceSafeHTML(dialog, html);
   dialog.showModal();
-  dialog.querySelector('[data-dialog-close]').focus();
+  dialog.querySelector('[data-dialog-close]')?.focus({ preventScroll: true });
 }
 
 root.addEventListener('click', (event) => {
@@ -656,58 +705,93 @@ root.addEventListener('click', (event) => {
   if (target.dataset.disconnectLoopback) { stopLoopbackStream(); render(); announce('Live market stream paused.'); return; }
   if (target.dataset.aiOverseerAction) { void sendOverseerAction(target.dataset.aiOverseerAction); return; }
   if (target.dataset.riskGear) { void setRiskGearMode(target.dataset.riskGear); return; }
+  if (target.dataset.lfCap) {
+    const cap = clampLiveCapitalUsd(target.dataset.lfCap);
+    const nextLf = { ...state.liveFunding, capitalUsd: cap };
+    if (nextLf.verifyResult) nextLf.verifyResult = evaluateLiveArmingPreflight(nextLf, state.brokerRouting);
+    state.liveFunding = nextLf;
+    rerenderLiveFundingInPlace(`[data-lf-cap="${cap}"]`);
+    return;
+  }
+  if (target.dataset.lfVerify) {
+    const phraseEl = root.querySelector('[data-lf-phrase-input="true"]');
+    const currentPhrase = phraseEl ? String(phraseEl.value ?? '') : state.liveFunding.armPhraseInput;
+    state.liveFunding = { ...state.liveFunding, armPhraseInput: currentPhrase };
+    const finishVerify = () => {
+      const res = evaluateLiveArmingPreflight(state.liveFunding, state.brokerRouting);
+      state.liveFunding = { ...state.liveFunding, verifyResult: res };
+      rerenderLiveFundingInPlace('[data-lf-verify="true"]');
+      announce(res.headline);
+    };
+    if (state.liveStreamConnected) void readBrokerRouting().finally(finishVerify);
+    else finishVerify();
+    return;
+  }
   if (target.dataset.mfTab) {
-    state.moneyFlow = { ...state.moneyFlow, tab: target.dataset.mfTab === 'lots' ? 'lots' : 'flow' };
-    render(); return;
+    const nextTab = target.dataset.mfTab === 'lots' ? 'lots' : 'flow';
+    state.moneyFlow = { ...state.moneyFlow, tab: nextTab };
+    rerenderMoneyFlowInPlace(`[data-mf-tab="${nextTab}"]`);
+    return;
   }
   if (target.dataset.mfSplit) {
-    state.moneyFlow = { ...state.moneyFlow, splitMode: target.dataset.mfSplit === '100_COMPOUND' ? '100_COMPOUND' : '50_50' };
-    render(); return;
+    const nextSplit = target.dataset.mfSplit === '100_COMPOUND' ? '100_COMPOUND' : '50_50';
+    state.moneyFlow = { ...state.moneyFlow, splitMode: nextSplit };
+    rerenderMoneyFlowInPlace(`[data-mf-split="${nextSplit}"]`);
+    return;
   }
   if (target.dataset.mfCap) {
     const cap = clampCapitalUsd(target.dataset.mfCap);
     state.moneyFlow = { ...state.moneyFlow, capitalUsd: cap, simWins: 0, simLosses: 0, simCapitalCents: cap * 100, simBankCents: 0 };
-    render(); return;
+    rerenderMoneyFlowInPlace(`[data-mf-cap="${cap}"]`);
+    return;
   }
   if (target.dataset.mfLiveBalance) {
     const cap = resolveLiveAccountBalanceUsd(state);
     state.moneyFlow = { ...state.moneyFlow, capitalUsd: cap, simWins: 0, simLosses: 0, simCapitalCents: cap * 100, simBankCents: 0 };
-    render(); return;
+    rerenderMoneyFlowInPlace('[data-mf-live-balance="true"]');
+    return;
   }
   if (target.dataset.mfMarket) {
-    state.moneyFlow = { ...state.moneyFlow, market: target.dataset.mfMarket, simWins: 0, simLosses: 0, simCapitalCents: state.moneyFlow.capitalUsd * 100, simBankCents: 0 };
-    render(); return;
+    const safeMkt = String(target.dataset.mfMarket).replace(/[^A-Z0-9_]/gi, '');
+    state.moneyFlow = { ...state.moneyFlow, market: safeMkt, simWins: 0, simLosses: 0, simCapitalCents: state.moneyFlow.capitalUsd * 100, simBankCents: 0 };
+    rerenderMoneyFlowInPlace(`[data-mf-market="${safeMkt}"]`);
+    return;
   }
   if (target.dataset.mfRisk) {
     const pct = Number(target.dataset.mfRisk) || 1;
     state.moneyFlow = { ...state.moneyFlow, lotMode: 'risk', riskPct: pct, simWins: 0, simLosses: 0, simCapitalCents: state.moneyFlow.capitalUsd * 100, simBankCents: 0 };
-    render(); return;
+    rerenderMoneyFlowInPlace(`[data-mf-risk="${pct}"]`);
+    return;
   }
   if (target.dataset.mfLot) {
-    const hund = clampLotHundredths(target.dataset.mfLot);
+    const safeLot = String(target.dataset.mfLot).replace(/[^0-9.]/g, '');
+    const hund = clampLotHundredths(safeLot);
     state.moneyFlow = { ...state.moneyFlow, lotMode: 'direct', directLotHundredths: hund, simWins: 0, simLosses: 0, simCapitalCents: state.moneyFlow.capitalUsd * 100, simBankCents: 0 };
-    render(); return;
+    rerenderMoneyFlowInPlace(`[data-mf-lot="${safeLot}"]`);
+    return;
   }
   if (target.dataset.mfStep) {
+    const safeStep = String(target.dataset.mfStep).replace(/[^a-z0-9]/gi, '');
     const maxRisk = Number(state.aiTrader?.riskGear?.ownerMaxRiskPct ?? 5) || 5;
-    state.moneyFlow = stepMoneyFlowSimulation(state.moneyFlow, target.dataset.mfStep, maxRisk);
-    render(); return;
+    state.moneyFlow = stepMoneyFlowSimulation(state.moneyFlow, safeStep, maxRisk);
+    rerenderMoneyFlowInPlace(`[data-mf-step="${safeStep}"]`);
+    return;
   }
   if (target.dataset.chartPair && ALL_WATCHLIST_MARKETS.includes(target.dataset.chartPair)) {
     state.chartPair = target.dataset.chartPair; render();
-    root.querySelector(`[data-chart-pair="${state.chartPair}"]`)?.focus(); return;
+    root.querySelector(`[data-chart-pair="${state.chartPair}"]`)?.focus({ preventScroll: true }); return;
   }
   if (target.dataset.chartTf && CHART_TIMEFRAMES.includes(target.dataset.chartTf)) {
     state.chartTimeframe = target.dataset.chartTf; render();
-    root.querySelector(`[data-chart-tf="${state.chartTimeframe}"]`)?.focus(); return;
+    root.querySelector(`[data-chart-tf="${state.chartTimeframe}"]`)?.focus({ preventScroll: true }); return;
   }
   if (target.dataset.chartLayout && CHART_LAYOUTS.includes(target.dataset.chartLayout)) {
     state.chartLayout = target.dataset.chartLayout; render();
-    root.querySelector(`[data-chart-layout="${state.chartLayout}"]`)?.focus(); return;
+    root.querySelector(`[data-chart-layout="${state.chartLayout}"]`)?.focus({ preventScroll: true }); return;
   }
   if (target.dataset.chartCat && ['all', 'US_INDEX', 'MAJOR', 'CROSS'].includes(target.dataset.chartCat)) {
     state.chartCategory = target.dataset.chartCat; render();
-    root.querySelector(`[data-chart-cat="${state.chartCategory}"]`)?.focus(); return;
+    root.querySelector(`[data-chart-cat="${state.chartCategory}"]`)?.focus({ preventScroll: true }); return;
   }
   if (target.dataset.chartZoom) {
     const z = target.dataset.chartZoom;
@@ -750,27 +834,27 @@ root.addEventListener('click', (event) => {
     const dark = state.theme === 'dark' || (state.theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
     state.theme = dark ? 'light' : 'dark';
     render();
-    root.querySelector('[data-theme-toggle]').focus();
+    root.querySelector('[data-theme-toggle]')?.focus({ preventScroll: true });
   }
   if (target.dataset.reviewFilter) {
     if (!['all', 'decisions', 'events', 'evidence'].includes(target.dataset.reviewFilter)) return;
     state.reviewFilter = target.dataset.reviewFilter;
     state.inspection = resetInspection();
     render();
-    root.querySelector(`[data-review-filter="${state.reviewFilter}"]`)?.focus();
+    root.querySelector(`[data-review-filter="${state.reviewFilter}"]`)?.focus({ preventScroll: true });
     announce('Record filter changed. Source state and coverage are unchanged.');
     return;
   }
   if (target.dataset.view) {
     state.reviewView = target.dataset.view === 'atlas' ? 'atlas' : 'list';
     render();
-    root.querySelector(`[data-view="${state.reviewView}"]`).focus();
+    root.querySelector(`[data-view="${state.reviewView}"]`)?.focus({ preventScroll: true });
     announce(`${state.reviewView === 'atlas' ? 'Atlas' : 'List'} view. Same supplied records.`);
   }
   if (target.dataset.record && state.projection) {
     state.inspection = inspectRecord(state.inspection, target.dataset.record, state.reviewEnvelope ? envelopeRecords(state.reviewEnvelope) : reviewRecords(state.projection));
     render();
-    [...root.querySelectorAll('[data-record]')].find((node) => node.dataset.record === state.inspection.focus_node_id)?.focus();
+    [...root.querySelectorAll('[data-record]')].find((node) => node.dataset.record === state.inspection.focus_node_id)?.focus({ preventScroll: true });
     announce('Inspection focus changed. Source state is unchanged.');
   }
 });
@@ -792,16 +876,40 @@ root.addEventListener('submit', async (event) => {
   }
 });
 
+root.addEventListener('input', (event) => {
+  if (event.target?.dataset?.lfPhraseInput) {
+    state.liveFunding = { ...state.liveFunding, armPhraseInput: String(event.target.value ?? '') };
+  }
+});
+
 root.addEventListener('change', async (event) => {
+  if (event.target?.dataset?.lfCustomCap) {
+    const cap = clampLiveCapitalUsd(event.target.value);
+    const nextLf = { ...state.liveFunding, capitalUsd: cap };
+    if (nextLf.verifyResult) nextLf.verifyResult = evaluateLiveArmingPreflight(nextLf, state.brokerRouting);
+    state.liveFunding = nextLf;
+    rerenderLiveFundingInPlace('[data-lf-custom-cap="true"]');
+    return;
+  }
+  if (event.target?.dataset?.lfPhraseInput) {
+    const nextPhrase = String(event.target.value ?? '');
+    const nextLf = { ...state.liveFunding, armPhraseInput: nextPhrase };
+    if (nextLf.verifyResult) nextLf.verifyResult = evaluateLiveArmingPreflight(nextLf, state.brokerRouting);
+    state.liveFunding = nextLf;
+    rerenderLiveFundingInPlace('[data-lf-phrase-input="true"]');
+    return;
+  }
   if (event.target?.dataset?.mfCustomCap) {
     const cap = clampCapitalUsd(event.target.value);
     state.moneyFlow = { ...state.moneyFlow, capitalUsd: cap, simWins: 0, simLosses: 0, simCapitalCents: cap * 100, simBankCents: 0 };
-    render(); return;
+    rerenderMoneyFlowInPlace('[data-mf-custom-cap="true"]');
+    return;
   }
   if (event.target?.dataset?.mfCustomLot) {
     const hund = clampLotHundredths(event.target.value);
     state.moneyFlow = { ...state.moneyFlow, lotMode: 'direct', directLotHundredths: hund, simWins: 0, simLosses: 0, simCapitalCents: state.moneyFlow.capitalUsd * 100, simBankCents: 0 };
-    render(); return;
+    rerenderMoneyFlowInPlace('[data-mf-custom-lot="true"]');
+    return;
   }
   if (event.target.dataset?.selectAiModel) { void selectAiModel(event.target.value); return; }
   if (event.target.name === 'theme') {
@@ -809,7 +917,7 @@ root.addEventListener('change', async (event) => {
     if (!['system', 'light', 'dark'].includes(theme)) return;
     state.theme = theme;
     render();
-    root.querySelector(`input[name="theme"][value="${theme}"]`).focus();
+    root.querySelector(`input[name="theme"][value="${theme}"]`)?.focus({ preventScroll: true });
   }
   if (event.target.id === 'decision-file') {
     if (controller?.attached) return;
@@ -854,7 +962,7 @@ dialog.addEventListener('click', (event) => {
   transportClick(target);
 });
 dialog.addEventListener('close', () => {
-  if (dialogTrigger?.isConnected) dialogTrigger.focus();
+  if (dialogTrigger?.isConnected) dialogTrigger.focus({ preventScroll: true });
   else document.querySelector('#main')?.focus({ preventScroll: true });
   dialogTrigger = null;
   dialogContext = null;

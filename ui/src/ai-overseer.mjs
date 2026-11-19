@@ -440,6 +440,9 @@ export function renderAiOverseerPanel(state) {
   const connectBtn = !trader.connected
     ? '<button type="button" class="button button-small button-primary" data-connect-loopback="true">Connect live server</button>'
     : '';
+  const unlockBar = !trader.connected
+    ? '<form class="mobile-unlock-bar prominent-unlock-bar" data-cockpit-unlock-form="true" autocomplete="on"><label class="sr-only" for="overseer-access-key">Cockpit access key</label><input id="overseer-access-key" class="mobile-unlock-input" type="password" name="cockpit_access_key" autocomplete="current-password" placeholder="Paste Cockpit access key here (or run D:\\MetaTrader5\\Launch_24x7_Cloud_Cockpit.cmd) to unlock live 24/7 cloud AI"><button type="submit" class="button button-small button-primary">Unlock &amp; Connect Live Cloud</button></form>'
+    : '';
   const workingPill = `<span class="working-now-pill" data-working-now="true">WORKING NOW: ${esc(trader.currentFocusStatus ?? (`SCANNING ${trader.marketsEvaluated} MARKETS`))}</span>`;
 
   return `<section class="panel ai-overseer-panel" aria-label="AI Autonomous Trader and Human Overseer">
@@ -454,6 +457,7 @@ export function renderAiOverseerPanel(state) {
     </div>
     <p class="panel-copy">${esc(trader.governanceReason)} Last signal: <strong>${esc(trader.lastAction)}</strong>${trader.lastSymbol !== 'None' ? ` on ${esc(trader.lastSymbol)}` : ''} · ${esc(trader.lastReason)}</p>
     ${issueNote}
+    ${unlockBar}
     <div class="ai-overseer-grid">
       <div class="ai-control-block">
         <label class="control-label" for="ai-model-select">Active AI Brain (#1-#8 Frontier, #9 Qwen Offline Fallback Last)</label>

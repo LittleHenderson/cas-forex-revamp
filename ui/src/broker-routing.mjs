@@ -1,4 +1,4 @@
-// Broker & MetaTrader 5 routing summary for the 03 Setup page.
+// Broker & MetaTrader 5 routing summary for 01 Operate and 03 Setup.
 // Pure data helpers: no DOM, no network, no storage. Every field is normalized to a
 // whitelisted string/boolean shape before rendering, and the renderer escapes all text.
 
@@ -6,7 +6,56 @@ export const MAX_BROKER_ROUTING_BYTES = 65536;
 const BROKER_IDS = Object.freeze(['HUGOSWAY_MT5', 'LHFX_MT5', 'OANDA_PRACTICE', 'OANDA_LIVE']);
 const STATUS_WORDS = Object.freeze(['ACTIVE', 'STANDBY', 'NOT_CONFIGURED', 'FAILED', 'DISCONNECTED', 'FROZEN', 'LIVE_FORBIDDEN', 'NOT_CONNECTED']);
 
-const str = (value, fallback = 'Unknown') => (typeof value === 'string' && value.length > 0 && value.length <= 200 ? value : fallback);
+const str = (value, fallback = 'Unknown', maxLen = 200) => (
+  typeof value === 'string' && value.length > 0 && value.length <= maxLen ? value : fallback
+);
+const strSlice = (value, fallback = 'Unknown', maxLen = 400) => (
+  typeof value === 'string' && value.trim().length > 0 ? value.trim().slice(0, maxLen) : fallback
+);
+
+export const STATIC_LIVE_READINESS = Object.freeze({
+  executionMode: 'DEMO',
+  liveArmed: false,
+  requiredArmPhrase: 'ARM_LIVE_REAL_MONEY_TRADING',
+  allGatesReady: false,
+  gates: Object.freeze([
+    Object.freeze({
+      id: 'LIVE_CREDENTIALS_STAGED',
+      step: 1,
+      title: 'Real-Money Broker Credentials Staged',
+      passed: false,
+      detail: "Stage OANDA Live v20 credentials plus Hugo's Way (Hugosway-Real3) and LHFX (LHFXSA-Live) logins on cloud host.",
+    }),
+    Object.freeze({
+      id: 'OWNER_ED25519_LIVE_TICKETS',
+      step: 2,
+      title: 'Owner Ed25519 Live Venue Authorization Tickets',
+      passed: false,
+      detail: 'Requires signed CAS_FOREX_HUGOSWAY_MT5_LIVE_TICKET, CAS_FOREX_LHFX_MT5_LIVE_TICKET, and CAS_FOREX_OANDA_LIVE_TICKET.',
+    }),
+    Object.freeze({
+      id: 'REAL_BARBELL_80_12_8_CUSTODY',
+      step: 3,
+      title: 'Real 80% / 12% / 8% Barbell Custody Allocation',
+      passed: false,
+      detail: "Disable demo virtual sleeve and verify OANDA (80%), Hugo's Way (12%), and LHFX (8%) live balances within ±2% tolerance.",
+    }),
+    Object.freeze({
+      id: 'VALVE_AND_DURABLE_JOURNALS',
+      step: 4,
+      title: '161-Param ForexMetaValveGate & Durable SQLite Journals',
+      passed: false,
+      detail: 'Requires active tks_meta_valve_controller (threshold 0.55) and durable SQLite mutation journals on MT5 and OANDA.',
+    }),
+    Object.freeze({
+      id: 'TWO_KEY_LIVE_ARMED',
+      step: 5,
+      title: 'Two-Key Real-Money Execution Mode Armed',
+      passed: false,
+      detail: 'Requires CAS_FOREX_EXECUTION_MODE=LIVE plus Key 2 confirmation phrase ARM_LIVE_REAL_MONEY_TRADING.',
+    }),
+  ]),
+});
 
 export const STATIC_BROKER_ROUTING = Object.freeze({
   connected: false,
@@ -30,6 +79,7 @@ export const STATIC_BROKER_ROUTING = Object.freeze({
     reserveShare: '0.80', hugoswayShare: '0.12', lhfxShare: '0.08', maxStopRiskPct: '1.00',
     safeHarbor: 'OANDA_PRACTICE', safeHarborLeverage: '1:50', degradations: '0', offsetPlanner: true, totalEquity: null,
   }),
+  liveReadiness: STATIC_LIVE_READINESS,
 });
 
 function normalizeChainItem(item) {
@@ -64,6 +114,37 @@ function normalizeShield(doc) {
   });
 }
 
+function normalizeLiveReadiness(doc, isLive) {
+  const lr = doc.live_readiness;
+  if (!lr || typeof lr !== 'object' || Array.isArray(lr)) return STATIC_LIVE_READINESS;
+  const rawGates = Array.isArray(lr.gates) && lr.gates.length > 0 ? lr.gates.slice(0, 10) : STATIC_LIVE_READINESS.gates;
+  const gates = rawGates.map((g, idx) => {
+    const fallbackGate = STATIC_LIVE_READINESS.gates[idx] ?? {
+      id: `GATE_${idx + 1}`,
+      step: idx + 1,
+      title: `Gate ${idx + 1}`,
+      detail: 'Pending readiness verification.',
+    };
+    return Object.freeze({
+      id: strSlice(g?.id, fallbackGate.id, 80),
+      step: Number.isSafeInteger(g?.step) && g.step >= 1 && g.step <= 20 ? g.step : fallbackGate.step,
+      title: strSlice(g?.title, fallbackGate.title, 200),
+      passed: Boolean(g?.passed),
+      detail: strSlice(g?.detail, fallbackGate.detail, 400),
+    });
+  });
+  const allGatesReady = typeof lr.all_gates_ready === 'boolean'
+    ? lr.all_gates_ready
+    : (gates.length >= 5 && gates.every((g) => g.passed));
+  return Object.freeze({
+    executionMode: lr.execution_mode === 'LIVE' ? 'LIVE' : (isLive ? 'LIVE' : 'DEMO'),
+    liveArmed: typeof lr.live_armed === 'boolean' ? lr.live_armed : isLive,
+    requiredArmPhrase: strSlice(lr.required_arm_phrase, 'ARM_LIVE_REAL_MONEY_TRADING', 80),
+    allGatesReady,
+    gates: Object.freeze(gates),
+  });
+}
+
 /** Validate a parsed /api/broker-routing document into a frozen, display-only shape. */
 export function normalizeBrokerRouting(doc) {
   if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new Error('Broker routing must be a JSON object.');
@@ -88,5 +169,6 @@ export function normalizeBrokerRouting(doc) {
     valve: Object.freeze({ controller: str(valve.controller), parameters: Number.isSafeInteger(valve.parameters) ? String(valve.parameters) : 'Unknown', threshold: str(valve.threshold) }),
     chain: Object.freeze(doc.chain.map(normalizeChainItem)),
     shield: normalizeShield(doc),
+    liveReadiness: normalizeLiveReadiness(doc, isLive),
   });
 }

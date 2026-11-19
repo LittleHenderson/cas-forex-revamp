@@ -20,6 +20,7 @@ from hashlib import sha256
 import json
 import logging
 from pathlib import Path
+import re
 import sqlite3
 from threading import RLock
 import time
@@ -728,6 +729,91 @@ class AutonomousAiTrader:
             venue_sequence=self._venue_seq,
         )
 
+    def _estimate_broker_closed_pnl(
+        self,
+        meta: Mapping[str, Any],
+        *,
+        venue: Mt5PaperBrokerVenue,
+        quotes: Mapping[str, tuple[Decimal, Decimal]] | None = None,
+    ) -> Decimal:
+        raw_profit = meta.get("profit")
+        pnl_dec = Decimal("0")
+        if raw_profit is not None and str(raw_profit).strip() != "":
+            try:
+                parsed = Decimal(str(raw_profit).strip())
+                if parsed.is_finite():
+                    pnl_dec = parsed
+            except (ValueError, TypeError, ArithmeticError):
+                pnl_dec = Decimal("0")
+
+        if pnl_dec == Decimal("0"):
+            sym = str(meta.get("symbol") or "").strip()
+            side_str = str(meta.get("side") or "").strip().upper()
+            raw_entry = meta.get("entry_price")
+            raw_sl = meta.get("stop_loss")
+            raw_lots = meta.get("volume_lots", "1")
+            try:
+                entry_px = (
+                    Decimal(str(raw_entry).strip())
+                    if raw_entry is not None and str(raw_entry).strip() != ""
+                    else None
+                )
+                exit_px: Decimal | None = None
+                if quotes is not None and sym in quotes:
+                    q_bid, q_ask = quotes[sym]
+                    exit_px = Decimal(str(q_bid)) if side_str == Side.BUY.value else Decimal(str(q_ask))
+                else:
+                    try:
+                        tick = venue._transport.symbol_tick(sym)
+                        exit_px = tick.bid if side_str == Side.BUY.value else tick.ask
+                    except Exception as exc:
+                        logger.debug("closed ticket %s tick fallback unavailable: %s", sym, type(exc).__name__)
+                        exit_px = None
+                if exit_px is None and raw_sl is not None and str(raw_sl).strip() != "":
+                    exit_px = Decimal(str(raw_sl).strip())
+                lots_dec = (
+                    Decimal(str(raw_lots).strip())
+                    if raw_lots is not None and str(raw_lots).strip() != ""
+                    else Decimal("0")
+                )
+                if (
+                    entry_px is not None
+                    and exit_px is not None
+                    and entry_px.is_finite()
+                    and exit_px.is_finite()
+                    and entry_px > Decimal("0")
+                    and exit_px > Decimal("0")
+                    and lots_dec.is_finite()
+                    and lots_dec > Decimal("0")
+                    and side_str in (Side.BUY.value, Side.SELL.value)
+                ):
+                    units = venue.margin_calculator.lots_to_units(lots_dec, symbol=sym)
+                    diff = (exit_px - entry_px) if side_str == Side.BUY.value else (entry_px - exit_px)
+                    conv = Decimal("1")
+                    try:
+                        _, q_ccy = venue.margin_calculator.split_symbol(sym)
+                        if q_ccy != venue.margin_calculator.account_currency:
+                            if quotes is not None:
+                                conv = venue.margin_calculator.conversion_rate(q_ccy, quotes)
+                            elif sym.startswith(venue.margin_calculator.account_currency) and exit_px > Decimal("0"):
+                                conv = Decimal("1") / exit_px
+                    except (ContractError, ArithmeticError, ValueError, TypeError):
+                        conv = Decimal("1")
+                    pnl_dec = diff * units * conv
+            except (ContractError, ValueError, TypeError, ArithmeticError):
+                pnl_dec = Decimal("0")
+
+        return pnl_dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def protect_open_positions(
+        self,
+        *,
+        quotes: Mapping[str, tuple[Decimal, Decimal]] | None = None,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Protect open MT5 positions (50ms breakeven/trail & broker SL/TP close accounting)."""
+        return self.evaluate_fast_protection(quotes=quotes, now=now)
+
     def evaluate_fast_protection(
         self,
         *,
@@ -756,12 +842,42 @@ class AutonomousAiTrader:
                     logger.warning("fast protection probe failed for %s: %s", broker_id, type(exc).__name__)
                     continue
 
+                for pos in venue.positions:
+                    if pos.ticket in self._open_position_meta:
+                        self._open_position_meta[pos.ticket]["profit"] = decimal_text(pos.profit)
+
                 live_tickets = {p.ticket for p in venue.positions}
                 for stale_tkt in [
                     t for t, meta in self._open_position_meta.items()
                     if meta.get("broker_id") == broker_id and t not in live_tickets
                 ]:
+                    meta = self._open_position_meta.get(stale_tkt)
+                    if isinstance(meta, Mapping):
+                        sym_closed = str(meta.get("symbol") or "").strip()
+                        if sym_closed:
+                            pnl_dec = self._estimate_broker_closed_pnl(
+                                meta, venue=venue, quotes=quotes
+                            )
+                            safe_ticket = re.sub(r"[^A-Za-z0-9_.-]", "-", str(stale_tkt))[:64]
+                            if not safe_ticket or not safe_ticket[0].isalnum():
+                                safe_ticket = f"tkt-{safe_ticket}"[:64]
+                            try:
+                                self._quota.record_realized_trade(
+                                    pnl_dec,
+                                    symbol=sym_closed,
+                                    ticket=safe_ticket,
+                                    starting_equity=total_eq if total_eq > Decimal("0") else None,
+                                    now=ts,
+                                )
+                            except ContractError as exc:
+                                logger.warning(
+                                    "fast protection close accounting skipped for %s: %s",
+                                    safe_ticket,
+                                    type(exc).__name__,
+                                )
                     self._open_position_meta.pop(stale_tkt, None)
+                    self._peak_favorable.pop(stale_tkt, None)
+                    self._protection_stage.pop(stale_tkt, None)
 
                 for pos in venue.positions:
                     sym = pos.symbol
@@ -816,7 +932,9 @@ class AutonomousAiTrader:
                                 candidate_sl = trail_sl
                                 new_stage = "TRAILING_ACTIVE"
 
+                    prev_meta = self._open_position_meta.get(pos.ticket, {})
                     self._open_position_meta[pos.ticket] = {
+                        **prev_meta,
                         "ticket": pos.ticket,
                         "broker_id": broker_id,
                         "symbol": sym,
@@ -1103,6 +1221,9 @@ class AutonomousAiTrader:
                 side = regime_res.direction
                 regime_name = regime_res.regime
                 setup_note = regime_res.reason
+
+            if any(m.get("symbol") == sym and m.get("side") != side.value for m in open_meta_list):
+                continue
 
             matching = [
                 m for m in open_meta_list
