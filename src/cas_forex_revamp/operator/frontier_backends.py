@@ -1492,9 +1492,10 @@ class FrontierModelRegistry:
                     "temperature": 0,
                     "maxOutputTokens": 1536,
                     "responseMimeType": "application/json",
+                    "thinkingConfig": {"thinkingLevel": "LOW"},
                 },
             })
-            timeout_s = 20.0 if clean_audio_b64 is not None else 12.0
+            timeout_s = 25.0
             try:
                 if self._http_post is not None:
                     status, raw = self._http_post(url, dict(headers), body_bytes, timeout_s, MAX_EXPLAINER_RESPONSE_BYTES)
