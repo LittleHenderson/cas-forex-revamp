@@ -62,6 +62,7 @@ from cas_forex_revamp.valve.tks_meta_valve_controller import (
     PeakEquityStore,
     ValveDecision,
     ValveRefusalError,
+    compute_drawdown_pct,
 )
 from cas_forex_revamp.composition.trend_regime import (
     MAX_PYRAMID_LEGS,
@@ -95,6 +96,129 @@ GOVERNANCE_MODES = (GOVERNANCE_ACTIVE, GOVERNANCE_PAUSED_NEW_RISK, GOVERNANCE_ST
 FEED_MT5_FAST_SPOOL = "MT5_DIRECT_SPOOL_50MS"
 FEED_PUBLIC_FALLBACK = "PUBLIC_15S_FALLBACK"
 GENESIS_SHA256 = "0" * 64
+
+ENV_RISK_GEAR_MODE = "CAS_FOREX_RISK_GEAR_MODE"
+RISK_GEAR_CONSERVATIVE = "CONSERVATIVE"
+RISK_GEAR_AUTO_ADAPTIVE = "AUTO_ADAPTIVE"
+RISK_GEAR_AGGRESSIVE = "AGGRESSIVE"
+VALID_RISK_GEAR_MODES = (
+    RISK_GEAR_CONSERVATIVE,
+    RISK_GEAR_AUTO_ADAPTIVE,
+    RISK_GEAR_AGGRESSIVE,
+)
+
+ACTIVE_GEAR_CONSERVATIVE = "CONSERVATIVE"
+ACTIVE_GEAR_GROWTH = "GROWTH"
+ACTIVE_GEAR_STRONG_TREND_RUNNER = "STRONG_TREND_RUNNER"
+
+SOFT_DRAWDOWN_DOWNSHIFT_PCT = Decimal("0.10")
+
+
+def resolve_adaptive_risk_and_quota(
+    *,
+    owner_gear_mode: str,
+    regime: str,
+    drawdown_pct: Decimal,
+    consecutive_losses: int,
+    owner_max_risk_pct: Decimal,
+    owner_max_drawdown_pct: Decimal,
+    owner_soft_quota_usd: Decimal,
+    owner_hard_quota_usd: Decimal,
+) -> dict[str, Any]:
+    """Resolve active Risk Gear & Dynamic Daily Profit Quota strictly inside owner ceilings.
+
+    Safety invariants:
+    - The AI can NEVER raise its own safety ceiling above owner_max_risk_pct,
+      owner_max_drawdown_pct, or owner_hard_quota_usd.
+    - AUTO_ADAPTIVE scales across three owner-bounded gears:
+      1. Conservative (CHOP_RANGE / loss streak / drawdown >= 10%): 1.00% risk, $500 soft / $1,000 hard.
+      2. Growth (TREND_IGNITION, 0 losses, drawdown < 10%): 2.50% risk, $2,000 soft / $2,500 hard.
+      3. Strong-Trend Runner (STRONG_TREND, 0 losses, drawdown < 10%): 5.00% risk, $2,000 soft / $3,000 hard.
+    """
+    mode = str(owner_gear_mode or RISK_GEAR_AUTO_ADAPTIVE).strip().upper()
+    if mode not in VALID_RISK_GEAR_MODES:
+        raise ContractError(f"owner_gear_mode must be one of {VALID_RISK_GEAR_MODES}")
+    max_risk = decimal_value(owner_max_risk_pct, "owner_max_risk_pct", positive=True)
+    max_dd = decimal_value(owner_max_drawdown_pct, "owner_max_drawdown_pct", positive=True)
+    dd = decimal_value(drawdown_pct, "drawdown_pct")
+    hard_cap = decimal_value(owner_hard_quota_usd, "owner_hard_quota_usd", positive=True)
+    soft_cap = decimal_value(owner_soft_quota_usd, "owner_soft_quota_usd", positive=True)
+    consec = max(0, int(consecutive_losses))
+    reg = str(regime or REGIME_CHOP_RANGE).strip().upper()
+
+    if mode == RISK_GEAR_CONSERVATIVE:
+        active_gear = ACTIVE_GEAR_CONSERVATIVE
+        target_risk = Decimal("1.00")
+        target_soft = Decimal("500")
+        target_hard = Decimal("1000")
+        reason = "Owner selected Conservative Gear (1.00% risk · $500/$1,000 daily quota)."
+    elif mode == RISK_GEAR_AGGRESSIVE:
+        active_gear = ACTIVE_GEAR_STRONG_TREND_RUNNER
+        target_risk = Decimal("5.00")
+        target_soft = Decimal("2000")
+        target_hard = Decimal("3000")
+        reason = "Owner selected Aggressive Gear (up to 5.00% risk · $2,000/$3,000 daily quota under Valve ceiling)."
+    else:
+        if dd >= SOFT_DRAWDOWN_DOWNSHIFT_PCT:
+            active_gear = ACTIVE_GEAR_CONSERVATIVE
+            target_risk = Decimal("1.00")
+            target_soft = Decimal("500")
+            target_hard = Decimal("1000")
+            reason = (
+                f"Auto-downshifted to Conservative Gear (drawdown {decimal_text(dd * Decimal('100'))}% >= 10% soft floor)."
+            )
+        elif consec >= 1:
+            active_gear = ACTIVE_GEAR_CONSERVATIVE
+            target_risk = Decimal("1.00")
+            target_soft = Decimal("500")
+            target_hard = Decimal("1000")
+            reason = f"Auto-downshifted to Conservative Gear (loss streak {consec} >= 1)."
+        elif reg == REGIME_STRONG_TREND:
+            active_gear = ACTIVE_GEAR_STRONG_TREND_RUNNER
+            target_risk = Decimal("5.00")
+            target_soft = Decimal("2000")
+            target_hard = Decimal("3000")
+            reason = "Strong-Trend Runner Gear active (0 loss streak, <10% drawdown: up to 5.00% risk · $2,000/$3,000 quota)."
+        elif reg == REGIME_TREND_IGNITION:
+            active_gear = ACTIVE_GEAR_GROWTH
+            target_risk = Decimal("2.50")
+            target_soft = Decimal("2000")
+            target_hard = Decimal("2500")
+            reason = "Growth Gear active on Trend Ignition (0 loss streak, <10% drawdown: 2.50% risk · $2,000/$2,500 quota)."
+        else:
+            active_gear = ACTIVE_GEAR_CONSERVATIVE
+            target_risk = Decimal("1.00")
+            target_soft = Decimal("500")
+            target_hard = Decimal("1000")
+            reason = f"Conservative Gear active in {reg} regime (1.00% risk · $500/$1,000 quota)."
+
+    eff_risk = min(target_risk, max_risk)
+    eff_hard = min(target_hard, hard_cap)
+    eff_soft = min(target_soft, eff_hard)
+    # Also respect owner_soft_quota_usd ceiling when owner configured a tighter soft target in Conservative mode
+    if soft_cap < eff_soft and mode == RISK_GEAR_CONSERVATIVE:
+        eff_soft = soft_cap
+    with localcontext() as ctx:
+        ctx.prec = 40
+        scale = (eff_risk / max_risk).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR)
+    if scale > Decimal("1"):
+        scale = Decimal("1")
+    if scale < Decimal("0.01"):
+        scale = Decimal("0.01")
+
+    return {
+        "owner_mode": mode,
+        "active_gear": active_gear,
+        "effective_risk_pct": decimal_text(eff_risk),
+        "owner_max_risk_pct": decimal_text(max_risk),
+        "risk_scale_factor": decimal_text(scale),
+        "effective_soft_quota_usd": decimal_text(eff_soft),
+        "effective_hard_quota_usd": decimal_text(eff_hard),
+        "owner_hard_quota_usd": decimal_text(hard_cap),
+        "soft_drawdown_downshift_pct": decimal_text(SOFT_DRAWDOWN_DOWNSHIFT_PCT),
+        "owner_max_drawdown_pct": decimal_text(max_dd),
+        "reason": reason,
+    }
 
 
 def _utc_now() -> datetime:
@@ -217,6 +341,8 @@ class AutonomousAiTrader:
         protection_overrides: Mapping[str, Mapping[str, Decimal]] | None = None,
         profit_vault: Any | None = None,
         parallel_tiers: Any | None = None,
+        risk_gear_mode: str | None = None,
+        risk_gear_path: str | Path | None = None,
     ) -> None:
         if not isinstance(router, DualShieldBrokerRouter):
             raise ContractError("AutonomousAiTrader requires a DualShieldBrokerRouter")
@@ -253,6 +379,22 @@ class AutonomousAiTrader:
         self._protection_overrides = {str(k): dict(v) for k, v in (protection_overrides or {}).items()}
         self._profit_vault = profit_vault
         self._parallel_tiers = parallel_tiers
+        self._risk_gear_path = Path(risk_gear_path) if risk_gear_path is not None else None
+        init_gear = RISK_GEAR_AUTO_ADAPTIVE
+        if risk_gear_mode is not None and str(risk_gear_mode).strip():
+            cand_g = str(risk_gear_mode).strip().upper()
+            if cand_g not in VALID_RISK_GEAR_MODES:
+                raise ContractError(f"risk_gear_mode must be one of {VALID_RISK_GEAR_MODES}")
+            init_gear = cand_g
+        elif self._risk_gear_path is not None and self._risk_gear_path.is_file() and not self._risk_gear_path.is_symlink():
+            try:
+                saved_g = str(json.loads(self._risk_gear_path.read_text(encoding="utf-8")).get("risk_gear_mode", "")).strip().upper()
+                if saved_g in VALID_RISK_GEAR_MODES:
+                    init_gear = saved_g
+            except (OSError, ValueError, TypeError):
+                init_gear = RISK_GEAR_AUTO_ADAPTIVE
+        self._risk_gear_mode = init_gear
+        self._last_risk_gear: dict[str, Any] | None = None
         self._lock = RLock()
         self._inference_lock = RLock()
         self._trend_detector = TrendRegimeDetector()
@@ -354,6 +496,66 @@ class AutonomousAiTrader:
     def governance_mode(self) -> str:
         with self._lock:
             return self._governance_mode
+
+    @property
+    def risk_gear_mode(self) -> str:
+        with self._lock:
+            return self._risk_gear_mode
+
+    def _resolve_risk_gear(
+        self,
+        *,
+        regime: str,
+        total_eq: Decimal,
+        peak_eq: Decimal,
+        quota_snap: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        dd_pct = compute_drawdown_pct(total_eq, peak_eq) if (peak_eq > Decimal("0") and total_eq > Decimal("0")) else Decimal("0")
+        consec = int(quota_snap.get("consecutive_losses", 0) or 0)
+        owner_soft = Decimal(str(quota_snap.get("soft_quota_usd", "500")))
+        owner_hard = Decimal(str(quota_snap.get("hard_quota_usd", "1000")))
+        resolved = resolve_adaptive_risk_and_quota(
+            owner_gear_mode=self._risk_gear_mode,
+            regime=regime,
+            drawdown_pct=dd_pct,
+            consecutive_losses=consec,
+            owner_max_risk_pct=self._router.barbell.max_stop_loss_equity_risk_pct,
+            owner_max_drawdown_pct=self._router.barbell.max_drawdown_pct,
+            owner_soft_quota_usd=owner_soft,
+            owner_hard_quota_usd=owner_hard,
+        )
+        self._last_risk_gear = resolved
+        return resolved
+
+    def set_risk_gear_mode(
+        self,
+        mode: str,
+        *,
+        reason: str = "Overseer updated risk gear mode",
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        clean = str(mode or "").strip().upper()
+        if clean not in VALID_RISK_GEAR_MODES:
+            raise ContractError(f"risk_gear must be one of {VALID_RISK_GEAR_MODES}")
+        ts = self._now(now)
+        with self._lock:
+            self._risk_gear_mode = clean
+            if self._risk_gear_path is not None and not self._risk_gear_path.is_symlink():
+                try:
+                    self._risk_gear_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._risk_gear_path.write_text(
+                        json.dumps({"risk_gear_mode": clean, "updated_at": _iso(ts)}) + "\n",
+                        encoding="utf-8",
+                    )
+                except OSError as exc:
+                    logger.warning("Failed to persist risk_gear_mode: %s", type(exc).__name__)
+            self._recent_actions.append({
+                "observed_at": _iso(ts),
+                "kind": "SET_RISK_GEAR",
+                "symbol": None,
+                "detail": f"Risk gear mode set to {clean} ({reason})",
+            })
+        return self.status_snapshot(now=ts)
 
     def _protection_cfg(self, symbol: str, risk_multiplier: Decimal) -> dict[str, Decimal]:
         cfg = _default_protection_params(symbol, risk_multiplier)
@@ -1126,7 +1328,38 @@ class AutonomousAiTrader:
                 return report
 
             sym, side, bid, ask, setup_note, regime_name, is_pyramid_add, parent_ticket, leg_index = setup
-            eff_mult = Decimal("0.50") if strong_runner_eligible else risk_mult
+            quota_full = self._quota.snapshot(now=ts, starting_equity=total_eq if total_eq > 0 else None)
+            gear_info = self._resolve_risk_gear(
+                regime=regime_name, total_eq=total_eq, peak_eq=peak_eq, quota_snap=quota_full
+            )
+            realized_today = Decimal(str(quota_full.get("realized_net_pnl_usd", "0")))
+            gear_soft_q = Decimal(gear_info["effective_soft_quota_usd"])
+            gear_hard_q = Decimal(gear_info["effective_hard_quota_usd"])
+            if realized_today >= gear_hard_q and not strong_runner_eligible:
+                self._veto_count += 1
+                self._last_action = "WAIT"
+                self._last_symbol = sym
+                self._last_reason = f"DYNAMIC_GEAR_QUOTA_REACHED ({gear_info['active_gear']}: ${decimal_text(realized_today)} >= ${decimal_text(gear_hard_q)})"
+                self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                if self._parallel_tiers is not None and quotes_map:
+                    self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
+                report = {
+                    "schema": "cas-forex.ai-cycle/1",
+                    "cycle_id": cycle_id,
+                    "observed_at": _iso(ts),
+                    "model_id": self._registry.active_model_id,
+                    "cadence": self._last_cadence,
+                    "action": "WAIT",
+                    "symbol": sym,
+                    "reason": self._last_reason,
+                    "valve_score": self._last_valve_score,
+                    "protection_updates": prot_updates,
+                }
+                self._append_journal_cycle(report)
+                return report
+            base_mult = Decimal("0.50") if (strong_runner_eligible or realized_today >= gear_soft_q) else risk_mult
+            gear_scale = Decimal(gear_info["risk_scale_factor"])
+            eff_mult = max(Decimal("0.05"), (base_mult * gear_scale).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR))
             params = self._protection_cfg(sym, eff_mult)
             t_sz = _tick_size(sym)
             entry_ref = ask if side is Side.BUY else bid
@@ -1717,6 +1950,12 @@ class AutonomousAiTrader:
                 "valve_parameters": int(self._valve_gate.controller.parameter_count),
                 "valve_threshold": decimal_text(Decimal(f"{self._valve_gate.controller.threshold:.2f}")),
                 "daily_quota": quota_snap,
+                "risk_gear": self._resolve_risk_gear(
+                    regime=self._last_regime,
+                    total_eq=total_eq,
+                    peak_eq=self._router.peak_equity() or total_eq,
+                    quota_snap=quota_snap,
+                ),
                 "open_positions": [dict(v) for v in self._open_position_meta.values()],
                 "active_working_markets": sorted({
                     str(v.get("symbol"))

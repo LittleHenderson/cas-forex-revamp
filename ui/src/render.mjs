@@ -4,6 +4,7 @@ import { displayFreshness } from './freshness.mjs';
 import { renderMarketChartSection } from './chart.mjs';
 import { STATIC_BROKER_ROUTING } from './broker-routing.mjs';
 import { renderAiOverseerPanel, renderAiModelCatalogPanel } from './ai-overseer.mjs';
+import { renderMoneyFlowSection } from './money-flow.mjs';
 import {
   renderAiTopSwitcherBar,
   renderEquityAndAnalyticsSection,
@@ -143,7 +144,7 @@ function effects(projection) {
 }
 
 function operate(projection, state) {
-  return `<section class="workspace-intro" aria-label="Workspace introduction"><div><p class="eyebrow">PERSONAL FOREX / OBSERVATION FIRST</p><h2>Every decision, with its evidence.</h2></div><p>Inspect the account snapshot, oversee autonomous AI execution, monitor 5 parallel account tiers &amp; 50%/50% Bank Vault sweeps, and keep unobserved outcomes visible.</p></section>${renderAiTopSwitcherBar(state)}<div class="route-index">${sectionNumber('01')}<h2>Permissions &amp; control</h2></div><div class="context-grid">${permissions(projection, state.transport)}${controls(state.transport)}</div><div class="route-index">${sectionNumber('02')}<h2>Account snapshot</h2></div>${metrics(projection, state)}<p class="account-coverage">P/L period, fees and cashflow coverage are unavailable in this projection.</p>${renderAiOverseerPanel(state)}<div class="route-index">${sectionNumber('03')}<h2>Live market &amp; candlestick chart</h2></div>${renderMarketChartSection(projection, state)}${renderEquityAndAnalyticsSection(state)}${renderParallelTiersSection(state)}<div class="route-index">${sectionNumber('04')}<h2>Positions, proposals &amp; effects</h2></div><div class="operate-grid">${positions(projection)}${decision(projection)}${effects(projection)}</div>`;
+  return `<section class="workspace-intro" aria-label="Workspace introduction"><div><p class="eyebrow">PERSONAL FOREX / OBSERVATION FIRST</p><h2>Every decision, with its evidence.</h2></div><p>Inspect the account snapshot, oversee autonomous AI execution, monitor 5 parallel account tiers &amp; 50%/50% Bank Vault sweeps, and keep unobserved outcomes visible.</p></section>${renderAiTopSwitcherBar(state)}<div class="route-index">${sectionNumber('01')}<h2>Permissions &amp; control</h2></div><div class="context-grid">${permissions(projection, state.transport)}${controls(state.transport)}</div><div class="route-index">${sectionNumber('02')}<h2>Account snapshot</h2></div>${metrics(projection, state)}<p class="account-coverage">P/L period, fees and cashflow coverage are unavailable in this projection.</p>${renderAiOverseerPanel(state)}<div class="route-index">${sectionNumber('03')}<h2>Live market &amp; candlestick chart</h2></div>${renderMarketChartSection(projection, state)}${renderEquityAndAnalyticsSection(state)}${renderParallelTiersSection(state)}${renderMoneyFlowSection(state)}<div class="route-index">${sectionNumber('04')}<h2>Positions, proposals &amp; effects</h2></div><div class="operate-grid">${positions(projection)}${decision(projection)}${effects(projection)}</div>`;
 }
 
 function catalogInspection(read, source = null) {

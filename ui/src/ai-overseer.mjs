@@ -19,6 +19,7 @@ export const PRIORITY_AI_MODELS = Object.freeze([
 const GOVERNANCE_MODES = Object.freeze(['ACTIVE', 'PAUSED_NEW_RISK', 'PAUSED', 'STOPPED', 'STANDBY']);
 const QUOTA_STATUSES = Object.freeze(['OPEN', 'SOFT_QUOTA_REACHED', 'DAILY_QUOTA_LOCKED', 'DAILY_LOSS_CIRCUIT_TRIPPED']);
 const PROTECTION_STAGES = Object.freeze(['INITIAL_SL', 'BREAKEVEN_LOCKED', 'TRAILING_ACTIVE']);
+export const RISK_GEAR_MODES = Object.freeze(['CONSERVATIVE', 'AUTO_ADAPTIVE', 'AGGRESSIVE']);
 const INDEX_PAIRS = Object.freeze(['NAS100', 'US30', 'SPX500', 'XAUUSD']);
 
 export function computeMarketSessions(nowMs = Date.now(), mt5TickFresh = false) {
@@ -133,6 +134,18 @@ export const STATIC_AI_TRADER = Object.freeze({
   valveController: 'tks_meta_valve_controller',
   valveParameters: '161',
   valveThreshold: '0.55',
+  riskGear: Object.freeze({
+    ownerMode: 'AUTO_ADAPTIVE',
+    activeGear: 'CONSERVATIVE',
+    effectiveRiskPct: '1',
+    ownerMaxRiskPct: '5',
+    effectiveSoftQuotaUsd: '500',
+    effectiveHardQuotaUsd: '1000',
+    ownerHardQuotaUsd: '3000',
+    softDrawdownDownshiftPct: '0.1',
+    ownerMaxDrawdownPct: '0.2',
+    reason: 'Auto-Adaptive Gear ready under owner Valve ceiling.',
+  }),
   dailyQuota: Object.freeze({
     sessionDate: 'Unknown',
     status: 'OPEN',
@@ -286,6 +299,19 @@ export function normalizeAiTrader(doc) {
     valveController: str(doc.valve_controller, 'tks_meta_valve_controller'),
     valveParameters: numStr(doc.valve_parameters, '161'),
     valveThreshold: str(doc.valve_threshold, '0.55'),
+    riskGear: doc.risk_gear && typeof doc.risk_gear === 'object' ? Object.freeze({
+      ownerMode: RISK_GEAR_MODES.includes(str(doc.risk_gear.owner_mode, 'AUTO_ADAPTIVE').toUpperCase())
+        ? str(doc.risk_gear.owner_mode, 'AUTO_ADAPTIVE').toUpperCase() : 'AUTO_ADAPTIVE',
+      activeGear: str(doc.risk_gear.active_gear, 'CONSERVATIVE', 40),
+      effectiveRiskPct: numStr(doc.risk_gear.effective_risk_pct, '1'),
+      ownerMaxRiskPct: numStr(doc.risk_gear.owner_max_risk_pct, '5'),
+      effectiveSoftQuotaUsd: numStr(doc.risk_gear.effective_soft_quota_usd, '500'),
+      effectiveHardQuotaUsd: numStr(doc.risk_gear.effective_hard_quota_usd, '1000'),
+      ownerHardQuotaUsd: numStr(doc.risk_gear.owner_hard_quota_usd, '3000'),
+      softDrawdownDownshiftPct: numStr(doc.risk_gear.soft_drawdown_downshift_pct, '0.1'),
+      ownerMaxDrawdownPct: numStr(doc.risk_gear.owner_max_drawdown_pct, '0.2'),
+      reason: str(doc.risk_gear.reason, 'Owner-bounded adaptive risk gear.', 200),
+    }) : STATIC_AI_TRADER.riskGear,
     dailyQuota: Object.freeze({
       sessionDate: str(q.session_date, 'Unknown'),
       status: quotaStatus,
@@ -445,6 +471,18 @@ export function renderAiOverseerPanel(state) {
         <progress class="quota-progress" value="${esc(pctVal)}" max="100" aria-label="Daily quota progress percent">${esc(pctVal)}%</progress>
         <p class="quiet-note numeric">Realized today: $${esc(q.realizedNetPnlUsd)} (${esc(q.realizedPnlPct)}%) · Soft $${esc(q.softQuotaUsd)} (0.5x risk) / Hard $${esc(q.hardQuotaUsd)} lock · Max daily loss $${esc(q.maxDailyLossUsd)} · Streak ${esc(q.consecutiveLosses)}/${esc(q.maxConsecutiveLosses)} · Risk mult ${esc(q.riskMultiplier)}x</p>
       </div>
+    </div>
+    <div class="risk-gear-block" role="group" aria-label="Owner risk gear and dynamic daily quota selector">
+      <div class="quota-header">
+        <strong>3-Gear Adaptive Risk &amp; Dynamic Daily Quota ($500 → $2,000 → $3,000)</strong>
+        <span class="tag" data-active-risk-gear="${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).activeGear)}"><span class="state-rule" aria-hidden="true"></span>${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).activeGear)} · ${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).effectiveRiskPct)}% risk · $${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).effectiveSoftQuotaUsd)}/$${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).effectiveHardQuotaUsd)}</span>
+      </div>
+      <div class="risk-gear-buttons">
+        <button type="button" class="button button-small ${(trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMode === 'CONSERVATIVE' ? 'selected' : 'button-secondary'}" data-risk-gear="CONSERVATIVE" aria-pressed="${(trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMode === 'CONSERVATIVE'}" ${!trader.connected || busy ? 'disabled' : ''}>Conservative (1% · $500–$1k)</button>
+        <button type="button" class="button button-small ${(trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMode === 'AUTO_ADAPTIVE' ? 'selected' : 'button-secondary'}" data-risk-gear="AUTO_ADAPTIVE" aria-pressed="${(trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMode === 'AUTO_ADAPTIVE'}" ${!trader.connected || busy ? 'disabled' : ''}>Auto-Adaptive (1%→2.5%→5% · $500→$3k)</button>
+        <button type="button" class="button button-small ${(trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMode === 'AGGRESSIVE' ? 'selected' : 'button-secondary'}" data-risk-gear="AGGRESSIVE" aria-pressed="${(trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMode === 'AGGRESSIVE'}" ${!trader.connected || busy ? 'disabled' : ''}>Aggressive (5% · $2k–$3k)</button>
+      </div>
+      <p class="quiet-note">${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).reason)} Hard owner ceiling: ${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMaxRiskPct)}% max stop risk · ${esc(String(Math.round(Number((trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMaxDrawdownPct) * 100)))}% max drawdown · $${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerHardQuotaUsd)} daily cap.</p>
     </div>
     <div class="overseer-controls" role="group" aria-label="Human overseer emergency controls">
       <button type="button" class="button button-small" data-ai-overseer-action="PAUSE_NEW_RISK" ${!trader.connected || busy ? 'disabled' : ''}>Pause AI new risk</button>
