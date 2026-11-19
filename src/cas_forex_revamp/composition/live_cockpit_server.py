@@ -339,6 +339,7 @@ def _build_mt5_index_snapshot_from_router(
 
 
 MAX_HTTP_RPC_BYTES = 262_144
+MAX_EXPLAINER_AUDIO_RPC_BYTES = 2_200_000
 MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
 _FORBIDDEN_ROUTING_KEY_TOKENS: tuple[str, ...] = (
     "password",
@@ -942,13 +943,13 @@ class LoopbackCockpitServer:
                     extra_headers=[("WWW-Authenticate", 'Bearer realm="cas-forex-cockpit"')],
                 )
 
-            def _read_json_body(self) -> Any:
+            def _read_json_body(self, *, max_bytes: int = MAX_HTTP_RPC_BYTES) -> Any:
                 raw_len = self.headers.get("Content-Length")
                 if raw_len is None:
                     raise ContractError("Content-Length header required")
                 length = int(raw_len)
-                if length < 0 or length > MAX_HTTP_RPC_BYTES:
-                    raise ContractError("RPC payload exceeds 256 KiB limit")
+                if length < 0 or length > max_bytes:
+                    raise ContractError("RPC payload exceeds byte limit")
                 data = self.rfile.read(length)
                 if len(data) != length:
                     raise ContractError("incomplete HTTP request body")
@@ -1358,35 +1359,270 @@ class LoopbackCockpitServer:
                         self._write_json(HTTPStatus.NOT_FOUND, {"error": "AI model registry not configured"})
                         return
                     try:
-                        body = self._read_json_body()
-                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
-                            self._reject_unauthorized()
-                            return
-                        if type(body) is not dict or not isinstance(body.get("question"), str):
+                        body = self._read_json_body(max_bytes=MAX_EXPLAINER_AUDIO_RPC_BYTES)
+                        if type(body) is not dict:
+                            raise ContractError("JSON object body required")
+                        raw_q = body.get("question")
+                        raw_audio = body.get("audio_base64")
+                        raw_mime = body.get("audio_mime_type")
+                        has_audio = isinstance(raw_audio, str) and bool(raw_audio.strip())
+                        if raw_q is None and has_audio:
+                            raw_q = ""
+                        if not isinstance(raw_q, str) or (not raw_q.strip() and not has_audio):
                             raise ContractError("question field required")
-                        ctx_summary: dict[str, Any] = {}
-                        if outer._broker_router_reader is not None:
-                            try:
-                                r_doc = outer._broker_router_reader()
-                                if isinstance(r_doc, Mapping):
-                                    ctx_summary["execution_mode"] = str(r_doc.get("execution_mode") or "DEMO")
-                                    ctx_summary["active_broker"] = str(r_doc.get("active_broker") or "HUGOSWAY_MT5")
-                            except Exception as exc_ctx:
-                                outer._last_routing_error = type(exc_ctx).__name__
-                        if outer._autonomous_trader is not None:
-                            try:
-                                t_doc = outer._autonomous_trader.status_snapshot()
-                                ctx_summary["current_focus_symbol"] = t_doc.get("current_focus_symbol")
-                                ctx_summary["current_focus_status"] = t_doc.get("current_focus_status")
-                                ctx_summary["cycle_count"] = t_doc.get("cycle_count")
-                                ctx_summary["market_sessions"] = t_doc.get("market_sessions")
-                            except Exception as exc_ctx:
-                                outer._last_routing_error = type(exc_ctx).__name__
-                        ans_doc = outer._ai_model_registry.answer_explainer_question(
-                            question=body["question"],
-                            context_summary=ctx_summary,
-                        )
+                        if raw_audio is not None and not isinstance(raw_audio, str):
+                            raise ContractError("audio_base64 must be a string")
+                        if raw_mime is not None and not isinstance(raw_mime, str):
+                            raise ContractError("audio_mime_type must be a string")
+
+                        with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=False):
+                            ctx_summary: dict[str, Any] = {}
+                            if outer._broker_router_reader is not None:
+                                try:
+                                    raw_r = outer._broker_router_reader()
+                                    if isinstance(raw_r, Mapping):
+                                        r_doc = safe_broker_routing_payload(dict(raw_r))
+                                        exec_m = str(r_doc.get("execution_mode") or "DEMO")
+                                        act_b = str(r_doc.get("active_broker") or "HUGOSWAY_MT5")
+                                        ctx_summary["execution_mode"] = exec_m
+                                        ctx_summary["active_broker"] = act_b
+                                        ds = r_doc.get("dual_shield") if isinstance(r_doc.get("dual_shield"), Mapping) else {}
+                                        alloc = ds.get("allocation") if isinstance(ds.get("allocation"), Mapping) else {}
+                                        bb = ds.get("barbell") if isinstance(ds.get("barbell"), Mapping) else {}
+                                        sh = ds.get("safe_harbor") if isinstance(ds.get("safe_harbor"), Mapping) else {}
+                                        vlv = r_doc.get("valve") if isinstance(r_doc.get("valve"), Mapping) else {}
+                                        lr = r_doc.get("live_readiness") if isinstance(r_doc.get("live_readiness"), Mapping) else {}
+                                        ctx_summary["broker_routing"] = {
+                                            "execution_mode": exec_m,
+                                            "live_armed": bool(lr.get("live_armed", r_doc.get("live_trading_armed", False))),
+                                            "active_broker": act_b,
+                                            "chain": [
+                                                {
+                                                    "broker_id": str(c.get("broker_id", "")),
+                                                    "status": str(c.get("status", "")),
+                                                    "role": str(c.get("role", "")),
+                                                    "server": str(c.get("server", "")),
+                                                    "max_leverage": str(c.get("max_leverage", "")),
+                                                }
+                                                for c in (r_doc.get("chain") or [])
+                                                if isinstance(c, Mapping)
+                                            ],
+                                            "total_equity": alloc.get("total_equity"),
+                                            "peak_equity": alloc.get("peak_equity"),
+                                            "drawdown_pct": alloc.get("drawdown_pct"),
+                                            "venues": [
+                                                {
+                                                    "broker_id": str(v.get("broker_id", "")),
+                                                    "equity": str(v.get("equity", "0")),
+                                                    "target_share": str(v.get("target_share", "0")),
+                                                    "actual_share": str(v.get("actual_share", "0")),
+                                                }
+                                                for v in (alloc.get("venues") or [])
+                                                if isinstance(v, Mapping)
+                                            ],
+                                            "barbell": {
+                                                "max_stop_loss_equity_risk_pct": bb.get("max_stop_loss_equity_risk_pct"),
+                                                "max_drawdown_pct": bb.get("max_drawdown_pct"),
+                                                "demo_virtual_sleeve": bb.get("demo_virtual_sleeve"),
+                                            },
+                                            "valve": {
+                                                "controller": vlv.get("controller"),
+                                                "parameters": vlv.get("parameters"),
+                                                "threshold": vlv.get("threshold"),
+                                            },
+                                            "live_readiness": {
+                                                "all_gates_ready": bool(lr.get("all_gates_ready", False)),
+                                                "gates": [
+                                                    {
+                                                        "id": str(g.get("id", "")),
+                                                        "step": int(g.get("step", idx + 1)),
+                                                        "title": str(g.get("title", "")),
+                                                        "passed": bool(g.get("passed", False)),
+                                                        "detail": str(g.get("detail", "")),
+                                                    }
+                                                    for idx, g in enumerate(lr.get("gates") or [])
+                                                    if isinstance(g, Mapping)
+                                                ],
+                                            },
+                                            "recent_degradations": list(sh.get("recent_degradations") or [])[-3:],
+                                        }
+                                except Exception as exc_ctx:
+                                    outer._last_routing_error = type(exc_ctx).__name__
+
+                            if outer._autonomous_trader is not None:
+                                try:
+                                    t_doc = outer._autonomous_trader.status_snapshot()
+                                    ctx_summary["current_focus_symbol"] = t_doc.get("current_focus_symbol")
+                                    ctx_summary["current_focus_status"] = t_doc.get("current_focus_status")
+                                    ctx_summary["cycle_count"] = t_doc.get("cycle_count")
+                                    ctx_summary["market_sessions"] = t_doc.get("market_sessions")
+                                    dq = t_doc.get("daily_quota") if isinstance(t_doc.get("daily_quota"), Mapping) else {}
+                                    ctx_summary["ai_trader"] = {
+                                        "governance_mode": t_doc.get("governance_mode"),
+                                        "active_model_id": t_doc.get("active_model_id"),
+                                        "fast_scout_enabled": t_doc.get("fast_scout_enabled"),
+                                        "cycle_count": t_doc.get("cycle_count"),
+                                        "veto_count": t_doc.get("veto_count"),
+                                        "current_focus_symbol": t_doc.get("current_focus_symbol"),
+                                        "current_focus_status": t_doc.get("current_focus_status"),
+                                        "last_action": t_doc.get("last_action"),
+                                        "last_symbol": t_doc.get("last_symbol"),
+                                        "last_reason": t_doc.get("last_reason"),
+                                        "risk_gear": t_doc.get("risk_gear"),
+                                        "daily_quota": {
+                                            "status": dq.get("status"),
+                                            "realized_net_pnl_usd": dq.get("realized_net_pnl_usd"),
+                                            "closed_trades": dq.get("closed_trades"),
+                                            "win_count": dq.get("win_count"),
+                                            "loss_count": dq.get("loss_count"),
+                                            "consecutive_losses": dq.get("consecutive_losses"),
+                                            "soft_quota_usd": dq.get("soft_quota_usd"),
+                                            "hard_quota_usd": dq.get("hard_quota_usd"),
+                                            "max_daily_loss_usd": dq.get("max_daily_loss_usd"),
+                                        },
+                                        "open_positions": [
+                                            {
+                                                "broker_id": p_item.get("broker_id"),
+                                                "symbol": p_item.get("symbol"),
+                                                "side": p_item.get("side"),
+                                                "volume_lots": p_item.get("volume_lots"),
+                                                "entry_price": p_item.get("entry_price"),
+                                                "stop_loss": p_item.get("stop_loss"),
+                                                "take_profit": p_item.get("take_profit"),
+                                                "profit": p_item.get("profit"),
+                                                "protection_stage": p_item.get("protection_stage"),
+                                            }
+                                            for p_item in (t_doc.get("open_positions") or [])
+                                            if isinstance(p_item, Mapping)
+                                        ],
+                                        "recent_actions": [
+                                            {
+                                                k_act: r_act.get(k_act)
+                                                for k_act in (
+                                                    "observed_at",
+                                                    "action",
+                                                    "kind",
+                                                    "symbol",
+                                                    "executed_on",
+                                                    "regime",
+                                                    "reason",
+                                                    "detail",
+                                                )
+                                                if k_act in r_act
+                                            }
+                                            for r_act in list(t_doc.get("recent_actions") or [])[:5]
+                                            if isinstance(r_act, Mapping)
+                                        ],
+                                        "market_sessions": t_doc.get("market_sessions"),
+                                    }
+                                except Exception as exc_ctx:
+                                    outer._last_routing_error = type(exc_ctx).__name__
+
+                            if outer._profit_vault is not None:
+                                try:
+                                    v_doc = outer._profit_vault.snapshot()
+                                    if isinstance(v_doc, Mapping):
+                                        ctx_summary["treasury"] = {
+                                            "total_realized_profit_usd": str(v_doc.get("total_realized_profit_usd", "0")),
+                                            "bank_sweep_reserved_usd": str(v_doc.get("bank_sweep_reserved_usd", "0")),
+                                            "retained_trading_usd": str(v_doc.get("retained_trading_usd", "0")),
+                                            "pending_confirmation_usd": str(
+                                                v_doc.get("pending_confirmation_usd")
+                                                or v_doc.get("pending_2fa_confirmation_usd")
+                                                or v_doc.get("pending_disbursement_usd")
+                                                or "0"
+                                            ),
+                                            "disbursed_to_bank_usd": str(v_doc.get("disbursed_to_bank_usd", "0")),
+                                        }
+                                except Exception as exc_ctx:
+                                    outer._last_routing_error = type(exc_ctx).__name__
+
+                            if outer._parallel_tiers is not None:
+                                try:
+                                    pt_doc = outer._parallel_tiers.snapshot()
+                                    if isinstance(pt_doc, Mapping):
+                                        ctx_summary["parallel_tiers"] = [
+                                            {
+                                                "tier_id": str(t_item.get("tier_id", "")),
+                                                "label": str(t_item.get("label", "")),
+                                                "starting_equity_usd": str(
+                                                    t_item.get("starting_equity_usd")
+                                                    or t_item.get("starting_capital_usd")
+                                                    or "0"
+                                                ),
+                                                "current_equity_usd": str(
+                                                    t_item.get("current_equity_usd")
+                                                    or t_item.get("equity_usd")
+                                                    or "0"
+                                                ),
+                                                "bank_vault_usd": str(
+                                                    t_item.get("bank_vault_usd")
+                                                    or t_item.get("bank_sweep_reserved_usd")
+                                                    or "0"
+                                                ),
+                                                "net_gain_pct": str(
+                                                    t_item.get("net_gain_pct")
+                                                    or t_item.get("growth_pct")
+                                                    or "0"
+                                                ),
+                                                "closed_trades": int(t_item.get("closed_trades", 0) or 0),
+                                                "win_count": int(t_item.get("win_count", 0) or 0),
+                                                "status": str(
+                                                    t_item.get("status")
+                                                    or (
+                                                        "IN_TRADE"
+                                                        if int(t_item.get("open_positions", 0) or 0) > 0
+                                                        else (t_item.get("last_skip_reason") or "READY")
+                                                    )
+                                                ),
+                                            }
+                                            for t_item in (pt_doc.get("tiers") or [])
+                                            if isinstance(t_item, Mapping)
+                                        ]
+                                except Exception as exc_ctx:
+                                    outer._last_routing_error = type(exc_ctx).__name__
+
+                            safe_ctx = assert_safe_ai_catalog_payload(ctx_summary)
+                            ans_doc = outer._ai_model_registry.answer_explainer_question(
+                                question=raw_q,
+                                context_summary=safe_ctx,
+                                audio_base64=raw_audio,
+                                audio_mime_type=raw_mime,
+                            )
                         self._write_json(HTTPStatus.OK, ans_doc)
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                if route == "/api/explainer-tts":
+                    try:
+                        body = self._read_json_body()
+                        if type(body) is not dict or not isinstance(body.get("text"), str):
+                            raise ContractError("text field required")
+                        raw_voice = body.get("voice_name")
+                        if raw_voice is None or (isinstance(raw_voice, str) and not raw_voice.strip()):
+                            clean_voice = "Kore"
+                        elif isinstance(raw_voice, str):
+                            clean_voice = raw_voice.strip()
+                        else:
+                            raise ContractError("voice_name must be a string")
+                        with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=False):
+                            if outer._ai_model_registry is None:
+                                tts_doc = {
+                                    "schema": "cas-forex.explainer-tts/1",
+                                    "ok": False,
+                                    "fallback": "WEB_SPEECH",
+                                    "reason": "AI_REGISTRY_NOT_ATTACHED",
+                                }
+                            else:
+                                tts_doc = outer._ai_model_registry.synthesize_explainer_speech(
+                                    body["text"],
+                                    voice_name=clean_voice,
+                                )
+                        self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(tts_doc))
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return

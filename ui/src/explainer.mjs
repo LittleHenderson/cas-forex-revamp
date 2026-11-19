@@ -1,22 +1,103 @@
-/* Modernist Explainer interaction, authored from the supplied written spec.
- * Local guide only: no model, network, transport, control dispatch or authority.
- * Persistence is limited to the three visual layout preferences below.
+/* Modernist Explainer & Real-Time Gemini 4 Neon Audible Voice Briefing Panel.
+ * Read-only advisory assistant: zero trading authority, zero control dispatch,
+ * strict CSP compliant (pure Web Audio API PCM/buffer synthesis + Web Speech fallback,
+ * zero HTML media tags, zero object URLs, zero inline CSS attributes).
  */
 import { replaceSafeHTML } from './render.mjs';
 
 const STORAGE_KEY = 'cas.forex.explainer.layout.v1';
+const AUTOSPEAK_STORAGE_KEY = 'cas.forex.explainer.autospeak.v1';
 const EDGES = ['left', 'right', 'top', 'bottom'];
 const DEFAULT_LAYOUT = Object.freeze({ edge: 'right', frac: 0.62, collapsed: false });
+const ALLOWED_AUDIO_MIMES = Object.freeze(['audio/webm', 'audio/ogg', 'audio/wav', 'audio/mp4', 'audio/mpeg']);
 const clamp = (value, lo, hi) => Math.min(hi, Math.max(lo, value));
+
+export const EXPLAINER_QUICK_QUESTIONS = Object.freeze([
+  'Give me a full live status briefing',
+  'Explain my open trades, risk gear, and stop protection',
+  'How much is in my 3 brokers, Bank Vault, and 5 parallel tiers?',
+  'Explain the CAS Forex architecture and 5-gate LIVE readiness',
+]);
+
+const escAttr = (v) => String(v ?? '').replace(/[&<>"']/g, (ch) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
+));
+
+function decodeBase64ToBytes(base64Str) {
+  const cleaned = String(base64Str ?? '').replace(/\s+/g, '');
+  if (!cleaned) return new Uint8Array(0);
+  if (typeof globalThis.atob === 'function') {
+    const bin = globalThis.atob(cleaned);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) {
+      bytes[i] = bin.charCodeAt(i) & 0xff;
+    }
+    return bytes;
+  }
+  if (typeof globalThis.Buffer === 'function') {
+    const buf = globalThis.Buffer.from(cleaned, 'base64');
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  }
+  throw new Error('Base64 decoder unavailable.');
+}
+
+function encodeBytesToBase64(bytes) {
+  if (typeof globalThis.btoa === 'function') {
+    const chunkSize = 0x8000;
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return globalThis.btoa(bin);
+  }
+  if (typeof globalThis.Buffer === 'function') {
+    return globalThis.Buffer.from(bytes).toString('base64');
+  }
+  throw new Error('Base64 encoder unavailable.');
+}
+
+/** Decode 16-bit signed little-endian PCM base64 audio into normalized [-1.0, 1.0) Float32 samples. */
+export function decodePcm16LeBase64ToFloat32(base64Str) {
+  const bytes = decodeBase64ToBytes(base64Str);
+  const sampleCount = Math.floor(bytes.byteLength / 2);
+  const out = new Float32Array(sampleCount);
+  if (sampleCount === 0) return out;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, sampleCount * 2);
+  for (let i = 0; i < sampleCount; i += 1) {
+    out[i] = view.getInt16(i * 2, true) / 32768;
+  }
+  return out;
+}
+
+function parseSampleRateHz(ttsDoc) {
+  if (Number.isSafeInteger(ttsDoc?.sample_rate_hz) && ttsDoc.sample_rate_hz >= 8000 && ttsDoc.sample_rate_hz <= 96000) {
+    return ttsDoc.sample_rate_hz;
+  }
+  const m = /rate\s*=\s*([0-9]{4,6})/i.exec(String(ttsDoc?.mime_type ?? ''));
+  if (m) {
+    const parsed = Number(m[1]);
+    if (Number.isSafeInteger(parsed) && parsed >= 8000 && parsed <= 96000) return parsed;
+  }
+  return 24000;
+}
 
 function readLayout() {
   try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+    const saved = JSON.parse(globalThis.localStorage?.getItem?.(STORAGE_KEY) || 'null');
     if (saved && EDGES.includes(saved.edge) && Number.isFinite(saved.frac) && typeof saved.collapsed === 'boolean') {
       return { edge: saved.edge, frac: clamp(saved.frac, 0, 1), collapsed: saved.collapsed };
     }
   } catch { /* Storage is optional; a blocked store must not block the UI. */ }
   return { ...DEFAULT_LAYOUT };
+}
+
+function readAutoSpeak() {
+  try {
+    const saved = globalThis.sessionStorage?.getItem?.(AUTOSPEAK_STORAGE_KEY);
+    if (saved === 'false') return false;
+    if (saved === 'true') return true;
+  } catch { /* Optional storage */ }
+  return true;
 }
 
 function scalar(value, fallback = 'Unknown') {
@@ -51,7 +132,7 @@ function localExplanation(topic, context) {
   return `${descriptions[route]}\n\nSource: ${scalar(context.source, 'No valid source')}. Run: ${scalar(p.scope?.run_id)}. State: ${scalar(p.state_id)}.\n\nThis is authored, deterministic UI guidance about the supplied read. It is not model output, a live venue observation or trading advice.`;
 }
 
-export function createExplainer({ getContext, askModel = null }) {
+export function createExplainer({ getContext, askModel = null, synthesizeSpeech = null }) {
   if (typeof getContext !== 'function') throw new TypeError('Explainer requires a read-only context getter.');
   if (document.querySelector('#forex-explainer')) throw new Error('Explainer already mounted.');
   const app = document.getElementById('app');
@@ -65,12 +146,22 @@ export function createExplainer({ getContext, askModel = null }) {
   workspace.setAttribute('role', 'region');
   workspace.setAttribute('aria-label', 'Forex workspace scroll area');
   let layout = readLayout();
+  let autoSpeak = readAutoSpeak();
   let open = false;
   let selectedTopic = 'overview';
   let answerMode = 'local';
   let askBusy = false;
   let askAnswer = null;
   let lastAskedQuestion = '';
+  let isListening = false;
+  let isSpeaking = false;
+  let speakGeneration = 0;
+  let voiceStatusNote = null;
+  let activeRecognition = null;
+  let activeMediaRecorder = null;
+  let activeMediaStream = null;
+  let activeBufferSource = null;
+  let audioCtx = null;
   let pointer = null;
   let suppressClick = false;
   let destroyed = false;
@@ -80,7 +171,12 @@ export function createExplainer({ getContext, askModel = null }) {
   const host = document.createElement('div');
   host.id = 'forex-explainer';
   host.className = 'forex-explainer-host';
-  // This template contains only authored UI strings. Source data uses textContent.
+
+  const quickChipButtons = EXPLAINER_QUICK_QUESTIONS.map((q) => (
+    `<button type="button" data-explainer-quick-ask="${escAttr(q)}">${escAttr(q)}</button>`
+  )).join('');
+
+  // Authored UI template only; dynamic source data always uses textContent.
   replaceSafeHTML(host, `
     <div class="forex-explainer-zones" aria-hidden="true">
       <span data-dock-zone="left"></span><span data-dock-zone="right"></span>
@@ -101,6 +197,9 @@ export function createExplainer({ getContext, askModel = null }) {
         <button type="button" data-explainer-topic="unknowns" aria-pressed="false">What remains unknown?</button>
         <button type="button" data-explainer-topic="controls" aria-pressed="false">What do these controls do?</button>
       </div>
+      <div class="forex-explainer-quick-chips" role="group" aria-label="Quick live voice briefings" hidden>
+        ${quickChipButtons}
+      </div>
       <div class="forex-explainer-content">
         <h3 class="forex-explainer-question">What am I looking at?</h3>
         <p class="forex-explainer-answer"></p>
@@ -120,9 +219,22 @@ export function createExplainer({ getContext, askModel = null }) {
           <div class="forex-explainer-layout-actions"><button type="button" data-guide-collapse>Collapse to tab</button><button type="button" data-guide-reset>Reset position</button></div>
         </details>
       </div>
-      <footer class="forex-explainer-footer"><label for="forex-explainer-prompt">Ask a model</label><div class="forex-explainer-ask-row"><input id="forex-explainer-prompt" type="text" disabled placeholder="No AI provider attached" aria-describedby="forex-explainer-unavailable"><button type="button" class="button button-small button-primary" data-explainer-ask-submit hidden>Ask</button></div><p id="forex-explainer-unavailable">AI explanations are unavailable. The local guide and all source records remain readable.</p></footer>
+      <footer class="forex-explainer-footer">
+        <label for="forex-explainer-prompt" data-explainer-prompt-label>Ask a model</label>
+        <div class="forex-explainer-ask-row">
+          <input id="forex-explainer-prompt" type="text" disabled placeholder="No AI provider attached" aria-describedby="forex-explainer-unavailable">
+          <button type="button" class="button button-small button-primary" data-explainer-ask-submit hidden>Ask</button>
+        </div>
+        <div class="forex-explainer-voice-bar" role="group" aria-label="Voice controls">
+          <button type="button" data-explainer-mic aria-pressed="false" disabled>Talk (Mic)</button>
+          <button type="button" data-explainer-autospeak aria-pressed="true">Auto-Speak: ON</button>
+          <button type="button" data-explainer-speak>Speak Answer</button>
+        </div>
+        <p id="forex-explainer-unavailable">AI explanations are unavailable. The local guide and all source records remain readable.</p>
+      </footer>
     </aside>
     <div class="forex-explainer-sr-only" role="status" aria-live="polite" data-guide-announcement></div>`);
+
   const mark = host.querySelector('.forex-explainer-mark');
   const panel = host.querySelector('.forex-explainer-panel');
   const closeButton = host.querySelector('.forex-explainer-close');
@@ -130,7 +242,10 @@ export function createExplainer({ getContext, askModel = null }) {
   const say = message => { announcement.textContent = message; };
 
   function persist() {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ edge: layout.edge, frac: layout.frac, collapsed: layout.collapsed })); } catch { /* No storage is required for use. */ }
+    try { globalThis.localStorage?.setItem?.(STORAGE_KEY, JSON.stringify({ edge: layout.edge, frac: layout.frac, collapsed: layout.collapsed })); } catch { /* No storage is required for use. */ }
+  }
+  function persistAutoSpeak() {
+    try { globalThis.sessionStorage?.setItem?.(AUTOSPEAK_STORAGE_KEY, String(autoSpeak)); } catch { /* Optional storage */ }
   }
   function frame() {
     const width = Math.max(48, document.documentElement.clientWidth);
@@ -173,11 +288,38 @@ export function createExplainer({ getContext, askModel = null }) {
     document.body.dataset.forexExplainerSide = f.side;
     for (const button of host.querySelectorAll('[data-guide-dock]')) button.setAttribute('aria-pressed', String(button.dataset.guideDock === layout.edge));
   }
+
+  const promptLabel = host.querySelector('[data-explainer-prompt-label]');
   const promptInput = host.querySelector('#forex-explainer-prompt');
   const askButton = host.querySelector('[data-explainer-ask-submit]');
+  const micButton = host.querySelector('[data-explainer-mic]');
+  const autoSpeakButton = host.querySelector('[data-explainer-autospeak]');
+  const speakButton = host.querySelector('[data-explainer-speak]');
+  const quickChipsWrap = host.querySelector('.forex-explainer-quick-chips');
   const footerNote = host.querySelector('#forex-explainer-unavailable');
   const modelField = host.querySelector('[data-guide-model]');
   const subtitleField = host.querySelector('[data-guide-subtitle]');
+
+  function updateVoiceControls() {
+    if (destroyed) return;
+    const context = getContext() || {};
+    const aiReady = Boolean(context.aiConnected && typeof askModel === 'function');
+    if (micButton) {
+      micButton.disabled = !aiReady || (askBusy && !isListening);
+      micButton.classList.toggle('is-listening', isListening);
+      micButton.setAttribute('aria-pressed', String(isListening));
+      micButton.textContent = isListening ? 'Listening… tap to finish' : 'Talk (Mic)';
+    }
+    if (autoSpeakButton) {
+      autoSpeakButton.setAttribute('aria-pressed', String(autoSpeak));
+      autoSpeakButton.textContent = autoSpeak ? 'Auto-Speak: ON' : 'Auto-Speak: OFF';
+    }
+    if (speakButton) {
+      speakButton.classList.toggle('is-speaking', isSpeaking);
+      speakButton.setAttribute('aria-pressed', String(isSpeaking));
+      speakButton.textContent = isSpeaking ? 'Stop Audio' : 'Speak Answer';
+    }
+  }
 
   function updateContent() {
     const context = getContext() || {};
@@ -201,38 +343,213 @@ export function createExplainer({ getContext, askModel = null }) {
 
     const aiReady = Boolean(context.aiConnected && typeof askModel === 'function');
     if (aiReady) {
+      const voiceModel = scalar(context.voiceExplainerModel, 'Gemini 4 Neon');
       const mName = scalar(context.activeModelLabel, 'Connected Frontier AI');
-      modelField.textContent = `${mName} (read-only Q&A)`;
-      subtitleField.textContent = `Live read-only guide · ${mName}`;
+      modelField.textContent = `${voiceModel} (voice Q&A · trading: ${mName})`;
+      subtitleField.textContent = 'Gemini 4 Neon · Real-Time Voice Explainer';
+      if (promptLabel) promptLabel.textContent = 'Ask Gemini 4 Neon (voice or text)';
       promptInput.disabled = askBusy;
-      promptInput.placeholder = 'Ask about markets, sessions, positions, or valve gates…';
+      promptInput.placeholder = isListening
+        ? 'Listening… speak your question now'
+        : 'Ask or tap Mic for a live spoken briefing…';
       askButton.hidden = false;
       askButton.disabled = askBusy;
-      footerNote.textContent = askBusy ? 'Asking connected AI model…' : `Read-only live explanations (${mName}). Zero execution authority.`;
+      if (quickChipsWrap) {
+        quickChipsWrap.hidden = false;
+        for (const chip of quickChipsWrap.querySelectorAll('[data-explainer-quick-ask]')) {
+          chip.disabled = askBusy;
+        }
+      }
+      footerNote.textContent = voiceStatusNote
+        ?? (askBusy
+          ? `Asking ${voiceModel}…`
+          : `Real-time voice & text explanations (${voiceModel}). Read-only — zero execution authority.`);
     } else {
       modelField.textContent = 'None — authored local guide';
       subtitleField.textContent = 'Local guide - no model';
+      if (promptLabel) promptLabel.textContent = 'Ask a model';
       promptInput.disabled = true;
       promptInput.placeholder = 'No AI provider attached';
       askButton.hidden = true;
       askButton.disabled = true;
-      footerNote.textContent = 'AI explanations are unavailable. The local guide and all source records remain readable.';
+      if (quickChipsWrap) quickChipsWrap.hidden = true;
+      footerNote.textContent = voiceStatusNote
+        ?? 'AI explanations are unavailable. The local guide and all source records remain readable.';
+    }
+    updateVoiceControls();
+  }
+
+  function stopAudio({ silent = false } = {}) {
+    speakGeneration += 1;
+    if (activeBufferSource) {
+      const src = activeBufferSource;
+      activeBufferSource = null;
+      try { src.onended = null; } catch { /* Ignore */ }
+      try { src.stop(0); } catch { /* Already stopped */ }
+      try { src.disconnect?.(); } catch { /* Ignore */ }
+    }
+    const synth = globalThis.window?.speechSynthesis ?? globalThis.speechSynthesis;
+    try { synth?.cancel?.(); } catch { /* Ignore */ }
+    isSpeaking = false;
+    if (!silent && !destroyed) {
+      say('Voice playback stopped.');
+      updateVoiceControls();
     }
   }
 
-  async function submitQuestion() {
+  function unlockWebAudioSync() {
+    if (destroyed) return;
+    const AudioCtxCtor = globalThis.window?.AudioContext
+      ?? globalThis.window?.webkitAudioContext
+      ?? globalThis.AudioContext
+      ?? globalThis.webkitAudioContext;
+    if (typeof AudioCtxCtor !== 'function') return;
+    try {
+      if (!audioCtx) audioCtx = new AudioCtxCtor();
+      if (audioCtx.state === 'suspended' && typeof audioCtx.resume === 'function') {
+        void Promise.resolve(audioCtx.resume()).catch(() => {});
+      }
+    } catch { /* Best-effort synchronous iOS/Android gesture unlock. */ }
+  }
+
+  async function speakText(rawText) {
+    const cleanText = String(rawText ?? '').trim().slice(0, 1800);
+    if (!cleanText || destroyed) return;
+    stopAudio({ silent: true });
+    const myToken = speakGeneration;
+    isSpeaking = true;
+    updateVoiceControls();
+
+    if (typeof synthesizeSpeech === 'function') {
+      try {
+        const ttsDoc = await synthesizeSpeech(cleanText, 'Kore');
+        if (destroyed || myToken !== speakGeneration) return;
+        if (ttsDoc && ttsDoc.ok === true && typeof ttsDoc.audio_base64 === 'string' && ttsDoc.audio_base64.length > 0) {
+          const AudioCtxCtor = globalThis.window?.AudioContext
+            ?? globalThis.window?.webkitAudioContext
+            ?? globalThis.AudioContext
+            ?? globalThis.webkitAudioContext;
+          if (typeof AudioCtxCtor === 'function') {
+            if (!audioCtx) audioCtx = new AudioCtxCtor();
+            if (audioCtx.state === 'suspended' && typeof audioCtx.resume === 'function') {
+              await audioCtx.resume().catch(() => {});
+            }
+            if (destroyed || myToken !== speakGeneration) return;
+            const mime = String(ttsDoc.mime_type ?? 'audio/L16;rate=24000').toLowerCase();
+            let audioBuffer;
+            if (mime.includes('l16') || mime.includes('pcm')) {
+              const floatSamples = decodePcm16LeBase64ToFloat32(ttsDoc.audio_base64);
+              if (floatSamples.length === 0) throw new Error('Empty PCM sample stream.');
+              const rate = parseSampleRateHz(ttsDoc);
+              audioBuffer = audioCtx.createBuffer(1, floatSamples.length, rate);
+              const ch0 = audioBuffer.getChannelData(0);
+              ch0.set(floatSamples);
+            } else {
+              const bytes = decodeBase64ToBytes(ttsDoc.audio_base64);
+              const sliced = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+              audioBuffer = await audioCtx.decodeAudioData(sliced);
+            }
+            if (destroyed || myToken !== speakGeneration) return;
+            const sourceNode = audioCtx.createBufferSource();
+            sourceNode.buffer = audioBuffer;
+            sourceNode.connect(audioCtx.destination);
+            activeBufferSource = sourceNode;
+            sourceNode.onended = () => {
+              if (activeBufferSource === sourceNode) activeBufferSource = null;
+              if (myToken === speakGeneration) {
+                isSpeaking = false;
+                updateVoiceControls();
+              }
+            };
+            sourceNode.start(0);
+            say('Playing Gemini 4 Neon voice explanation.');
+            updateVoiceControls();
+            return;
+          }
+        }
+      } catch {
+        if (destroyed || myToken !== speakGeneration) return;
+        // Fall through seamlessly to browser speechSynthesis fallback.
+      }
+    }
+
+    if (destroyed || myToken !== speakGeneration) return;
+    const synth = globalThis.window?.speechSynthesis ?? globalThis.speechSynthesis;
+    const UtterCtor = globalThis.window?.SpeechSynthesisUtterance ?? globalThis.SpeechSynthesisUtterance;
+    if (synth && typeof synth.speak === 'function') {
+      try { synth.cancel?.(); } catch { /* Ignore */ }
+      const utter = typeof UtterCtor === 'function' ? new UtterCtor(cleanText) : { text: cleanText };
+      utter.rate = 1.02;
+      utter.onend = () => {
+        if (myToken === speakGeneration) {
+          isSpeaking = false;
+          updateVoiceControls();
+        }
+      };
+      utter.onerror = () => {
+        if (myToken === speakGeneration) {
+          isSpeaking = false;
+          updateVoiceControls();
+        }
+      };
+      synth.speak(utter);
+      say('Speaking explanation via browser voice fallback.');
+      updateVoiceControls();
+      return;
+    }
+
+    isSpeaking = false;
+    updateVoiceControls();
+  }
+
+  function stopMicCaptureOnly() {
+    if (activeRecognition) {
+      const rec = activeRecognition;
+      activeRecognition = null;
+      try { rec.onresult = null; rec.onend = null; rec.onerror = null; } catch { /* Ignore */ }
+      try { rec.abort?.(); } catch { /* Ignore */ }
+      try { rec.stop?.(); } catch { /* Ignore */ }
+    }
+    if (activeMediaRecorder) {
+      const mr = activeMediaRecorder;
+      activeMediaRecorder = null;
+      try { mr.ondataavailable = null; mr.onstop = null; mr.onerror = null; } catch { /* Ignore */ }
+      try { if (mr.state !== 'inactive') mr.stop?.(); } catch { /* Ignore */ }
+    }
+    if (activeMediaStream) {
+      const stream = activeMediaStream;
+      activeMediaStream = null;
+      try { stream.getTracks?.().forEach((t) => t.stop?.()); } catch { /* Ignore */ }
+    }
+    isListening = false;
+  }
+
+  async function submitQuestion({ overrideQuestion = null, extraAudio = null, forceSpeak = false } = {}) {
     const context = getContext() || {};
     if (!context.aiConnected || typeof askModel !== 'function' || askBusy) return;
-    const q = String(promptInput.value ?? '').trim();
+    const rawQ = overrideQuestion !== null ? overrideQuestion : promptInput.value;
+    const q = String(rawQ ?? '').trim() || (extraAudio ? 'Voice question' : '');
     if (!q) return;
+    voiceStatusNote = null;
     askBusy = true;
     lastAskedQuestion = q;
     updateContent();
+    let shouldSpeak = false;
     try {
-      const reply = await askModel(q);
+      const hasAudio = Boolean(
+        extraAudio
+        && typeof extraAudio === 'object'
+        && typeof extraAudio.audio_base64 === 'string'
+        && extraAudio.audio_base64.length > 0
+      );
+      const reply = hasAudio ? await askModel(q, extraAudio) : await askModel(q);
+      if (reply && typeof reply === 'object' && typeof reply.spoken_question === 'string' && reply.spoken_question.trim()) {
+        lastAskedQuestion = reply.spoken_question.trim();
+      }
       askAnswer = scalar(typeof reply === 'string' ? reply : reply?.answer, 'No answer text returned.');
       answerMode = 'ask';
       promptInput.value = '';
+      shouldSpeak = Boolean((autoSpeak || forceSpeak) && askAnswer);
       say('Live AI explanation updated (read-only).');
     } catch (err) {
       answerMode = 'ask';
@@ -242,7 +559,177 @@ export function createExplainer({ getContext, askModel = null }) {
       askBusy = false;
       updateContent();
     }
+    if (shouldSpeak && !destroyed) {
+      await speakText(askAnswer);
+    }
   }
+
+  async function toggleMicrophone() {
+    const context = getContext() || {};
+    if (!context.aiConnected || typeof askModel !== 'function') return;
+
+    if (isListening) {
+      if (activeRecognition) {
+        try { activeRecognition.stop(); } catch { stopMicCaptureOnly(); updateContent(); }
+        return;
+      }
+      if (activeMediaRecorder && activeMediaRecorder.state !== 'inactive') {
+        try { activeMediaRecorder.stop(); } catch { stopMicCaptureOnly(); updateContent(); }
+        return;
+      }
+      stopMicCaptureOnly();
+      updateContent();
+      return;
+    }
+
+    autoSpeak = true;
+    persistAutoSpeak();
+    stopAudio({ silent: true });
+    voiceStatusNote = null;
+
+    const SpeechRecCtor = globalThis.window?.SpeechRecognition
+      ?? globalThis.window?.webkitSpeechRecognition
+      ?? globalThis.SpeechRecognition
+      ?? globalThis.webkitSpeechRecognition;
+
+    if (typeof SpeechRecCtor === 'function') {
+      try {
+        const rec = new SpeechRecCtor();
+        rec.lang = 'en-US';
+        rec.interimResults = true;
+        rec.continuous = false;
+        let capturedTranscript = '';
+        let submitted = false;
+        activeRecognition = rec;
+        isListening = true;
+        voiceStatusNote = 'Listening… speak your question clearly.';
+        updateContent();
+
+        rec.onresult = (ev) => {
+          const parts = [];
+          const list = ev?.results ?? [];
+          for (let i = 0; i < list.length; i += 1) {
+            const alt = list[i]?.[0] ?? list[i];
+            const piece = typeof alt?.transcript === 'string' ? alt.transcript : '';
+            if (piece) parts.push(piece);
+          }
+          const combined = parts.join(' ').trim();
+          if (combined) {
+            capturedTranscript = combined;
+            promptInput.value = combined;
+          }
+        };
+
+        rec.onerror = (ev) => {
+          submitted = true;
+          if (activeRecognition === rec) activeRecognition = null;
+          isListening = false;
+          const code = String(ev?.error ?? 'unavailable');
+          voiceStatusNote = code === 'not-allowed' || code === 'service-not-allowed'
+            ? 'Microphone permission denied. Allow mic access, or tap the prompt box and use your phone keyboard microphone.'
+            : `Voice recognition unavailable (${code}). You can also use your phone keyboard microphone or type below.`;
+          updateContent();
+        };
+
+        rec.onend = () => {
+          if (activeRecognition === rec) activeRecognition = null;
+          isListening = false;
+          voiceStatusNote = null;
+          const spoken = String(capturedTranscript || promptInput.value || '').trim();
+          if (!destroyed && !submitted && spoken) {
+            submitted = true;
+            promptInput.value = spoken;
+            void submitQuestion({ overrideQuestion: spoken, forceSpeak: true });
+          } else {
+            updateContent();
+          }
+        };
+
+        rec.start();
+        say('Listening for your spoken question.');
+        return;
+      } catch {
+        stopMicCaptureOnly();
+      }
+    }
+
+    const mediaDevices = globalThis.navigator?.mediaDevices ?? globalThis.window?.navigator?.mediaDevices;
+    const RecorderCtor = globalThis.window?.MediaRecorder ?? globalThis.MediaRecorder;
+    if (mediaDevices && typeof mediaDevices.getUserMedia === 'function' && typeof RecorderCtor === 'function') {
+      try {
+        const stream = await mediaDevices.getUserMedia({ audio: true });
+        if (destroyed) {
+          stream.getTracks?.().forEach((t) => t.stop?.());
+          return;
+        }
+        const preferredMime = ALLOWED_AUDIO_MIMES.find(
+          (m) => typeof RecorderCtor.isTypeSupported !== 'function' || RecorderCtor.isTypeSupported(m)
+        ) || 'audio/webm';
+        const recorder = new RecorderCtor(stream, { mimeType: preferredMime });
+        const chunks = [];
+        activeMediaStream = stream;
+        activeMediaRecorder = recorder;
+        isListening = true;
+        voiceStatusNote = 'Recording voice clip… tap Mic again to send to Gemini 4 Neon.';
+        updateContent();
+
+        recorder.ondataavailable = (ev) => {
+          if (ev?.data && ev.data.size > 0) chunks.push(ev.data);
+        };
+        recorder.onerror = () => {
+          stopMicCaptureOnly();
+          voiceStatusNote = 'Audio recording interrupted. Type your question below.';
+          updateContent();
+        };
+        recorder.onstop = async () => {
+          const usedMime = String(recorder.mimeType || preferredMime).split(';')[0].trim().toLowerCase();
+          const safeMime = ALLOWED_AUDIO_MIMES.includes(usedMime) ? usedMime : 'audio/webm';
+          stopMicCaptureOnly();
+          voiceStatusNote = null;
+          try {
+            let totalLen = 0;
+            const partArrays = [];
+            for (const c of chunks) {
+              const ab = await c.arrayBuffer();
+              const arr = new Uint8Array(ab);
+              partArrays.push(arr);
+              totalLen += arr.byteLength;
+            }
+            if (totalLen > 0 && !destroyed) {
+              const merged = new Uint8Array(totalLen);
+              let offset = 0;
+              for (const arr of partArrays) {
+                merged.set(arr, offset);
+                offset += arr.byteLength;
+              }
+              const audioBase64 = encodeBytesToBase64(merged);
+              await submitQuestion({
+                overrideQuestion: String(promptInput.value ?? '').trim() || 'Voice question',
+                extraAudio: { audio_base64: audioBase64, audio_mime_type: safeMime },
+                forceSpeak: true,
+              });
+              return;
+            }
+          } catch {
+            voiceStatusNote = 'Unable to encode recorded voice clip.';
+          }
+          updateContent();
+        };
+        recorder.start();
+        say('Recording voice question.');
+        return;
+      } catch {
+        stopMicCaptureOnly();
+        voiceStatusNote = 'Microphone permission denied or unavailable. You can also tap the prompt box and use your phone keyboard microphone.';
+        updateContent();
+        return;
+      }
+    }
+
+    voiceStatusNote = 'In-page SpeechRecognition is unavailable in this mobile WebView — tap the prompt box and use your phone keyboard microphone, or type below.';
+    updateContent();
+  }
+
   function setOpen(next, { focus = false } = {}) {
     if (next && !open && !wide.matches) returnScroll = { left: workspace.scrollLeft, top: workspace.scrollTop };
     open = Boolean(next);
@@ -285,7 +772,7 @@ export function createExplainer({ getContext, askModel = null }) {
     if (corner) setOpen(false);
     savePosition(`Explainer docked ${edge}${corner ? ', collapsed to a tab' : ''}.`);
   }
-  promptInput.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); void submitQuestion(); } });
+  promptInput.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); unlockWebAudioSync(); void submitQuestion(); } });
   mark.addEventListener('pointerdown', event => {
     if (!event.isPrimary || event.button !== 0) return;
     const box = mark.getBoundingClientRect();
@@ -346,8 +833,46 @@ export function createExplainer({ getContext, askModel = null }) {
   host.addEventListener('click', event => {
     const button = event.target.closest('button');
     if (!button || button.disabled) return;
-    if (button.dataset.explainerTopic) { selectedTopic = button.dataset.explainerTopic; answerMode = 'local'; updateContent(); say('Local guide answer updated. No model was called.'); }
-    if (button.hasAttribute('data-explainer-ask-submit')) { void submitQuestion(); }
+    if (button.dataset.explainerTopic) {
+      selectedTopic = button.dataset.explainerTopic;
+      answerMode = 'local';
+      updateContent();
+      say('Local guide answer updated. No model was called.');
+      return;
+    }
+    const quickQ = button.getAttribute('data-explainer-quick-ask');
+    if (quickQ) {
+      unlockWebAudioSync();
+      void submitQuestion({ overrideQuestion: quickQ });
+      return;
+    }
+    if (button.hasAttribute('data-explainer-ask-submit')) {
+      unlockWebAudioSync();
+      void submitQuestion();
+      return;
+    }
+    if (button.hasAttribute('data-explainer-mic')) {
+      unlockWebAudioSync();
+      void toggleMicrophone();
+      return;
+    }
+    if (button.hasAttribute('data-explainer-autospeak')) {
+      unlockWebAudioSync();
+      autoSpeak = !autoSpeak;
+      persistAutoSpeak();
+      updateVoiceControls();
+      say(autoSpeak ? 'Auto-speak enabled.' : 'Auto-speak disabled.');
+      return;
+    }
+    if (button.hasAttribute('data-explainer-speak')) {
+      if (isSpeaking) stopAudio();
+      else {
+        unlockWebAudioSync();
+        const currentText = host.querySelector('.forex-explainer-answer')?.textContent ?? '';
+        void speakText(currentText);
+      }
+      return;
+    }
     if (button.dataset.guideDock) { layout.edge = button.dataset.guideDock;layout.collapsed = false;savePosition(`Explainer docked ${layout.edge}.`); }
     if (button.hasAttribute('data-guide-collapse')) { setOpen(false, { focus: true });layout.collapsed = true;savePosition('Explainer collapsed to a tab.'); }
     if (button.hasAttribute('data-guide-reset')) { layout = { ...DEFAULT_LAYOUT };savePosition('Explainer position reset.'); }
@@ -360,6 +885,13 @@ export function createExplainer({ getContext, askModel = null }) {
   function destroy() {
     if (destroyed) return;
     destroyed = true;
+    stopMicCaptureOnly();
+    stopAudio({ silent: true });
+    if (audioCtx) {
+      const ctx = audioCtx;
+      audioCtx = null;
+      try { void ctx.close?.(); } catch { /* Ignore */ }
+    }
     const scroll = returnScroll || (mounted ? { left: workspace.scrollLeft, top: workspace.scrollTop } : initialScroll);
     document.removeEventListener('keydown', onEscape);
     window.removeEventListener('resize', onResize);

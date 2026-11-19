@@ -122,3 +122,79 @@ body.forex-explainer-ready[data-forex-explainer-edge="bottom"] .forex-explainer-
 }
 .forex-explainer-ask-row { display: flex; gap: 6px; align-items: stretch; margin: 6px 0; }
 .forex-explainer-ask-row input { flex: 1 1 auto; min-width: 0; }
+.forex-explainer-footer input:not(:disabled) {
+  border-style: solid;
+  border-color: var(--fxe-rule);
+  color: var(--fxe-ink);
+  opacity: 1;
+  cursor: text;
+}
+.forex-explainer-quick-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 20px 12px;
+  border-bottom: 1px solid var(--fxe-line);
+  background: var(--fxe-canvas);
+  flex: none;
+}
+.forex-explainer-quick-chips button {
+  padding: 6px 9px;
+  border: 1px solid var(--fxe-rule);
+  background: var(--fxe-panel);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+  min-height: 32px;
+}
+.forex-explainer-quick-chips button:not(:disabled):hover {
+  border-color: var(--fxe-accent);
+  color: var(--fxe-deep);
+}
+.forex-explainer-voice-bar {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 8px 0 4px;
+}
+.forex-explainer-voice-bar button {
+  padding: 8px 8px;
+  min-height: 44px;
+  border: var(--border-control, 2px) solid var(--fxe-rule);
+  background: var(--fxe-panel);
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+}
+.forex-explainer-voice-bar button:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+.forex-explainer-voice-bar button:not(:disabled):hover {
+  background: var(--fxe-canvas);
+  border-color: var(--fxe-ink);
+}
+[data-explainer-mic].is-listening {
+  border-color: var(--fxe-accent);
+  background: var(--fxe-accent);
+  color: #080807;
+}
+[data-explainer-speak].is-speaking {
+  border-color: var(--mf-red, #dc2626);
+  color: var(--mf-red, #dc2626);
+}
+[data-explainer-autospeak][aria-pressed="true"] {
+  border-color: var(--mf-green, #16a34a);
+  color: var(--mf-green, #16a34a);
+}
+@media (max-width: 1099px) {
+  .forex-explainer-voice-bar button,
+  .forex-explainer-quick-chips button {
+    min-height: 44px;
+  }
+}
+@media (max-width: 420px) {
+  .forex-explainer-voice-bar {
+    grid-template-columns: 1fr;
+  }
+}
