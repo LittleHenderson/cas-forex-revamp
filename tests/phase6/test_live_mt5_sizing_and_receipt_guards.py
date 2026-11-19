@@ -119,8 +119,11 @@ class _StubMt5Transport:
                 volume_lots=None,
                 price=None,
                 stop_loss=None,
-                take_profit=None,
+                server=self._server,
+                observed_at=NOW,
+                transport=self.transport_name,
                 message=msg,
+                take_profit=None,
             )
         return Mt5OrderReceipt(
             request_id=request.request_id,
@@ -132,8 +135,11 @@ class _StubMt5Transport:
             volume_lots=request.volume_lots,
             price=request.price,
             stop_loss=request.stop_loss,
-            take_profit=request.take_profit,
+            server=self._server,
+            observed_at=NOW,
+            transport=self.transport_name,
             message="done",
+            take_profit=request.take_profit,
         )
 
 
@@ -267,8 +273,8 @@ class TestLiveMt5SizingAndReceiptGuards(unittest.TestCase):
 
         trader = AutonomousAiTrader(
             router=router,
+            model_registry=FrontierModelRegistry(environ={}),
             valve_gate=GATE,
-            registry=FrontierModelRegistry({}),
             clock=lambda: NOW,
         )
         # With 100 contracts/lot at 1:200 leverage and 1000% margin level floor, NAS100 MUST size <= 0.70 lots
@@ -342,9 +348,10 @@ class TestLiveMt5SizingAndReceiptGuards(unittest.TestCase):
         v_lhfx.connect()
 
         oracle = OandaQuoteTruthOracle(
-            reference_provider=lambda syms: {
+            reference_source=lambda syms: {
                 s: (Decimal("27660.60"), Decimal("27661.72")) for s in syms
-            }
+            },
+            reference_name="UNIT_TEST_REF",
         )
         router = DualShieldBrokerRouter(
             environ={"CAS_FOREX_EXECUTION_MODE": "DEMO", "CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE": "1"},
