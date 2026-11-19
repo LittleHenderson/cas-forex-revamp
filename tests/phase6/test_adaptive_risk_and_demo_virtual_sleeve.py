@@ -8,7 +8,8 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-import urllib.request
+import http.client
+from urllib.parse import urlparse
 
 from cas_forex_revamp.composition.autonomous_trader import (
     ACTIVE_GEAR_CONSERVATIVE,
@@ -290,15 +291,20 @@ class AdaptiveRiskAndDemoVirtualSleeveTests(unittest.TestCase):
             )
             srv.start()
             try:
-                req = urllib.request.Request(
-                    f"{srv.base_url}/api/ai-overseer-action",
-                    data=json.dumps({"action": "SET_RISK_GEAR", "risk_gear": RISK_GEAR_CONSERVATIVE}).encode("utf-8"),
-                    headers={"Authorization": f"Bearer {srv.auth_token}", "Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                parsed = urlparse(srv.base_url)
+                conn = http.client.HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port, timeout=10)
+                try:
+                    conn.request(
+                        "POST",
+                        "/api/ai-overseer-action",
+                        body=json.dumps({"action": "SET_RISK_GEAR", "risk_gear": RISK_GEAR_CONSERVATIVE}).encode("utf-8"),
+                        headers={"Authorization": f"Bearer {srv.auth_token}", "Content-Type": "application/json"},
+                    )
+                    resp = conn.getresponse()
                     self.assertEqual(resp.status, 200)
                     doc = json.loads(resp.read().decode("utf-8"))
+                finally:
+                    conn.close()
                 self.assertEqual(doc["risk_gear"]["owner_mode"], RISK_GEAR_CONSERVATIVE)
                 self.assertEqual(doc["risk_gear"]["active_gear"], ACTIVE_GEAR_CONSERVATIVE)
                 self.assertTrue(gear_file.is_file())
