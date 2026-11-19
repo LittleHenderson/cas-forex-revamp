@@ -1,0 +1,105 @@
+{
+ "about": "Security findings the builder reviewed and accepted, with reasons. Managed by `lantern accept`.",
+ "accepted": [
+  {
+   "id": "196232f88462",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "shared-interface/accepted-contracts/examples/role-release-evidence.json",
+   "line": 3745,
+   "reason": "False positive: checkpoint_access_selection_sha256 is a public SHA-256 contract digest in a canonical example fixture, not an API key or secret.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
+   "id": "2ac0bcf296c3",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "shared-interface/accepted-contracts/examples/role-release-evidence.json",
+   "line": 1093,
+   "reason": "False positive: checkpoint_access_selection_sha256 is a public SHA-256 contract digest in a canonical example fixture, not an API key or secret.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
+   "id": "4c4df28af71b",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "src/cas_forex_revamp/composition/custody_schema.py",
+   "line": 14,
+   "reason": "False positive: custody-independent-keys-v1.schema.json value is a public SHA-256 integrity hash of a committed JSON schema file, not a secret key.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
+   "id": "5108a14f1b32",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "shared-interface/accepted-contracts/examples/public-flow.json",
+   "line": 3497,
+   "reason": "False positive: checkpoint_access_selection_sha256 is a public SHA-256 contract digest in a canonical example fixture, not an API key or secret.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
+   "id": "5b9436bb36c9",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "shared-interface/accepted-contracts/examples/role-release-evidence.json",
+   "line": 1191,
+   "reason": "False positive: checkpoint_access_selection_sha256 is a public SHA-256 contract digest in a canonical example fixture, not an API key or secret.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
+   "id": "77a23b8c1c06",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "shared-interface/accepted-contracts/role-release-evidence.candidate.json",
+   "line": 118,
+   "reason": "False positive: authentication_domain CAS_FOREX_PROTECTED_RECORD_V1 is a public cryptographic domain-separation label, not a credential or secret.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
+   "id": "abf45f63d55f",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "shared-interface/accepted-contracts/examples/role-release-evidence.json",
+   "line": 1355,
+   "reason": "False positive: checkpoint_access_selection_sha256 is a public SHA-256 contract digest in a canonical example fixture, not an API key or secret.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
+   "id": "e6e1d875106e",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "shared-interface/accepted-contracts/examples/role-release-evidence.json",
+   "line": 3827,
+   "reason": "False positive: checkpoint_access_selection_sha256 is a public SHA-256 contract digest in a canonical example fixture, not an API key or secret.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
+   "id": "f20ddac698bc",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "shared-interface/accepted-contracts/examples/public-flow.json",
+   "line": 1107,
+   "reason": "False positive: checkpoint_access_selection_sha256 is a public SHA-256 contract digest in a canonical example fixture, not an API key or secret.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  },
+  {
+   "id": "f348c74dc9a6",
+   "tool": "gitleaks",
+   "rule": "generic-api-key",
+   "file": "shared-interface/accepted-contracts/examples/public-flow.json",
+   "line": 3579,
+   "reason": "False positive: checkpoint_access_selection_sha256 is a public SHA-256 contract digest in a canonical example fixture, not an API key or secret.",
+   "by": "cas-forex-security-review",
+   "date": "2026-11-19"
+  }
+ ]
+}

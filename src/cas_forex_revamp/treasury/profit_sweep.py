@@ -477,19 +477,20 @@ class KrakenOfframpClient:
         *,
         amount_usd: Decimal,
         key_id: str | None = None,
+        client_reference_id: str | None = None,
     ) -> dict[str, Any]:
         """Submit Kraken ZUSD ACH withdrawal strictly to the owner-linked bank key."""
         decimal_value(amount_usd, "amount_usd", positive=True)
         if key_id is not None and key_id.strip() != self._bank_key:
             raise OfframpSecurityError("Cannot override pinned Kraken bank withdrawal key")
-        return self._private_post(
-            "/0/private/Withdraw",
-            {
-                "asset": "ZUSD",
-                "key": self._bank_key,
-                "amount": decimal_text(amount_usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
-            },
-        )
+        params: dict[str, Any] = {
+            "asset": "ZUSD",
+            "key": self._bank_key,
+            "amount": decimal_text(amount_usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        }
+        if client_reference_id is not None and str(client_reference_id).strip():
+            params["client_ref"] = str(client_reference_id).strip()[:64]
+        return self._private_post("/0/private/Withdraw", params)
 
 
 class ProfitSweepVault:
@@ -565,7 +566,9 @@ class ProfitSweepVault:
                     owner_request_id TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    settled_at TEXT
+                    settled_at TEXT,
+                    idempotency_key TEXT UNIQUE,
+                    error_detail TEXT
                 );
                 CREATE TABLE IF NOT EXISTS vault_audit (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -578,6 +581,12 @@ class ProfitSweepVault:
                 );
                 """
             )
+            bt_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(bank_transfers)").fetchall()}
+            if "idempotency_key" not in bt_cols:
+                conn.execute("ALTER TABLE bank_transfers ADD COLUMN idempotency_key TEXT")
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bank_transfers_idem ON bank_transfers(idempotency_key) WHERE idempotency_key IS NOT NULL")
+            if "error_detail" not in bt_cols:
+                conn.execute("ALTER TABLE bank_transfers ADD COLUMN error_detail TEXT")
             row = conn.execute("SELECT scope_id FROM vault_config WHERE scope_id = ?", (self.scope_id,)).fetchone()
             if row is None:
                 conn.execute(
@@ -791,34 +800,134 @@ class ProfitSweepVault:
         *,
         transfer_id: str,
         provider_tx_id: str,
+        owner_request_id: str,
+        verifier: Any,
+        recovery_token: str,
+        provider_verifier: Callable[[str, str], Mapping[str, Any]],
     ) -> dict[str, Any]:
-        if not transfer_id or not provider_tx_id:
+        """Settle a broker 2FA withdrawal ONLY after transfer-bound recovery auth AND independent provider receipt proof (Finding [11])."""
+        tid = str(transfer_id or "").strip()
+        ptx = str(provider_tx_id or "").strip()
+        if not tid or not ptx:
             raise ContractError("transfer_id and provider_tx_id are required")
-        ts = _iso(self._clock())
+        if verifier is None or not callable(getattr(verifier, "verify_and_consume", None)):
+            raise ContractError("OWNER_RECOVERY_VERIFIER_REQUIRED: transfer-bound owner recovery authorization required")
+        if not isinstance(recovery_token, str) or not recovery_token.strip():
+            raise ContractError("OWNER_RECOVERY_TOKEN_REQUIRED: transfer-bound owner recovery token required")
+        if provider_verifier is None or not callable(provider_verifier):
+            raise OfframpSecurityError("PROVIDER_RECEIPT_VERIFIER_REQUIRED: independent provider settlement proof required")
+
+        # 1. Inspect pending transfer metadata before external lookup
         with self._lock, closing(self._connect()) as conn:
-            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM bank_transfers WHERE transfer_id = ? AND scope_id = ?",
-                (transfer_id, self.scope_id),
+                (tid, self.scope_id),
             ).fetchone()
-            if row is None:
-                conn.execute("ROLLBACK")
-                raise ContractError(f"Unknown transfer_id {transfer_id!r}")
-            if str(row["status"]) != "PENDING_OWNER_BROKER_2FA":
-                conn.execute("ROLLBACK")
-                raise ContractError(f"Transfer {transfer_id!r} is already {row['status']}")
-            conn.execute(
-                "UPDATE bank_transfers SET status = 'SETTLED', provider_tx_id = ?, settled_at = ? WHERE transfer_id = ?",
-                (str(provider_tx_id).strip(), ts, transfer_id),
+        if row is None:
+            raise ContractError(f"Unknown transfer_id {tid!r}")
+        cur_status = str(row["status"])
+        if cur_status not in ("PENDING_OWNER_BROKER_2FA", "BROKER_2FA_VERIFICATION_UNKNOWN"):
+            raise ContractError(f"Transfer {tid!r} is already {cur_status}")
+        expected_broker = str(row["broker_id"] or "")
+        expected_dest = str(row["destination_bank_id"] or "")
+        expected_amount = Decimal(str(row["amount_usd_text"])).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        # 2. Enforce fresh, single-use, transfer-bound recovery authorization (exact target_ref == transfer_id, no wildcard '*')
+        verifier.verify_and_consume(
+            recovery_token,
+            expected_scope="TREASURY_SWEEP",
+            target_ref=tid,
+            require_exact_target=True,
+            owner_request_id=owner_request_id,
+            now=self._clock(),
+        )
+
+        # 3. Independently verify provider settlement status/receipt matching broker, tx, amount, destination, and SETTLED status
+        ts = _iso(self._clock())
+        try:
+            receipt = provider_verifier(expected_broker, ptx)
+        except Exception as exc:
+            with self._lock, closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE bank_transfers SET status = 'BROKER_2FA_VERIFICATION_UNKNOWN', error_detail = ? "
+                    "WHERE transfer_id = ? AND scope_id = ? AND status IN ('PENDING_OWNER_BROKER_2FA', 'BROKER_2FA_VERIFICATION_UNKNOWN')",
+                    (f"PROVIDER_LOOKUP_ERROR:{type(exc).__name__}", tid, self.scope_id),
+                )
+                self._append_audit(
+                    conn,
+                    "BROKER_2FA_VERIFICATION_UNKNOWN",
+                    {"transfer_id": tid, "provider_tx_id": ptx, "error": type(exc).__name__},
+                    ts,
+                )
+                conn.execute("COMMIT")
+            raise OfframpTransportError(f"Provider withdrawal verification failed ({type(exc).__name__}); reserve kept locked") from None
+
+        if not isinstance(receipt, Mapping):
+            raise OfframpSecurityError("Provider withdrawal verifier returned malformed receipt")
+        rec_status = str(receipt.get("status") or "").strip().upper()
+        rec_broker = str(receipt.get("broker_id") or "").strip()
+        rec_tx = str(receipt.get("provider_tx_id") or "").strip()
+        rec_dest = str(receipt.get("destination_bank_id") or "").strip()
+        raw_amt = receipt.get("amount_usd")
+        try:
+            rec_amt = Decimal(str(raw_amt)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if raw_amt is not None else None
+        except Exception:
+            rec_amt = None
+
+        if rec_status in ("PENDING", "UNKNOWN", "PROCESSING"):
+            with self._lock, closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE bank_transfers SET status = 'BROKER_2FA_VERIFICATION_UNKNOWN', error_detail = ? "
+                    "WHERE transfer_id = ? AND scope_id = ? AND status IN ('PENDING_OWNER_BROKER_2FA', 'BROKER_2FA_VERIFICATION_UNKNOWN')",
+                    (f"PROVIDER_STATUS_{rec_status}", tid, self.scope_id),
+                )
+                self._append_audit(
+                    conn,
+                    "BROKER_2FA_VERIFICATION_UNKNOWN",
+                    {"transfer_id": tid, "provider_tx_id": ptx, "provider_status": rec_status},
+                    ts,
+                )
+                conn.execute("COMMIT")
+            raise OfframpSecurityError(f"Provider withdrawal status is {rec_status!r}, not SETTLED; reserve kept locked")
+
+        if (
+            rec_status != "SETTLED"
+            or rec_broker != expected_broker
+            or rec_tx != ptx
+            or rec_amt != expected_amount
+            or (expected_dest and rec_dest != expected_dest)
+        ):
+            raise OfframpSecurityError(
+                "Provider withdrawal receipt mismatch (status/broker/tx/amount/destination); settlement rejected"
             )
+
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE bank_transfers SET status = 'SETTLED', provider_tx_id = ?, settled_at = ?, error_detail = NULL "
+                "WHERE transfer_id = ? AND scope_id = ? AND status IN ('PENDING_OWNER_BROKER_2FA', 'BROKER_2FA_VERIFICATION_UNKNOWN')",
+                (ptx, ts, tid, self.scope_id),
+            )
+            if cur.rowcount != 1:
+                conn.execute("ROLLBACK")
+                raise ContractError(f"Transfer {tid!r} state changed concurrently")
             self._append_audit(
                 conn,
                 "BROKER_2FA_WITHDRAWAL_SETTLED",
-                {"transfer_id": transfer_id, "provider_tx_id": str(provider_tx_id).strip()},
+                {
+                    "transfer_id": tid,
+                    "broker_id": expected_broker,
+                    "destination_bank_id": expected_dest,
+                    "amount_usd": decimal_text(expected_amount),
+                    "provider_tx_id": ptx,
+                    "owner_request_id": owner_request_id,
+                },
                 ts,
             )
             conn.execute("COMMIT")
-        return {"transfer_id": transfer_id, "status": "SETTLED", "vault": self.snapshot()}
+        return {"transfer_id": tid, "provider_tx_id": ptx, "status": "SETTLED", "vault": self.snapshot()}
 
     def execute_offramp_ach_payout(
         self,
@@ -836,20 +945,14 @@ class ProfitSweepVault:
         coinbase_source_account_uuid: str | None = None,
         coinbase_usd_account_uuid: str | None = None,
         kraken_pair: str = "USDCUSD",
+        idempotency_key: str | None = None,
+        retry_transfer_id: str | None = None,
     ) -> dict[str, Any]:
-        """Convert (optional) to USD and dispatch ACH payout strictly to owner's linked bank ID."""
+        """Atomically reserve funds & durable idempotency intent BEFORE dispatching ACH payout (Finding [9])."""
         decimal_value(amount_usd, "amount_usd", positive=True)
+        amt_q = amount_usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         if rail not in (RAIL_COINBASE_ACH, RAIL_KRAKEN_ACH):
             raise OfframpSecurityError(f"Unsupported automated ACH rail {rail!r}")
-        verifier.verify_and_consume(recovery_token, expected_scope="TREASURY_SWEEP", owner_request_id=owner_request_id, now=self._clock())
-
-        with self._lock, closing(self._connect()) as conn:
-            pending = self._pending_disbursement_unlocked(conn)
-        if amount_usd > pending:
-            raise ContractError(
-                f"Requested ACH payout ${decimal_text(amount_usd)} exceeds pending Bank Vault ${decimal_text(pending)}"
-            )
-
         if rail == RAIL_COINBASE_ACH:
             if coinbase_client is None:
                 raise OfframpSecurityError("CoinbaseOfframpClient is not configured")
@@ -857,63 +960,174 @@ class ProfitSweepVault:
             if convert_from_currency is not None and convert_amount is not None:
                 if not coinbase_source_account_uuid or not coinbase_usd_account_uuid:
                     raise ContractError("Coinbase source/USD account UUIDs are required for conversion")
-                coinbase_client.convert_to_usd(
-                    from_currency=convert_from_currency,
-                    amount=convert_amount,
-                    from_account_uuid=coinbase_source_account_uuid,
-                    usd_account_uuid=coinbase_usd_account_uuid,
-                )
-            resp = coinbase_client.withdraw_usd_to_linked_bank_ach(amount_usd=amount_usd)
-            provider_tx = str(resp.get("id") or resp.get("payout_id") or resp.get("refid") or f"cb-{uuid.uuid4().hex[:10]}")
         else:
             if kraken_client is None:
                 raise OfframpSecurityError("KrakenOfframpClient is not configured")
             dest_bank = kraken_client.linked_bank_account_id
-            if convert_amount is not None:
-                kraken_client.convert_to_usd(pair=kraken_pair, volume=convert_amount)
-            resp = kraken_client.withdraw_usd_to_linked_bank_ach(amount_usd=amount_usd)
-            provider_tx = str(resp.get("refid") or f"krk-{uuid.uuid4().hex[:10]}")
 
-        transfer_id = f"trach-{uuid.uuid4().hex[:16]}"
-        ts = _iso(self._clock())
+        verifier.verify_and_consume(
+            recovery_token, expected_scope="TREASURY_SWEEP", owner_request_id=owner_request_id, now=self._clock()
+        )
+
+        ts_reserve = _iso(self._clock())
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if retry_transfer_id is not None and str(retry_transfer_id).strip():
+                existing = conn.execute(
+                    "SELECT * FROM bank_transfers WHERE transfer_id = ? AND scope_id = ?",
+                    (str(retry_transfer_id).strip(), self.scope_id),
+                ).fetchone()
+                if existing is None:
+                    conn.execute("ROLLBACK")
+                    raise ContractError(f"Unknown retry_transfer_id {retry_transfer_id!r}")
+                if str(existing["status"]) not in ("OUTCOME_UNKNOWN", "RESERVED_PENDING_DISPATCH"):
+                    conn.execute("ROLLBACK")
+                    raise ContractError(f"Transfer {retry_transfer_id!r} cannot be retried from status {existing['status']}")
+                if str(existing["rail"]) != rail or Decimal(str(existing["amount_usd_text"])) != amt_q:
+                    conn.execute("ROLLBACK")
+                    raise ContractError("Retry transfer rail/amount does not match persisted intent")
+                transfer_id = str(existing["transfer_id"])
+                eff_idem = str(existing["idempotency_key"] or f"ach-{transfer_id}")
+                conn.execute(
+                    "UPDATE bank_transfers SET status = 'RESERVED_PENDING_DISPATCH' WHERE transfer_id = ?",
+                    (transfer_id,),
+                )
+                conn.execute("COMMIT")
+            else:
+                pending = self._pending_disbursement_unlocked(conn)
+                if amt_q > pending:
+                    conn.execute("ROLLBACK")
+                    raise ContractError(
+                        f"Requested ACH payout ${decimal_text(amt_q)} exceeds pending Bank Vault ${decimal_text(pending)}"
+                    )
+                transfer_id = f"trach-{uuid.uuid4().hex[:16]}"
+                eff_idem = (
+                    str(idempotency_key).strip()
+                    if idempotency_key is not None and str(idempotency_key).strip()
+                    else "ach-" + sha256(
+                        f"{self.scope_id}|{rail}|{owner_request_id}|{decimal_text(amt_q)}|{transfer_id}".encode("utf-8")
+                    ).hexdigest()[:24]
+                )
+                dup = conn.execute(
+                    "SELECT transfer_id, status FROM bank_transfers WHERE idempotency_key = ?",
+                    (eff_idem,),
+                ).fetchone()
+                if dup is not None:
+                    conn.execute("ROLLBACK")
+                    raise OfframpSecurityError(
+                        f"Duplicate ACH idempotency_key {eff_idem!r} already bound to {dup['transfer_id']} ({dup['status']})"
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO bank_transfers(
+                        transfer_id, scope_id, rail, broker_id, destination_bank_id, amount_usd_text,
+                        status, provider_tx_id, owner_request_id, reason, created_at, settled_at,
+                        idempotency_key, error_detail
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'RESERVED_PENDING_DISPATCH', NULL, ?, ?, ?, NULL, ?, NULL)
+                    """,
+                    (
+                        transfer_id,
+                        self.scope_id,
+                        rail,
+                        None,
+                        dest_bank,
+                        decimal_text(amt_q),
+                        str(owner_request_id),
+                        str(reason)[:240],
+                        ts_reserve,
+                        eff_idem,
+                    ),
+                )
+                self._append_audit(
+                    conn,
+                    "ACH_OFFRAMP_RESERVED",
+                    {
+                        "transfer_id": transfer_id,
+                        "idempotency_key": eff_idem,
+                        "rail": rail,
+                        "destination_bank_id": dest_bank,
+                        "amount_usd": decimal_text(amt_q),
+                    },
+                    ts_reserve,
+                )
+                conn.execute("COMMIT")
+
+        # External provider side effect executes ONLY after durable reservation & idempotency commit!
+        try:
+            if rail == RAIL_COINBASE_ACH:
+                if coinbase_client is None:
+                    raise OfframpSecurityError("CoinbaseOfframpClient is not configured")
+                if convert_from_currency is not None and convert_amount is not None:
+                    coinbase_client.convert_to_usd(
+                        from_currency=convert_from_currency,
+                        amount=convert_amount,
+                        from_account_uuid=str(coinbase_source_account_uuid),
+                        usd_account_uuid=str(coinbase_usd_account_uuid),
+                    )
+                resp = coinbase_client.withdraw_usd_to_linked_bank_ach(
+                    amount_usd=amt_q, client_reference_id=eff_idem
+                )
+                raw_tx = resp.get("id") or resp.get("payout_id") or resp.get("refid") if isinstance(resp, Mapping) else None
+            else:
+                if kraken_client is None:
+                    raise OfframpSecurityError("KrakenOfframpClient is not configured")
+                if convert_amount is not None:
+                    kraken_client.convert_to_usd(pair=kraken_pair, volume=convert_amount)
+                resp = kraken_client.withdraw_usd_to_linked_bank_ach(
+                    amount_usd=amt_q, client_reference_id=eff_idem
+                )
+                raw_tx = resp.get("refid") if isinstance(resp, Mapping) else None
+            provider_tx = str(raw_tx).strip() if isinstance(raw_tx, str) and raw_tx.strip() else ""
+            if not provider_tx:
+                raise OfframpSecurityError(
+                    f"Provider {rail} withdrawal response omitted a trustworthy transaction ID; retaining OUTCOME_UNKNOWN"
+                )
+        except Exception as exc:
+            ts_err = _iso(self._clock())
+            with self._lock, closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE bank_transfers SET status = 'OUTCOME_UNKNOWN', error_detail = ? WHERE transfer_id = ?",
+                    (f"{type(exc).__name__}:{str(exc)[:180]}", transfer_id),
+                )
+                self._append_audit(
+                    conn,
+                    "ACH_OFFRAMP_OUTCOME_UNKNOWN",
+                    {"transfer_id": transfer_id, "idempotency_key": eff_idem, "error": type(exc).__name__},
+                    ts_err,
+                )
+                conn.execute("COMMIT")
+            raise
+
+        ts_done = _iso(self._clock())
         with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                """
-                INSERT INTO bank_transfers(
-                    transfer_id, scope_id, rail, broker_id, destination_bank_id, amount_usd_text,
-                    status, provider_tx_id, owner_request_id, reason, created_at, settled_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    transfer_id,
-                    self.scope_id,
-                    rail,
-                    None,
-                    dest_bank,
-                    decimal_text(amount_usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
-                    "ACH_SUBMITTED",
-                    provider_tx,
-                    str(owner_request_id),
-                    str(reason)[:240],
-                    ts,
-                    ts,
-                ),
+                "UPDATE bank_transfers SET status = 'ACH_SUBMITTED', provider_tx_id = ?, settled_at = ?, error_detail = NULL "
+                "WHERE transfer_id = ?",
+                (provider_tx, ts_done, transfer_id),
             )
             self._append_audit(
                 conn,
                 "ACH_OFFRAMP_SUBMITTED",
                 {
                     "transfer_id": transfer_id,
+                    "idempotency_key": eff_idem,
                     "rail": rail,
                     "destination_bank_id": dest_bank,
-                    "amount_usd": decimal_text(amount_usd),
+                    "amount_usd": decimal_text(amt_q),
                     "provider_tx_id": provider_tx,
                 },
-                ts,
+                ts_done,
             )
             conn.execute("COMMIT")
-        return {"transfer_id": transfer_id, "provider_tx_id": provider_tx, "status": "ACH_SUBMITTED", "vault": self.snapshot()}
+        return {
+            "transfer_id": transfer_id,
+            "idempotency_key": eff_idem,
+            "provider_tx_id": provider_tx,
+            "status": "ACH_SUBMITTED",
+            "vault": self.snapshot(),
+        }
 
     def _pending_disbursement_unlocked(self, conn: sqlite3.Connection) -> Decimal:
         swept = Decimal("0")
@@ -923,7 +1137,7 @@ class ProfitSweepVault:
         for r in conn.execute(
             "SELECT amount_usd_text, status FROM bank_transfers WHERE scope_id = ?", (self.scope_id,)
         ):
-            if str(r["status"]) in ("SETTLED", "ACH_SUBMITTED"):
+            if str(r["status"]) in ("SETTLED", "ACH_SUBMITTED", "RESERVED_PENDING_DISPATCH", "OUTCOME_UNKNOWN"):
                 disbursed += Decimal(str(r["amount_usd_text"]))
         rem = swept - disbursed
         return rem if rem > Decimal("0") else Decimal("0.00")
@@ -965,9 +1179,9 @@ class ProfitSweepVault:
             for idx, r in enumerate(trows):
                 amt = Decimal(str(r["amount_usd_text"]))
                 st = str(r["status"])
-                if st in ("SETTLED", "ACH_SUBMITTED"):
+                if st in ("SETTLED", "ACH_SUBMITTED", "RESERVED_PENDING_DISPATCH", "OUTCOME_UNKNOWN"):
                     disbursed += amt
-                elif st == "PENDING_OWNER_BROKER_2FA":
+                elif st in ("PENDING_OWNER_BROKER_2FA", "BROKER_2FA_VERIFICATION_UNKNOWN"):
                     pending_2fa += amt
                 if idx < 25:
                     recent_transfers.append({

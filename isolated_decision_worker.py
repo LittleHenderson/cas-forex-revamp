@@ -110,17 +110,11 @@ def main():
             'supervisor':json.loads(canonical_bytes(supervisor)),'pin':json.loads(canonical_bytes(pin))})
         method,binding=channel.receive();need(method=='RELEASE_BOUND','release required before current frames')
         channel.custody_binding=binding
-        store=CurrentModelStore(channel,run_id=cfg['run_id'],deadline=deadline)
-        active=None
-        def gate(invocation):
-            need(active is not None and invocation==active and clock()<deadline,'exact current invocation/window required')
-            channel.call('GATE',{'invocation_sha256':content_digest(invocation)})
-        ports={};backends={};counts={'probe':0,'acceptance':0}
-        for phase in ('probe','acceptance'):
-            p=RemoteObservedPorts(channel=channel,store=store,phase=phase,runtime=runtime,clock=clock,execution_gate=gate)
-            ports[phase]=p
-            backends[phase]=p.backend(pin=pin,selection_schema_bytes=schema,max_calls=PHASES[phase][0],max_total_seconds=PHASES[phase][4])
-        previous_runner=None
+        # Finding [4]: model transport, byte capture, attempt reservation, and
+        # runtime/socket observation execute strictly inside the controller-owned
+        # trusted observer boundary. The worker only requests controller-minted
+        # invocations and receives bounded parsed results.
+        counts={'probe':0,'acceptance':0}
         while True:
             # Waiting for the next frame is bounded too; the authenticated frame
             # then supplies the earlier original controller-minted deadline.
@@ -137,30 +131,22 @@ def main():
             need(invocation_deadline<=datetime.fromisoformat(frame['not_before_utc'].replace('Z','+00:00'))
                  +timedelta(seconds=PHASES[phase][3]),'frame extends per-invocation budget')
             channel.begin_invocation(delivery_id,invocation_deadline)
-            # No previous model context may carry into another trajectory. The
-            # pinned keep_alive=0 route must actually retire the old runner.
-            if previous_runner is not None:
-                expiry=min(invocation_deadline,clock()+timedelta(seconds=10))
-                while _runner_alive(previous_runner['pid']) and clock()<expiry:time.sleep(.05)
-                need(not _runner_alive(previous_runner['pid']),'previous model runner not unloaded')
-                reap_expiry=min(invocation_deadline,clock()+timedelta(seconds=2))
-                ollama_pid=getattr(runtime,'ollama_pid',runtime.spec.ollama_pid)
-                while _runner_in_children(ollama_pid,previous_runner['pid'],runtime.proc_root) and clock()<reap_expiry:time.sleep(.02)
             active=ModelInvocation(packet['exact_request_sha256'],model,
                 'session-'+content_digest((cfg['run_id']+'-'+phase,packet['request_id'],counts[phase])),
                 SYSTEM_POLICY,canonical_bytes(packet).decode(),InferenceBudget(*PHASES[phase]),seed=cfg['seed'])
             key=content_digest(active)
             try:
-                counted=backends[phase].count_input_tokens(active)
-                channel.send('PREFLIGHT_READY',{'invocation_sha256':key,'input_tokens':counted})
+                pref=channel.call('OBSERVED_PREFLIGHT',{'invocation_sha256':key})
+                need(type(pref) is dict and type(pref.get('input_tokens')) is int,'controller preflight count required')
+                channel.send('PREFLIGHT_READY',{'invocation_sha256':key,'input_tokens':pref['input_tokens']})
                 method,value=channel.receive()
                 need(method=='GENERATE' and value=={'invocation_sha256':key},'explicit exact generation request required')
                 counts[phase]+=1
-                reply=backends[phase].infer(active)
-                previous_runner=store.resolve('token-proof-'+key)['payload']['runtime']['runner']
-                # The controller independently resolves raw receipts and builds
+                gen=channel.call('OBSERVED_GENERATE',{'invocation_sha256':key})
+                need(type(gen) is dict and isinstance(gen.get('receipt_id'),str),'controller observed generation required')
+                # The controller independently resolves observer-attested receipts and builds
                 # the public-contract proposal envelope from this exact outcome.
-                result=channel.call('OUTCOME',{'invocation_sha256':key,'status':'COMPLETE','receipt_id':reply.receipt_id})
+                result=channel.call('OUTCOME',{'invocation_sha256':key,'status':'COMPLETE','receipt_id':gen['receipt_id']})
                 channel.accept_public(result,binding)
                 channel.send('DECISION_RESULT',result)
                 channel.finish_invocation(delivery_id)

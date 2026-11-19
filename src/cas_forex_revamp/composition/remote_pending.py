@@ -23,9 +23,15 @@ class ControllerDueEvents:
 
     def submitted(self, message):
         need(self.submission is None,'complete-send identity already retained; no resend')
-        s = self.store.resolve('generation-sent-'+self.key)
-        p = s['payload']; a=self.store.resolve('generation-attempt-'+self.key)
-        token=self.store.resolve('token-proof-'+self.key)
+        if getattr(self.store, 'has_observer_key', False) and callable(getattr(self.store, 'require_observer_provenance', None)):
+            s = self.store.require_observer_provenance('generation-sent-'+self.key)
+            a = self.store.require_observer_provenance('generation-attempt-'+self.key)
+            token = self.store.require_observer_provenance('token-proof-'+self.key)
+        else:
+            s = self.store.resolve('generation-sent-'+self.key)
+            a = self.store.resolve('generation-attempt-'+self.key)
+            token = self.store.resolve('token-proof-'+self.key)
+        p = s['payload']
         expected={'generation_attempt_id':a['receipt_id'],'generation_http_id':'generation-http-'+self.key,
             'invocation_sha256':self.key,'generation_body_sha256':p['body_sha256'],
             'transport_sent_receipt_sha256':s['sha256'],

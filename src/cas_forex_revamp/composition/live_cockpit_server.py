@@ -20,7 +20,11 @@ from collections.abc import Callable, Mapping
 import os
 import hmac
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+import math
+import re
 import socket
 import ipaddress
 import json
@@ -33,17 +37,181 @@ from typing import Any
 import urllib.parse
 
 from cas_forex_revamp.contracts import ContractError
+from cas_forex_revamp.composition.state_store import (
+    create_owner_only_file_atomic,
+    open_verified_directory_fd,
+    verify_and_read_owner_only_file,
+)
 from cas_forex_revamp.operator.frontier_backends import assert_safe_ai_catalog_payload
 
-class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
-    """Loopback HTTP server preventing duplicate-port SO_REUSEADDR hijacking."""
+class _SessionRevokedError(Exception):
+    """Raised when a session epoch is revoked prior to commit."""
+
+
+_COCKPIT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
+MAX_HTTP_HEADER_BYTES = 16384
+MAX_HTTP_HEADER_COUNT = 64
+
+
+def _is_valid_generated_cockpit_token(raw: str) -> bool:
+    """Validate that a cockpit bearer matches generated high-entropy urlsafe base64 format (Finding [2])."""
+    if not isinstance(raw, str) or not _COCKPIT_TOKEN_RE.match(raw):
+        return False
+    unique_chars = len(set(raw))
+    if unique_chars < 16:
+        return False
+    length = float(len(raw))
+    counts: dict[str, int] = {}
+    for ch in raw:
+        counts[ch] = counts.get(ch, 0) + 1
+    entropy = -sum((c / length) * math.log2(c / length) for c in counts.values())
+    return entropy >= 3.5
+
+
+class _DeadlineRFile:
+    """Wrap socket rfile with an absolute header-read wall-clock deadline and cumulative byte ceiling (Finding [8])."""
+
+    def __init__(self, sock: socket.socket, raw_rfile: Any, *, deadline: float, max_bytes: int) -> None:
+        self._sock = sock
+        self._raw = raw_rfile
+        self._deadline = deadline
+        self._max_bytes = max_bytes
+        self._total_read = 0
+        self.header_deadline_exceeded = False
+        self.header_size_exceeded = False
+
+    def readline(self, limit: int = -1) -> bytes:
+        rem = self._deadline - time.monotonic()
+        if rem <= 0:
+            self.header_deadline_exceeded = True
+            raise TimeoutError("absolute HTTP header deadline exceeded")
+        self._sock.settimeout(min(rem, 1.0))
+        budget = self._max_bytes - self._total_read
+        if budget <= 0:
+            self.header_size_exceeded = True
+            raise ValueError("HTTP header byte limit exceeded")
+        eff_limit = budget + 1 if limit < 0 else min(limit, budget + 1)
+        try:
+            line = self._raw.readline(eff_limit)
+        except (TimeoutError, socket.timeout):
+            if time.monotonic() >= self._deadline:
+                self.header_deadline_exceeded = True
+                raise TimeoutError("absolute HTTP header deadline exceeded") from None
+            rem2 = self._deadline - time.monotonic()
+            if rem2 <= 0:
+                self.header_deadline_exceeded = True
+                raise TimeoutError("absolute HTTP header deadline exceeded") from None
+            self._sock.settimeout(rem2)
+            line = self._raw.readline(eff_limit)
+        self._total_read += len(line)
+        if self._total_read > self._max_bytes:
+            self.header_size_exceeded = True
+            raise ValueError("HTTP header byte limit exceeded")
+        if time.monotonic() > self._deadline:
+            self.header_deadline_exceeded = True
+            raise TimeoutError("absolute HTTP header deadline exceeded")
+        return line
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw, name)
+
+
+class _ExclusiveThreadingHTTPServer(HTTPServer):
+    """Bounded loopback HTTP server preventing SO_REUSEADDR hijacking and pre-auth thread exhaustion (Finding [8])."""
 
     allow_reuse_address = False
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        RequestHandlerClass: type[BaseHTTPRequestHandler],
+        *,
+        ordinary_slots: int = 16,
+        emergency_slots: int = 4,
+    ) -> None:
+        self._ordinary_slots = max(1, int(ordinary_slots))
+        self._emergency_slots = max(1, int(emergency_slots))
+        self._ordinary_conn_sem = threading.BoundedSemaphore(self._ordinary_slots)
+        self._emergency_conn_sem = threading.BoundedSemaphore(self._emergency_slots)
+        self._slot_lock = threading.Lock()
+        self._conn_slot_kind: dict[int, str] = {}
+        self._active_workers = 0
+        self._peak_workers = 0
+        self._rejected_pre_auth = 0
+        self._executor = ThreadPoolExecutor(
+            max_workers=self._ordinary_slots + self._emergency_slots,
+            thread_name_prefix="cas-cockpit-worker",
+        )
+        super().__init__(server_address, RequestHandlerClass)
 
     def server_bind(self) -> None:
         if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
+
+    def slot_kind_for(self, request: socket.socket) -> str:
+        with self._slot_lock:
+            return self._conn_slot_kind.get(id(request), "ordinary")
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if self._ordinary_conn_sem.acquire(blocking=False):
+            slot_kind = "ordinary"
+            sem = self._ordinary_conn_sem
+        elif self._emergency_conn_sem.acquire(blocking=False):
+            slot_kind = "emergency_probe"
+            sem = self._emergency_conn_sem
+        else:
+            with self._slot_lock:
+                self._rejected_pre_auth += 1
+            try:
+                if isinstance(request, socket.socket):
+                    request.settimeout(0.25)
+                    request.sendall(
+                        b"HTTP/1.1 503 Service Unavailable\r\n"
+                        b"Content-Type: application/json; charset=utf-8\r\n"
+                        b"Connection: close\r\n"
+                        b"Content-Length: 43\r\n\r\n"
+                        b"{\"error\": \"Cockpit connection pool full\"}\n"
+                    )
+            except OSError as exc:
+                _drop_err = str(exc)  # best-effort 503 before pre-auth close
+            self.shutdown_request(request)
+            return
+
+        with self._slot_lock:
+            self._conn_slot_kind[id(request)] = slot_kind
+            self._active_workers += 1
+            if self._active_workers > self._peak_workers:
+                self._peak_workers = self._active_workers
+
+        def _worker() -> None:
+            try:
+                self.finish_request(request, client_address)
+            except Exception:
+                self.handle_error(request, client_address)
+            finally:
+                try:
+                    self.shutdown_request(request)
+                finally:
+                    with self._slot_lock:
+                        self._conn_slot_kind.pop(id(request), None)
+                        self._active_workers = max(0, self._active_workers - 1)
+                    sem.release()
+
+        try:
+            self._executor.submit(_worker)
+        except RuntimeError:
+            with self._slot_lock:
+                self._conn_slot_kind.pop(id(request), None)
+                self._active_workers = max(0, self._active_workers - 1)
+            sem.release()
+            self.shutdown_request(request)
+
+    def server_close(self) -> None:
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        finally:
+            super().server_close()
 
 
 def _roll_mt5_index_bars(prev_bars: Any, bucket_iso: str, mid_px: Any, _dec_txt: Any, limit: int = 48) -> list[dict[str, Any]]:
@@ -282,6 +450,10 @@ class LoopbackCockpitServer:
         owner_recovery: Any | None = None,
         token_file: str | Path | None = None,
         public_origin: str | None = None,
+        withdrawal_provider_verifier: Callable[[str, str], Mapping[str, Any]] | None = None,
+        max_ordinary_connections: int = 16,
+        max_emergency_connections: int = 4,
+        header_deadline_seconds: float = 3.0,
     ) -> None:
         self._host = validate_loopback_host(host)
         if type(port) is not int or not (0 <= port <= 65535):
@@ -311,15 +483,30 @@ class LoopbackCockpitServer:
         self._sse_cond = threading.Condition()
         self._sse_version = 0
         self._last_routing_error: str | None = None
+        self._withdrawal_provider_verifier = withdrawal_provider_verifier
+        self._max_ordinary_connections = max(1, int(max_ordinary_connections))
+        self._max_emergency_connections = max(1, int(max_emergency_connections))
+        self._header_deadline_seconds = max(0.2, float(header_deadline_seconds))
         self._auth_lock = threading.RLock()
+        self._auth_cond = threading.Condition(self._auth_lock)
         self._auth_secret: _CockpitSecret | None = None
         self._session_epoch: str | None = None
-        self._worker_sem = threading.BoundedSemaphore(16)
-        self._emergency_sem = threading.BoundedSemaphore(4)
+        self._revoked_epochs: set[str] = set()
+        self._inflight_commits: dict[str, int] = {}
+        self._worker_sem = threading.BoundedSemaphore(self._max_ordinary_connections)
+        self._emergency_sem = threading.BoundedSemaphore(self._max_emergency_connections)
         self._sse_sem = threading.BoundedSemaphore(4)
         self._sockets_lock = threading.Lock()
         self._active_sockets: set[socket.socket] = set()
-        self._token_file: Path | None = Path(token_file).resolve() if token_file else None
+        # Finding [2]: preserve un-resolved Path so symlink/parent custody checks run BEFORE any open!
+        if token_file is not None and str(token_file).strip():
+            tf_raw = str(token_file).strip()
+            tf_path = Path(tf_raw)
+            if not tf_path.is_absolute() or ".." in tf_path.parts:
+                raise ContractError(f"token_file must be an absolute path without '..': {tf_raw!r}")
+            self._token_file: Path | None = tf_path
+        else:
+            self._token_file = None
         self._public_origin, self._public_host = validate_public_origin(public_origin)
 
     def __repr__(self) -> str:
@@ -391,39 +578,126 @@ class LoopbackCockpitServer:
     def _verify_commit_epoch(self, bearer_token: str | None, captured_epoch: str) -> bool:
         if not bearer_token or not captured_epoch:
             return False
-        with self._auth_lock:
+        with self._auth_cond:
             if self._stop_event.is_set() or self._httpd is None:
+                return False
+            if captured_epoch in self._revoked_epochs:
                 return False
             if self._auth_secret is None or self._session_epoch != captured_epoch:
                 return False
             return hmac.compare_digest(bearer_token.encode("utf-8"), self._auth_secret.reveal().encode("utf-8"))
 
+    @contextmanager
+    def _commit_lease(self, bearer_token: str | None, captured_epoch: str, *, hold_lock: bool = True):
+        """Acquire a revocable commit lease verified at commit time; rotation drains active leases before returning (Finding [10])."""
+        if not bearer_token or not captured_epoch:
+            raise _SessionRevokedError("missing bearer or epoch")
+        with self._auth_cond:
+            if (
+                self._stop_event.is_set()
+                or self._httpd is None
+                or captured_epoch in self._revoked_epochs
+                or self._auth_secret is None
+                or self._session_epoch != captured_epoch
+                or not hmac.compare_digest(bearer_token.encode("utf-8"), self._auth_secret.reveal().encode("utf-8"))
+            ):
+                raise _SessionRevokedError("session epoch revoked or bearer mismatch")
+            self._inflight_commits[captured_epoch] = self._inflight_commits.get(captured_epoch, 0) + 1
+            if hold_lock:
+                # Hold auth_lock strictly across short in-memory/SQLite state commits so rotation cannot interleave
+                try:
+                    yield captured_epoch
+                finally:
+                    rem = self._inflight_commits.get(captured_epoch, 1) - 1
+                    if rem <= 0:
+                        self._inflight_commits.pop(captured_epoch, None)
+                    else:
+                        self._inflight_commits[captured_epoch] = rem
+                    self._auth_cond.notify_all()
+                return
+        # Non-blocking lease for external network I/O routes: tracked for deterministic rotation drain
+        try:
+            yield captured_epoch
+        finally:
+            with self._auth_cond:
+                rem = self._inflight_commits.get(captured_epoch, 1) - 1
+                if rem <= 0:
+                    self._inflight_commits.pop(captured_epoch, None)
+                else:
+                    self._inflight_commits[captured_epoch] = rem
+                self._auth_cond.notify_all()
+
     def _write_token_file(self, tok_value: str) -> None:
         if self._token_file is None:
             return
-        self._token_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp_p = self._token_file.with_suffix(".tmp")
-        tmp_p.write_text(tok_value + "\n", encoding="utf-8")
-        tmp_p.replace(self._token_file)
-        if os.name != "nt":
-            os.chmod(self._token_file, 0o600)
+        create_owner_only_file_atomic(
+            self._token_file.parent,
+            self._token_file.name,
+            (tok_value + "\n").encode("utf-8"),
+            replace_existing=True,
+            label="cockpit token file",
+        )
 
     def _load_or_init_auth_token(self) -> None:
-        if self._token_file is not None and self._token_file.is_file():
-            raw = self._token_file.read_text(encoding="utf-8").strip()
-            if len(raw) >= 32 and not any(ch in raw for ch in ("\r", "\n", "\x00")):
+        if self._token_file is not None:
+            parent_path, dir_fd = open_verified_directory_fd(
+                self._token_file.parent, create=True, label="cockpit token directory"
+            )
+            try:
+                fname = self._token_file.name
+                exists = False
+                if os.name == "posix" and dir_fd is not None:
+                    try:
+                        os.lstat(fname, dir_fd=dir_fd)
+                        exists = True
+                    except FileNotFoundError:
+                        exists = False
+                else:
+                    exists = os.path.lexists(self._token_file)
+                if exists:
+                    raw_bytes, _ = verify_and_read_owner_only_file(
+                        parent_path, fname, dir_fd=dir_fd, label="cockpit token file", max_bytes=256
+                    )
+                    raw = raw_bytes.decode("utf-8").strip()
+                    if not _is_valid_generated_cockpit_token(raw):
+                        raise ContractError(
+                            "Refusing malformed or low-entropy pre-existing cockpit token file (expected generated 43+ char high-entropy token)"
+                        )
+                    new_epoch = "epoch-" + secrets.token_hex(16)
+                    with self._auth_cond:
+                        self._auth_secret = _CockpitSecret(raw)
+                        self._session_epoch = new_epoch
+                        if self._ui_service is not None and callable(getattr(self._ui_service, "rotate_adapter_session", None)):
+                            self._ui_service.rotate_adapter_session(new_epoch)
+                    return
+                # Missing: generate new secret and create exclusively relative to verified parent dir_fd
+                new_tok = _CockpitSecret(secrets.token_urlsafe(32))
                 new_epoch = "epoch-" + secrets.token_hex(16)
-                with self._auth_lock:
-                    self._auth_secret = _CockpitSecret(raw)
+                create_owner_only_file_atomic(
+                    parent_path,
+                    fname,
+                    (new_tok.reveal() + "\n").encode("utf-8"),
+                    dir_fd=dir_fd,
+                    replace_existing=False,
+                    label="cockpit token file",
+                )
+                with self._auth_cond:
+                    self._auth_secret = new_tok
                     self._session_epoch = new_epoch
                     if self._ui_service is not None and callable(getattr(self._ui_service, "rotate_adapter_session", None)):
                         self._ui_service.rotate_adapter_session(new_epoch)
                 return
+            finally:
+                if dir_fd is not None:
+                    os.close(dir_fd)
         self.rotate_auth_token()
 
     def rotate_auth_token(self) -> str:
-        """Rotate per-launch bearer secret + session_epoch, terminating prior connections."""
-        with self._auth_lock:
+        """Rotate per-launch bearer secret + session_epoch, revoking prior epoch and draining active commits (Finding [10])."""
+        with self._auth_cond:
+            old_epoch = self._session_epoch
+            if old_epoch is not None:
+                self._revoked_epochs.add(old_epoch)
             new_tok = _CockpitSecret(secrets.token_urlsafe(32))
             new_epoch = "epoch-" + secrets.token_hex(16)
             self._auth_secret = new_tok
@@ -432,8 +706,14 @@ class LoopbackCockpitServer:
                 self._ui_service.rotate_adapter_session(new_epoch)
             if self._token_file is not None:
                 self._write_token_file(new_tok.reveal())
+            self._auth_cond.notify_all()
         self.notify_stream_updated()
         self._close_active_sockets()
+        if old_epoch is not None:
+            drain_deadline = time.monotonic() + 5.0
+            with self._auth_cond:
+                while self._inflight_commits.get(old_epoch, 0) > 0 and time.monotonic() < drain_deadline:
+                    self._auth_cond.wait(timeout=0.05)
         return new_tok.reveal()
 
     def notify_stream_updated(self) -> None:
@@ -561,9 +841,59 @@ class LoopbackCockpitServer:
 
             def setup(self) -> None:
                 super().setup()
+                self._slot_kind = (
+                    self.server.slot_kind_for(self.connection)
+                    if hasattr(self.server, "slot_kind_for")
+                    else "ordinary"
+                )
                 if isinstance(self.connection, socket.socket):
-                    self.connection.settimeout(5.0)
+                    self.connection.settimeout(min(outer._header_deadline_seconds, 5.0))
                     outer._register_socket(self.connection)
+
+            def parse_request(self) -> bool:
+                if isinstance(self.connection, socket.socket):
+                    hdr_budget = (
+                        min(1.0, outer._header_deadline_seconds)
+                        if getattr(self, "_slot_kind", "ordinary") == "emergency_probe"
+                        else outer._header_deadline_seconds
+                    )
+                    orig_rfile = self.rfile
+                    wrapped = _DeadlineRFile(
+                        self.connection,
+                        orig_rfile,
+                        deadline=time.monotonic() + hdr_budget,
+                        max_bytes=MAX_HTTP_HEADER_BYTES,
+                    )
+                    self.rfile = wrapped  # type: ignore[assignment]
+                    try:
+                        ok = super().parse_request()
+                    except TimeoutError:
+                        self.close_connection = True
+                        return False
+                    except ValueError:
+                        self.close_connection = True
+                        return False
+                    finally:
+                        self.rfile = orig_rfile
+                        try:
+                            self.connection.settimeout(5.0)
+                        except OSError as exc:
+                            _to_err = str(exc)  # socket already closed
+                    if not ok:
+                        return False
+                    if len(self.headers) > MAX_HTTP_HEADER_COUNT:
+                        self._write_json(HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE, {"error": "Too many HTTP headers"})
+                        return False
+                    if getattr(self, "_slot_kind", "ordinary") == "emergency_probe":
+                        req_route = urllib.parse.urlsplit(self.path).path
+                        if not (
+                            str(self.command).upper() == "POST"
+                            and req_route in ("/api/ai-overseer-action", "/api/request-control")
+                        ):
+                            self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Ordinary cockpit connection slots full; emergency capacity reserved"})
+                            return False
+                    return True
+                return super().parse_request()
 
             def finish(self) -> None:
                 try:
@@ -892,13 +1222,16 @@ class LoopbackCockpitServer:
                             return
                         if type(body) is not dict or "model_id" not in body:
                             raise ContractError("model_id field required")
-                        if "fast_scout_enabled" in body:
-                            outer._ai_model_registry.set_fast_scout_enabled(bool(body["fast_scout_enabled"]))
-                        if "thinking_depth" in body and body["thinking_depth"] is not None:
-                            outer._ai_model_registry.set_thinking_depth(str(body["thinking_depth"]))
-                        updated = assert_safe_ai_catalog_payload(outer._ai_model_registry.select_model(str(body["model_id"])))
+                        with outer._commit_lease(supplied_tok, auth_epoch):
+                            if "fast_scout_enabled" in body:
+                                outer._ai_model_registry.set_fast_scout_enabled(bool(body["fast_scout_enabled"]))
+                            if "thinking_depth" in body and body["thinking_depth"] is not None:
+                                outer._ai_model_registry.set_thinking_depth(str(body["thinking_depth"]))
+                            updated = assert_safe_ai_catalog_payload(outer._ai_model_registry.select_model(str(body["model_id"])))
                         outer.notify_stream_updated()
                         self._write_json(HTTPStatus.OK, updated)
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
@@ -913,11 +1246,14 @@ class LoopbackCockpitServer:
                             return
                         if type(body) is not dict or "thinking_depth" not in body:
                             raise ContractError("thinking_depth field required")
-                        updated = assert_safe_ai_catalog_payload(
-                            outer._ai_model_registry.set_thinking_depth(str(body["thinking_depth"]))
-                        )
+                        with outer._commit_lease(supplied_tok, auth_epoch):
+                            updated = assert_safe_ai_catalog_payload(
+                                outer._ai_model_registry.set_thinking_depth(str(body["thinking_depth"]))
+                            )
                         outer.notify_stream_updated()
                         self._write_json(HTTPStatus.OK, updated)
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
@@ -936,13 +1272,16 @@ class LoopbackCockpitServer:
                         ratio_v = _Dec(str(body["sweep_ratio"])) if body.get("sweep_ratio") is not None else None
                         auto_v = bool(body["auto_sweep_enabled"]) if "auto_sweep_enabled" in body else None
                         rail_v = str(body["preferred_rail"]) if body.get("preferred_rail") is not None else None
-                        updated = assert_safe_ai_catalog_payload(
-                            outer._profit_vault.set_config(
-                                sweep_ratio=ratio_v, auto_sweep_enabled=auto_v, preferred_rail=rail_v
+                        with outer._commit_lease(supplied_tok, auth_epoch):
+                            updated = assert_safe_ai_catalog_payload(
+                                outer._profit_vault.set_config(
+                                    sweep_ratio=ratio_v, auto_sweep_enabled=auto_v, preferred_rail=rail_v
+                                )
                             )
-                        )
                         outer.notify_stream_updated()
                         self._write_json(HTTPStatus.OK, updated)
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
@@ -965,38 +1304,47 @@ class LoopbackCockpitServer:
                         reason = str(body.get("reason") or "Owner treasury disbursement")
                         rec_tok = body.get("recovery_token") or body.get("owner_authorization")
                         if act == "REQUEST_BROKER_2FA_WITHDRAWAL":
-                            res = outer._profit_vault.request_broker_2fa_withdrawal(
-                                broker_id=str(body.get("broker_id") or "HUGOSWAY_MT5"),
-                                amount_usd=_Dec(str(body["amount_usd"])),
-                                owner_request_id=req_id,
-                                reason=reason,
-                                verifier=outer._owner_recovery,
-                                recovery_token=str(rec_tok or ""),
-                            )
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                res = outer._profit_vault.request_broker_2fa_withdrawal(
+                                    broker_id=str(body.get("broker_id") or "HUGOSWAY_MT5"),
+                                    amount_usd=_Dec(str(body["amount_usd"])),
+                                    owner_request_id=req_id,
+                                    reason=reason,
+                                    verifier=outer._owner_recovery,
+                                    recovery_token=str(rec_tok or ""),
+                                )
                         elif act == "CONFIRM_BROKER_2FA_WITHDRAWAL":
-                            res = outer._profit_vault.confirm_broker_2fa_withdrawal(
-                                transfer_id=str(body["transfer_id"]),
-                                provider_tx_id=str(body["provider_tx_id"]),
-                            )
+                            with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=False):
+                                res = outer._profit_vault.confirm_broker_2fa_withdrawal(
+                                    transfer_id=str(body["transfer_id"]),
+                                    provider_tx_id=str(body["provider_tx_id"]),
+                                    owner_request_id=req_id,
+                                    verifier=outer._owner_recovery,
+                                    recovery_token=str(rec_tok or ""),
+                                    provider_verifier=outer._withdrawal_provider_verifier,  # type: ignore[arg-type]
+                                )
                         elif act == "EXECUTE_OFFRAMP_ACH":
                             from cas_forex_revamp.treasury.profit_sweep import CoinbaseOfframpClient, KrakenOfframpClient
                             rail_name = str(body.get("rail") or "COINBASE_ACH").strip().upper()
                             cb = CoinbaseOfframpClient.from_environ(os.environ) if rail_name == "COINBASE_ACH" else None
                             krk = KrakenOfframpClient.from_environ(os.environ) if rail_name == "KRAKEN_ACH" else None
-                            res = outer._profit_vault.execute_offramp_ach_payout(
-                                rail=rail_name,
-                                amount_usd=_Dec(str(body["amount_usd"])),
-                                owner_request_id=req_id,
-                                reason=reason,
-                                verifier=outer._owner_recovery,
-                                recovery_token=str(rec_tok or ""),
-                                coinbase_client=cb,
-                                kraken_client=krk,
-                            )
+                            with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=False):
+                                res = outer._profit_vault.execute_offramp_ach_payout(
+                                    rail=rail_name,
+                                    amount_usd=_Dec(str(body["amount_usd"])),
+                                    owner_request_id=req_id,
+                                    reason=reason,
+                                    verifier=outer._owner_recovery,
+                                    recovery_token=str(rec_tok or ""),
+                                    coinbase_client=cb,
+                                    kraken_client=krk,
+                                )
                         else:
                             raise ContractError(f"unsupported treasury action {act!r}")
                         outer.notify_stream_updated()
                         self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(res))
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
                     except Exception as exc:
                         code = HTTPStatus.FORBIDDEN if "OWNER_RECOVERY" in str(exc) else HTTPStatus.BAD_REQUEST
                         self._write_json(code, {"error": str(exc)})
@@ -1051,51 +1399,56 @@ class LoopbackCockpitServer:
                         if act == "TOGGLE_FAST_SCOUT":
                             if outer._ai_model_registry is None:
                                 raise ContractError("AI model registry not configured")
-                            enabled = bool(body.get("enabled", not outer._ai_model_registry.fast_scout_enabled))
-                            res = assert_safe_ai_catalog_payload(outer._ai_model_registry.set_fast_scout_enabled(enabled))
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                enabled = bool(body.get("enabled", not outer._ai_model_registry.fast_scout_enabled))
+                                res = assert_safe_ai_catalog_payload(outer._ai_model_registry.set_fast_scout_enabled(enabled))
                             outer.notify_stream_updated()
                             self._write_json(HTTPStatus.OK, res)
                             return
                         if outer._autonomous_trader is None:
                             self._write_json(HTTPStatus.NOT_FOUND, {"error": "Autonomous AI trader not attached"})
                             return
-                        if act == "PAUSE_NEW_RISK":
-                            res = outer._autonomous_trader.pause_new_risk(reason=reason)
-                        elif act == "RESUME_AUTONOMOUS":
-                            res = outer._autonomous_trader.resume_autonomous(reason=reason)
-                        elif act == "STOP_AUTOMATION":
-                            res = outer._autonomous_trader.stop_automation(reason=reason)
-                        elif act == "EMERGENCY_CLOSE_ALL":
-                            res = outer._autonomous_trader.emergency_close_all(reason=reason)
-                        elif act in ("REARM_DRAWDOWN", "UNLOCK_QUOTA_SESSION"):
-                            req_id = str(body.get("owner_request_id") or "overseer-unlock-1")
-                            rec_tok = body.get("recovery_token")
-                            new_pk = body.get("new_peak_equity")
-                            from decimal import Decimal as _Dec
-                            pk_val = _Dec(str(new_pk)) if new_pk is not None else None
-                            res = outer._autonomous_trader.rearm_and_unlock(
-                                owner_request_id=req_id,
-                                reason=reason,
-                                recovery_token=None if rec_tok is None else str(rec_tok),
-                                unlock_recovery_token=None if body.get("unlock_recovery_token") is None else str(body.get("unlock_recovery_token")),
-                                new_peak_equity=pk_val,
-                            )
-                        elif act == "UPDATE_QUOTA_TARGETS":
-                            req_id = str(body.get("owner_request_id") or "overseer-quota-1")
-                            rec_tok = body.get("recovery_token")
-                            res = outer._autonomous_trader.quota_store.update_targets(
-                                soft_quota_usd=body.get("soft_quota_usd"),
-                                hard_quota_usd=body.get("hard_quota_usd"),
-                                daily_quota_pct=body.get("daily_quota_pct"),
-                                quota_mode=body.get("quota_mode"),
-                                owner_request_id=req_id,
-                                recovery_token=None if rec_tok is None else str(rec_tok),
-                            )
-                            res = assert_safe_ai_catalog_payload(res)
-                        else:
-                            raise ContractError(f"unsupported overseer action {act!r}")
+                        hold_sync = act != "EMERGENCY_CLOSE_ALL"
+                        with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=hold_sync):
+                            if act == "PAUSE_NEW_RISK":
+                                res = outer._autonomous_trader.pause_new_risk(reason=reason)
+                            elif act == "RESUME_AUTONOMOUS":
+                                res = outer._autonomous_trader.resume_autonomous(reason=reason)
+                            elif act == "STOP_AUTOMATION":
+                                res = outer._autonomous_trader.stop_automation(reason=reason)
+                            elif act == "EMERGENCY_CLOSE_ALL":
+                                res = outer._autonomous_trader.emergency_close_all(reason=reason)
+                            elif act in ("REARM_DRAWDOWN", "UNLOCK_QUOTA_SESSION"):
+                                req_id = str(body.get("owner_request_id") or "overseer-unlock-1")
+                                rec_tok = body.get("recovery_token")
+                                new_pk = body.get("new_peak_equity")
+                                from decimal import Decimal as _Dec
+                                pk_val = _Dec(str(new_pk)) if new_pk is not None else None
+                                res = outer._autonomous_trader.rearm_and_unlock(
+                                    owner_request_id=req_id,
+                                    reason=reason,
+                                    recovery_token=None if rec_tok is None else str(rec_tok),
+                                    unlock_recovery_token=None if body.get("unlock_recovery_token") is None else str(body.get("unlock_recovery_token")),
+                                    new_peak_equity=pk_val,
+                                )
+                            elif act == "UPDATE_QUOTA_TARGETS":
+                                req_id = str(body.get("owner_request_id") or "overseer-quota-1")
+                                rec_tok = body.get("recovery_token")
+                                res = outer._autonomous_trader.quota_store.update_targets(
+                                    soft_quota_usd=body.get("soft_quota_usd"),
+                                    hard_quota_usd=body.get("hard_quota_usd"),
+                                    daily_quota_pct=body.get("daily_quota_pct"),
+                                    quota_mode=body.get("quota_mode"),
+                                    owner_request_id=req_id,
+                                    recovery_token=None if rec_tok is None else str(rec_tok),
+                                )
+                                res = assert_safe_ai_catalog_payload(res)
+                            else:
+                                raise ContractError(f"unsupported overseer action {act!r}")
                         outer.notify_stream_updated()
                         self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(res))
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
                     except Exception as exc:
                         code = HTTPStatus.FORBIDDEN if "OWNER_RECOVERY" in str(exc) else HTTPStatus.BAD_REQUEST
                         self._write_json(code, {"error": str(exc)})
@@ -1121,15 +1474,22 @@ class LoopbackCockpitServer:
                     if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
                         self._reject_unauthorized()
                         return
-                    result = fn(body)
+                    with outer._commit_lease(supplied_tok, auth_epoch):
+                        result = fn(body)
                     self._write_json(HTTPStatus.OK, result)
+                except _SessionRevokedError:
+                    self._reject_unauthorized()
                 except Exception as exc:
                     self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
         self._stop_event.clear()
         self._load_or_init_auth_token()
-        self._httpd = _ExclusiveThreadingHTTPServer((self._host, self._port), _Handler)
-        self._httpd.daemon_threads = True
+        self._httpd = _ExclusiveThreadingHTTPServer(
+            (self._host, self._port),
+            _Handler,
+            ordinary_slots=self._max_ordinary_connections,
+            emergency_slots=self._max_emergency_connections,
+        )
         self._httpd.request_queue_size = 32
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="cas-forex-cockpit-http", daemon=True)
         self._thread.start()
@@ -1289,6 +1649,8 @@ def run_cockpit_cli(
         valve_gate=gate,
         peak_equity_store=runtime_state.peak_equity_store,
         index_reference_source=_read_index_ref,
+        oanda_mutation_journal=runtime_state.oanda_mutation_journal,
+        mt5_mutation_journal=runtime_state.mt5_mutation_journal,
     )
     merged_ai = dict(merged)
     if not str(merged_ai.get("CAS_FOREX_THINKING_DEPTH", "")).strip():
