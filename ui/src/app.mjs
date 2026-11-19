@@ -980,6 +980,8 @@ window.addEventListener('pointerup', releasePointer);
 window.addEventListener('pointercancel', releasePointer);
 root.addEventListener('focusout', () => { window.setTimeout(flushDeferredRender, 0); });
 
+const MAX_EXPLAINER_TTS_BYTES = 4 * 1024 * 1024;
+
 // This local presentation helper has no execution or order authority.
 try {
   explainer = createExplainer({
@@ -989,25 +991,51 @@ try {
       route: state.route,
       source: state.source,
       aiConnected: Boolean(state.liveStreamConnected && state.aiModels?.connected),
+      voiceExplainerModel: 'Gemini 4 Neon',
       activeModelLabel: state.aiModels?.activeDisplayName ?? null,
       liveAccountLabel: state.brokerRouting?.connected ? `${state.brokerRouting.executionMode} (${state.brokerRouting.activeBroker})` : null,
       liveRunLabel: state.aiTrader?.connected ? `${state.aiTrader.activeDisplayName} / ${state.aiTrader.thinkingDepth}` : null,
       liveStateLabel: state.aiTrader?.connected ? `cycle-${state.aiTrader.cycleCount}` : null,
     }),
-    askModel: async (question) => {
+    askModel: async (question, extra = null) => {
       const headers = { Accept: 'application/json', 'Content-Type': 'application/json' };
       if (loopbackAuthToken) headers.Authorization = `Bearer ${loopbackAuthToken}`;
+      const payload = { question };
+      if (extra && typeof extra === 'object') {
+        if (typeof extra.audio_base64 === 'string' && extra.audio_base64.length > 0) {
+          payload.audio_base64 = extra.audio_base64;
+        }
+        if (typeof extra.audio_mime_type === 'string' && extra.audio_mime_type.length > 0) {
+          payload.audio_mime_type = extra.audio_mime_type;
+        }
+      }
       const resp = await fetch(new URL('/api/explainer-ask', window.location.origin), {
         method: 'POST',
         credentials: 'omit',
         cache: 'no-store',
         redirect: 'error',
         headers,
-        body: JSON.stringify({ question }),
+        body: JSON.stringify(payload),
       });
       const txt = await resp.text();
       const doc = parseUniqueJSON(txt, MAX_AI_PAYLOAD_BYTES);
       if (!resp.ok) throw new Error(doc?.error || `Explainer request failed (${resp.status}).`);
+      return doc;
+    },
+    synthesizeSpeech: async (text, voiceName = 'Kore') => {
+      const headers = { Accept: 'application/json', 'Content-Type': 'application/json' };
+      if (loopbackAuthToken) headers.Authorization = `Bearer ${loopbackAuthToken}`;
+      const resp = await fetch(new URL('/api/explainer-tts', window.location.origin), {
+        method: 'POST',
+        credentials: 'omit',
+        cache: 'no-store',
+        redirect: 'error',
+        headers,
+        body: JSON.stringify({ text, voice_name: voiceName }),
+      });
+      const txt = await resp.text();
+      const doc = parseUniqueJSON(txt, MAX_EXPLAINER_TTS_BYTES);
+      if (!resp.ok) throw new Error(doc?.error || `Explainer TTS failed (${resp.status}).`);
       return doc;
     },
   });

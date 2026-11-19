@@ -18,6 +18,7 @@ Every backend implements :class:`cas_forex_revamp.operator.model.ModelBackend`, 
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -67,6 +68,50 @@ ENV_GEMINI_ARGON_MODEL_ID = "CAS_FOREX_GEMINI_ARGON_MODEL_ID"
 ENV_OPENAI_ASTRA_MODEL_ID = "CAS_FOREX_OPENAI_ASTRA_MODEL_ID"
 ENV_DEEPSEEK_FLASH_MODEL_ID = "CAS_FOREX_DEEPSEEK_FLASH_MODEL_ID"
 ENV_OLLAMA_FALLBACK_MODEL_ID = "CAS_FOREX_OLLAMA_FALLBACK_MODEL_ID"
+ENV_EXPLAINER_MODEL_ID = "CAS_FOREX_EXPLAINER_MODEL_ID"
+DEFAULT_EXPLAINER_MODEL_ID = "gemini-4-neon"
+ENV_EXPLAINER_TTS_MODEL_ID = "CAS_FOREX_EXPLAINER_TTS_MODEL_ID"
+DEFAULT_EXPLAINER_TTS_MODEL_ID = "gemini-3.8-flash-tts"
+FALLBACK_EXPLAINER_TTS_MODEL_ID = "gemini-3.8-flash-lite-tts"
+
+VALID_EXPLAINER_VOICES = ("Kore", "Puck", "Charon", "Fenrir", "Aoede")
+ALLOWED_EXPLAINER_AUDIO_MIMES = frozenset({
+    "audio/webm",
+    "audio/ogg",
+    "audio/wav",
+    "audio/mp4",
+    "audio/mpeg",
+})
+MAX_EXPLAINER_AUDIO_B64_CHARS = 2_000_000
+MAX_EXPLAINER_RESPONSE_BYTES = 524_288
+MAX_TTS_WIRE_BYTES = 4 * 1024 * 1024
+
+EXPLAINER_SYSTEM_PROMPT = (
+    "You are the read-only CAS Forex Voice & Text Explainer powered by Gemini 4 Neon. "
+    "Give crisp, natural, spoken-friendly plain-English answers (2 to 6 clear sentences, "
+    "avoiding markdown tables or raw code) grounded strictly in the live numbers inside `cockpit` "
+    "and these verified CAS Forex architecture invariants: "
+    "(1) Dual-Shield 80/12/8 Barbell: 80% regulated OANDA 1:50 safe-harbor reserve, 12% Hugo's Way "
+    "MT5 primary sleeve, and 8% LHFX MT5 backup sleeve; "
+    "(2) Leverage & Margin Safety: up to 1:500 on FX and 1:200 (100 contracts per lot) on NAS100/US30/SPX500 "
+    "indices with a 1,000% minimum post-trade margin-level cushion; "
+    "(3) Valve Gate: every trade/amendment is gated by the 161-parameter tks_meta_valve_controller "
+    "(ForexMetaValveGate, threshold 0.55); "
+    "(4) 3-Gear Auto-Adaptive Risk & Daily Quota: scales 1.00% Conservative ($500 soft / $1,000 hard quota) "
+    "-> 2.50% Growth ($2,000 / $2,500) -> 5.00% Strong-Trend Runner ($2,000 / $3,000), auto-downshifting to "
+    "Conservative on any loss streak >= 1 or >= 10% soft drawdown (20% hard max-drawdown lock); "
+    "(5) Treasury & Parallel Tiers: 50%/50% Profit-Sweep Bank Vault (50% retained for trading, 50% reserved "
+    "for owner bank sweep) plus 5 parallel simulated/live tier accounts; "
+    "(6) Fast Protection & Burst Strategy: 50ms direct-MT5 spool burst scalping (NAS100 25-pt SL / 60-pt TP, "
+    "US30 50-pt SL / 120-pt TP) with instant snap-to-breakeven, monotonic trailing stops, and anti-self-hedge blocking; "
+    "(7) 5-Gate Real-Money LIVE Readiness: requires LIVE_CREDENTIALS_STAGED, OWNER_ED25519_LIVE_TICKETS, "
+    "REAL_BARBELL_80_12_8_CUSTODY, VALVE_AND_DURABLE_JOURNALS, and TWO_KEY_LIVE_ARMED with phrase "
+    "ARM_LIVE_REAL_MONEY_TRADING. "
+    "You are strictly read-only and advisory: never claim to place trades or alter settings. "
+    "If audio input is attached, transcribe what the owner asked into `spoken_question` and answer it in `answer`. "
+    'Respond with valid JSON: {"spoken_question": "<transcribed question if audio attached else empty string>", '
+    '"answer": "<spoken-friendly plain-English explanation under 160 words>"}.'
+)
 
 ALLOWED_FRONTIER_HOSTS = frozenset({
     "api.anthropic.com",
@@ -1048,6 +1093,10 @@ class FrontierModelRegistry:
         self._decide_404: bool = False
         self._last_effective_effort: str = "low"
         self._last_latency_ms: int | None = None
+        raw_exp_model = (self._env.get(ENV_EXPLAINER_MODEL_ID, "").strip() or DEFAULT_EXPLAINER_MODEL_ID).removeprefix("models/")
+        self._explainer_model_slug: str = _validate_slug(raw_exp_model, ENV_EXPLAINER_MODEL_ID)
+        raw_tts_model = (self._env.get(ENV_EXPLAINER_TTS_MODEL_ID, "").strip() or DEFAULT_EXPLAINER_TTS_MODEL_ID).removeprefix("models/")
+        self._explainer_tts_model_slug: str = _validate_slug(raw_tts_model, ENV_EXPLAINER_TTS_MODEL_ID)
 
     def __repr__(self) -> str:
         with self._lock:
@@ -1370,67 +1419,186 @@ class FrontierModelRegistry:
 
     def answer_explainer_question(
         self,
+        question: str = "",
         *,
-        question: str,
         context_summary: Mapping[str, Any] | None = None,
+        audio_base64: str | None = None,
+        audio_mime_type: str | None = None,
     ) -> dict[str, Any]:
-        """Read-only Explainer helper answering operator questions with zero execution authority."""
+        """Read-only Explainer helper routed to Gemini 4 Neon with zero trading execution authority."""
         if not isinstance(question, str):
             raise FrontierConfigurationError("question must be a string")
-        clean_q = " ".join(ch for ch in question.replace("\r", " ").replace("\n", " ").strip().split())
-        if not clean_q or len(clean_q) > 500:
-            raise FrontierConfigurationError("question must be 1..500 characters")
+        clean_q = " ".join(question.replace("\r", " ").replace("\n", " ").strip().split())
+
+        clean_audio_b64: str | None = None
+        clean_audio_mime: str | None = None
+        if audio_base64 is not None and str(audio_base64).strip() != "":
+            if not isinstance(audio_base64, str):
+                raise FrontierConfigurationError("audio_base64 must be a string")
+            compact_b64 = re.sub(r"\s+", "", audio_base64)
+            if not compact_b64 or len(compact_b64) > MAX_EXPLAINER_AUDIO_B64_CHARS or not compact_b64.isascii():
+                raise FrontierConfigurationError("audio_base64 must be 1..2000000 ASCII base64 characters")
+            norm_b64 = compact_b64.replace("-", "+").replace("_", "/")
+            pad_len = (-len(norm_b64)) % 4
+            if pad_len:
+                norm_b64 = norm_b64 + ("=" * pad_len)
+            try:
+                decoded_audio = base64.b64decode(norm_b64, validate=True)
+            except ValueError as exc:
+                raise FrontierConfigurationError("audio_base64 is not valid base64") from exc
+            if not decoded_audio:
+                raise FrontierConfigurationError("audio_base64 decoded to empty bytes")
+            raw_mime = audio_mime_type if isinstance(audio_mime_type, str) and audio_mime_type.strip() else "audio/webm"
+            base_mime = raw_mime.split(";", 1)[0].strip().lower()
+            if base_mime not in ALLOWED_EXPLAINER_AUDIO_MIMES:
+                raise FrontierConfigurationError(
+                    f"audio_mime_type must be one of {sorted(ALLOWED_EXPLAINER_AUDIO_MIMES)}"
+                )
+            clean_audio_b64 = norm_b64
+            clean_audio_mime = base_mime
+
+        if clean_audio_b64 is None:
+            if not clean_q or len(clean_q) > 500:
+                raise FrontierConfigurationError("question must be 1..500 characters")
+        elif len(clean_q) > 500:
+            raise FrontierConfigurationError("question must be 0..500 characters when audio_base64 is attached")
 
         summary_obj = dict(context_summary) if isinstance(context_summary, Mapping) else {}
+        gemini_secret = self._secrets.get(ENV_GEMINI_API_KEY)
+        has_gemini_key = gemini_secret is not None
+        fallback_reason = "OFFLINE"
+
+        # 1. Primary dedicated Voice/Text Explainer route: Gemini 4 Neon (independent of active_model_id & trading lock)
+        if gemini_secret is not None:
+            neon_slug = self._explainer_model_slug
+            neon_display = "Gemini 4 Neon" if neon_slug == DEFAULT_EXPLAINER_MODEL_ID else neon_slug
+            raw_url = f"https://generativelanguage.googleapis.com/v1beta/models/{neon_slug}:generateContent"
+            url = _validate_frontier_https_url(raw_url, expected_host="generativelanguage.googleapis.com")
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "x-goog-api-key": gemini_secret.reveal_for_header(),
+            }
+            prompt_q = clean_q if clean_q else "Transcribe the attached spoken question and answer it using the cockpit snapshot."
+            pkt_str = canonical_bytes({"question": prompt_q, "cockpit": summary_obj}).decode("utf-8")
+            user_parts: list[dict[str, Any]] = []
+            if clean_audio_b64 is not None and clean_audio_mime is not None:
+                user_parts.append({"inlineData": {"mimeType": clean_audio_mime, "data": clean_audio_b64}})
+            user_parts.append({"text": pkt_str})
+            body_bytes = canonical_bytes({
+                "systemInstruction": {"parts": [{"text": EXPLAINER_SYSTEM_PROMPT}]},
+                "contents": [{"role": "user", "parts": user_parts}],
+                "generationConfig": {
+                    "temperature": 0,
+                    "maxOutputTokens": 1536,
+                    "responseMimeType": "application/json",
+                },
+            })
+            timeout_s = 20.0 if clean_audio_b64 is not None else 12.0
+            try:
+                if self._http_post is not None:
+                    status, raw = self._http_post(url, dict(headers), body_bytes, timeout_s, MAX_EXPLAINER_RESPONSE_BYTES)
+                else:
+                    status, raw = default_frontier_https_post(
+                        url,
+                        dict(headers),
+                        body_bytes,
+                        timeout_s,
+                        MAX_EXPLAINER_RESPONSE_BYTES,
+                        expected_host="generativelanguage.googleapis.com",
+                        resolve_dns=self._resolve_dns,
+                    )
+                if 200 <= status < 300:
+                    doc = _decode_json_dict(raw, max_bytes=MAX_EXPLAINER_RESPONSE_BYTES)
+                    txt = _extract_gemini_cand_text(doc)
+                    ans_text = txt
+                    spoken_q = ""
+                    try:
+                        parsed_txt = json.loads(txt)
+                        if isinstance(parsed_txt, Mapping):
+                            if isinstance(parsed_txt.get("answer"), str):
+                                ans_text = parsed_txt["answer"]
+                            if isinstance(parsed_txt.get("spoken_question"), str):
+                                spoken_q = " ".join(parsed_txt["spoken_question"].strip().split())[:500]
+                    except (ValueError, TypeError):
+                        ans_text = txt
+                    ans_text = " ".join(str(ans_text).strip().split())[:2000]
+                    if ans_text:
+                        eff_q = spoken_q or clean_q or "Voice question"
+                        out_neon: dict[str, Any] = {
+                            "schema": "cas-forex.explainer-answer/1",
+                            "question": eff_q,
+                            "answer": ans_text,
+                            "model_id": neon_slug,
+                            "display_name": neon_display,
+                            "source": "FRONTIER_READ_ONLY",
+                            "read_only": True,
+                            "advisory_only": True,
+                            "voice_ready": True,
+                        }
+                        if spoken_q:
+                            out_neon["spoken_question"] = spoken_q
+                        return assert_safe_ai_catalog_payload(out_neon)
+                fallback_reason = f"HTTP_{status}"
+            except Exception as exc_neon:
+                fallback_reason = type(exc_neon).__name__
+            finally:
+                headers.clear()
+
+        # 2. Secondary fallback to configured active/alternate read-only model when Gemini 4 Neon is unconfigured or unavailable
         chosen_entry = self.active_entry
-        if chosen_entry.provider == "gemini_decision" or not self.is_model_ready(chosen_entry.model_id):
+        if (
+            chosen_entry.provider == "gemini_decision"
+            or not self.is_model_ready(chosen_entry.model_id)
+            or (has_gemini_key and chosen_entry.provider == "gemini" and self._slugs.get(chosen_entry.model_id) == self._explainer_model_slug)
+        ):
             fallback_entry = None
             for cand in FRONTIER_MODEL_CATALOG:
-                if cand.provider != "gemini_decision" and not cand.is_fallback and self.is_model_ready(cand.model_id):
+                if (
+                    cand.provider != "gemini_decision"
+                    and not cand.is_fallback
+                    and self.is_model_ready(cand.model_id)
+                    and not (has_gemini_key and cand.provider == "gemini" and self._slugs.get(cand.model_id) == self._explainer_model_slug)
+                ):
                     fallback_entry = cand
                     break
             if fallback_entry is not None:
                 chosen_entry = fallback_entry
 
-        fallback_reason = "OFFLINE"
         secret = self._secrets.get(chosen_entry.credential_env) if chosen_entry.credential_env else None
         ready_for_call = (
             self._is_entry_ready(chosen_entry)
             and (chosen_entry.provider == "ollama" or secret is not None)
             and chosen_entry.provider != "gemini_decision"
+            and not (has_gemini_key and chosen_entry.provider == "gemini" and fallback_reason != "OFFLINE")
         )
 
+        eff_q_fallback = clean_q or "Voice question"
         if ready_for_call:
             api_slug = self._slugs[chosen_entry.model_id]
-            sys_prompt = (
-                "You are the read-only CAS Forex Explainer. "
-                "Explain live state, active market focus, sessions, broker routing, and valve gates in plain English "
-                "using only supplied facts. Never advise trades or emit execution commands. "
-                'Respond with compact JSON: {"answer": "<plain-English explanation under 120 words>"}.'
-            )
             from types import SimpleNamespace
 
-            pkt = canonical_bytes({"question": clean_q, "cockpit": summary_obj}).decode("utf-8")
+            pkt = canonical_bytes({"question": eff_q_fallback, "cockpit": summary_obj}).decode("utf-8")
             inv = SimpleNamespace(
                 model=SimpleNamespace(reasoning_effort="low"),
-                system_policy=sys_prompt,
+                system_policy=EXPLAINER_SYSTEM_PROMPT,
                 packet_json=pkt,
-                budget=SimpleNamespace(max_generated_tokens_per_call=512),
+                budget=SimpleNamespace(max_generated_tokens_per_call=768),
                 seed=None,
             )
             url, headers, body = _build_provider_payload(chosen_entry, api_slug, inv, secret)
             fallback_reason = "LOCAL_READ_ONLY_FALLBACK"
             try:
                 if self._http_post is not None:
-                    status, raw = self._http_post(url, dict(headers), body, 10.0, MAX_PROVIDER_WIRE_BYTES)
+                    status, raw = self._http_post(url, dict(headers), body, 12.0, MAX_PROVIDER_WIRE_BYTES)
                 elif chosen_entry.provider == "ollama":
-                    status, raw = default_ollama_loopback_post(url, dict(headers), body, 10.0, MAX_PROVIDER_WIRE_BYTES)
+                    status, raw = default_ollama_loopback_post(url, dict(headers), body, 12.0, MAX_PROVIDER_WIRE_BYTES)
                 else:
                     status, raw = default_frontier_https_post(
                         url,
                         dict(headers),
                         body,
-                        10.0,
+                        12.0,
                         MAX_PROVIDER_WIRE_BYTES,
                         expected_host=chosen_entry.allowed_host,
                         resolve_dns=self._resolve_dns,
@@ -1451,11 +1619,14 @@ class FrontierModelRegistry:
                     if ans_text:
                         return assert_safe_ai_catalog_payload({
                             "schema": "cas-forex.explainer-answer/1",
+                            "question": eff_q_fallback,
+                            "answer": ans_text,
                             "model_id": chosen_entry.model_id,
                             "display_name": chosen_entry.display_name,
                             "source": "FRONTIER_READ_ONLY",
                             "read_only": True,
-                            "answer": ans_text,
+                            "advisory_only": True,
+                            "voice_ready": has_gemini_key,
                         })
             except Exception as exc_exp:
                 fallback_reason = type(exc_exp).__name__
@@ -1467,15 +1638,136 @@ class FrontierModelRegistry:
         broker_txt = str(summary_obj.get("active_broker") or "HUGOSWAY_MT5")
         fallback_ans = (
             f"Read-only status ({mode_txt} via {broker_txt}, model {chosen_entry.display_name}): "
-            f"{focus_txt} Question noted: {clean_q}"
+            f"{focus_txt} Question noted: {eff_q_fallback}"
         )[:2000]
         return assert_safe_ai_catalog_payload({
             "schema": "cas-forex.explainer-answer/1",
+            "question": eff_q_fallback,
+            "answer": fallback_ans,
             "model_id": chosen_entry.model_id,
             "display_name": chosen_entry.display_name,
-            "source": "LOCAL_READ_ONLY_FALLBACK" if not ready_for_call else f"LOCAL_READ_ONLY_FALLBACK ({fallback_reason})",
+            "source": "LOCAL_READ_ONLY_FALLBACK" if (not ready_for_call and fallback_reason == "OFFLINE") else f"LOCAL_READ_ONLY_FALLBACK ({fallback_reason})",
             "read_only": True,
-            "answer": fallback_ans,
+            "advisory_only": True,
+            "voice_ready": has_gemini_key,
+        })
+
+    def synthesize_explainer_speech(
+        self,
+        text: str,
+        *,
+        voice_name: str = "Kore",
+    ) -> dict[str, Any]:
+        """Synthesize natural spoken Explainer audio via Gemini 3.8 Flash TTS with graceful WEB_SPEECH fallback."""
+        if not isinstance(text, str):
+            raise FrontierConfigurationError("text must be a string")
+        cleaned_text = " ".join(
+            "".join(" " if (ord(c) < 32 or ord(c) == 127) else c for c in text).split()
+        )
+        if not cleaned_text or len(cleaned_text) > 1800:
+            raise FrontierConfigurationError("text must be 1..1800 characters")
+        clean_voice = voice_name.strip() if isinstance(voice_name, str) else ""
+        if clean_voice not in VALID_EXPLAINER_VOICES:
+            raise FrontierConfigurationError(f"voice_name must be one of {VALID_EXPLAINER_VOICES}")
+
+        gemini_secret = self._secrets.get(ENV_GEMINI_API_KEY)
+        if gemini_secret is None:
+            return assert_safe_ai_catalog_payload({
+                "schema": "cas-forex.explainer-tts/1",
+                "ok": False,
+                "fallback": "WEB_SPEECH",
+                "reason": "GEMINI_API_KEY_UNCONFIGURED",
+            })
+
+        candidates = [self._explainer_tts_model_slug]
+        if FALLBACK_EXPLAINER_TTS_MODEL_ID not in candidates:
+            candidates.append(FALLBACK_EXPLAINER_TTS_MODEL_ID)
+
+        safe_reason = "TTS_UNAVAILABLE"
+        for tts_slug in candidates:
+            raw_url = f"https://generativelanguage.googleapis.com/v1beta/models/{tts_slug}:generateContent"
+            url = _validate_frontier_https_url(raw_url, expected_host="generativelanguage.googleapis.com")
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "x-goog-api-key": gemini_secret.reveal_for_header(),
+            }
+            body_bytes = canonical_bytes({
+                "contents": [{"parts": [{"text": cleaned_text}]}],
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {
+                        "voiceConfig": {
+                            "prebuiltVoiceConfig": {
+                                "voiceName": clean_voice,
+                            }
+                        }
+                    },
+                },
+            })
+            try:
+                if self._http_post is not None:
+                    status, raw = self._http_post(url, dict(headers), body_bytes, 25.0, MAX_TTS_WIRE_BYTES)
+                else:
+                    status, raw = default_frontier_https_post(
+                        url,
+                        dict(headers),
+                        body_bytes,
+                        25.0,
+                        MAX_TTS_WIRE_BYTES,
+                        expected_host="generativelanguage.googleapis.com",
+                        resolve_dns=self._resolve_dns,
+                    )
+                if 200 <= status < 300:
+                    doc = _decode_json_dict(raw, max_bytes=MAX_TTS_WIRE_BYTES)
+                    cands = doc.get("candidates")
+                    if isinstance(cands, list) and cands and isinstance(cands[0], Mapping):
+                        content = cands[0].get("content")
+                        parts = content.get("parts") if isinstance(content, Mapping) else None
+                        if isinstance(parts, list):
+                            for part in parts:
+                                if not isinstance(part, Mapping):
+                                    continue
+                                inline = part.get("inlineData") or part.get("inline_data")
+                                if not isinstance(inline, Mapping):
+                                    continue
+                                raw_b64 = inline.get("data")
+                                raw_mime = (
+                                    inline.get("mimeType")
+                                    or inline.get("mime_type")
+                                    or "audio/L16;codec=pcm;rate=24000"
+                                )
+                                if isinstance(raw_b64, str) and raw_b64.strip():
+                                    audio_b64 = re.sub(r"\s+", "", raw_b64)
+                                    mime_type = str(raw_mime).strip()[:120]
+                                    rate_match = re.search(
+                                        r"rate\s*=\s*([0-9]{4,6})", mime_type, flags=re.IGNORECASE
+                                    )
+                                    sample_rate = int(rate_match.group(1)) if rate_match else 24000
+                                    if not (8000 <= sample_rate <= 96000):
+                                        sample_rate = 24000
+                                    return assert_safe_ai_catalog_payload({
+                                        "schema": "cas-forex.explainer-tts/1",
+                                        "ok": True,
+                                        "model_id": tts_slug,
+                                        "voice_name": clean_voice,
+                                        "mime_type": mime_type,
+                                        "sample_rate_hz": sample_rate,
+                                        "audio_base64": audio_b64,
+                                    })
+                    safe_reason = "EMPTY_AUDIO_PAYLOAD"
+                else:
+                    safe_reason = f"HTTP_{status}"
+            except Exception as exc_tts:
+                safe_reason = type(exc_tts).__name__
+            finally:
+                headers.clear()
+
+        return assert_safe_ai_catalog_payload({
+            "schema": "cas-forex.explainer-tts/1",
+            "ok": False,
+            "fallback": "WEB_SPEECH",
+            "reason": safe_reason,
         })
 
     def select_model(self, model_id: str) -> dict[str, Any]:
