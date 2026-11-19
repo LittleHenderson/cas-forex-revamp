@@ -22,7 +22,7 @@ from cas_forex_revamp.composition.autonomous_trader import (
 from cas_forex_revamp.composition.live_cockpit_server import safe_broker_routing_payload
 from cas_forex_revamp.composition.trend_regime import REGIME_STRONG_TREND
 from cas_forex_revamp.contracts import Side
-from cas_forex_revamp.operator.frontier_backends import FrontierModelRegistry, _RedactedSecret
+from cas_forex_revamp.operator.frontier_backends import FrontierModelRegistry
 from cas_forex_revamp.valve.daily_quota import DailyQuotaGovernanceStore
 from cas_forex_revamp.valve.tks_meta_valve_controller import load_default_forex_valve_gate
 from cas_forex_revamp.venue.dual_shield_router import (
@@ -66,6 +66,7 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
     Mt5MutationJournal,
     Mt5NativePythonTransport,
     Mt5PaperBrokerVenue,
+    _RedactedSecret,
 )
 
 GATE = load_default_forex_valve_gate()
@@ -292,11 +293,11 @@ class Pr17LiveReadinessAndCloseAccountingTests(unittest.TestCase):
                 ticket=88001,
                 symbol="EURUSD",
                 type=0,
-                volume="0.10",
-                price_open="1.10000",
-                sl="1.09800",
-                tp="1.10400",
-                profit="-185.25",
+                volume=Decimal("0.10"),
+                price_open=Decimal("1.10000"),
+                sl=Decimal("1.09800"),
+                tp=Decimal("1.10400"),
+                profit=Decimal("-185.25"),
             ),
         )
         creds = Mt5Credentials(
