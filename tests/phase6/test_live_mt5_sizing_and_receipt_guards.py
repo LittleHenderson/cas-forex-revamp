@@ -276,6 +276,7 @@ class TestLiveMt5SizingAndReceiptGuards(unittest.TestCase):
             model_registry=FrontierModelRegistry(environ={}),
             valve_gate=GATE,
             clock=lambda: NOW,
+            execution_gate=lambda _inv: None,
         )
         # With 100 contracts/lot at 1:200 leverage and 1000% margin level floor, NAS100 MUST size <= 0.70 lots
         # (NEVER 50.00 lots that triggered MT5 retcode 10019 [not enough money]!)
