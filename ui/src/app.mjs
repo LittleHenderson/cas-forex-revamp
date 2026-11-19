@@ -9,6 +9,14 @@ import { ALL_WATCHLIST_MARKETS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStr
 import { MAX_BROKER_ROUTING_BYTES, normalizeBrokerRouting } from './broker-routing.mjs';
 import { MAX_AI_PAYLOAD_BYTES, normalizeAiModels, normalizeAiTrader, normalizeIndexStream, shouldAutoConnectLiveFeed } from './ai-overseer.mjs';
 import { MAX_TREASURY_BYTES, mountAnalyticsCanvases, normalizeParallelTiers, normalizeTreasury } from './analytics.mjs';
+import {
+  clampCapitalUsd,
+  clampLotHundredths,
+  createDefaultMoneyFlowState,
+  mountMoneyFlowWidget,
+  resolveLiveAccountBalanceUsd,
+  stepMoneyFlowSimulation,
+} from './money-flow.mjs';
 
 // Fixed same-origin assets. Only explicit trusted bootstrap may inject a scoped bridge.
 const schemaURL = new URL('../docs/contracts/cockpit.schema.json', document.baseURI);
@@ -75,6 +83,7 @@ let state = {
   liveStreamConnected: false, chartMicroBars: {}, brokerRouting: null,
   aiModels: null, aiTrader: null, indexStream: null, aiActionBusy: false, aiIssue: null,
   treasury: null, parallelTiers: null, chartZoomBars: 60, inspectedTradeIdx: 0,
+  moneyFlow: createDefaultMoneyFlowState(),
 };
 
 function routeFromHash() {
@@ -124,7 +133,7 @@ function render(focusMain = false) {
   document.documentElement.dataset.theme = state.theme;
   try { releaseDetachedCanvases(root); } catch { /* Best-effort buffer release. */ }
   replaceSafeHTML(root, renderApp(state));
-  try { mountMarketCharts(root, state); mountAnalyticsCanvases(root, state); } catch { /* Chart canvas optional in headless environments. */ }
+  try { mountMarketCharts(root, state); mountAnalyticsCanvases(root, state); mountMoneyFlowWidget(root, state); } catch { /* Chart/SVG optional in headless environments. */ }
   try { explainer?.sync(); } catch { disableExplainer(); }
   document.title = `${state.route[0].toUpperCase() + state.route.slice(1)} / CAS Forex`;
   if (focusMain) document.querySelector('#main').focus({ preventScroll: true });
@@ -441,6 +450,25 @@ async function sendOverseerAction(action) {
   }
 }
 
+async function setRiskGearMode(riskGear) {
+  if (state.aiActionBusy) return;
+  state.aiActionBusy = true;
+  state.aiIssue = null;
+  render();
+  try {
+    const res = await postLoopbackJson('/api/ai-overseer-action', { action: 'SET_RISK_GEAR', risk_gear: riskGear });
+    if (res?.schema === 'cas-forex.ai-trader/1') state.aiTrader = normalizeAiTrader(res);
+    else await readAiCockpitFeeds();
+    announce(`Risk gear set to ${riskGear}.`);
+  } catch (error) {
+    state.aiIssue = error instanceof Error ? error.message : 'Risk gear update failed.';
+    announce(state.aiIssue);
+  } finally {
+    state.aiActionBusy = false;
+    render();
+  }
+}
+
 async function setThinkingDepth(depth) {
   if (state.aiActionBusy) return;
   state.aiActionBusy = true;
@@ -627,6 +655,44 @@ root.addEventListener('click', (event) => {
   if (target.dataset.connectLoopback) { report(connectLoopbackLiveFeed()); return; }
   if (target.dataset.disconnectLoopback) { stopLoopbackStream(); render(); announce('Live market stream paused.'); return; }
   if (target.dataset.aiOverseerAction) { void sendOverseerAction(target.dataset.aiOverseerAction); return; }
+  if (target.dataset.riskGear) { void setRiskGearMode(target.dataset.riskGear); return; }
+  if (target.dataset.mfTab) {
+    state.moneyFlow = { ...state.moneyFlow, tab: target.dataset.mfTab === 'lots' ? 'lots' : 'flow' };
+    render(); return;
+  }
+  if (target.dataset.mfSplit) {
+    state.moneyFlow = { ...state.moneyFlow, splitMode: target.dataset.mfSplit === '100_COMPOUND' ? '100_COMPOUND' : '50_50' };
+    render(); return;
+  }
+  if (target.dataset.mfCap) {
+    const cap = clampCapitalUsd(target.dataset.mfCap);
+    state.moneyFlow = { ...state.moneyFlow, capitalUsd: cap, simWins: 0, simLosses: 0, simCapitalCents: cap * 100, simBankCents: 0 };
+    render(); return;
+  }
+  if (target.dataset.mfLiveBalance) {
+    const cap = resolveLiveAccountBalanceUsd(state);
+    state.moneyFlow = { ...state.moneyFlow, capitalUsd: cap, simWins: 0, simLosses: 0, simCapitalCents: cap * 100, simBankCents: 0 };
+    render(); return;
+  }
+  if (target.dataset.mfMarket) {
+    state.moneyFlow = { ...state.moneyFlow, market: target.dataset.mfMarket, simWins: 0, simLosses: 0, simCapitalCents: state.moneyFlow.capitalUsd * 100, simBankCents: 0 };
+    render(); return;
+  }
+  if (target.dataset.mfRisk) {
+    const pct = Number(target.dataset.mfRisk) || 1;
+    state.moneyFlow = { ...state.moneyFlow, lotMode: 'risk', riskPct: pct, simWins: 0, simLosses: 0, simCapitalCents: state.moneyFlow.capitalUsd * 100, simBankCents: 0 };
+    render(); return;
+  }
+  if (target.dataset.mfLot) {
+    const hund = clampLotHundredths(target.dataset.mfLot);
+    state.moneyFlow = { ...state.moneyFlow, lotMode: 'direct', directLotHundredths: hund, simWins: 0, simLosses: 0, simCapitalCents: state.moneyFlow.capitalUsd * 100, simBankCents: 0 };
+    render(); return;
+  }
+  if (target.dataset.mfStep) {
+    const maxRisk = Number(state.aiTrader?.riskGear?.ownerMaxRiskPct ?? 5) || 5;
+    state.moneyFlow = stepMoneyFlowSimulation(state.moneyFlow, target.dataset.mfStep, maxRisk);
+    render(); return;
+  }
   if (target.dataset.chartPair && ALL_WATCHLIST_MARKETS.includes(target.dataset.chartPair)) {
     state.chartPair = target.dataset.chartPair; render();
     root.querySelector(`[data-chart-pair="${state.chartPair}"]`)?.focus(); return;
@@ -727,6 +793,16 @@ root.addEventListener('submit', async (event) => {
 });
 
 root.addEventListener('change', async (event) => {
+  if (event.target?.dataset?.mfCustomCap) {
+    const cap = clampCapitalUsd(event.target.value);
+    state.moneyFlow = { ...state.moneyFlow, capitalUsd: cap, simWins: 0, simLosses: 0, simCapitalCents: cap * 100, simBankCents: 0 };
+    render(); return;
+  }
+  if (event.target?.dataset?.mfCustomLot) {
+    const hund = clampLotHundredths(event.target.value);
+    state.moneyFlow = { ...state.moneyFlow, lotMode: 'direct', directLotHundredths: hund, simWins: 0, simLosses: 0, simCapitalCents: state.moneyFlow.capitalUsd * 100, simBankCents: 0 };
+    render(); return;
+  }
   if (event.target.dataset?.selectAiModel) { void selectAiModel(event.target.value); return; }
   if (event.target.name === 'theme') {
     const theme = event.target.value;

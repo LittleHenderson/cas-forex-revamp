@@ -1420,6 +1420,9 @@ class LoopbackCockpitServer:
                                 res = outer._autonomous_trader.resume_autonomous(reason=reason)
                             elif act == "STOP_AUTOMATION":
                                 res = outer._autonomous_trader.stop_automation(reason=reason)
+                            elif act == "SET_RISK_GEAR":
+                                gear_val = str(body.get("risk_gear") or "").strip().upper()
+                                res = outer._autonomous_trader.set_risk_gear_mode(gear_val, reason=reason)
                             elif act == "EMERGENCY_CLOSE_ALL":
                                 res = outer._autonomous_trader.emergency_close_all(reason=reason)
                             elif act in ("REARM_DRAWDOWN", "UNLOCK_QUOTA_SESSION"):
@@ -1574,7 +1577,7 @@ def run_cockpit_cli(
     if args.env_file is not None:
         merged.update(load_dotenv_file(args.env_file))
 
-    from cas_forex_revamp.composition.autonomous_trader import AutonomousAiTrader
+    from cas_forex_revamp.composition.autonomous_trader import AutonomousAiTrader, ENV_RISK_GEAR_MODE
     from cas_forex_revamp.composition.state_store import initialize_shared_runtime_state
     from cas_forex_revamp.operator.frontier_backends import FrontierModelRegistry
     from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
@@ -1679,6 +1682,8 @@ def run_cockpit_cli(
         fast_tick_ms=args.fast_tick_ms,
         profit_vault=runtime_state.profit_vault,
         parallel_tiers=runtime_state.parallel_tiers,
+        risk_gear_mode=merged.get(ENV_RISK_GEAR_MODE),
+        risk_gear_path=runtime_state.state_dir / "risk_gear.json",
     )
     if not args.autonomous_ai:
         trader.stop_automation(reason="CLI launched with --no-autonomous-ai")

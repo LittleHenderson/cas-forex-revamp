@@ -41,6 +41,7 @@ from cas_forex_revamp.valve.tks_meta_valve_controller import (
     compute_drawdown_pct,
 )
 from .external_paper_broker import (
+    EXECUTION_MODE_DEMO,
     EXECUTION_MODE_LIVE,
     EXPANDED_FX_PAIRS,
     OandaOutcomeUnknownError,
