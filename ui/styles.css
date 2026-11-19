@@ -524,3 +524,234 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
 }
 .mf-pos { color: var(--mf-green); }
 .mf-neg { color: var(--mf-red); }
+
+/* --- PR #17: Prominent Cloud Unlock Bar, Real-Money Live Funding Gate & Two-Key Arming --- */
+.mobile-unlock-bar.prominent-unlock-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin: 0 0 20px;
+  padding: 12px 14px;
+  border: 2px solid var(--orange);
+  background: var(--warning-surface);
+}
+.ai-overseer-panel .mobile-unlock-bar.prominent-unlock-bar {
+  margin: 12px 0 14px;
+}
+.exec-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 10px;
+  border: 2px solid var(--mf-blue);
+  background: var(--panel);
+  color: var(--mf-blue);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.exec-mode-badge.is-live-armed {
+  border-color: var(--mf-red);
+  color: var(--mf-red);
+  background: var(--warning-surface);
+}
+.live-funding-panel {
+  margin-bottom: 22px;
+}
+.lf-mode-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 16px 18px;
+  margin-bottom: 18px;
+  border: 2px solid var(--mf-blue);
+  border-left-width: 6px;
+  background: var(--panel);
+}
+.lf-mode-banner.is-live {
+  border-color: var(--mf-red);
+  background: var(--warning-surface);
+}
+.lf-mode-copy {
+  flex: 1 1 360px;
+  min-width: 0;
+}
+.lf-mode-copy p:not(.eyebrow) {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.lf-mode-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.lf-step-block {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+.lf-step-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.lf-total-pill {
+  font-size: 12px;
+  color: var(--muted);
+}
+.lf-total-pill strong {
+  color: var(--ink);
+}
+.lf-cap-controls {
+  margin-bottom: 14px;
+}
+.lf-split-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 12px;
+}
+.lf-venue-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-top: 4px solid var(--mf-blue);
+  background: var(--panel-soft);
+}
+.lf-venue-card.is-reserve {
+  border-top-color: var(--mf-green);
+}
+.lf-venue-card.is-primary {
+  border-top-color: var(--orange);
+}
+.lf-venue-card.is-backup {
+  border-top-color: var(--mf-blue);
+}
+.lf-venue-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.lf-venue-amount {
+  font-size: clamp(20px, 2vw, 26px);
+  font-weight: 800;
+  color: var(--ink);
+}
+.lf-risk-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+.lf-risk-strip strong {
+  color: var(--ink);
+}
+.lf-gate-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.lf-gate-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--mf-gold);
+  background: var(--panel-soft);
+}
+.lf-gate-item.is-ready {
+  border-left-color: var(--mf-green);
+}
+.lf-gate-main {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+.lf-gate-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.lf-gate-step {
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.lf-gate-detail {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.lf-gate-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border: 1px solid var(--mf-gold);
+  color: var(--mf-gold);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.lf-gate-badge.is-ready {
+  border-color: var(--mf-green);
+  color: var(--mf-green);
+}
+.lf-arm-box {
+  border: 2px solid var(--orange);
+}
+.lf-arm-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin: 12px 0;
+}
+.lf-phrase-input {
+  flex: 1 1 280px;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  background: var(--panel-soft);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+}
+.lf-verify-result {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--mf-gold);
+  background: var(--panel-soft);
+}
+.lf-verify-result.is-ready {
+  border-left-color: var(--mf-green);
+}
+.lf-verify-result.is-partial {
+  border-left-color: var(--orange);
+}
+.lf-verify-result p {
+  margin-top: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}

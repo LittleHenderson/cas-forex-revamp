@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 import logging
+import re
 from typing import Any
 
 from cas_forex_revamp.contracts import ActionKind, ContractError, Side, decimal_text, parse_decimal
@@ -41,6 +42,8 @@ from cas_forex_revamp.valve.tks_meta_valve_controller import (
     compute_drawdown_pct,
 )
 from .external_paper_broker import (
+    ENV_OANDA_LIVE_ACCOUNT_ID,
+    ENV_OANDA_LIVE_TOKEN,
     EXECUTION_MODE_DEMO,
     EXECUTION_MODE_LIVE,
     EXPANDED_FX_PAIRS,
@@ -55,6 +58,10 @@ from .mt5_broker_bridge import (
     BROKER_OANDA_LIVE,
     BROKER_OANDA_PRACTICE,
     BROKER_SPECS,
+    ENV_HUGOSWAY_MT5_LOGIN,
+    ENV_HUGOSWAY_MT5_SERVER,
+    ENV_LHFX_MT5_LOGIN,
+    ENV_LHFX_MT5_SERVER,
     BrokerFailoverExhaustedError,
     BrokerHierarchyRouter,
     LiveBrokerEndpointForbiddenError,
@@ -98,6 +105,37 @@ ENV_BARBELL_LHFX_SHARE = "CAS_FOREX_BARBELL_LHFX_SHARE"
 ENV_BARBELL_MAX_STOP_RISK_PCT = "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT"
 ENV_BARBELL_MAX_DRAWDOWN_PCT = "CAS_FOREX_MAX_DRAWDOWN_PCT"
 ENV_DEMO_BARBELL_VIRTUAL_SLEEVE = "CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE"
+ENV_OANDA_LIVE_API_TOKEN = "CAS_FOREX_OANDA_LIVE_API_TOKEN"  # nosec B105: environment variable name constant, not a secret value
+ENV_HUGOSWAY_MT5_LIVE_TICKET = "CAS_FOREX_HUGOSWAY_MT5_LIVE_TICKET"
+ENV_LHFX_MT5_LIVE_TICKET = "CAS_FOREX_LHFX_MT5_LIVE_TICKET"
+ENV_OANDA_LIVE_TICKET = "CAS_FOREX_OANDA_LIVE_TICKET"
+LIVE_FUNDING_ARM_PHRASE = "ARM_LIVE_REAL_MONEY_TRADING"  # nosec B105: explicit dual-confirmation arm phrase literal, not a credential
+
+_LIVE_HUGOSWAY_SERVERS: frozenset[str] = frozenset({
+    "hugosway-real3",
+    "hugosway-real",
+    "hugosway real3",
+    "hugosway real",
+    "hugo pro5",
+    "hugopro5",
+    "hugo-real",
+    "hugosway-live",
+    "hugosway live",
+})
+_LIVE_LHFX_SERVERS: frozenset[str] = frozenset({
+    "lhfxsa-live",
+    "lhfx-live",
+    "lhfxsa-real",
+    "lhfxsa-trade",
+    "lhfxsa trade",
+})
+
+
+def _has_staged_env_value(environ: Mapping[str, str], key: str) -> bool:
+    raw = environ.get(key, "")
+    val = raw.strip() if isinstance(raw, str) else ""
+    return bool(val) and not val.upper().startswith("REPLACE_WITH_")
+
 
 OANDA_SAFE_HARBOR_LEVERAGE = 50
 MAJOR_FX_PAIRS: tuple[str, ...] = tuple(p for p in EXPANDED_FX_PAIRS if "USD" in p)
@@ -464,6 +502,10 @@ class BarbellCapitalPolicy:
         self.tolerance = _share(allocation_tolerance_share, "allocation_tolerance_share")
         self.demo_virtual_sleeve = bool(demo_virtual_sleeve)
         self._calc = Mt5MarginCalculator(account_currency=account_currency)
+
+    @property
+    def allocation_tolerance_share(self) -> Decimal:
+        return self.tolerance
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str], **kwargs: Any) -> "BarbellCapitalPolicy":
@@ -1279,6 +1321,166 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             results.append(oanda.execute(intent, valve_decision=valve_decisions.get(intent.action_ref)))  # type: ignore[arg-type]
         return tuple(results)
 
+    def _is_live_mt5_server_staged(self, broker_id: str, server_env_key: str) -> bool:
+        raw = str(self._env.get(server_env_key, "")).strip()
+        if not raw and self.execution_mode == EXECUTION_MODE_LIVE:
+            raw = str(self._servers.get(broker_id) or "").strip()
+        if not raw or raw.upper().startswith("REPLACE_WITH_"):
+            return False
+        low = raw.lower()
+        if "demo" in low or "practice" in low:
+            return False
+        compact = re.sub(r"[\s_]+", " ", low)
+        if broker_id == BROKER_HUGOSWAY_MT5:
+            return compact in _LIVE_HUGOSWAY_SERVERS
+        if broker_id == BROKER_LHFX_MT5:
+            if compact in {"lhfxsa-trade", "lhfxsa trade"} and self.execution_mode != EXECUTION_MODE_LIVE:
+                return False
+            return compact in _LIVE_LHFX_SERVERS
+        return False
+
+    def live_funding_readiness(self) -> dict[str, Any]:
+        """Return secret-free 5-gate readiness status for Real-Money LIVE funding & arming."""
+        oanda_acct_ok = _has_staged_env_value(self._env, ENV_OANDA_LIVE_ACCOUNT_ID)
+        oanda_tok_ok = (
+            _has_staged_env_value(self._env, ENV_OANDA_LIVE_API_TOKEN)
+            or _has_staged_env_value(self._env, ENV_OANDA_LIVE_TOKEN)
+        )
+        hugo_ok = (
+            _has_staged_env_value(self._env, ENV_HUGOSWAY_MT5_LOGIN)
+            and self._is_live_mt5_server_staged(BROKER_HUGOSWAY_MT5, ENV_HUGOSWAY_MT5_SERVER)
+        )
+        lhfx_ok = (
+            _has_staged_env_value(self._env, ENV_LHFX_MT5_LOGIN)
+            and self._is_live_mt5_server_staged(BROKER_LHFX_MT5, ENV_LHFX_MT5_SERVER)
+        )
+        gate1_passed = bool(oanda_acct_ok and oanda_tok_ok and hugo_ok and lhfx_ok)
+        missing_g1: list[str] = []
+        if not (oanda_acct_ok and oanda_tok_ok):
+            missing_g1.append("OANDA_LIVE")
+        if not hugo_ok:
+            missing_g1.append("HUGOSWAY_MT5")
+        if not lhfx_ok:
+            missing_g1.append("LHFX_MT5")
+        gate1_detail = (
+            "OANDA Live + Hugo's Way + LHFX live endpoints staged."
+            if gate1_passed
+            else f"Pending live venue staging: {', '.join(missing_g1)}."
+        )
+
+        hugo_tkt_ok = _has_staged_env_value(self._env, ENV_HUGOSWAY_MT5_LIVE_TICKET)
+        lhfx_tkt_ok = _has_staged_env_value(self._env, ENV_LHFX_MT5_LIVE_TICKET)
+        oanda_tkt_ok = _has_staged_env_value(self._env, ENV_OANDA_LIVE_TICKET)
+        gate2_passed = bool(hugo_tkt_ok and lhfx_tkt_ok and oanda_tkt_ok)
+        missing_g2: list[str] = []
+        if not hugo_tkt_ok:
+            missing_g2.append("HUGOSWAY_MT5")
+        if not lhfx_tkt_ok:
+            missing_g2.append("LHFX_MT5")
+        if not oanda_tkt_ok:
+            missing_g2.append("OANDA_LIVE")
+        gate2_detail = (
+            "All 3 owner Ed25519 live tickets staged."
+            if gate2_passed
+            else f"Pending owner Ed25519 live tickets: {', '.join(missing_g2)}."
+        )
+
+        eq_map = self.equities()
+        total_eq = self.barbell.total_equity(eq_map)
+        tol = self.barbell.allocation_tolerance_share
+        if self.barbell.demo_virtual_sleeve:
+            gate3_passed = False
+            gate3_detail = "Demo virtual sleeve active; set CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE=0 for LIVE."
+        elif total_eq > Decimal("0"):
+            alloc_rows = self.barbell.allocation_report(eq_map)["venues"]
+            drifted = [
+                f"{row['broker_id']} ({row['actual_share']} vs {row['target_share']})"
+                for row in alloc_rows
+                if abs(Decimal(str(row["actual_share"])) - Decimal(str(row["target_share"]))) > tol
+            ]
+            gate3_passed = len(drifted) == 0
+            gate3_detail = (
+                f"Real 80/12/8 barbell custody verified across ${decimal_text(total_eq)}."
+                if gate3_passed
+                else f"Barbell custody outside +/-{decimal_text(tol)} tolerance: {', '.join(drifted)}."
+            )
+        else:
+            gate3_passed = True
+            gate3_detail = (
+                f"Real 80/12/8 barbell policy active (virtual sleeve off; +/-{decimal_text(tol)} tolerance)."
+            )
+
+        valve_ok = self._valve_gate is not None
+        mt5_db_ok = (
+            self._mt5_mutation_journal is not None
+            and getattr(self._mt5_mutation_journal, "db_path", None) is not None
+        )
+        oanda_db_ok = (
+            True
+            if self._oanda_mutation_journal is None
+            else getattr(self._oanda_mutation_journal, "db_path", None) is not None
+        )
+        gate4_passed = bool(valve_ok and mt5_db_ok and oanda_db_ok)
+        gate4_detail = (
+            "ForexMetaValveGate active with durable SQLite WAL mutation journals."
+            if gate4_passed
+            else "Requires ForexMetaValveGate and durable SQLite paths on mutation journals."
+        )
+
+        gate5_passed = bool(self.execution_mode == EXECUTION_MODE_LIVE and bool(self._live_armed))
+        gate5_detail = (
+            "Two-key LIVE execution mode armed and verified."
+            if gate5_passed
+            else f"Currently in {self.execution_mode} mode; two-key LIVE arming is disarmed."
+        )
+
+        gates: list[dict[str, Any]] = [
+            {
+                "id": "LIVE_CREDENTIALS_STAGED",
+                "step": 1,
+                "title": "Live OANDA + Hugo's Way + LHFX Endpoints Staged",
+                "passed": gate1_passed,
+                "detail": gate1_detail,
+            },
+            {
+                "id": "OWNER_ED25519_LIVE_TICKETS",
+                "step": 2,
+                "title": "Owner Ed25519 Live Authorization Tickets Staged",
+                "passed": gate2_passed,
+                "detail": gate2_detail,
+            },
+            {
+                "id": "REAL_BARBELL_80_12_8_CUSTODY",
+                "step": 3,
+                "title": "Real 80% / 12% / 8% Barbell Custody Active",
+                "passed": gate3_passed,
+                "detail": gate3_detail,
+            },
+            {
+                "id": "VALVE_AND_DURABLE_JOURNALS",
+                "step": 4,
+                "title": "ForexMetaValveGate & Durable SQLite Journals Ready",
+                "passed": gate4_passed,
+                "detail": gate4_detail,
+            },
+            {
+                "id": "TWO_KEY_LIVE_ARMED",
+                "step": 5,
+                "title": "Two-Key Real-Money LIVE Mode Armed",
+                "passed": gate5_passed,
+                "detail": gate5_detail,
+            },
+        ]
+        out: dict[str, Any] = {
+            "execution_mode": self.execution_mode,
+            "live_armed": bool(self._live_armed),
+            "required_arm_phrase": LIVE_FUNDING_ARM_PHRASE,
+            "gates": gates,
+            "all_gates_ready": all(bool(g["passed"]) for g in gates),
+        }
+        assert_safe_json_numbers(out)
+        return out
+
     def routing_snapshot(self) -> dict[str, Any]:
         snap = super().routing_snapshot()
         try:
@@ -1309,5 +1511,6 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             },
             "offset_planner": self.offset_planner.config_dict(),
         }
+        snap["live_readiness"] = self.live_funding_readiness()
         assert_safe_json_numbers(snap)
         return snap
