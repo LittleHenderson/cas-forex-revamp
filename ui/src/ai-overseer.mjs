@@ -22,6 +22,13 @@ const PROTECTION_STAGES = Object.freeze(['INITIAL_SL', 'BREAKEVEN_LOCKED', 'TRAI
 export const RISK_GEAR_MODES = Object.freeze(['CONSERVATIVE', 'AUTO_ADAPTIVE', 'AGGRESSIVE']);
 export const CAPITAL_STATUSES = Object.freeze(['RECOVERY_MODE', 'AT_PRINCIPAL', 'IN_SURPLUS']);
 export const SESSION_CADENCE_MODES = Object.freeze(['AUTO', 'REGIONAL_RECOVERY', 'REGIONAL_8H', 'DAILY_NY']);
+export const LIVE_TRADING_STATE_CODES = Object.freeze([
+  'TRADING_NOW_OPEN_POSITIONS',
+  'ACTIVE_SCANNING_MARKETS',
+  'PAUSED_RESEARCH_RESPITE',
+  'PAUSED_SAFETY_LOCK',
+  'STOPPED_OR_PAUSED',
+]);
 const INDEX_PAIRS = Object.freeze(['NAS100', 'US30', 'SPX500', 'XAUUSD']);
 
 export function computeMarketSessions(nowMs = Date.now(), mt5TickFresh = false) {
@@ -164,6 +171,239 @@ function defaultRegionWindowLabel(sessionDate, capitalStatus, sessionCadence) {
   return 'DAILY_NY (17:00 America/New_York)';
 }
 
+export function isSyntheticSyncEntry(tradeId, symbol) {
+  const tid = String(tradeId ?? '').trim().toUpperCase();
+  const sym = String(symbol ?? '').trim().toUpperCase();
+  return tid.startsWith('SESSION_SYNC') || sym === 'SESSION_BASKET' || sym.startsWith('SESSION_SYNC');
+}
+
+export function forexSessionLabelForUtc(isoUtc) {
+  if (typeof isoUtc !== 'string' || !isoUtc.trim()) return 'Unknown Session';
+  const ms = Date.parse(isoUtc.trim());
+  if (!Number.isFinite(ms)) return 'Unknown Session';
+  const hr = new Date(ms).getUTCHours();
+  if (hr >= 22 || hr < 7) return 'Asia / Tokyo–Sydney';
+  if (hr >= 7 && hr < 12) return 'London';
+  return 'New York / US';
+}
+
+export function formatUtcTimestamp(isoUtc) {
+  if (typeof isoUtc !== 'string' || !isoUtc.trim()) return '';
+  const ms = Date.parse(isoUtc.trim());
+  if (!Number.isFinite(ms)) return str(isoUtc, '', 64);
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} UTC`;
+}
+
+export function formatPacificTimestamp(isoUtc) {
+  if (typeof isoUtc !== 'string' || !isoUtc.trim()) return '';
+  const ms = Date.parse(isoUtc.trim());
+  if (!Number.isFinite(ms)) return str(isoUtc, '', 64);
+  try {
+    const dtf = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+      timeZoneName: 'short',
+    });
+    const parts = dtf.formatToParts(new Date(ms));
+    const map = {};
+    for (const p of parts) map[p.type] = p.value;
+    const hh = map.hour === '24' ? '00' : map.hour;
+    const tz = map.timeZoneName || 'PT';
+    return `${map.year}-${map.month}-${map.day} ${hh}:${map.minute}:${map.second} ${tz}`;
+  } catch {
+    const pt = new Date(ms - 8 * 3600000);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pt.getUTCFullYear()}-${pad(pt.getUTCMonth() + 1)}-${pad(pt.getUTCDate())} ${pad(pt.getUTCHours())}:${pad(pt.getUTCMinutes())}:${pad(pt.getUTCSeconds())} PST`;
+  }
+}
+
+export function friendlyBrokerLabel(brokerId, explicitLabel = '') {
+  if (typeof explicitLabel === 'string' && explicitLabel.trim().length > 0 && explicitLabel.trim().length <= 48) {
+    return explicitLabel.trim();
+  }
+  const raw = String(brokerId ?? '').trim();
+  const upper = raw.toUpperCase();
+  if (upper.startsWith('LHFX')) return 'LHFX';
+  if (upper.startsWith('HUGOSWAY') || upper.startsWith('HUGO')) return "Hugo's Way";
+  if (upper.startsWith('OANDA')) return 'OANDA';
+  return raw ? raw.slice(0, 40) : 'MT5';
+}
+
+function normalizeMarketBreakdownRows(rawRows) {
+  if (!Array.isArray(rawRows)) return Object.freeze([]);
+  const out = [];
+  for (const row of rawRows) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+    const sym = str(row.symbol, '', 32);
+    if (!sym || isSyntheticSyncEntry('', sym)) continue;
+    const occUtc = str(row.last_occurred_at_utc ?? row.last_occurred_at ?? '', '', 64);
+    const brokerId = str(row.broker_id ?? row.last_broker_id ?? '', '', 40);
+    const brokerLabel = brokerId || row.broker_label || row.last_broker_label
+      ? friendlyBrokerLabel(brokerId, str(row.broker_label ?? row.last_broker_label ?? '', '', 48))
+      : '';
+    out.push(Object.freeze({
+      symbol: sym,
+      brokerId,
+      brokerLabel,
+      realizedPnlUsd: numStr(row.realized_pnl_usd ?? row.realized_net_usd, '0'),
+      tradeCount: Number.isSafeInteger(row.trade_count) ? row.trade_count : 0,
+      winCount: Number.isSafeInteger(row.win_count) ? row.win_count : 0,
+      lossCount: Number.isSafeInteger(row.loss_count) ? row.loss_count : 0,
+      lastOccurredAtUtc: occUtc,
+      lastOccurredAtPacific: str(row.last_occurred_at_pacific, formatPacificTimestamp(occUtc), 80),
+      lastSessionLabel: str(row.last_session_label, occUtc ? forexSessionLabelForUtc(occUtc) : 'Unknown Session', 64),
+    }));
+  }
+  return Object.freeze(out);
+}
+
+function normalizeBrokerBreakdownRows(rawRows) {
+  if (!Array.isArray(rawRows)) return Object.freeze([]);
+  const out = [];
+  for (const row of rawRows) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+    const rawId = str(row.broker_id ?? row.broker_label ?? '', '', 40);
+    if (!rawId || isSyntheticSyncEntry('', rawId)) continue;
+    const occUtc = str(row.last_occurred_at_utc ?? row.last_occurred_at ?? '', '', 64);
+    out.push(Object.freeze({
+      brokerId: rawId,
+      brokerLabel: friendlyBrokerLabel(rawId, str(row.broker_label ?? '', '', 48)),
+      realizedPnlUsd: numStr(row.realized_pnl_usd ?? row.realized_net_usd, '0'),
+      tradeCount: Number.isSafeInteger(row.trade_count) ? row.trade_count : 0,
+      winCount: Number.isSafeInteger(row.win_count) ? row.win_count : 0,
+      lossCount: Number.isSafeInteger(row.loss_count) ? row.loss_count : 0,
+      lastOccurredAtUtc: occUtc,
+      lastOccurredAtPacific: str(row.last_occurred_at_pacific, formatPacificTimestamp(occUtc), 80),
+      lastSessionLabel: str(row.last_session_label, occUtc ? forexSessionLabelForUtc(occUtc) : 'Unknown Session', 64),
+    }));
+  }
+  return Object.freeze(out);
+}
+
+function normalizeLiveTradingStatus(doc, govMode, quotaStatus, respiteMode, openPositions) {
+  const raw = doc?.live_trading_status && typeof doc.live_trading_status === 'object' && !Array.isArray(doc.live_trading_status)
+    ? doc.live_trading_status
+    : null;
+  const openCount = Number.isSafeInteger(raw?.open_positions_count) ? raw.open_positions_count : openPositions.length;
+  const openSymbols = Object.freeze(
+    Array.isArray(raw?.open_symbols)
+      ? raw.open_symbols.map((s) => str(s, '', 32)).filter((s) => s && !isSyntheticSyncEntry('', s))
+      : [...new Set(openPositions.map((p) => p.symbol).filter(Boolean))],
+  );
+  let defaultCode = 'ACTIVE_SCANNING_MARKETS';
+  let defaultHeadline = 'ACTIVE — SCANNING MARKETS (0 OPEN TRADES)';
+  let defaultTrading = true;
+  if (openCount > 0 && govMode === 'ACTIVE') {
+    defaultCode = 'TRADING_NOW_OPEN_POSITIONS';
+    defaultHeadline = `TRADING NOW — ${openCount} OPEN POSITION${openCount === 1 ? '' : 'S'}: ${openSymbols.join(', ')}`;
+    defaultTrading = true;
+  } else if (respiteMode || quotaStatus === 'DAILY_QUOTA_LOCKED' || quotaStatus === 'PROFIT_FLOOR_LOCKED') {
+    defaultCode = 'PAUSED_RESEARCH_RESPITE';
+    defaultHeadline = 'PAUSED — RESEARCH RESPITE (PROFIT LOCKED)';
+    defaultTrading = false;
+  } else if (quotaStatus === 'DAILY_LOSS_CIRCUIT_TRIPPED') {
+    defaultCode = 'PAUSED_SAFETY_LOCK';
+    defaultHeadline = 'PAUSED — SAFETY LOCK';
+    defaultTrading = false;
+  } else if (govMode !== 'ACTIVE') {
+    defaultCode = 'STOPPED_OR_PAUSED';
+    defaultHeadline = `PAUSED — ${govMode}`;
+    defaultTrading = false;
+  }
+  const rawCode = typeof raw?.state_code === 'string' ? raw.state_code.trim().toUpperCase() : '';
+  const stateCode = LIVE_TRADING_STATE_CODES.includes(rawCode) ? rawCode : defaultCode;
+  return Object.freeze({
+    stateCode,
+    headline: str(raw?.headline, defaultHeadline, 200),
+    isCurrentlyTrading: typeof raw?.is_currently_trading === 'boolean' ? raw.is_currently_trading : defaultTrading,
+    hasOpenPositions: typeof raw?.has_open_positions === 'boolean' ? raw.has_open_positions : (openCount > 0),
+    openPositionsCount: openCount,
+    openSymbols,
+  });
+}
+
+function normalizeLastTrade(doc) {
+  const lt = doc?.last_trade;
+  if (!lt || typeof lt !== 'object' || Array.isArray(lt)) return null;
+  const tradeId = str(lt.trade_id, '', 120);
+  const symbol = str(lt.symbol, '', 32);
+  if (!symbol || isSyntheticSyncEntry(tradeId, symbol)) return null;
+  const occUtc = str(lt.occurred_at_utc ?? lt.occurred_at ?? '', '', 64);
+  const brokerId = str(lt.broker_id, 'MT5', 40);
+  const brokerLabel = friendlyBrokerLabel(brokerId, str(lt.broker_label ?? '', '', 48));
+  return Object.freeze({
+    tradeId,
+    symbol,
+    brokerId,
+    brokerLabel,
+    action: str(lt.action, 'CLOSED_TRADE', 40),
+    realizedPnlUsd: lt.realized_pnl_usd === null || lt.realized_pnl_usd === undefined
+      ? null
+      : numStr(lt.realized_pnl_usd, '0'),
+    occurredAtUtc: occUtc,
+    occurredAtPacific: str(lt.occurred_at_pacific, formatPacificTimestamp(occUtc), 80),
+    sessionLabel: str(lt.session_label, occUtc ? forexSessionLabelForUtc(occUtc) : 'Unknown Session', 64),
+  });
+}
+
+function normalizeRealizedPnlLedger(doc) {
+  const rpl = doc?.realized_pnl_ledger && typeof doc.realized_pnl_ledger === 'object' && !Array.isArray(doc.realized_pnl_ledger)
+    ? doc.realized_pnl_ledger
+    : null;
+  const bs = doc?.banked_session && typeof doc.banked_session === 'object' && !Array.isArray(doc.banked_session)
+    ? doc.banked_session
+    : null;
+  const rawEntries = Array.isArray(rpl?.entries) ? rpl.entries.slice(0, 50) : [];
+  const entries = [];
+  for (const item of rawEntries) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const tradeId = str(item.trade_id, '', 120);
+    const symbol = str(item.symbol, '', 32);
+    if (!symbol || isSyntheticSyncEntry(tradeId, symbol)) continue;
+    const occUtc = str(item.occurred_at_utc ?? item.occurred_at ?? '', '', 64);
+    const brokerId = str(item.broker_id, 'MT5', 40);
+    const brokerLabel = friendlyBrokerLabel(brokerId, str(item.broker_label ?? '', '', 48));
+    entries.push(Object.freeze({
+      tradeId,
+      symbol,
+      brokerId,
+      brokerLabel,
+      realizedPnlUsd: numStr(item.realized_pnl_usd ?? item.realized_net_usd, '0'),
+      occurredAtUtc: occUtc,
+      occurredAtPacific: str(item.occurred_at_pacific, formatPacificTimestamp(occUtc), 80),
+      sessionLabel: str(item.session_label, occUtc ? forexSessionLabelForUtc(occUtc) : 'Unknown Session', 64),
+      sessionKey: str(item.session_key, '', 64),
+    }));
+  }
+  const sessionByMarket = normalizeMarketBreakdownRows(rpl?.session_by_market ?? bs?.session_by_market);
+  const lifetimeByMarket = normalizeMarketBreakdownRows(rpl?.lifetime_by_market);
+  const sessionByBroker = normalizeBrokerBreakdownRows(rpl?.session_by_broker ?? bs?.session_by_broker);
+  const lifetimeByBroker = normalizeBrokerBreakdownRows(rpl?.lifetime_by_broker);
+  const rawSummary = rpl?.session_provenance_summary ?? bs?.session_provenance_summary;
+  let defaultSummary = 'No closed trades in current session yet';
+  if (sessionByMarket.length > 0) {
+    const parts = sessionByMarket.map((m) => `${m.symbol} (${formatSignedUsd(m.realizedPnlUsd)}${m.brokerLabel ? ` · ${m.brokerLabel}` : ''})`).join(' · ');
+    const lead = sessionByMarket[0];
+    defaultSummary = `${parts} · ${lead.lastSessionLabel}${lead.lastOccurredAtPacific ? ` · ${lead.lastOccurredAtPacific}` : ''}`;
+  }
+  return Object.freeze({
+    entries: Object.freeze(entries),
+    sessionByMarket,
+    lifetimeByMarket,
+    sessionByBroker,
+    lifetimeByBroker,
+    sessionProvenanceSummary: str(rawSummary, defaultSummary, 240),
+  });
+}
+
 function normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operatingMode) {
   const bs = doc?.banked_session && typeof doc.banked_session === 'object' && !Array.isArray(doc.banked_session)
     ? doc.banked_session
@@ -255,6 +495,9 @@ function normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operating
     operatingMode: str(bs?.operating_mode, operatingMode, 40),
     sessionRolloverLabel: str(bs?.session_rollover_label, '17:00 America/New_York (14:00 Pacific)', 120),
     nextSessionOpensUtc: bs?.next_session_opens_utc ? str(bs.next_session_opens_utc, '', 64) : null,
+    sessionByMarket: normalizeMarketBreakdownRows(bs?.session_by_market),
+    sessionByBroker: normalizeBrokerBreakdownRows(bs?.session_by_broker),
+    sessionProvenanceSummary: str(bs?.session_provenance_summary, 'No closed trades in current session yet', 240),
   });
 }
 
@@ -391,6 +634,26 @@ export const STATIC_AI_TRADER = Object.freeze({
     operatingMode: 'ACTIVE_TRADING',
     sessionRolloverLabel: '17:00 America/New_York (14:00 Pacific)',
     nextSessionOpensUtc: null,
+    sessionByMarket: Object.freeze([]),
+    sessionByBroker: Object.freeze([]),
+    sessionProvenanceSummary: 'No closed trades in current session yet',
+  }),
+  liveTradingStatus: Object.freeze({
+    stateCode: 'STOPPED_OR_PAUSED',
+    headline: 'PAUSED — STANDBY',
+    isCurrentlyTrading: false,
+    hasOpenPositions: false,
+    openPositionsCount: 0,
+    openSymbols: Object.freeze([]),
+  }),
+  lastTrade: null,
+  realizedPnlLedger: Object.freeze({
+    entries: Object.freeze([]),
+    sessionByMarket: Object.freeze([]),
+    lifetimeByMarket: Object.freeze([]),
+    sessionByBroker: Object.freeze([]),
+    lifetimeByBroker: Object.freeze([]),
+    sessionProvenanceSummary: 'No closed trades in current session yet',
   }),
   accountingBasis: 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT',
   confirmedBankPayoutsUsd: '0',
@@ -516,6 +779,15 @@ export function normalizeAiTrader(doc) {
     protectedProfitFloorUsd: numStr(q.protected_profit_floor_usd, '0'),
   });
   const bankedSession = normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operatingMode);
+  const liveTradingStatus = normalizeLiveTradingStatus(
+    doc,
+    govMode,
+    quotaStatus,
+    Boolean(doc.respite_mode),
+    openPositions,
+  );
+  const lastTrade = normalizeLastTrade(doc);
+  const realizedPnlLedger = normalizeRealizedPnlLedger(doc);
   return Object.freeze({
     connected: true,
     humanRole: str(doc.human_role, 'OVERSEER_ONLY'),
@@ -599,6 +871,9 @@ export function normalizeAiTrader(doc) {
     }) : STATIC_AI_TRADER.riskGear,
     dailyQuota,
     bankedSession,
+    liveTradingStatus,
+    lastTrade,
+    realizedPnlLedger,
     openPositions: Object.freeze(openPositions),
     recentActions: Object.freeze(recentActions),
   });
@@ -760,6 +1035,7 @@ export function renderAiOverseerPanel(state) {
         <progress class="quota-progress" value="${esc(pctVal)}" max="100" aria-label="Daily quota progress percent">${esc(pctVal)}%</progress>
         ${profitRatchetRow}
         <p class="quiet-note numeric">Realized today: $${esc(q.realizedNetPnlUsd)} (${esc(q.realizedPnlPct)}%) · Soft $${esc(q.softQuotaUsd)} (0.5x risk) / Hard $${esc(q.hardQuotaUsd)} lock · Max daily loss $${esc(q.maxDailyLossUsd)} · Streak ${esc(q.consecutiveLosses)}/${esc(q.maxConsecutiveLosses)} · Risk mult ${esc(q.riskMultiplier)}x</p>
+        <p class="quiet-note provenance-inline" data-quota-realized-provenance="true">Provenance: ${esc(resolveRealizedPnlProvenance(state).compactSummary)}</p>
       </div>
     </div>
     <div class="risk-gear-block" role="group" aria-label="Owner risk gear and dynamic daily quota selector">
@@ -800,6 +1076,189 @@ export function renderAiModelCatalogPanel(aiModels) {
   </section>`;
 }
 
+export function resolveRealizedPnlProvenance(state) {
+  const trader = state?.aiTrader ?? STATIC_AI_TRADER;
+  const bs = trader.bankedSession ?? STATIC_AI_TRADER.bankedSession;
+  const rpl = trader.realizedPnlLedger ?? STATIC_AI_TRADER.realizedPnlLedger;
+  const treasury = state?.treasury;
+
+  const seenIds = new Set();
+  const entries = [];
+  const pushEntry = (raw) => {
+    if (!raw || typeof raw !== 'object') return;
+    const tradeId = str(raw.tradeId ?? raw.trade_id ?? '', '', 120);
+    const symbol = str(raw.symbol ?? '', '', 32);
+    if (!symbol || isSyntheticSyncEntry(tradeId, symbol)) return;
+    const dedupKey = tradeId || `${symbol}:${raw.occurredAtUtc ?? raw.occurredAt ?? ''}:${raw.realizedPnlUsd ?? raw.realizedNetUsd ?? ''}`;
+    if (seenIds.has(dedupKey)) return;
+    seenIds.add(dedupKey);
+    const occUtc = str(raw.occurredAtUtc ?? raw.occurredAt ?? raw.occurred_at_utc ?? raw.occurred_at ?? '', '', 64);
+    const occUtcFmt = formatUtcTimestamp(occUtc);
+    const occPac = str(raw.occurredAtPacific ?? raw.occurred_at_pacific ?? '', formatPacificTimestamp(occUtc), 80);
+    const sessLbl = str(raw.sessionLabel ?? raw.session_label ?? '', occUtc ? forexSessionLabelForUtc(occUtc) : 'Unknown Session', 64);
+    const brokerId = str(raw.brokerId ?? raw.broker_id ?? 'MT5', 'MT5', 40);
+    const brokerLabel = friendlyBrokerLabel(brokerId, str(raw.brokerLabel ?? raw.broker_label ?? '', '', 48));
+    entries.push(Object.freeze({
+      tradeId,
+      symbol,
+      brokerId,
+      brokerLabel,
+      realizedPnlUsd: numStr(raw.realizedPnlUsd ?? raw.realizedNetUsd ?? raw.realized_pnl_usd ?? raw.realized_net_usd, '0'),
+      occurredAtUtc: occUtc,
+      occurredAtUtcFormatted: occUtcFmt,
+      occurredAtPacific: occPac,
+      sessionLabel: sessLbl,
+    }));
+  };
+
+  for (const eItem of rpl.entries ?? []) pushEntry(eItem);
+  for (const sItem of treasury?.tradeSweeps ?? []) pushEntry(sItem);
+  for (const sItem of treasury?.recentSweeps ?? []) {
+    if (!sItem?.isReconciliationSync) pushEntry(sItem);
+  }
+
+  let lastTrade = null;
+  if (trader.lastTrade && !isSyntheticSyncEntry(trader.lastTrade.tradeId, trader.lastTrade.symbol)) {
+    const ltBrokerId = str(trader.lastTrade.brokerId ?? 'MT5', 'MT5', 40);
+    lastTrade = Object.freeze({
+      ...trader.lastTrade,
+      brokerId: ltBrokerId,
+      brokerLabel: friendlyBrokerLabel(ltBrokerId, trader.lastTrade.brokerLabel ?? ''),
+      occurredAtUtcFormatted: formatUtcTimestamp(trader.lastTrade.occurredAtUtc),
+    });
+  } else if (entries.length > 0) {
+    const first = entries[0];
+    lastTrade = Object.freeze({
+      tradeId: first.tradeId,
+      symbol: first.symbol,
+      brokerId: first.brokerId,
+      brokerLabel: first.brokerLabel,
+      action: 'CLOSED_TRADE',
+      realizedPnlUsd: first.realizedPnlUsd,
+      occurredAtUtc: first.occurredAtUtc,
+      occurredAtUtcFormatted: first.occurredAtUtcFormatted,
+      occurredAtPacific: first.occurredAtPacific,
+      sessionLabel: first.sessionLabel,
+    });
+  }
+
+  const brokersBySym = new Map();
+  for (const row of entries) {
+    if (!brokersBySym.has(row.symbol)) brokersBySym.set(row.symbol, new Set());
+    if (row.brokerLabel) brokersBySym.get(row.symbol).add(row.brokerLabel);
+  }
+
+  let marketRows = [];
+  if ((rpl.sessionByMarket ?? []).length > 0) {
+    marketRows = [...rpl.sessionByMarket];
+  } else if ((bs.sessionByMarket ?? []).length > 0) {
+    marketRows = [...bs.sessionByMarket];
+  } else if ((rpl.lifetimeByMarket ?? []).length > 0) {
+    marketRows = [...rpl.lifetimeByMarket];
+  } else if (Array.isArray(treasury?.realizedByMarket) && treasury.realizedByMarket.length > 0) {
+    marketRows = treasury.realizedByMarket
+      .filter((m) => m?.symbol && !isSyntheticSyncEntry('', m.symbol))
+      .map((m) => Object.freeze({
+        symbol: m.symbol,
+        brokerLabel: m.brokerLabel ?? '',
+        realizedPnlUsd: m.realizedPnlUsd ?? m.realizedNetUsd ?? '0',
+        tradeCount: m.tradeCount ?? 0,
+        lastOccurredAtUtc: m.lastOccurredAtUtc ?? m.lastOccurredAt ?? '',
+        lastOccurredAtPacific: m.lastOccurredAtPacific ?? '',
+        lastSessionLabel: m.lastSessionLabel ?? 'Unknown Session',
+      }));
+  } else if (entries.length > 0) {
+    const bySym = new Map();
+    for (const row of entries) {
+      const prev = bySym.get(row.symbol);
+      const nextCents = (prev?.cents ?? 0n) + toCentsBigInt(row.realizedPnlUsd);
+      bySym.set(row.symbol, {
+        symbol: row.symbol,
+        cents: nextCents,
+        tradeCount: (prev?.tradeCount ?? 0) + 1,
+        lastOccurredAtPacific: prev?.lastOccurredAtPacific || row.occurredAtPacific,
+        lastOccurredAtUtc: prev?.lastOccurredAtUtc || row.occurredAtUtc,
+        lastSessionLabel: prev?.lastSessionLabel || row.sessionLabel,
+      });
+    }
+    marketRows = [...bySym.values()].map((m) => Object.freeze({
+      symbol: m.symbol,
+      brokerLabel: [...(brokersBySym.get(m.symbol) ?? [])].join(' / '),
+      realizedPnlUsd: centsBigIntToDecimal(m.cents),
+      tradeCount: m.tradeCount,
+      lastOccurredAtUtc: m.lastOccurredAtUtc,
+      lastOccurredAtPacific: m.lastOccurredAtPacific,
+      lastSessionLabel: m.lastSessionLabel,
+    }));
+  }
+
+  let brokerRows = [];
+  if ((rpl.sessionByBroker ?? []).length > 0) {
+    brokerRows = [...rpl.sessionByBroker];
+  } else if ((bs.sessionByBroker ?? []).length > 0) {
+    brokerRows = [...bs.sessionByBroker];
+  } else if ((rpl.lifetimeByBroker ?? []).length > 0) {
+    brokerRows = [...rpl.lifetimeByBroker];
+  } else if (Array.isArray(treasury?.realizedByBroker) && treasury.realizedByBroker.length > 0) {
+    brokerRows = [...treasury.realizedByBroker];
+  } else if (entries.length > 0) {
+    const byBrk = new Map();
+    for (const row of entries) {
+      const key = row.brokerLabel || friendlyBrokerLabel(row.brokerId);
+      const prev = byBrk.get(key);
+      byBrk.set(key, {
+        brokerId: row.brokerId,
+        brokerLabel: key,
+        cents: (prev?.cents ?? 0n) + toCentsBigInt(row.realizedPnlUsd),
+        tradeCount: (prev?.tradeCount ?? 0) + 1,
+      });
+    }
+    brokerRows = [...byBrk.values()].map((b) => Object.freeze({
+      brokerId: b.brokerId,
+      brokerLabel: b.brokerLabel,
+      realizedPnlUsd: centsBigIntToDecimal(b.cents),
+      tradeCount: b.tradeCount,
+    }));
+  }
+
+  const singleFallbackBroker = brokerRows.length === 1 ? brokerRows[0].brokerLabel : (lastTrade?.brokerLabel ?? '');
+  const marketBreakdownText = marketRows.length > 0
+    ? marketRows.map((m) => {
+        const symBrokers = m.brokerLabel
+          || [...(brokersBySym.get(m.symbol) ?? [])].join(' / ')
+          || (marketRows.length === 1 ? singleFallbackBroker : '');
+        return `${m.symbol} (${formatSignedUsd(m.realizedPnlUsd)}${symBrokers ? ` · ${symBrokers}` : ''})`;
+      }).join(' · ')
+    : 'No closed real-symbol trades attributed in this window';
+  const brokerBreakdownText = brokerRows.length > 0
+    ? brokerRows.map((b) => `${b.brokerLabel} (${formatSignedUsd(b.realizedPnlUsd ?? b.realizedNetUsd ?? '0')})`).join(' · ')
+    : '';
+  const sessionLabel = lastTrade?.sessionLabel
+    || marketRows[0]?.lastSessionLabel
+    || bs.activeRegionWindow
+    || 'DAILY_NY (17:00 America/New_York)';
+  const timestampText = lastTrade && (lastTrade.occurredAtPacific || lastTrade.occurredAtUtcFormatted)
+    ? [lastTrade.occurredAtPacific, lastTrade.occurredAtUtcFormatted].filter(Boolean).join(' · ')
+    : 'No closed-trade timestamp recorded in this session';
+  const compactSummary = marketRows.length > 0 || lastTrade
+    ? `${marketBreakdownText}${brokerBreakdownText ? ` · Accounts: ${brokerBreakdownText}` : ''} · Session: ${sessionLabel} · ${timestampText}`
+    : (rpl.sessionProvenanceSummary && rpl.sessionProvenanceSummary !== 'No closed trades in current session yet'
+      ? rpl.sessionProvenanceSummary
+      : `Session: ${sessionLabel} · No closed real-symbol trades recorded yet`);
+
+  return Object.freeze({
+    lastTrade,
+    entries: Object.freeze(entries.slice(0, 20)),
+    marketRows: Object.freeze(marketRows),
+    brokerRows: Object.freeze(brokerRows),
+    marketBreakdownText,
+    brokerBreakdownText,
+    sessionLabel,
+    timestampText,
+    compactSummary,
+  });
+}
+
 function resolveNextAutoWakeupLabel(bs) {
   const nextUtc = String(bs.nextSessionOpensUtc ?? '');
   const win = String(bs.activeRegionWindow ?? '').toUpperCase();
@@ -834,9 +1293,35 @@ export function renderBankedProfitsHeroBanner(state) {
   const busy = Boolean(state?.aiActionBusy);
   const q = trader.dailyQuota ?? STATIC_AI_TRADER.dailyQuota;
   const bs = trader.bankedSession ?? normalizeBankedSession(null, q, trader.bankSweepReservedUsd ?? '0', trader.operatingMode ?? 'ACTIVE_TRADING');
+  const liveStatus = trader.liveTradingStatus ?? normalizeLiveTradingStatus(
+    null,
+    trader.governanceMode ?? 'ACTIVE',
+    q.status ?? 'OPEN',
+    Boolean(trader.respiteMode),
+    trader.openPositions ?? [],
+  );
+  const prov = resolveRealizedPnlProvenance(state);
   const isLiveArmed = state?.brokerRouting?.executionMode === 'LIVE' && state?.brokerRouting?.liveArmed === true;
   const isRespite = Boolean(bs.profitsLockedForSession || trader.respiteMode || bs.operatingMode === 'RESEARCH_RESPITE');
   const isUnderwater = bs.capitalStatus !== 'IN_SURPLUS';
+
+  let statusStripTone = 'is-scanning';
+  if (liveStatus.stateCode === 'TRADING_NOW_OPEN_POSITIONS') statusStripTone = 'is-trading-now';
+  else if (liveStatus.stateCode === 'PAUSED_RESEARCH_RESPITE') statusStripTone = 'is-respite-paused';
+  else if (liveStatus.stateCode === 'PAUSED_SAFETY_LOCK' || liveStatus.stateCode === 'STOPPED_OR_PAUSED') statusStripTone = 'is-safety-paused';
+
+  const lt = prov.lastTrade;
+  const lastTradeStripBody = lt
+    ? `<span class="last-trade-label">LAST EXECUTED TRADE:</span> <strong>${esc(lt.symbol)}</strong> · Account: <strong>${esc(lt.brokerLabel || friendlyBrokerLabel(lt.brokerId))}</strong> · <span class="numeric">${esc(lt.action)}${lt.realizedPnlUsd !== null ? ` (${esc(formatSignedUsd(lt.realizedPnlUsd))})` : ''}</span> · Session: <strong>${esc(lt.sessionLabel)}</strong> · <span class="numeric">${esc([lt.occurredAtPacific, lt.occurredAtUtcFormatted].filter(Boolean).join(' · '))}</span>`
+    : '<span class="last-trade-label">LAST EXECUTED TRADE:</span> No executed trades recorded yet in this ledger';
+
+  const ledgerRowsHtml = prov.entries.length > 0
+    ? `<div class="provenance-ledger-wrap" data-realized-pnl-provenance-ledger="true"><div class="provenance-ledger-head"><strong>Realized P&amp;L Per-Trade Provenance Ledger (Real Closed Trades Only)</strong><span class="quiet-note numeric">${esc(prov.marketBreakdownText)}${prov.brokerBreakdownText ? ` · Accounts: ${esc(prov.brokerBreakdownText)}` : ''}</span></div><table class="ai-ticket-table provenance-ledger-table" aria-label="Realized P&L per-trade provenance ledger"><thead><tr><th>Market</th><th>Broker Account</th><th>Session</th><th>Pacific &amp; UTC Timestamp</th><th>Realized P&amp;L</th></tr></thead><tbody>${
+      prov.entries.slice(0, 8).map((row) => (
+        `<tr><td><strong>${esc(row.symbol)}</strong></td><td><strong>${esc(row.brokerLabel || friendlyBrokerLabel(row.brokerId))}</strong></td><td>${esc(row.sessionLabel)}</td><td class="numeric">${esc([row.occurredAtPacific, row.occurredAtUtcFormatted].filter(Boolean).join(' · '))}</td><td class="numeric ${compareDecimalStrings(row.realizedPnlUsd, '0') < 0 ? 'is-neg' : 'is-pos'}"><strong>${esc(formatSignedUsd(row.realizedPnlUsd))}</strong></td></tr>`
+      )).join('')
+    }</tbody></table></div>`
+    : `<div class="provenance-ledger-wrap is-empty" data-realized-pnl-provenance-ledger="true"><strong>Realized P&amp;L Per-Trade Provenance Ledger:</strong> <span class="quiet-note">No executed real-symbol closed trades recorded in this window yet (${esc(prov.sessionLabel)}).</span></div>`;
 
   const principalFormatted = formatExactUsd(bs.initialCapitalUsd ?? '300000');
   const signedSurplusPct = formatSignedPct(bs.netSurplusPct ?? '0');
@@ -927,6 +1412,13 @@ export function renderBankedProfitsHeroBanner(state) {
     : '';
 
   return `<section class="panel banked-profits-hero is-connected ${isUnderwater ? 'is-recovery-mode' : 'is-in-surplus'}" data-banked-profits-hero="true" aria-label="Principal High-Water Mark and Session Vault Scoreboard">
+    <div class="hero-live-telemetry-bar">
+      <div class="live-trading-status-strip ${statusStripTone}" data-live-trading-status-strip="true" data-trading-state-code="${esc(liveStatus.stateCode)}">
+        <span class="live-pulse-dot" aria-hidden="true"></span>
+        <strong>${esc(liveStatus.headline)}</strong>
+      </div>
+      <div class="last-real-trade-strip" data-last-real-trade-strip="true">${lastTradeStripBody}</div>
+    </div>
     <div class="banked-hero-head">
       <div>
         <p class="eyebrow">PRINCIPAL HIGH-WATER MARK &amp; INTERNAL VAULT LEDGER · ZERO-SCROLL SCOREBOARD</p>
@@ -949,6 +1441,7 @@ export function renderBankedProfitsHeroBanner(state) {
         <span class="eyebrow">${card2Eyebrow}</span>
         <div class="banked-hero-value numeric ${pnlNegative ? 'is-neg' : 'is-pos'}">${esc(formatSignedUsd(bs.bankedNetPnlUsd))}</div>
         <p class="banked-hero-sub numeric">${esc(card2Sub)}</p>
+        <p class="banked-hero-sub provenance-sub numeric" data-card2-pnl-provenance="true">Provenance: ${esc(prov.compactSummary)}</p>
       </article>
       <article class="banked-hero-card ${bs.vaultSweepsPausedForRecovery ? 'is-recovery-card' : ''}">
         <span class="eyebrow">3 · 50% Principal High-Water Vault &amp; Confirmed Payouts</span>
@@ -967,5 +1460,6 @@ export function renderBankedProfitsHeroBanner(state) {
         <div class="banked-card-cta">${advanceBtnHtml}<button type="button" class="button button-small button-primary banked-voice-btn" data-open-voice-explainer="true">Ask / Speak to Gemini 4 Neon</button></div>
       </article>
     </div>
+    ${ledgerRowsHtml}
   </section>`;
 }

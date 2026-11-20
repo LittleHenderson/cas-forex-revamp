@@ -561,6 +561,17 @@ class ProfitSweepVault:
             conn.close()
             raise
 
+    def _connect_ro(self) -> sqlite3.Connection:
+        ro_uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0, isolation_level=None)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000")
+            return conn
+        except Exception:
+            conn.close()
+            raise
+
     def _init_db(
         self,
         *,
@@ -976,7 +987,7 @@ class ProfitSweepVault:
         if not isinstance(session_date, str) or not session_date.strip():
             raise ContractError("session_date must be a non-empty session identifier")
         sdate = session_date.strip()
-        with self._lock, closing(self._connect()) as conn:
+        with self._lock, closing(self._connect_ro()) as conn:
             rows = self._select_session_sweep_rows(conn, sdate)
             s_realized = Decimal("0")
             s_retained = Decimal("0")
@@ -1589,33 +1600,153 @@ class ProfitSweepVault:
         rem = swept - disbursed
         return rem if rem > Decimal("0") else Decimal("0.00")
 
+    @staticmethod
+    def is_reconciliation_sync_event(trade_id: str, symbol: str) -> bool:
+        return str(trade_id).startswith("SESSION_SYNC_") or str(symbol) == "SESSION_BASKET"
+
     def snapshot(self) -> dict[str, Any]:
-        with self._lock, closing(self._connect()) as conn:
+        from cas_forex_revamp.valve.daily_quota import (
+            forex_session_label_for_utc,
+            format_pacific_timestamp,
+            friendly_broker_label,
+        )
+
+        with self._lock, closing(self._connect_ro()) as conn:
             cfg = conn.execute("SELECT * FROM vault_config WHERE scope_id = ?", (self.scope_id,)).fetchone()
             total_realized = Decimal("0")
             retained = Decimal("0")
             bank_reserved_total = Decimal("0")
             recent_sweeps: list[dict[str, Any]] = []
+            trade_sweeps: list[dict[str, Any]] = []
+            market_agg: dict[str, dict[str, Any]] = {}
+            broker_agg: dict[str, dict[str, Any]] = {}
             rows = conn.execute(
                 "SELECT * FROM sweep_events WHERE scope_id = ? ORDER BY rowid DESC", (self.scope_id,)
             ).fetchall()
+            row_keys_checked = False
+            has_sdate_col = False
             for idx, r in enumerate(rows):
+                if not row_keys_checked:
+                    has_sdate_col = "session_date" in r.keys()
+                    row_keys_checked = True
+                tid_str = str(r["trade_id"])
+                sym_str = str(r["symbol"])
+                brk_str = str(r["broker_id"])
+                brk_lbl = friendly_broker_label(brk_str)
+                occ_str = str(r["occurred_at"])
+                sdate_val = str(r["session_date"]) if (has_sdate_col and r["session_date"]) else None
                 net_v = Decimal(str(r["realized_net_usd_text"]))
                 ret_v = Decimal(str(r["retained_trading_usd_text"]))
                 bnk_v = Decimal(str(r["bank_sweep_usd_text"]))
                 total_realized += net_v
                 retained += ret_v
                 bank_reserved_total += bnk_v
+
+                is_sync = self.is_reconciliation_sync_event(tid_str, sym_str)
+                occ_pac = format_pacific_timestamp(occ_str)
+                sess_lbl = forex_session_label_for_utc(occ_str)
+                row_item: dict[str, Any] = {
+                    "trade_id": tid_str,
+                    "symbol": sym_str,
+                    "broker_id": brk_str,
+                    "broker_label": brk_lbl,
+                    "realized_net_usd": decimal_text(net_v),
+                    "retained_trading_usd": decimal_text(ret_v),
+                    "bank_sweep_usd": decimal_text(bnk_v),
+                    "occurred_at": occ_str,
+                    "occurred_at_pacific": occ_pac,
+                    "session_label": sess_lbl,
+                    "is_reconciliation_sync": is_sync,
+                }
+                if sdate_val is not None:
+                    row_item["session_date"] = sdate_val
                 if idx < 25:
-                    recent_sweeps.append({
-                        "trade_id": str(r["trade_id"]),
-                        "symbol": str(r["symbol"]),
-                        "broker_id": str(r["broker_id"]),
-                        "realized_net_usd": decimal_text(net_v),
-                        "retained_trading_usd": decimal_text(ret_v),
-                        "bank_sweep_usd": decimal_text(bnk_v),
-                        "occurred_at": str(r["occurred_at"]),
-                    })
+                    recent_sweeps.append(row_item)
+                if not is_sync:
+                    if len(trade_sweeps) < 50:
+                        trade_sweeps.append(dict(row_item))
+                    m_bucket = market_agg.get(sym_str)
+                    if m_bucket is None:
+                        market_agg[sym_str] = {
+                            "symbol": sym_str,
+                            "net_dec": net_v,
+                            "trade_count": 1,
+                            "win_count": 1 if net_v > Decimal("0") else 0,
+                            "loss_count": 1 if net_v < Decimal("0") else 0,
+                            "last_occurred_at": occ_str,
+                            "last_occurred_at_pacific": occ_pac,
+                            "last_session_label": sess_lbl,
+                        }
+                    else:
+                        m_bucket["net_dec"] += net_v
+                        m_bucket["trade_count"] += 1
+                        if net_v > Decimal("0"):
+                            m_bucket["win_count"] += 1
+                        elif net_v < Decimal("0"):
+                            m_bucket["loss_count"] += 1
+                        if occ_str > str(m_bucket["last_occurred_at"]):
+                            m_bucket["last_occurred_at"] = occ_str
+                            m_bucket["last_occurred_at_pacific"] = occ_pac
+                            m_bucket["last_session_label"] = sess_lbl
+
+                    b_bucket = broker_agg.get(brk_str)
+                    if b_bucket is None:
+                        broker_agg[brk_str] = {
+                            "broker_id": brk_str,
+                            "broker_label": brk_lbl,
+                            "net_dec": net_v,
+                            "trade_count": 1,
+                            "win_count": 1 if net_v > Decimal("0") else 0,
+                            "loss_count": 1 if net_v < Decimal("0") else 0,
+                            "last_occurred_at": occ_str,
+                            "last_occurred_at_pacific": occ_pac,
+                            "last_session_label": sess_lbl,
+                        }
+                    else:
+                        b_bucket["net_dec"] += net_v
+                        b_bucket["trade_count"] += 1
+                        if net_v > Decimal("0"):
+                            b_bucket["win_count"] += 1
+                        elif net_v < Decimal("0"):
+                            b_bucket["loss_count"] += 1
+                        if occ_str > str(b_bucket["last_occurred_at"]):
+                            b_bucket["last_occurred_at"] = occ_str
+                            b_bucket["last_occurred_at_pacific"] = occ_pac
+                            b_bucket["last_session_label"] = sess_lbl
+
+            realized_by_market = [
+                {
+                    "symbol": str(b["symbol"]),
+                    "realized_net_usd": decimal_text(b["net_dec"]),
+                    "trade_count": int(b["trade_count"]),
+                    "win_count": int(b["win_count"]),
+                    "loss_count": int(b["loss_count"]),
+                    "last_occurred_at": str(b["last_occurred_at"]),
+                    "last_occurred_at_pacific": str(b["last_occurred_at_pacific"]),
+                    "last_session_label": str(b["last_session_label"]),
+                }
+                for b in sorted(
+                    market_agg.values(),
+                    key=lambda item: (-Decimal(item["net_dec"]), str(item["symbol"])),
+                )
+            ]
+            realized_by_broker = [
+                {
+                    "broker_id": str(b["broker_id"]),
+                    "broker_label": str(b["broker_label"]),
+                    "realized_net_usd": decimal_text(b["net_dec"]),
+                    "trade_count": int(b["trade_count"]),
+                    "win_count": int(b["win_count"]),
+                    "loss_count": int(b["loss_count"]),
+                    "last_occurred_at": str(b["last_occurred_at"]),
+                    "last_occurred_at_pacific": str(b["last_occurred_at_pacific"]),
+                    "last_session_label": str(b["last_session_label"]),
+                }
+                for b in sorted(
+                    broker_agg.values(),
+                    key=lambda item: (-Decimal(item["net_dec"]), str(item["broker_id"])),
+                )
+            ]
 
             disbursed = Decimal("0")
             confirmed_settled = Decimal("0")
@@ -1675,6 +1806,9 @@ class ProfitSweepVault:
                 "pending_2fa_confirmation_usd": decimal_text(pending_2fa),
                 "pending_disbursement_usd": decimal_text(pending_rem),
                 "recent_sweeps": recent_sweeps,
+                "trade_sweeps": trade_sweeps,
+                "realized_by_market": realized_by_market,
+                "realized_by_broker": realized_by_broker,
                 "recent_transfers": recent_transfers,
             }
 

@@ -69,12 +69,85 @@ QUOTA_MODES = ("USD", "PCT", "COMPOUND_CAPPED")
 GENESIS_SHA256 = "0" * 64
 
 
+BROKER_FRIENDLY_LABELS: dict[str, str] = {
+    "LHFX_MT5": "LHFX",
+    "LHFX": "LHFX",
+    "HUGOSWAY_MT5": "Hugo's Way",
+    "HUGOSWAY": "Hugo's Way",
+    "OANDA_PRACTICE": "OANDA",
+    "OANDA_LIVE": "OANDA",
+    "OANDA": "OANDA",
+    "DUAL_SHIELD": "Dual-Shield Barbell",
+    "DUAL_SHIELD_BARBELL": "Dual-Shield Barbell",
+}
+
+
+def friendly_broker_label(broker_id: str | None) -> str:
+    """Map canonical broker_id to owner-facing account label ('LHFX', 'Hugo\'s Way', 'OANDA')."""
+    raw = str(broker_id or "").strip()
+    if not raw:
+        return "Unknown Broker"
+    upper = raw.upper()
+    if upper in BROKER_FRIENDLY_LABELS:
+        return BROKER_FRIENDLY_LABELS[upper]
+    if "LHFX" in upper:
+        return "LHFX"
+    if "HUGO" in upper:
+        return "Hugo's Way"
+    if "OANDA" in upper:
+        return "OANDA"
+    return raw
+
+
 def _ny_zone():
     try:
         return ZoneInfo("America/New_York")
     except ZoneInfoNotFoundError:
         logger.warning("America/New_York tzdata unavailable; falling back to UTC-05:00 session boundary")
         return timezone(timedelta(hours=-5))
+
+
+def _la_zone():
+    try:
+        return ZoneInfo("America/Los_Angeles")
+    except ZoneInfoNotFoundError:
+        logger.warning("America/Los_Angeles tzdata unavailable; falling back to PST UTC-08:00")
+        return timezone(timedelta(hours=-8), name="PST")
+
+
+def _coerce_utc_datetime(dt_or_iso: datetime | str | None) -> datetime:
+    if dt_or_iso is None:
+        return datetime.now(timezone.utc)
+    if isinstance(dt_or_iso, datetime):
+        return utc_time(dt_or_iso, "dt_or_iso")
+    if isinstance(dt_or_iso, str) and dt_or_iso.strip():
+        raw = dt_or_iso.strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    raise ContractError("dt_or_iso must be a UTC datetime, ISO-8601 string, or None")
+
+
+def forex_session_label_for_utc(dt_or_iso: datetime | str | None) -> str:
+    """Return exact global Forex market session label for a UTC datetime or ISO-8601 string."""
+    ts = _coerce_utc_datetime(dt_or_iso)
+    h = ts.hour
+    if h >= 22 or h < 7:
+        return "Asia / Tokyo\u2013Sydney"
+    if 7 <= h < 12:
+        return "London"
+    return "New York / US"
+
+
+def format_pacific_timestamp(dt_or_iso: datetime | str | None) -> str:
+    """Format a UTC datetime or ISO-8601 string in America/Los_Angeles (e.g. '2026-11-19 16:46:41 PST')."""
+    ts = _coerce_utc_datetime(dt_or_iso)
+    local_pt = ts.astimezone(_la_zone())
+    abbr = local_pt.tzname() or "PT"
+    return f"{local_pt.strftime('%Y-%m-%d %H:%M:%S')} {abbr}"
 
 
 def session_date_for(now: datetime | None = None, *, rollover_hour_ny: int = 17) -> str:
@@ -192,6 +265,7 @@ class DailyQuotaGovernanceStore:
         self._meta_loaded = False
         self._owner_verifier = owner_verifier
         self._days: dict[str, dict[str, Any]] = {}
+        self._events: list[dict[str, Any]] = []
         self._soft_quota_usd = decimal_value(Decimal(soft_quota_usd), "soft_quota_usd", positive=True)
         self._hard_quota_usd = decimal_value(Decimal(hard_quota_usd), "hard_quota_usd", positive=True)
         if self._soft_quota_usd > self._hard_quota_usd:
@@ -340,10 +414,23 @@ class DailyQuotaGovernanceStore:
                     status_after TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
                     prev_sha256 TEXT NOT NULL,
-                    event_sha256 TEXT NOT NULL
+                    event_sha256 TEXT NOT NULL,
+                    symbol TEXT,
+                    trade_id TEXT,
+                    broker_id TEXT
                 )
                 """
             )
+            ev_cols = {
+                str(r[1])
+                for r in conn.execute("PRAGMA table_info(daily_quota_events)").fetchall()
+            }
+            if "symbol" not in ev_cols:
+                conn.execute("ALTER TABLE daily_quota_events ADD COLUMN symbol TEXT")
+            if "trade_id" not in ev_cols:
+                conn.execute("ALTER TABLE daily_quota_events ADD COLUMN trade_id TEXT")
+            if "broker_id" not in ev_cols:
+                conn.execute("ALTER TABLE daily_quota_events ADD COLUMN broker_id TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS daily_quota_meta (
@@ -1095,13 +1182,28 @@ class DailyQuotaGovernanceStore:
         event_kind: str,
         delta_pnl_usd: str,
         conn: sqlite3.Connection | None,
+        symbol: str | None = None,
+        trade_id: str | None = None,
+        broker_id: str | None = None,
     ) -> None:
         if conn is None:
             self._days[row["session_key"]] = dict(row)
+            if event_kind in ("CLOSED_TRADE", "REALIZED_TRADE"):
+                self._events.append({
+                    "seq": len(self._events) + 1,
+                    "session_key": str(row["session_key"]),
+                    "event_kind": event_kind,
+                    "delta_pnl_usd": delta_pnl_usd,
+                    "status_after": str(row["status"]),
+                    "observed_at": str(row["updated_at"]),
+                    "symbol": symbol,
+                    "trade_id": trade_id,
+                    "broker_id": broker_id,
+                })
             return
         prev = conn.execute("SELECT event_sha256 FROM daily_quota_events ORDER BY seq DESC LIMIT 1").fetchone()
         prev_sha = str(prev[0]) if prev is not None else GENESIS_SHA256
-        ev_payload = {
+        ev_payload: dict[str, Any] = {
             "session_key": row["session_key"],
             "event_kind": event_kind,
             "delta_pnl_usd": delta_pnl_usd,
@@ -1109,6 +1211,12 @@ class DailyQuotaGovernanceStore:
             "observed_at": row["updated_at"],
             "prev_sha256": prev_sha,
         }
+        if symbol is not None:
+            ev_payload["symbol"] = symbol
+        if trade_id is not None:
+            ev_payload["trade_id"] = trade_id
+        if broker_id is not None:
+            ev_payload["broker_id"] = broker_id
         ev_sha = sha256(canonical_bytes(ev_payload)).hexdigest()
         conn.execute(
             """
@@ -1136,8 +1244,9 @@ class DailyQuotaGovernanceStore:
         conn.execute(
             """
             INSERT INTO daily_quota_events (
-                session_key, event_kind, delta_pnl_usd, status_after, observed_at, prev_sha256, event_sha256
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                session_key, event_kind, delta_pnl_usd, status_after, observed_at,
+                prev_sha256, event_sha256, symbol, trade_id, broker_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["session_key"],
@@ -1147,6 +1256,9 @@ class DailyQuotaGovernanceStore:
                 row["updated_at"],
                 prev_sha,
                 ev_sha,
+                symbol,
+                trade_id,
+                broker_id,
             ),
         )
 
@@ -1195,17 +1307,34 @@ class DailyQuotaGovernanceStore:
         self,
         pnl_usd: Decimal,
         *,
-        symbol: str,
-        ticket: str,
+        symbol: str | None = None,
+        ticket: str | None = None,
+        trade_id: str | None = None,
+        broker_id: str | None = None,
         starting_equity: Decimal | None = None,
         now: datetime | None = None,
         in_recovery_mode: bool = False,
     ) -> dict[str, Any]:
         pnl_dec = decimal_value(pnl_usd, "pnl_usd")
-        identifier(symbol, "symbol")
-        identifier(ticket, "ticket")
+        clean_sym = (
+            identifier(str(symbol).strip(), "symbol")
+            if (symbol is not None and str(symbol).strip())
+            else None
+        )
+        raw_tid = (
+            str(trade_id).strip()
+            if (trade_id is not None and str(trade_id).strip())
+            else (str(ticket).strip() if (ticket is not None and str(ticket).strip()) else "")
+        )
+        clean_tid = identifier(raw_tid, "trade_id") if raw_tid else None
+        clean_brk = (
+            identifier(str(broker_id).strip(), "broker_id")
+            if (broker_id is not None and str(broker_id).strip())
+            else None
+        )
         ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
         ts_str = ts.isoformat().replace("+00:00", "Z")
+        delta_txt = decimal_text(_q2(pnl_dec))
         with self._lock:
             if self._path is None:
                 sdate, _, act_leg, leg_cap = self._resolve_session_target(
@@ -1220,6 +1349,15 @@ class DailyQuotaGovernanceStore:
                     row["status"] = QUOTA_STATUS_LOSS_TRIPPED
                     row["lock_reason"] = overlaid["lock_reason"]
                     row["consecutive_losses"] = overlaid["consecutive_losses"]
+                self._save_row_and_event(
+                    row,
+                    event_kind="CLOSED_TRADE",
+                    delta_pnl_usd=delta_txt,
+                    conn=None,
+                    symbol=clean_sym,
+                    trade_id=clean_tid,
+                    broker_id=clean_brk,
+                )
                 return self._format_snapshot(overlaid, session_cadence=self._session_cadence, active_leg=act_leg)
             conn = self._connect()
             try:
@@ -1236,7 +1374,15 @@ class DailyQuotaGovernanceStore:
                     row["status"] = QUOTA_STATUS_LOSS_TRIPPED
                     row["lock_reason"] = overlaid["lock_reason"]
                     row["consecutive_losses"] = overlaid["consecutive_losses"]
-                self._save_row_and_event(row, event_kind="REALIZED_TRADE", delta_pnl_usd=decimal_text(_q2(pnl_dec)), conn=conn)
+                self._save_row_and_event(
+                    row,
+                    event_kind="CLOSED_TRADE",
+                    delta_pnl_usd=delta_txt,
+                    conn=conn,
+                    symbol=clean_sym,
+                    trade_id=clean_tid,
+                    broker_id=clean_brk,
+                )
                 conn.commit()
                 return self._format_snapshot(overlaid, session_cadence=self._session_cadence, active_leg=act_leg)
             except Exception:
@@ -1247,6 +1393,108 @@ class DailyQuotaGovernanceStore:
                 conn.close()
 
     record_closed_trade = record_realized_trade
+
+    @staticmethod
+    def _select_closed_events_static(
+        conn: sqlite3.Connection,
+        scope_prefix: str,
+        limit: int,
+        *,
+        has_prov_cols: bool,
+    ) -> list[Any]:
+        if has_prov_cols:
+            return conn.execute(
+                "SELECT seq, session_key, delta_pnl_usd, status_after, observed_at, "
+                "symbol, trade_id, broker_id "
+                "FROM daily_quota_events "
+                "WHERE session_key LIKE ? AND event_kind IN ('CLOSED_TRADE', 'REALIZED_TRADE') "
+                "ORDER BY seq DESC LIMIT ?",
+                (scope_prefix, limit),
+            ).fetchall()
+        return conn.execute(
+            "SELECT seq, session_key, delta_pnl_usd, status_after, observed_at, "
+            "NULL, NULL, NULL "
+            "FROM daily_quota_events "
+            "WHERE session_key LIKE ? AND event_kind IN ('CLOSED_TRADE', 'REALIZED_TRADE') "
+            "ORDER BY seq DESC LIMIT ?",
+            (scope_prefix, limit),
+        ).fetchall()
+
+    def recent_closed_trades(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Strictly read-only query (?mode=ro, 0 SQLite writes) returning newest closed trade events."""
+        lim = max(1, min(500, integer(limit, "limit", minimum=1)))
+        prefix = f"{self._scope_id}:"
+        with self._lock:
+            if self._path is None:
+                out_mem: list[dict[str, Any]] = []
+                for ev in reversed(self._events):
+                    skey = str(ev.get("session_key", ""))
+                    if not skey.startswith(prefix):
+                        continue
+                    sdate_part = skey[len(prefix):]
+                    obs_utc = str(ev["observed_at"])
+                    brk_val = ev.get("broker_id")
+                    out_mem.append({
+                        "seq": int(ev["seq"]),
+                        "session_key": sdate_part,
+                        "scoped_session_key": skey,
+                        "trade_id": ev.get("trade_id"),
+                        "symbol": ev.get("symbol"),
+                        "broker_id": brk_val,
+                        "broker_label": None if brk_val in (None, "") else friendly_broker_label(str(brk_val)),
+                        "realized_pnl_usd": str(ev["delta_pnl_usd"]),
+                        "status_after": str(ev["status_after"]),
+                        "occurred_at_utc": obs_utc,
+                        "occurred_at_pacific": format_pacific_timestamp(obs_utc),
+                        "session_label": forex_session_label_for_utc(obs_utc),
+                    })
+                    if len(out_mem) >= lim:
+                        break
+                return out_mem
+
+            if not self._path.is_file():
+                return []
+
+            ro_uri = f"{self._path.resolve().as_uri()}?mode=ro"
+            conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0, isolation_level=None)
+            try:
+                tables = {
+                    str(r[0])
+                    for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                if "daily_quota_events" not in tables:
+                    return []
+                ev_cols = {
+                    str(c[1])
+                    for c in conn.execute("PRAGMA table_info(daily_quota_events)").fetchall()
+                }
+                has_prov = {"symbol", "trade_id", "broker_id"}.issubset(ev_cols)
+                rows = self._select_closed_events_static(
+                    conn, f"{prefix}%", lim, has_prov_cols=has_prov
+                )
+                out_db: list[dict[str, Any]] = []
+                for r in rows:
+                    skey = str(r[1])
+                    sdate_part = skey[len(prefix):] if skey.startswith(prefix) else skey
+                    obs_utc = str(r[4])
+                    brk_db = None if r[7] in (None, "") else str(r[7])
+                    out_db.append({
+                        "seq": int(r[0]),
+                        "session_key": sdate_part,
+                        "scoped_session_key": skey,
+                        "trade_id": None if r[6] in (None, "") else str(r[6]),
+                        "symbol": None if r[5] in (None, "") else str(r[5]),
+                        "broker_id": brk_db,
+                        "broker_label": None if brk_db is None else friendly_broker_label(brk_db),
+                        "realized_pnl_usd": str(r[2]),
+                        "status_after": str(r[3]),
+                        "occurred_at_utc": obs_utc,
+                        "occurred_at_pacific": format_pacific_timestamp(obs_utc),
+                        "session_label": forex_session_label_for_utc(obs_utc),
+                    })
+                return out_db
+            finally:
+                conn.close()
 
     def _apply_trade(self, row: dict[str, Any], pnl_dec: Decimal, ts_str: str) -> None:
         new_pnl = _q2(Decimal(str(row["realized_net_pnl_usd"])) + pnl_dec)

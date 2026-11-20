@@ -3,7 +3,12 @@ import { envelopeRecords, canonicalJSON } from './decision-read.mjs';
 import { displayFreshness } from './freshness.mjs';
 import { renderMarketChartSection } from './chart.mjs';
 import { STATIC_BROKER_ROUTING } from './broker-routing.mjs';
-import { renderAiOverseerPanel, renderAiModelCatalogPanel, renderBankedProfitsHeroBanner } from './ai-overseer.mjs';
+import {
+  renderAiOverseerPanel,
+  renderAiModelCatalogPanel,
+  renderBankedProfitsHeroBanner,
+  resolveRealizedPnlProvenance,
+} from './ai-overseer.mjs';
 import { renderMoneyFlowSection } from './money-flow.mjs';
 import { renderLiveFundingPanel } from './live-funding.mjs';
 import { renderQrPairingDrawer } from './qr-pairing.mjs';
@@ -100,11 +105,16 @@ function metrics(projection, state) {
     ? '<p class="account-locked-hint" data-account-locked-hint="true">Locked preview — unlock Live Cockpit above to load live Hugo&#39;s Way, LHFX, and OANDA Equity, Balance, Open P/L, and Banked Realized P/L.</p>'
     : '';
 
+  const realizedProvenanceHtml = state?.liveStreamConnected === true
+    ? `<span class="metric-provenance" data-account-realized-provenance="true">${e(resolveRealizedPnlProvenance(state).compactSummary)}</span>`
+    : '';
+
   return `${lockedHint}<section class="metrics" aria-label="Account snapshot">${[
     ['Equity', eqVal], ['Balance', balVal], ['Open P/L', openVal], ['Realized P/L', realVal],
   ].map(([label, value]) => {
     const money = moneyLabel(value);
-    return `<article class="metric"><h2>${label}</h2><div class="metric-value${value === null ? ' unknown' : ''}">${e(money.amount)}</div><span class="metric-unit">${e(money.unit)}</span></article>`;
+    const extraProv = label === 'Realized P/L' ? realizedProvenanceHtml : '';
+    return `<article class="metric"><h2>${label}</h2><div class="metric-value${value === null ? ' unknown' : ''}">${e(money.amount)}</div><span class="metric-unit">${e(money.unit)}</span>${extraProv}</article>`;
   }).join('')}</section>`;
 }
 

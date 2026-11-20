@@ -60,6 +60,10 @@ from cas_forex_revamp.valve.daily_quota import (
     QUOTA_STATUS_PROFIT_FLOOR_LOCKED,
     QUOTA_STATUS_SOFT,
     SESSION_CADENCE_AUTO,
+    forex_session_label_for_utc,
+    format_pacific_timestamp,
+    friendly_broker_label,
+    session_date_for,
     session_period_info_for,
 )
 from cas_forex_revamp.valve.tks_meta_valve_controller import (
@@ -1058,6 +1062,8 @@ class AutonomousAiTrader:
                                     pnl_dec,
                                     symbol=sym_closed,
                                     ticket=safe_ticket,
+                                    trade_id=safe_ticket,
+                                    broker_id=broker_id,
                                     starting_equity=eq_post if eq_post > Decimal("0") else None,
                                     now=ts,
                                     in_recovery_mode=in_rec_post,
@@ -1639,6 +1645,7 @@ class AutonomousAiTrader:
         *,
         symbol: str,
         ticket: str,
+        broker_id: str | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         ts = self._now(now)
@@ -1646,12 +1653,24 @@ class AutonomousAiTrader:
         with self._lock:
             equities = self._router.equities()
             total_eq = self._router.barbell.total_equity(equities)
-            self._open_position_meta.pop(ticket, None)
+            popped_meta = self._open_position_meta.pop(ticket, None)
+            active_brk = getattr(self._router, "active_broker_id", None)
+            eff_broker = (
+                str(broker_id).strip()
+                if (broker_id is not None and str(broker_id).strip())
+                else (
+                    str(popped_meta.get("broker_id")).strip()
+                    if (isinstance(popped_meta, Mapping) and popped_meta.get("broker_id"))
+                    else (str(active_brk).strip() if active_brk else "DUAL_SHIELD")
+                )
+            )
             ps = self._principal_surplus_metrics(total_eq, v_snap=v_snap)
             snap = self._quota.record_realized_trade(
                 pnl_usd,
                 symbol=symbol,
                 ticket=ticket,
+                trade_id=ticket,
+                broker_id=eff_broker,
                 starting_equity=total_eq,
                 now=ts,
                 in_recovery_mode=bool(ps["in_recovery_mode"]),
@@ -1670,7 +1689,7 @@ class AutonomousAiTrader:
                 self._profit_vault.record_realized_close(
                     trade_id=ticket,
                     symbol=symbol,
-                    broker_id="DUAL_SHIELD",
+                    broker_id=eff_broker,
                     realized_net_usd=pnl_usd,
                     occurred_at=ts,
                     session_date=str(snap.get("session_date", "")),
@@ -2465,6 +2484,8 @@ class AutonomousAiTrader:
                         pos.profit,
                         symbol=pos.symbol,
                         ticket=pos.ticket,
+                        trade_id=pos.ticket,
+                        broker_id=broker_id,
                         starting_equity=eq_em_after,
                         now=ts,
                         in_recovery_mode=bool(ps_em["in_recovery_mode"]),
@@ -2630,6 +2651,355 @@ class AutonomousAiTrader:
             })
         return self.status_snapshot(now=ts)
 
+    @staticmethod
+    def _is_synthetic_sync_trade(trade_id: str | None, symbol: str | None) -> bool:
+        tid = str(trade_id or "").strip()
+        sym = str(symbol or "").strip()
+        return (not sym) or tid.startswith("SESSION_SYNC_") or sym == "SESSION_BASKET"
+
+    @staticmethod
+    def _entry_matches_active_session(entry_skey: str, active_sdate: str, occurred_utc: str) -> bool:
+        if not active_sdate:
+            return False
+        if entry_skey == active_sdate:
+            return True
+        if active_sdate.endswith("-ASIA") and len(active_sdate) == 15 and entry_skey == active_sdate[:-5]:
+            try:
+                anchor_dt = datetime.fromisoformat(f"{active_sdate[:-5]}T00:00:00+00:00")
+                occ_dt = datetime.fromisoformat(occurred_utc.replace("Z", "+00:00"))
+                return (anchor_dt - timedelta(hours=2)) <= occ_dt < (anchor_dt + timedelta(hours=7))
+            except ValueError:
+                return False
+        return False
+
+    @staticmethod
+    def _aggregate_pnl_by_market(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        buckets: dict[str, dict[str, Any]] = {}
+        for e in entries:
+            sym = str(e["symbol"])
+            pnl = Decimal(str(e["realized_pnl_usd"]))
+            occ_utc = str(e["occurred_at_utc"])
+            occ_pac = str(e["occurred_at_pacific"])
+            sess_lbl = str(e["session_label"])
+            b = buckets.get(sym)
+            if b is None:
+                buckets[sym] = {
+                    "symbol": sym,
+                    "pnl_dec": pnl,
+                    "trade_count": 1,
+                    "win_count": 1 if pnl > Decimal("0") else 0,
+                    "loss_count": 1 if pnl < Decimal("0") else 0,
+                    "last_occurred_at_utc": occ_utc,
+                    "last_occurred_at_pacific": occ_pac,
+                    "last_session_label": sess_lbl,
+                }
+            else:
+                b["pnl_dec"] += pnl
+                b["trade_count"] += 1
+                if pnl > Decimal("0"):
+                    b["win_count"] += 1
+                elif pnl < Decimal("0"):
+                    b["loss_count"] += 1
+                if occ_utc > str(b["last_occurred_at_utc"]):
+                    b["last_occurred_at_utc"] = occ_utc
+                    b["last_occurred_at_pacific"] = occ_pac
+                    b["last_session_label"] = sess_lbl
+        return [
+            {
+                "symbol": str(item["symbol"]),
+                "realized_pnl_usd": decimal_text(item["pnl_dec"]),
+                "trade_count": int(item["trade_count"]),
+                "win_count": int(item["win_count"]),
+                "loss_count": int(item["loss_count"]),
+                "last_occurred_at_utc": str(item["last_occurred_at_utc"]),
+                "last_occurred_at_pacific": str(item["last_occurred_at_pacific"]),
+                "last_session_label": str(item["last_session_label"]),
+            }
+            for item in sorted(
+                buckets.values(),
+                key=lambda x: (-Decimal(x["pnl_dec"]), str(x["symbol"])),
+            )
+        ]
+
+    @staticmethod
+    def _aggregate_pnl_by_broker(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        buckets: dict[str, dict[str, Any]] = {}
+        for e in entries:
+            brk = str(e["broker_id"])
+            brk_lbl = str(e.get("broker_label") or friendly_broker_label(brk))
+            pnl = Decimal(str(e["realized_pnl_usd"]))
+            occ_utc = str(e["occurred_at_utc"])
+            occ_pac = str(e["occurred_at_pacific"])
+            sess_lbl = str(e["session_label"])
+            b = buckets.get(brk)
+            if b is None:
+                buckets[brk] = {
+                    "broker_id": brk,
+                    "broker_label": brk_lbl,
+                    "pnl_dec": pnl,
+                    "trade_count": 1,
+                    "win_count": 1 if pnl > Decimal("0") else 0,
+                    "loss_count": 1 if pnl < Decimal("0") else 0,
+                    "last_occurred_at_utc": occ_utc,
+                    "last_occurred_at_pacific": occ_pac,
+                    "last_session_label": sess_lbl,
+                }
+            else:
+                b["pnl_dec"] += pnl
+                b["trade_count"] += 1
+                if pnl > Decimal("0"):
+                    b["win_count"] += 1
+                elif pnl < Decimal("0"):
+                    b["loss_count"] += 1
+                if occ_utc > str(b["last_occurred_at_utc"]):
+                    b["last_occurred_at_utc"] = occ_utc
+                    b["last_occurred_at_pacific"] = occ_pac
+                    b["last_session_label"] = sess_lbl
+        return [
+            {
+                "broker_id": str(item["broker_id"]),
+                "broker_label": str(item["broker_label"]),
+                "realized_pnl_usd": decimal_text(item["pnl_dec"]),
+                "trade_count": int(item["trade_count"]),
+                "win_count": int(item["win_count"]),
+                "loss_count": int(item["loss_count"]),
+                "last_occurred_at_utc": str(item["last_occurred_at_utc"]),
+                "last_occurred_at_pacific": str(item["last_occurred_at_pacific"]),
+                "last_session_label": str(item["last_session_label"]),
+            }
+            for item in sorted(
+                buckets.values(),
+                key=lambda x: (-Decimal(x["pnl_dec"]), str(x["broker_id"])),
+            )
+        ]
+
+    @staticmethod
+    def _fmt_signed_usd(raw_dec_str: str) -> str:
+        val = Decimal(str(raw_dec_str))
+        txt = decimal_text(abs(val))
+        if val > Decimal("0"):
+            return f"+${txt}"
+        if val < Decimal("0"):
+            return f"-${txt}"
+        return f"${txt}"
+
+    def _build_provenance_and_live_status_unlocked(
+        self,
+        *,
+        quota_closed_rows: Sequence[Mapping[str, Any]],
+        v_snap: Mapping[str, Any],
+        sdate_curr: str,
+        quota_snap: Mapping[str, Any],
+        open_positions_list: Sequence[Mapping[str, Any]],
+        locked_for_session: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+        # 1. Live Trading Status Banner
+        n_open = len(open_positions_list)
+        open_syms = list(
+            dict.fromkeys(str(p.get("symbol")) for p in open_positions_list if p.get("symbol"))
+        )
+        dq_status = str(quota_snap.get("status", ""))
+        if n_open > 0 and self._governance_mode == GOVERNANCE_ACTIVE:
+            state_code = "TRADING_NOW_OPEN_POSITIONS"
+            headline = (
+                f"TRADING NOW \u2014 {n_open} OPEN POSITION"
+                f"{'S' if n_open != 1 else ''}: {', '.join(open_syms)}"
+            )
+            is_trading = True
+        elif locked_for_session or dq_status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
+            state_code = "PAUSED_RESEARCH_RESPITE"
+            headline = "PAUSED \u2014 RESEARCH RESPITE (PROFIT LOCKED)"
+            is_trading = False
+        elif dq_status == QUOTA_STATUS_LOSS_TRIPPED:
+            state_code = "PAUSED_SAFETY_LOCK"
+            headline = "PAUSED \u2014 SAFETY LOCK"
+            is_trading = False
+        elif self._governance_mode != GOVERNANCE_ACTIVE:
+            state_code = "STOPPED_OR_PAUSED"
+            headline = f"PAUSED \u2014 {self._governance_mode}"
+            is_trading = False
+        else:
+            state_code = "ACTIVE_SCANNING_MARKETS"
+            headline = "ACTIVE \u2014 SCANNING MARKETS (0 OPEN TRADES)"
+            is_trading = True
+
+        live_trading_status: dict[str, Any] = {
+            "state_code": state_code,
+            "headline": headline,
+            "is_currently_trading": is_trading,
+            "has_open_positions": n_open > 0,
+            "open_positions_count": n_open,
+            "open_symbols": open_syms,
+        }
+
+        # 2. Merge real closed trades from quota events + profit_vault trade_sweeps (0 synthetic rows)
+        seen_ids: set[str] = set()
+        vault_broker_by_tid: dict[str, str] = {}
+        for sw_map in (v_snap.get("trade_sweeps") or []):
+            if isinstance(sw_map, Mapping) and sw_map.get("trade_id") and sw_map.get("broker_id"):
+                vault_broker_by_tid[str(sw_map["trade_id"])] = str(sw_map["broker_id"])
+
+        merged_closed: list[dict[str, Any]] = []
+        for q_row in quota_closed_rows:
+            sym = q_row.get("symbol")
+            tid = q_row.get("trade_id")
+            if self._is_synthetic_sync_trade(tid, sym):
+                continue
+            tid_s = str(tid or f"qt-{q_row.get('seq', 0)}")
+            if tid_s in seen_ids:
+                continue
+            seen_ids.add(tid_s)
+            occ_utc = str(q_row["occurred_at_utc"])
+            skey_s = str(
+                q_row.get("session_key")
+                or session_date_for(datetime.fromisoformat(occ_utc.replace("Z", "+00:00")))
+            )
+            raw_brk = q_row.get("broker_id") or vault_broker_by_tid.get(tid_s) or "DUAL_SHIELD"
+            brk_s = str(raw_brk)
+            merged_closed.append({
+                "trade_id": tid_s,
+                "symbol": str(sym),
+                "broker_id": brk_s,
+                "broker_label": friendly_broker_label(brk_s),
+                "realized_pnl_usd": str(q_row["realized_pnl_usd"]),
+                "occurred_at_utc": occ_utc,
+                "occurred_at_pacific": str(q_row.get("occurred_at_pacific") or format_pacific_timestamp(occ_utc)),
+                "session_label": str(q_row.get("session_label") or forex_session_label_for_utc(occ_utc)),
+                "session_key": skey_s,
+            })
+
+        for sw in (v_snap.get("trade_sweeps") or []):
+            if not isinstance(sw, Mapping):
+                continue
+            tid_sw = str(sw.get("trade_id") or "").strip()
+            sym_sw = str(sw.get("symbol") or "").strip()
+            if self._is_synthetic_sync_trade(tid_sw, sym_sw) or not tid_sw:
+                continue
+            if tid_sw in seen_ids:
+                continue
+            seen_ids.add(tid_sw)
+            occ_utc = str(sw["occurred_at"])
+            raw_sdate = sw.get("session_date")
+            if raw_sdate:
+                skey_sw = str(raw_sdate)
+            else:
+                try:
+                    skey_sw = session_date_for(datetime.fromisoformat(occ_utc.replace("Z", "+00:00")))
+                except ValueError:
+                    skey_sw = occ_utc[:10]
+            brk_sw = str(sw.get("broker_id") or "DUAL_SHIELD")
+            merged_closed.append({
+                "trade_id": tid_sw,
+                "symbol": sym_sw,
+                "broker_id": brk_sw,
+                "broker_label": str(sw.get("broker_label") or friendly_broker_label(brk_sw)),
+                "realized_pnl_usd": str(sw["realized_net_usd"]),
+                "occurred_at_utc": occ_utc,
+                "occurred_at_pacific": str(sw.get("occurred_at_pacific") or format_pacific_timestamp(occ_utc)),
+                "session_label": str(sw.get("session_label") or forex_session_label_for_utc(occ_utc)),
+                "session_key": skey_sw,
+            })
+
+        merged_closed.sort(key=lambda item: (str(item["occurred_at_utc"]), str(item["trade_id"])), reverse=True)
+        entries_50 = merged_closed[:50]
+
+        session_entries = [
+            e
+            for e in merged_closed
+            if self._entry_matches_active_session(str(e["session_key"]), sdate_curr, str(e["occurred_at_utc"]))
+        ]
+        session_by_market = self._aggregate_pnl_by_market(session_entries)
+        lifetime_by_market = self._aggregate_pnl_by_market(merged_closed)
+        session_by_broker = self._aggregate_pnl_by_broker(session_entries)
+        lifetime_by_broker = self._aggregate_pnl_by_broker(merged_closed)
+
+        if session_entries:
+            mkt_parts = [
+                f"{m['symbol']} ({self._fmt_signed_usd(m['realized_pnl_usd'])})"
+                for m in session_by_market[:6]
+            ]
+            brk_parts = [
+                f"{b['broker_label']} ({self._fmt_signed_usd(b['realized_pnl_usd'])})"
+                for b in session_by_broker[:3]
+            ]
+            latest_s = session_entries[0]
+            summary_str = (
+                f"{' \u00b7 '.join(mkt_parts)} \u00b7 {' / '.join(brk_parts)} \u00b7 "
+                f"{latest_s['session_label']} \u00b7 "
+                f"{latest_s['occurred_at_pacific']} ({latest_s['occurred_at_utc']})"
+            )[:500]
+        else:
+            summary_str = "No closed trades in current session yet"
+
+        realized_pnl_ledger: dict[str, Any] = {
+            "entries": entries_50,
+            "session_by_market": session_by_market,
+            "lifetime_by_market": lifetime_by_market,
+            "session_by_broker": session_by_broker,
+            "lifetime_by_broker": lifetime_by_broker,
+            "session_provenance_summary": summary_str,
+        }
+
+        # 3. Last Real Trade (closed trade OR real executed open/add fill in _recent_actions; never synthetic)
+        candidates: list[tuple[str, int, dict[str, Any]]] = []
+        for ce in entries_50:
+            candidates.append((
+                str(ce["occurred_at_utc"]),
+                2,
+                {
+                    "trade_id": str(ce["trade_id"]),
+                    "symbol": str(ce["symbol"]),
+                    "broker_id": str(ce["broker_id"]),
+                    "broker_label": str(ce["broker_label"]),
+                    "action": "CLOSE",
+                    "realized_pnl_usd": str(ce["realized_pnl_usd"]),
+                    "occurred_at_utc": str(ce["occurred_at_utc"]),
+                    "occurred_at_pacific": str(ce["occurred_at_pacific"]),
+                    "session_label": str(ce["session_label"]),
+                },
+            ))
+        for act in self._recent_actions:
+            if not isinstance(act, Mapping):
+                continue
+            tkt_a = act.get("ticket")
+            sym_a = act.get("symbol")
+            brk_a = act.get("executed_on")
+            act_name = str(act.get("action") or "").strip()
+            obs_a = str(act.get("observed_at") or "").strip()
+            if (
+                not tkt_a
+                or not sym_a
+                or not brk_a
+                or not act_name
+                or not obs_a
+                or self._is_synthetic_sync_trade(str(tkt_a), str(sym_a))
+                or str(tkt_a) in seen_ids
+            ):
+                continue
+            brk_a_str = str(brk_a)
+            candidates.append((
+                obs_a,
+                1,
+                {
+                    "trade_id": str(tkt_a),
+                    "symbol": str(sym_a),
+                    "broker_id": brk_a_str,
+                    "broker_label": friendly_broker_label(brk_a_str),
+                    "action": act_name,
+                    "realized_pnl_usd": None,
+                    "occurred_at_utc": obs_a,
+                    "occurred_at_pacific": format_pacific_timestamp(obs_a),
+                    "session_label": forex_session_label_for_utc(obs_a),
+                },
+            ))
+
+        last_trade: dict[str, Any] | None = None
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            last_trade = candidates[0][2]
+
+        return live_trading_status, last_trade, realized_pnl_ledger
+
     def status_snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:
         ts = self._now(now)
         v_snap = self._read_vault_snapshot_outside_lock()
@@ -2650,6 +3020,11 @@ class AutonomousAiTrader:
                     now=ts,
                     starting_equity=total_eq if total_eq > 0 else None,
                 )
+            quota_closed_rows = (
+                self._quota.recent_closed_trades(limit=200)
+                if hasattr(self._quota, "recent_closed_trades")
+                else []
+            )
             sdate_curr = str(quota_snap.get("session_date", ""))
         sess_vault_reserved = "0"
         if self._profit_vault is not None and v_snap:
@@ -2677,6 +3052,17 @@ class AutonomousAiTrader:
                 FOCUS_MODE_RESEARCH_RESPITE
                 if locked_for_session
                 else OPERATING_MODE_ACTIVE_TRADING
+            )
+            open_positions_list = [dict(v) for v in self._open_position_meta.values()]
+            live_trading_status, last_trade, realized_pnl_ledger = (
+                self._build_provenance_and_live_status_unlocked(
+                    quota_closed_rows=quota_closed_rows,
+                    v_snap=v_snap,
+                    sdate_curr=sdate_curr,
+                    quota_snap=quota_snap,
+                    open_positions_list=open_positions_list,
+                    locked_for_session=locked_for_session,
+                )
             )
             banked_session = {
                 "schema": "cas-forex.banked-session/1",
@@ -2713,6 +3099,9 @@ class AutonomousAiTrader:
                 "operating_mode": operating_mode_val,
                 "session_rollover_label": str(pinfo["session_rollover_label"]),
                 "next_session_opens_utc": str(pinfo["next_session_opens_utc"]),
+                "session_provenance_summary": str(realized_pnl_ledger["session_provenance_summary"]),
+                "session_by_market": list(realized_pnl_ledger["session_by_market"]),
+                "session_by_broker": list(realized_pnl_ledger["session_by_broker"]),
             }
             cat_snap = self._registry.catalog_snapshot()
             payload = {
@@ -2727,6 +3116,9 @@ class AutonomousAiTrader:
                 ),
                 "respite_mode": quota_snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED),
                 "operating_mode": operating_mode_val,
+                "live_trading_status": live_trading_status,
+                "last_trade": last_trade,
+                "realized_pnl_ledger": realized_pnl_ledger,
                 "banked_session": banked_session,
                 "fast_tick_ms": int(self._fast_tick_ms),
                 "cadence": self._last_cadence,
@@ -2762,7 +3154,7 @@ class AutonomousAiTrader:
                     peak_eq=self._router.peak_equity() or total_eq,
                     quota_snap=quota_snap,
                 ),
-                "open_positions": [dict(v) for v in self._open_position_meta.values()],
+                "open_positions": open_positions_list,
                 "active_working_markets": sorted({
                     str(v.get("symbol"))
                     for v in self._open_position_meta.values()

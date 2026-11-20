@@ -87,6 +87,27 @@
     },
     "pending_or_unconfirmed_transfers_usd": {
       "$ref": "#/$defs/decimal"
+    },
+    "trade_sweeps": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "$ref": "#/$defs/sweepEvent"
+      }
+    },
+    "realized_by_market": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/marketRealizedSummary"
+      }
+    },
+    "realized_by_broker": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "$ref": "#/$defs/brokerRealizedSummary"
+      }
     }
   },
   "$defs": {
@@ -132,7 +153,11 @@
         "realized_net_usd",
         "retained_trading_usd",
         "bank_sweep_usd",
-        "occurred_at"
+        "occurred_at",
+        "broker_label",
+        "occurred_at_pacific",
+        "session_label",
+        "is_reconciliation_sync"
       ],
       "properties": {
         "trade_id": {
@@ -155,6 +180,32 @@
         },
         "occurred_at": {
           "$ref": "#/$defs/timestamp"
+        },
+        "broker_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "occurred_at_pacific": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "session_label": {
+          "enum": [
+            "Asia / Tokyo\u2013Sydney",
+            "London",
+            "New York / US"
+          ]
+        },
+        "is_reconciliation_sync": {
+          "type": "boolean"
+        },
+        "session_date": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 48,
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}(?:-[A-Z_]+)?(?:#leg[0-9]+)?$"
         }
       }
     },
@@ -230,6 +281,116 @@
             {
               "$ref": "#/$defs/timestamp"
             }
+          ]
+        }
+      }
+    },
+    "marketRealizedSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "symbol",
+        "realized_net_usd",
+        "trade_count",
+        "win_count",
+        "loss_count",
+        "last_occurred_at",
+        "last_occurred_at_pacific",
+        "last_session_label"
+      ],
+      "properties": {
+        "symbol": {
+          "$ref": "#/$defs/symbol"
+        },
+        "realized_net_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "trade_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "win_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "loss_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "last_occurred_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "last_occurred_at_pacific": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "last_session_label": {
+          "enum": [
+            "Asia / Tokyo\u2013Sydney",
+            "London",
+            "New York / US"
+          ]
+        }
+      }
+    },
+    "brokerRealizedSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "broker_id",
+        "broker_label",
+        "realized_net_usd",
+        "trade_count",
+        "win_count",
+        "loss_count",
+        "last_occurred_at",
+        "last_occurred_at_pacific",
+        "last_session_label"
+      ],
+      "properties": {
+        "broker_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "broker_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "realized_net_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "trade_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "win_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "loss_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "last_occurred_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "last_occurred_at_pacific": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "last_session_label": {
+          "enum": [
+            "Asia / Tokyo\u2013Sydney",
+            "London",
+            "New York / US"
           ]
         }
       }
