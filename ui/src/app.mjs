@@ -7,7 +7,16 @@ import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decisio
 import { ScopedBridge, createAuthenticatedLoopbackBridge } from './bridge.mjs';
 import { ALL_WATCHLIST_MARKETS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts, releaseDetachedCanvases } from './chart.mjs';
 import { MAX_BROKER_ROUTING_BYTES, normalizeBrokerRouting } from './broker-routing.mjs';
-import { MAX_AI_PAYLOAD_BYTES, normalizeAiModels, normalizeAiTrader, normalizeIndexStream, shouldAutoConnectLiveFeed } from './ai-overseer.mjs';
+import {
+  MAX_AI_PAYLOAD_BYTES,
+  SESSION_CADENCE_MODES,
+  normalizeAiModels,
+  normalizeAiTrader,
+  normalizeIndexStream,
+  renderAiOverseerPanel,
+  renderBankedProfitsHeroBanner,
+  shouldAutoConnectLiveFeed,
+} from './ai-overseer.mjs';
 import { MAX_TREASURY_BYTES, mountAnalyticsCanvases, normalizeParallelTiers, normalizeTreasury } from './analytics.mjs';
 import {
   clampCapitalUsd,
@@ -195,6 +204,29 @@ function rerenderLiveFundingInPlace(focusSelector = null) {
     if (focusSelector) {
       nextSec.querySelector(focusSelector)?.focus({ preventScroll: true });
     }
+  }
+  if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
+}
+
+function rerenderAiSectionsInPlace(focusSelector = null) {
+  const sx = window.scrollX || 0;
+  const sy = window.scrollY || 0;
+  const currentHero = root.querySelector('[data-banked-profits-hero="true"]');
+  const currentOverseer = root.querySelector('.ai-overseer-panel');
+  if (!currentHero && !currentOverseer) {
+    render();
+    return;
+  }
+  if (currentHero) {
+    const nextHero = new DOMParser().parseFromString(renderBankedProfitsHeroBanner(state), 'text/html').body.firstElementChild;
+    if (nextHero) currentHero.replaceWith(nextHero);
+  }
+  if (currentOverseer) {
+    const nextOverseer = new DOMParser().parseFromString(renderAiOverseerPanel(state), 'text/html').body.firstElementChild;
+    if (nextOverseer) currentOverseer.replaceWith(nextOverseer);
+  }
+  if (focusSelector) {
+    root.querySelector(focusSelector)?.focus({ preventScroll: true });
   }
   if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
 }
@@ -536,6 +568,63 @@ async function postLoopbackJson(pathname, payload) {
   return parsed;
 }
 
+async function postTraderControlJson(payload) {
+  try {
+    return await postLoopbackJson('/api/ai-trader-control', payload);
+  } catch (error) {
+    if (error instanceof Error && /\b404\b/.test(error.message)) {
+      return postLoopbackJson('/api/ai-overseer-action', payload);
+    }
+    throw error;
+  }
+}
+
+async function advanceRecoverySession() {
+  if (state.aiActionBusy) return;
+  state.aiActionBusy = true;
+  state.aiIssue = null;
+  rerenderAiSectionsInPlace('[data-ai-overseer-action="ADVANCE_RECOVERY_SESSION"]');
+  try {
+    const res = await postTraderControlJson({
+      action: 'ADVANCE_RECOVERY_SESSION',
+      reason: 'Owner recovery session advance',
+    });
+    if (res?.schema === 'cas-forex.ai-trader/1') state.aiTrader = normalizeAiTrader(res);
+    else await readAiCockpitFeeds();
+    announce('Recovery session advanced to next active leg.');
+  } catch (error) {
+    state.aiIssue = error instanceof Error ? error.message : 'Recovery session advance failed.';
+    announce(state.aiIssue);
+  } finally {
+    state.aiActionBusy = false;
+    rerenderAiSectionsInPlace('[data-open-voice-explainer="true"]');
+  }
+}
+
+async function setSessionCadence(rawCadence) {
+  const cadence = String(rawCadence ?? '').trim().toUpperCase();
+  if (!SESSION_CADENCE_MODES.includes(cadence) || state.aiActionBusy) return;
+  state.aiActionBusy = true;
+  state.aiIssue = null;
+  rerenderAiSectionsInPlace(`[data-ai-session-cadence="${cadence}"]`);
+  try {
+    const res = await postTraderControlJson({
+      action: 'SET_SESSION_CADENCE',
+      session_cadence: cadence,
+      reason: 'Owner session cadence update',
+    });
+    if (res?.schema === 'cas-forex.ai-trader/1') state.aiTrader = normalizeAiTrader(res);
+    else await readAiCockpitFeeds();
+    announce(`Session cadence set to ${cadence}.`);
+  } catch (error) {
+    state.aiIssue = error instanceof Error ? error.message : 'Session cadence update failed.';
+    announce(state.aiIssue);
+  } finally {
+    state.aiActionBusy = false;
+    rerenderAiSectionsInPlace(`[data-ai-session-cadence="${cadence}"]`);
+  }
+}
+
 async function sendOverseerAction(action) {
   if (state.aiActionBusy) return;
   state.aiActionBusy = true;
@@ -818,6 +907,14 @@ root.addEventListener('click', (event) => {
       render();
       announce(state.qrPairingCopiedNotice);
     })();
+    return;
+  }
+  if (target.dataset.aiOverseerAction === 'ADVANCE_RECOVERY_SESSION') {
+    void advanceRecoverySession();
+    return;
+  }
+  if (target.dataset.aiSessionCadence) {
+    void setSessionCadence(target.dataset.aiSessionCadence);
     return;
   }
   if (target.dataset.aiOverseerAction) { void sendOverseerAction(target.dataset.aiOverseerAction); return; }

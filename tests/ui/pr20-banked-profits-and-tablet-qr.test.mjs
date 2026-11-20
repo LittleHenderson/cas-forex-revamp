@@ -83,9 +83,9 @@ function buildBankedTraderDoc(withBankedSession = true) {
       new_risk_allowed: false,
       lock_reason: 'Daily hard quota reached',
       quota_mode: 'USD',
-      starting_equity_usd: '280000',
+      starting_equity_usd: '300000',
       realized_net_pnl_usd: '4640.06',
-      realized_pnl_pct: '1.66',
+      realized_pnl_pct: '1.55',
       soft_quota_usd: '2000',
       hard_quota_usd: '3000',
       quota_progress_pct: '100',
@@ -109,8 +109,15 @@ function buildBankedTraderDoc(withBankedSession = true) {
       schema: 'cas-forex.banked-session/1',
       accounting_basis: 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT',
       session_date: '2026-11-20',
+      initial_capital_usd: '300000',
+      current_total_equity_usd: '304640.06',
+      net_surplus_usd: '4640.06',
+      net_surplus_pct: '1.55',
+      deficit_to_principal_usd: '0',
+      capital_status: 'IN_SURPLUS',
+      vault_sweeps_paused_for_recovery: false,
       banked_net_pnl_usd: '4640.06',
-      realized_pnl_pct: '1.66',
+      realized_pnl_pct: '1.55',
       peak_realized_pnl_usd: '4852.73',
       protected_profit_floor_usd: '3396.91',
       ratchet_armed: true,
@@ -312,17 +319,17 @@ test('PR20_02 Session Realized P&L & Internal Vault Scoreboard renders truthful 
     assert.match(html, /data-accounting-disclaimer="true"/);
     assert.ok(html.includes('Internal Accounting Figure — Not a Confirmed Bank Payout'), `Missing disclaimer on ${route}`);
     assert.ok(html.includes('DEMO PRACTICE ACCOUNT (SIMULATED FUNDS)'), `Missing DEMO PRACTICE badge on ${route}`);
+    assert.ok(html.includes('Net Surplus vs Starting Capital ($300,000.00)'));
     assert.ok(html.includes('Session Realized Net P&amp;L (Today · Internal Ledger)'));
     assert.ok(html.includes('+$4,640.06'), `Missing +$4,640.06 on ${route}`);
-    assert.ok(html.includes('+1.66% · 10 closed trades (7W / 3L) · Internal ledger figure · Session 2026-11-20'));
-    assert.ok(html.includes('70% Protected Profit Floor (Session Rule)'));
+    assert.ok(html.includes('+1.55% · 10 closed trades (7W / 3L) · Internal ledger figure · 70% Session Floor: +$3,396.91'));
     assert.ok(html.includes('+$3,396.91'), `Missing +$3,396.91 floor on ${route}`);
     assert.ok(html.includes('Peak Today: +$4,852.73 · RATCHET ARMED'));
-    assert.ok(html.includes('50% Internal Vault Reserve &amp; Confirmed Payouts'));
+    assert.ok(html.includes('50% Principal High-Water Vault &amp; Confirmed Payouts'));
     assert.ok(html.includes('$2,320.03 Internal Vault Reserve'));
-    assert.ok(html.includes('$2,320.03 Retained Compounding'));
+    assert.ok(html.includes('$2,320.03 Surplus Compounding'));
     assert.ok(html.includes('Confirmed Bank Payouts: $0.00'));
-    assert.ok(html.includes('Session Mode &amp; 17:00 Rollover'));
+    assert.ok(html.includes('Session Mode &amp; Recovery Cadence'));
     assert.ok(html.includes('RESEARCH RESPITE · Quota Lock Active'));
     assert.ok(html.includes('17:00 America/New_York'));
     assert.match(html, /data-open-voice-explainer="true"/);
@@ -332,6 +339,8 @@ test('PR20_02 Session Realized P&L & Internal Vault Scoreboard renders truthful 
   // Multi-day session reserve isolation & confirmed bank payout fallback
   const day2Doc = buildBankedTraderDoc(true);
   day2Doc.daily_quota.realized_net_pnl_usd = '300.00';
+  day2Doc.banked_session.current_total_equity_usd = '300400.00';
+  day2Doc.banked_session.net_surplus_usd = '400.00';
   day2Doc.banked_session.banked_net_pnl_usd = '300.00';
   day2Doc.banked_session.vault_swept_50pct_usd = '200.00';
   day2Doc.banked_session.session_vault_reserved_50pct_usd = '150.00';

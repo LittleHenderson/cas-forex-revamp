@@ -52,12 +52,15 @@ from cas_forex_revamp.operator.frontier_backends import (
     assert_safe_ai_catalog_payload,
 )
 from cas_forex_revamp.operator.model import ActualModelDecisionAdapter, ModelInvocation
+from cas_forex_revamp.treasury.profit_sweep import ENV_INITIAL_CAPITAL_USD
 from cas_forex_revamp.valve.daily_quota import (
     DailyQuotaGovernanceStore,
     QUOTA_STATUS_LOCKED,
     QUOTA_STATUS_LOSS_TRIPPED,
     QUOTA_STATUS_PROFIT_FLOOR_LOCKED,
     QUOTA_STATUS_SOFT,
+    SESSION_CADENCE_AUTO,
+    session_period_info_for,
 )
 from cas_forex_revamp.valve.tks_meta_valve_controller import (
     ForexMetaValveGate,
@@ -101,6 +104,11 @@ GOVERNANCE_MODES = (GOVERNANCE_ACTIVE, GOVERNANCE_PAUSED_NEW_RISK, GOVERNANCE_ST
 
 FOCUS_MODE_RESEARCH_RESPITE = "RESEARCH_RESPITE"
 OPERATING_MODE_ACTIVE_TRADING = "ACTIVE_TRADING"
+
+CAPITAL_STATUS_RECOVERY_MODE = "RECOVERY_MODE"
+CAPITAL_STATUS_AT_PRINCIPAL = "AT_PRINCIPAL"
+CAPITAL_STATUS_IN_SURPLUS = "IN_SURPLUS"
+DEFAULT_DEMO_3BROKER_CAPITAL_USD = Decimal("300000.00")
 
 FEED_MT5_FAST_SPOOL = "MT5_DIRECT_SPOOL_50MS"
 FEED_PUBLIC_FALLBACK = "PUBLIC_15S_FALLBACK"
@@ -373,6 +381,7 @@ class AutonomousAiTrader:
         parallel_tiers: Any | None = None,
         risk_gear_mode: str | None = None,
         risk_gear_path: str | Path | None = None,
+        initial_capital_usd: Decimal | None = None,
     ) -> None:
         if not isinstance(router, DualShieldBrokerRouter):
             raise ContractError("AutonomousAiTrader requires a DualShieldBrokerRouter")
@@ -457,6 +466,13 @@ class AutonomousAiTrader:
         self._recent_actions: deque[dict[str, Any]] = deque(maxlen=12)
         self._journal_initialized = False
         self._startup_vault_synced = False
+        self._explicit_initial_capital_usd: Decimal | None = (
+            decimal_value(Decimal(initial_capital_usd), "initial_capital_usd", positive=True).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            if initial_capital_usd is not None
+            else None
+        )
 
     def _connect_journal(self) -> sqlite3.Connection | None:
         if self._journal_path is None:
@@ -853,7 +869,13 @@ class AutonomousAiTrader:
             equities = self._router.equities()
             total_eq = self._router.barbell.total_equity(equities)
             peak_eq = self._router.peak_equity() or total_eq
-            _, _, risk_mult = self._quota.evaluate_new_risk(ActionKind.OPEN, now=ts, starting_equity=total_eq)
+            ps_prot = self._principal_surplus_metrics(total_eq)
+            _, _, risk_mult = self._quota.evaluate_new_risk(
+                ActionKind.OPEN,
+                now=ts,
+                starting_equity=total_eq,
+                in_recovery_mode=bool(ps_prot["in_recovery_mode"]),
+            )
             if risk_mult <= Decimal("0"):
                 risk_mult = Decimal("0.50")
 
@@ -886,12 +908,15 @@ class AutonomousAiTrader:
                             if not safe_ticket or not safe_ticket[0].isalnum():
                                 safe_ticket = f"tkt-{safe_ticket}"[:64]
                             try:
+                                eq_post = self._router.barbell.total_equity(self._router.equities())
+                                ps_post = self._principal_surplus_metrics(eq_post)
                                 q_closed = self._quota.record_realized_trade(
                                     pnl_dec,
                                     symbol=sym_closed,
                                     ticket=safe_ticket,
-                                    starting_equity=total_eq if total_eq > Decimal("0") else None,
+                                    starting_equity=eq_post if eq_post > Decimal("0") else None,
                                     now=ts,
+                                    in_recovery_mode=bool(ps_post["in_recovery_mode"]),
                                 )
                                 if self._profit_vault is not None:
                                     if pnl_dec > Decimal("0"):
@@ -902,6 +927,8 @@ class AutonomousAiTrader:
                                             realized_net_usd=pnl_dec,
                                             occurred_at=ts,
                                             session_date=str(q_closed.get("session_date", "")),
+                                            total_equity_usd=eq_post,
+                                            initial_capital_usd=ps_post["configured_initial_capital_usd"],
                                         )
                                     self.sync_session_profit_to_vault(now=ts)
                                 if q_closed["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
@@ -1357,6 +1384,119 @@ class AutonomousAiTrader:
             self._last_evaluated_regime = best_reg
         return None
 
+    def _resolve_initial_capital_usd(self, v_snap: Mapping[str, Any] | None = None) -> Decimal | None:
+        if self._profit_vault is not None:
+            if v_snap is not None and v_snap.get("initial_capital_usd") not in (None, ""):
+                return Decimal(str(v_snap["initial_capital_usd"])).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+            if v_snap is None and hasattr(self._profit_vault, "configured_initial_capital_usd"):
+                try:
+                    v_cfg = self._profit_vault.configured_initial_capital_usd()
+                    if v_cfg is not None:
+                        return v_cfg
+                except Exception as exc_vcfg:
+                    logger.debug("vault initial capital lookup skipped: %s", type(exc_vcfg).__name__)
+        if self._explicit_initial_capital_usd is not None:
+            return self._explicit_initial_capital_usd
+        raw_env_cap = str(self._router._env.get(ENV_INITIAL_CAPITAL_USD, "")).strip()
+        if raw_env_cap:
+            try:
+                parsed_cap = Decimal(raw_env_cap)
+                if parsed_cap.is_finite() and parsed_cap > Decimal("0"):
+                    return parsed_cap.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            except (ValueError, ArithmeticError):
+                pass
+        configured_count = sum(
+            1
+            for b_id in self._router.priority_order
+            if self._router.is_configured(b_id) or b_id in self._router.venues
+        )
+        if self._router.execution_mode == "DEMO" and configured_count == 3:
+            return DEFAULT_DEMO_3BROKER_CAPITAL_USD
+        if self._router.execution_mode == "LIVE":
+            if self._router._initial_peak_equity is not None and self._router._initial_peak_equity > Decimal("0"):
+                return self._router._initial_peak_equity.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            bal_sum = Decimal("0.00")
+            for venue in self._router.venues.values():
+                if isinstance(venue, Mt5PaperBrokerVenue) and venue.account is not None:
+                    bal_sum += venue.account.balance
+                elif isinstance(venue, OandaPracticeFallbackVenue) and venue.nav is not None:
+                    bal_sum += venue.nav
+            if bal_sum > Decimal("0.00"):
+                return bal_sum.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return None
+
+    def _principal_surplus_metrics(
+        self,
+        total_eq: Decimal,
+        *,
+        v_snap: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        v_data: Mapping[str, Any] = v_snap if v_snap is not None else {}
+        if v_snap is None and self._profit_vault is not None:
+            try:
+                v_data = self._profit_vault.snapshot()
+            except Exception as exc_vs:
+                logger.debug("profit vault snapshot skipped: %s", type(exc_vs).__name__)
+                v_data = {}
+        disbursed_usd = Decimal(str(v_data.get("disbursed_to_bank_usd", "0") or "0")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        eff_init_cap = self._resolve_initial_capital_usd(v_data)
+        eq_q = total_eq.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        economic_eq = (eq_q + disbursed_usd).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if eff_init_cap is not None:
+            principal_usd = eff_init_cap
+            net_surplus = (economic_eq - principal_usd).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            with localcontext() as ctx:
+                ctx.prec = 28
+                net_surplus_pct = (
+                    ((net_surplus / principal_usd) * Decimal("100")).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+                    if principal_usd > Decimal("0")
+                    else Decimal("0.00")
+                )
+            if net_surplus < Decimal("0.00"):
+                capital_status = CAPITAL_STATUS_RECOVERY_MODE
+                deficit_usd = (-net_surplus).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            elif net_surplus > Decimal("0.00"):
+                capital_status = CAPITAL_STATUS_IN_SURPLUS
+                deficit_usd = Decimal("0.00")
+            else:
+                capital_status = CAPITAL_STATUS_AT_PRINCIPAL
+                deficit_usd = Decimal("0.00")
+        else:
+            fallback_base = self._router._initial_peak_equity if self._router._initial_peak_equity else eq_q
+            principal_usd = Decimal(fallback_base).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            net_surplus = (economic_eq - principal_usd).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            with localcontext() as ctx:
+                ctx.prec = 28
+                net_surplus_pct = (
+                    ((net_surplus / principal_usd) * Decimal("100")).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+                    if principal_usd > Decimal("0")
+                    else Decimal("0.00")
+                )
+            capital_status = (
+                CAPITAL_STATUS_IN_SURPLUS if net_surplus > Decimal("0.00") else CAPITAL_STATUS_AT_PRINCIPAL
+            )
+            deficit_usd = Decimal("0.00")
+        return {
+            "configured_initial_capital_usd": eff_init_cap,
+            "principal_usd": principal_usd,
+            "current_total_equity_usd": eq_q,
+            "economic_equity_usd": economic_eq,
+            "net_surplus_usd": net_surplus,
+            "net_surplus_pct": net_surplus_pct,
+            "deficit_to_principal_usd": deficit_usd,
+            "capital_status": capital_status,
+            "in_recovery_mode": capital_status == CAPITAL_STATUS_RECOVERY_MODE,
+            "vault_sweeps_paused_for_recovery": capital_status != CAPITAL_STATUS_IN_SURPLUS,
+        }
+
     def sync_session_profit_to_vault(self, *, now: datetime | None = None) -> dict[str, Any] | None:
         """Explicit write-path reconciliation of current session realized net P&L into ProfitSweepVault."""
         if self._profit_vault is None or not hasattr(self._profit_vault, "reconcile_session_realized_profit"):
@@ -1366,7 +1506,12 @@ class AutonomousAiTrader:
             self._startup_vault_synced = True
             equities = self._router.equities()
             total_eq = self._router.barbell.total_equity(equities)
-            dq_snap = self._quota.snapshot(now=ts, starting_equity=total_eq if total_eq > Decimal("0") else None)
+            ps = self._principal_surplus_metrics(total_eq)
+            dq_snap = self._quota.snapshot(
+                now=ts,
+                starting_equity=total_eq if total_eq > Decimal("0") else None,
+                in_recovery_mode=bool(ps["in_recovery_mode"]),
+            )
             sdate = str(dq_snap.get("session_date", "")).strip()
             if not sdate:
                 return None
@@ -1375,6 +1520,8 @@ class AutonomousAiTrader:
                 session_date=sdate,
                 session_realized_net_usd=sess_net,
                 occurred_at=ts,
+                total_equity_usd=total_eq,
+                initial_capital_usd=ps["configured_initial_capital_usd"],
             )
 
     def record_closed_pnl(
@@ -1390,8 +1537,14 @@ class AutonomousAiTrader:
         total_eq = self._router.barbell.total_equity(equities)
         with self._lock:
             self._open_position_meta.pop(ticket, None)
+            ps = self._principal_surplus_metrics(total_eq)
             snap = self._quota.record_realized_trade(
-                pnl_usd, symbol=symbol, ticket=ticket, starting_equity=total_eq, now=ts
+                pnl_usd,
+                symbol=symbol,
+                ticket=ticket,
+                starting_equity=total_eq,
+                now=ts,
+                in_recovery_mode=bool(ps["in_recovery_mode"]),
             )
             if self._profit_vault is not None:
                 self._profit_vault.record_realized_close(
@@ -1401,6 +1554,8 @@ class AutonomousAiTrader:
                     realized_net_usd=pnl_usd,
                     occurred_at=ts,
                     session_date=str(snap.get("session_date", "")),
+                    total_equity_usd=total_eq,
+                    initial_capital_usd=ps["configured_initial_capital_usd"],
                 )
                 self.sync_session_profit_to_vault(now=ts)
             if snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
@@ -1516,13 +1671,19 @@ class AutonomousAiTrader:
             equities = self._router.equities()
             total_eq = self._router.barbell.total_equity(equities)
             peak_eq = self._router.peak_equity() or total_eq
+            ps_cyc = self._principal_surplus_metrics(total_eq)
+            in_rec_cyc = bool(ps_cyc["in_recovery_mode"])
             deployable_eq = self._profit_vault.deployable_equity(total_eq) if self._profit_vault is not None else total_eq
-            self._quota.observe_day_start(total_eq, now=ts)
+            self._quota.observe_day_start(total_eq, now=ts, in_recovery_mode=in_rec_cyc)
 
             allowed, quota_veto, risk_mult = self._quota.evaluate_new_risk(
-                ActionKind.OPEN, now=ts, starting_equity=total_eq
+                ActionKind.OPEN, now=ts, starting_equity=total_eq, in_recovery_mode=in_rec_cyc
             )
-            q_snap = self._quota.snapshot(now=ts, starting_equity=total_eq if total_eq > 0 else None)
+            q_snap = self._quota.snapshot(
+                now=ts,
+                starting_equity=total_eq if total_eq > 0 else None,
+                in_recovery_mode=in_rec_cyc,
+            )
             quota_status = q_snap["status"]
             if quota_status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
                 obs_sym, obs_reg = self._observe_markets_readonly(markets)
@@ -1629,7 +1790,11 @@ class AutonomousAiTrader:
                 return report
 
             sym, side, bid, ask, setup_note, regime_name, is_pyramid_add, parent_ticket, leg_index = setup
-            quota_full = self._quota.snapshot(now=ts, starting_equity=total_eq if total_eq > 0 else None)
+            quota_full = self._quota.snapshot(
+                now=ts,
+                starting_equity=total_eq if total_eq > 0 else None,
+                in_recovery_mode=in_rec_cyc,
+            )
             gear_info = self._resolve_risk_gear(
                 regime=regime_name, total_eq=total_eq, peak_eq=peak_eq, quota_snap=quota_full
             )
@@ -2084,7 +2249,13 @@ class AutonomousAiTrader:
         with self._lock:
             equities = self._router.equities()
             total_eq = self._router.barbell.total_equity(equities)
-            allowed, veto_code, _ = self._quota.evaluate_new_risk(ActionKind.OPEN, now=ts, starting_equity=total_eq)
+            ps_res = self._principal_surplus_metrics(total_eq)
+            allowed, veto_code, _ = self._quota.evaluate_new_risk(
+                ActionKind.OPEN,
+                now=ts,
+                starting_equity=total_eq,
+                in_recovery_mode=bool(ps_res["in_recovery_mode"]),
+            )
             if not allowed:
                 self._governance_mode = GOVERNANCE_PAUSED_NEW_RISK
                 self._governance_reason = f"Cannot resume while {veto_code} is active"
@@ -2150,8 +2321,15 @@ class AutonomousAiTrader:
                     )
                     order = OrderIntent.from_action_intent(intent, symbol=pos.symbol, position_ticket=pos.ticket)
                     self._router.execute_management(broker_id, order, valve_decision=dec)
+                    eq_em_after = self._router.barbell.total_equity(self._router.equities())
+                    ps_em = self._principal_surplus_metrics(eq_em_after)
                     q_em = self._quota.record_realized_trade(
-                        pos.profit, symbol=pos.symbol, ticket=pos.ticket, starting_equity=total_eq, now=ts
+                        pos.profit,
+                        symbol=pos.symbol,
+                        ticket=pos.ticket,
+                        starting_equity=eq_em_after,
+                        now=ts,
+                        in_recovery_mode=bool(ps_em["in_recovery_mode"]),
                     )
                     if self._profit_vault is not None:
                         if pos.profit > Decimal("0"):
@@ -2162,6 +2340,8 @@ class AutonomousAiTrader:
                                 realized_net_usd=pos.profit,
                                 occurred_at=ts,
                                 session_date=str(q_em.get("session_date", "")),
+                                total_equity_usd=eq_em_after,
+                                initial_capital_usd=ps_em["configured_initial_capital_usd"],
                             )
                         self.sync_session_profit_to_vault(now=ts)
                     self._open_position_meta.pop(pos.ticket, None)
@@ -2213,6 +2393,8 @@ class AutonomousAiTrader:
                         fence_request=fence_request,
                         now=ts,
                     )
+                eq_unl = self._router.barbell.total_equity(self._router.equities())
+                in_rec_unl = bool(self._principal_surplus_metrics(eq_unl)["in_recovery_mode"])
                 if unlock_recovery_token is not None:
                     self._quota.unlock_session(
                         owner_request_id=f"{owner_request_id}-q",
@@ -2220,17 +2402,78 @@ class AutonomousAiTrader:
                         recovery_verifier=verifier,
                         recovery_token=unlock_recovery_token,
                         now=ts,
+                        in_recovery_mode=in_rec_unl,
                     )
             else:
+                eq_unl = self._router.barbell.total_equity(self._router.equities())
+                in_rec_unl = bool(self._principal_surplus_metrics(eq_unl)["in_recovery_mode"])
                 self._quota.unlock_session(
                     owner_request_id=owner_request_id,
                     reason=reason,
                     recovery_verifier=verifier,
                     recovery_token=recovery_token,
                     now=ts,
+                    in_recovery_mode=in_rec_unl,
                 )
             self._governance_mode = GOVERNANCE_ACTIVE
             self._governance_reason = f"Re-armed & unlocked ({owner_request_id})"
+        return self.status_snapshot(now=ts)
+
+    def advance_recovery_session(
+        self,
+        *,
+        reason: str = "Owner recovery leg advance",
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Advance to a fresh recovery leg (#leg2+) while below starting principal, capping giveback at <=30%."""
+        ts = self._now(now)
+        with self._lock:
+            equities = self._router.equities()
+            total_eq = self._router.barbell.total_equity(equities)
+            ps = self._principal_surplus_metrics(total_eq)
+            if ps["capital_status"] != CAPITAL_STATUS_RECOVERY_MODE:
+                raise ContractError(
+                    f"Recovery session advance is only permitted in RECOVERY_MODE "
+                    f"(current capital_status={ps['capital_status']})"
+                )
+            leg_snap = self._quota.advance_recovery_leg(
+                reason=reason,
+                in_recovery_mode=True,
+                now=ts,
+            )
+            self._recent_actions.appendleft({
+                "observed_at": _iso(ts),
+                "kind": "ADVANCE_RECOVERY_SESSION",
+                "action": "ADVANCE_RECOVERY_SESSION",
+                "symbol": None,
+                "reason": str(reason)[:200],
+                "detail": (
+                    f"Advanced recovery leg to {leg_snap['session_date']} "
+                    f"(max_loss_cap=${leg_snap['max_daily_loss_usd']})"
+                ),
+            })
+        return self.status_snapshot(now=ts)
+
+    def set_session_cadence(
+        self,
+        cadence: str,
+        *,
+        reason: str = "Owner cadence update",
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Update session rollover cadence (AUTO, REGIONAL_RECOVERY / REGIONAL_8H, or DAILY_NY)."""
+        ts = self._now(now)
+        with self._lock:
+            self._quota.set_session_cadence(cadence, now=ts)
+            eff_cad = self._quota.session_cadence
+            self._recent_actions.appendleft({
+                "observed_at": _iso(ts),
+                "kind": "SET_SESSION_CADENCE",
+                "action": "SET_SESSION_CADENCE",
+                "symbol": None,
+                "reason": str(reason)[:200],
+                "detail": f"Session cadence set to {eff_cad} ({reason})",
+            })
         return self.status_snapshot(now=ts)
 
     def status_snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:
@@ -2238,33 +2481,67 @@ class AutonomousAiTrader:
         with self._lock:
             equities = self._router.equities()
             total_eq = self._router.barbell.total_equity(equities)
-            quota_snap = self._quota.snapshot(now=ts, starting_equity=total_eq if total_eq > 0 else None)
             v_snap: Mapping[str, Any] = {}
-            sess_vault_reserved = "0"
             deployable_eq_val = total_eq
-            sdate_curr = str(quota_snap.get("session_date", ""))
             if self._profit_vault is not None:
                 try:
                     v_snap = self._profit_vault.snapshot()
+                    deployable_eq_val = self._profit_vault.deployable_equity(total_eq)
+                except Exception as exc_vread:
+                    logger.warning("profit vault read skipped: %s", type(exc_vread).__name__)
+                    v_snap = {}
+            ps = self._principal_surplus_metrics(total_eq, v_snap=v_snap)
+            in_rec_snap = bool(ps["in_recovery_mode"])
+            if hasattr(self._quota, "peek_snapshot"):
+                quota_snap = self._quota.peek_snapshot(
+                    now=ts,
+                    starting_equity=total_eq if total_eq > 0 else None,
+                    in_recovery_mode=in_rec_snap,
+                )
+            else:
+                quota_snap = self._quota.snapshot(
+                    now=ts,
+                    starting_equity=total_eq if total_eq > 0 else None,
+                )
+            sdate_curr = str(quota_snap.get("session_date", ""))
+            sess_vault_reserved = "0"
+            if self._profit_vault is not None and v_snap:
+                try:
                     if sdate_curr and hasattr(self._profit_vault, "session_totals"):
                         sess_vault_reserved = str(
                             self._profit_vault.session_totals(sdate_curr).get("bank_sweep_usd", "0")
                         )
                     else:
                         sess_vault_reserved = str(v_snap.get("bank_sweep_reserved_usd", "0"))
-                    deployable_eq_val = self._profit_vault.deployable_equity(total_eq)
-                except Exception as exc_vread:
-                    logger.warning("profit vault read skipped: %s", type(exc_vread).__name__)
-                    v_snap = {}
+                except Exception as exc_st:
+                    logger.warning("profit vault session_totals skipped: %s", type(exc_st).__name__)
+                    sess_vault_reserved = "0"
+            cad_mode = str(quota_snap.get("session_cadence", SESSION_CADENCE_AUTO))
+            pinfo = session_period_info_for(ts, session_cadence=cad_mode, in_recovery_mode=in_rec_snap)
+            dq_status = str(quota_snap.get("status", ""))
+            locked_for_session = dq_status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED)
             operating_mode_val = (
                 FOCUS_MODE_RESEARCH_RESPITE
-                if quota_snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED)
+                if locked_for_session
                 else OPERATING_MODE_ACTIVE_TRADING
             )
             banked_session = {
                 "schema": "cas-forex.banked-session/1",
                 "accounting_basis": "INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT",
                 "session_date": sdate_curr,
+                "initial_capital_usd": decimal_text(ps["principal_usd"]),
+                "current_total_equity_usd": decimal_text(ps["current_total_equity_usd"]),
+                "net_surplus_usd": decimal_text(ps["net_surplus_usd"]),
+                "net_surplus_pct": decimal_text(ps["net_surplus_pct"]),
+                "deficit_to_principal_usd": decimal_text(ps["deficit_to_principal_usd"]),
+                "capital_status": str(ps["capital_status"]),
+                "vault_sweeps_paused_for_recovery": bool(ps["vault_sweeps_paused_for_recovery"]),
+                "session_cadence": cad_mode,
+                "active_region_window": str(pinfo["active_region_window"]),
+                "active_session_leg": int(quota_snap.get("active_session_leg", 1)),
+                "can_advance_recovery_session": bool(
+                    ps["capital_status"] == CAPITAL_STATUS_RECOVERY_MODE and locked_for_session
+                ),
                 "banked_net_pnl_usd": str(quota_snap.get("realized_net_pnl_usd", "0")),
                 "realized_pnl_pct": str(quota_snap.get("realized_pnl_pct", "0")),
                 "peak_realized_pnl_usd": str(quota_snap.get("peak_realized_pnl_usd", "0")),
@@ -2278,12 +2555,10 @@ class AutonomousAiTrader:
                 "session_vault_reserved_50pct_usd": sess_vault_reserved,
                 "vault_retained_50pct_usd": str(v_snap.get("retained_trading_usd", "0")),
                 "confirmed_bank_payouts_usd": str(v_snap.get("disbursed_to_bank_usd", "0")),
-                "profits_locked_for_session": bool(
-                    quota_snap.get("status") in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED)
-                ),
+                "profits_locked_for_session": bool(locked_for_session),
                 "operating_mode": operating_mode_val,
-                "session_rollover_label": "17:00 America/New_York (14:00 Pacific)",
-                "next_session_opens_utc": _next_ny_session_rollover_utc(ts),
+                "session_rollover_label": str(pinfo["session_rollover_label"]),
+                "next_session_opens_utc": str(pinfo["next_session_opens_utc"]),
             }
             cat_snap = self._registry.catalog_snapshot()
             payload = {

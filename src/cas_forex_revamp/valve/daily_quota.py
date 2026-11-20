@@ -1,8 +1,9 @@
 """Durable Daily Profit Quota Lock ($500-$1,000 or % compounding) & Loss Circuit Breaker.
 
-Persists per-session-day state into SQLite WAL (when ``path`` is supplied) or scoped in-memory
-history. Inert on construction (zero I/O in ``__init__``). Strictly vetoes new ``OPEN`` / ``ADD``
-entries once daily profit reaches hard quota (``DAILY_QUOTA_LOCKED``) or loss / consecutive-loss
+Persists per-session-day (or per-regional-recovery-window) state into SQLite WAL (when ``path``
+is supplied) or scoped in-memory history. Inert on construction (zero I/O in ``__init__``).
+Strictly vetoes new ``OPEN`` / ``ADD`` entries once session profit reaches hard quota
+(``DAILY_QUOTA_LOCKED``) or trailing floor (``PROFIT_FLOOR_LOCKED``) or loss / consecutive-loss
 limits trip (``DAILY_LOSS_CIRCUIT_TRIPPED``), while always permitting protective ``AMEND_STOP``,
 ``REDUCE``, ``CLOSE``, and ``WAIT``.
 """
@@ -33,9 +34,23 @@ ENV_DAILY_MAX_LOSS_PCT = "CAS_FOREX_DAILY_MAX_LOSS_PCT"
 ENV_MAX_CONSECUTIVE_LOSSES = "CAS_FOREX_MAX_CONSECUTIVE_LOSSES"
 ENV_PROFIT_RATCHET_ACTIVATION_RATIO = "CAS_FOREX_PROFIT_RATCHET_ACTIVATION_RATIO"
 ENV_PROFIT_RATCHET_FLOOR_RATIO = "CAS_FOREX_PROFIT_RATCHET_FLOOR_RATIO"
+ENV_SESSION_CADENCE = "CAS_FOREX_SESSION_CADENCE"
 
 DEFAULT_PROFIT_RATCHET_ACTIVATION_RATIO = Decimal("0.50")
 DEFAULT_PROFIT_RATCHET_FLOOR_RATIO = Decimal("0.70")
+DEFAULT_RECOVERY_LEG_GIVEBACK_RATIO = Decimal("0.30")
+MIN_RECOVERY_LEG_LOSS_FLOOR_USD = Decimal("250.00")
+
+SESSION_CADENCE_AUTO = "AUTO"
+SESSION_CADENCE_DAILY_NY = "DAILY_NY"
+SESSION_CADENCE_REGIONAL_RECOVERY = "REGIONAL_RECOVERY"
+SESSION_CADENCE_REGIONAL_8H = "REGIONAL_8H"
+VALID_SESSION_CADENCES = (
+    SESSION_CADENCE_AUTO,
+    SESSION_CADENCE_DAILY_NY,
+    SESSION_CADENCE_REGIONAL_RECOVERY,
+    SESSION_CADENCE_REGIONAL_8H,
+)
 
 QUOTA_STATUS_OPEN = "OPEN"
 QUOTA_STATUS_SOFT = "SOFT_QUOTA_REACHED"
@@ -70,12 +85,88 @@ def session_date_for(now: datetime | None = None, *, rollover_hour_ny: int = 17)
     return shifted.date().isoformat()
 
 
+def next_ny_rollover_utc(now: datetime | None = None, *, rollover_hour_ny: int = 17) -> str:
+    """Return exact next 17:00 America/New_York session open timestamp in ISO-8601 UTC."""
+    ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+    ny_tz = _ny_zone()
+    local_ny = ts.astimezone(ny_tz)
+    cand_ny = datetime(local_ny.year, local_ny.month, local_ny.day, rollover_hour_ny, 0, 0, tzinfo=ny_tz)
+    if local_ny >= cand_ny:
+        nxt_d = local_ny.date() + timedelta(days=1)
+        cand_ny = datetime(nxt_d.year, nxt_d.month, nxt_d.day, rollover_hour_ny, 0, 0, tzinfo=ny_tz)
+    return cand_ny.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def regional_session_window_for(now: datetime | None = None) -> dict[str, str]:
+    """Compute contiguous 24h Global Forex Region window (ASIA 22-07Z, LONDON 07-12Z, NY 12-22Z)."""
+    ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+    h = ts.hour
+    if h >= 22 or h < 7:
+        anchor = (ts + timedelta(hours=2)).strftime("%Y-%m-%d")
+        return {
+            "period_key": f"{anchor}-ASIA",
+            "region_code": "ASIA",
+            "active_region_window": "ASIA (22:00–07:00 UTC / 14:00–23:00 PT)",
+            "next_session_opens_utc": f"{anchor}T07:00:00Z",
+            "session_rollover_label": "London Session 07:00 UTC (23:00 PT)",
+        }
+    if 7 <= h < 12:
+        dstr = ts.strftime("%Y-%m-%d")
+        return {
+            "period_key": f"{dstr}-LONDON",
+            "region_code": "LONDON",
+            "active_region_window": "LONDON (07:00–12:00 UTC / 23:00–04:00 PT)",
+            "next_session_opens_utc": f"{dstr}T12:00:00Z",
+            "session_rollover_label": "New York Session 12:00 UTC (04:00 PT)",
+        }
+    dstr = ts.strftime("%Y-%m-%d")
+    return {
+        "period_key": f"{dstr}-NY",
+        "region_code": "NY",
+        "active_region_window": "NEW_YORK (12:00–22:00 UTC / 04:00–14:00 PT)",
+        "next_session_opens_utc": f"{dstr}T22:00:00Z",
+        "session_rollover_label": "Asia Session 22:00 UTC (14:00 PT)",
+    }
+
+
+def session_period_info_for(
+    now: datetime | None = None,
+    *,
+    session_cadence: str = SESSION_CADENCE_AUTO,
+    in_recovery_mode: bool = False,
+) -> dict[str, Any]:
+    """Resolve effective session period key, active region window, and next rollover UTC."""
+    ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+    cad = str(session_cadence or SESSION_CADENCE_AUTO).strip().upper()
+    if cad not in VALID_SESSION_CADENCES:
+        raise ContractError(f"session_cadence must be one of {VALID_SESSION_CADENCES}")
+    use_regional = cad in (SESSION_CADENCE_REGIONAL_RECOVERY, SESSION_CADENCE_REGIONAL_8H) or (
+        cad == SESSION_CADENCE_AUTO and bool(in_recovery_mode)
+    )
+    if use_regional:
+        reg = regional_session_window_for(ts)
+        return {
+            **reg,
+            "session_cadence": cad,
+            "uses_regional_windows": True,
+        }
+    return {
+        "period_key": session_date_for(ts),
+        "region_code": "DAILY_NY",
+        "active_region_window": "DAILY_NY (17:00 America/New_York)",
+        "next_session_opens_utc": next_ny_rollover_utc(ts),
+        "session_rollover_label": "17:00 America/New_York (14:00 Pacific)",
+        "session_cadence": cad,
+        "uses_regional_windows": False,
+    }
+
+
 def _q2(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 class DailyQuotaGovernanceStore:
-    """Thread-safe durable daily profit target lock & daily loss circuit breaker."""
+    """Thread-safe durable daily/regional profit target lock & session loss circuit breaker."""
 
     def __init__(
         self,
@@ -91,12 +182,14 @@ class DailyQuotaGovernanceStore:
         max_consecutive_losses: int = 3,
         ratchet_activation_ratio: Decimal = DEFAULT_PROFIT_RATCHET_ACTIVATION_RATIO,
         ratchet_floor_ratio: Decimal = DEFAULT_PROFIT_RATCHET_FLOOR_RATIO,
+        session_cadence: str = SESSION_CADENCE_AUTO,
         owner_verifier: Any | None = None,
     ) -> None:
         self._path = Path(path) if path is not None else None
         self._scope_id = identifier(scope_id, "scope_id")
         self._lock = RLock()
         self._initialized = False
+        self._meta_loaded = False
         self._owner_verifier = owner_verifier
         self._days: dict[str, dict[str, Any]] = {}
         self._soft_quota_usd = decimal_value(Decimal(soft_quota_usd), "soft_quota_usd", positive=True)
@@ -131,6 +224,14 @@ class DailyQuotaGovernanceStore:
             raise ContractError("ratchet_floor_ratio must be strictly in (0, 1)")
         self._ratchet_activation_ratio = act_r
         self._ratchet_floor_ratio = flr_r
+        cad_norm = str(session_cadence or SESSION_CADENCE_AUTO).strip().upper()
+        if cad_norm not in VALID_SESSION_CADENCES:
+            raise ContractError(f"session_cadence must be one of {VALID_SESSION_CADENCES}")
+        self._session_cadence = cad_norm
+        self._explicit_cadence_arg = cad_norm != SESSION_CADENCE_AUTO
+        self._active_period_base: str | None = None
+        self._active_leg: int = 1
+        self._leg_max_loss_cap_usd: Decimal | None = None
 
     @classmethod
     def from_environ(
@@ -151,6 +252,7 @@ class DailyQuotaGovernanceStore:
         consec_raw = str(environ.get(ENV_MAX_CONSECUTIVE_LOSSES, "")).strip() or "3"
         act_raw = str(environ.get(ENV_PROFIT_RATCHET_ACTIVATION_RATIO, "")).strip() or "0.50"
         flr_raw = str(environ.get(ENV_PROFIT_RATCHET_FLOOR_RATIO, "")).strip() or "0.70"
+        cad_raw = str(environ.get(ENV_SESSION_CADENCE, "")).strip().upper() or SESSION_CADENCE_AUTO
         try:
             soft = Decimal(soft_raw)
             hard = Decimal(hard_raw)
@@ -174,11 +276,17 @@ class DailyQuotaGovernanceStore:
             max_consecutive_losses=consec,
             ratchet_activation_ratio=act_ratio,
             ratchet_floor_ratio=flr_ratio,
+            session_cadence=cad_raw,
         )
 
     @property
     def path(self) -> Path | None:
         return self._path
+
+    @property
+    def session_cadence(self) -> str:
+        with self._lock:
+            return self._session_cadence
 
     def _connect(self) -> sqlite3.Connection:
         if self._path is None:
@@ -203,7 +311,8 @@ class DailyQuotaGovernanceStore:
                     consecutive_losses INTEGER NOT NULL,
                     status TEXT NOT NULL,
                     lock_reason TEXT,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    max_loss_override_usd TEXT
                 )
                 """
             )
@@ -214,6 +323,10 @@ class DailyQuotaGovernanceStore:
             if "peak_realized_pnl_usd" not in existing_cols:
                 conn.execute(
                     "ALTER TABLE daily_quota_sessions ADD COLUMN peak_realized_pnl_usd TEXT NOT NULL DEFAULT '0'"
+                )
+            if "max_loss_override_usd" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE daily_quota_sessions ADD COLUMN max_loss_override_usd TEXT"
                 )
             conn.execute(
                 """
@@ -229,10 +342,233 @@ class DailyQuotaGovernanceStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_quota_meta (
+                    scope_id TEXT PRIMARY KEY,
+                    session_cadence TEXT NOT NULL,
+                    active_period_base TEXT,
+                    active_leg INTEGER NOT NULL DEFAULT 1,
+                    leg_max_loss_cap_usd TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             self._initialized = True
+        if not self._meta_loaded:
+            self._load_meta_from_conn(conn)
+            self._meta_loaded = True
         return conn
 
-    def _effective_targets(self, starting_equity: Decimal | None) -> tuple[Decimal, Decimal, Decimal]:
+    def _load_meta_from_conn(self, conn: sqlite3.Connection) -> None:
+        tables = {
+            str(r[0])
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        if "daily_quota_meta" not in tables:
+            return
+        mrow = conn.execute(
+            "SELECT session_cadence, active_period_base, active_leg, leg_max_loss_cap_usd "
+            "FROM daily_quota_meta WHERE scope_id = ?",
+            (self._scope_id,),
+        ).fetchone()
+        if mrow is None:
+            return
+        saved_cad = str(mrow[0] or "").strip().upper()
+        if not self._explicit_cadence_arg and saved_cad in VALID_SESSION_CADENCES:
+            self._session_cadence = saved_cad
+        self._active_period_base = str(mrow[1]) if mrow[1] not in (None, "") else None
+        self._active_leg = max(1, int(mrow[2] or 1))
+        self._leg_max_loss_cap_usd = (
+            Decimal(str(mrow[3])) if mrow[3] not in (None, "") else None
+        )
+
+    def _persist_meta(self, conn: sqlite3.Connection, ts_str: str) -> None:
+        conn.execute(
+            """
+            INSERT INTO daily_quota_meta (
+                scope_id, session_cadence, active_period_base, active_leg, leg_max_loss_cap_usd, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scope_id) DO UPDATE SET
+                session_cadence = excluded.session_cadence,
+                active_period_base = excluded.active_period_base,
+                active_leg = excluded.active_leg,
+                leg_max_loss_cap_usd = excluded.leg_max_loss_cap_usd,
+                updated_at = excluded.updated_at
+            """,
+            (
+                self._scope_id,
+                self._session_cadence,
+                self._active_period_base,
+                int(self._active_leg),
+                None if self._leg_max_loss_cap_usd is None else decimal_text(self._leg_max_loss_cap_usd),
+                ts_str,
+            ),
+        )
+
+    def _resolve_session_target(
+        self,
+        ts: datetime,
+        *,
+        in_recovery_mode: bool = False,
+        cadence_override: str | None = None,
+        active_base_override: str | None = None,
+        active_leg_override: int | None = None,
+        leg_cap_override: Decimal | None = None,
+    ) -> tuple[str, dict[str, Any], int, Decimal | None]:
+        cad = cadence_override if cadence_override is not None else self._session_cadence
+        pinfo = session_period_info_for(ts, session_cadence=cad, in_recovery_mode=in_recovery_mode)
+        base_key = str(pinfo["period_key"])
+        act_base = active_base_override if active_base_override is not None else self._active_period_base
+        act_leg = active_leg_override if active_leg_override is not None else self._active_leg
+        leg_cap = leg_cap_override if leg_cap_override is not None else self._leg_max_loss_cap_usd
+        if act_base == base_key and act_leg > 1:
+            return f"{base_key}#leg{act_leg}", pinfo, act_leg, leg_cap
+        return base_key, pinfo, 1, None
+
+    def set_session_cadence(
+        self,
+        cadence: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        clean = str(cadence or "").strip().upper()
+        if clean not in VALID_SESSION_CADENCES:
+            raise ContractError(f"session_cadence must be one of {VALID_SESSION_CADENCES}")
+        ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        ts_str = ts.isoformat().replace("+00:00", "Z")
+        with self._lock:
+            self._session_cadence = clean
+            self._explicit_cadence_arg = True
+            if self._path is not None:
+                conn = self._connect()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._persist_meta(conn, ts_str)
+                    conn.commit()
+                except Exception:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    raise
+                finally:
+                    conn.close()
+        return self.peek_snapshot(now=ts)
+
+    def advance_recovery_leg(
+        self,
+        *,
+        reason: str,
+        in_recovery_mode: bool = True,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Advance to a fresh recovery leg (#leg2, #leg3, ...) after a locked green leg, capping giveback at <=30%."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise ContractError("advance_recovery_leg requires a non-empty reason")
+        ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        ts_str = ts.isoformat().replace("+00:00", "Z")
+        with self._lock:
+            if self._path is None:
+                sdate, pinfo, cur_leg, leg_cap = self._resolve_session_target(
+                    ts, in_recovery_mode=in_recovery_mode
+                )
+                cur_row = self._load_or_init_row(
+                    sdate, starting_equity=None, ts_str=ts_str, max_loss_override=leg_cap
+                )
+                cur_status = str(cur_row["status"])
+                if cur_status == QUOTA_STATUS_LOSS_TRIPPED:
+                    raise ContractError(
+                        "DAILY_LOSS_CIRCUIT_TRIPPED cannot be bypassed via recovery leg advance; owner recovery token required"
+                    )
+                if cur_status not in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
+                    raise ContractError(
+                        f"Recovery leg advance requires DAILY_QUOTA_LOCKED or PROFIT_FLOOR_LOCKED, got {cur_status}"
+                    )
+                new_leg_cap = self._compute_next_leg_loss_cap(cur_row)
+                base_key = str(pinfo["period_key"])
+                next_leg = cur_leg + 1
+                next_sdate = f"{base_key}#leg{next_leg}"
+                self._active_period_base = base_key
+                self._active_leg = next_leg
+                self._leg_max_loss_cap_usd = new_leg_cap
+                start_eq = Decimal(str(cur_row["starting_equity"]))
+                next_row = self._load_or_init_row(
+                    next_sdate,
+                    starting_equity=start_eq if start_eq > Decimal("0") else None,
+                    ts_str=ts_str,
+                    max_loss_override=new_leg_cap,
+                )
+                next_row["max_loss_override_usd"] = decimal_text(new_leg_cap)
+                return self._format_snapshot(
+                    next_row, session_cadence=self._session_cadence, active_leg=next_leg
+                )
+
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                sdate, pinfo, cur_leg, leg_cap = self._resolve_session_target(
+                    ts, in_recovery_mode=in_recovery_mode
+                )
+                cur_row = self._load_or_init_row(
+                    sdate, starting_equity=None, ts_str=ts_str, conn=conn, max_loss_override=leg_cap
+                )
+                cur_status = str(cur_row["status"])
+                if cur_status == QUOTA_STATUS_LOSS_TRIPPED:
+                    raise ContractError(
+                        "DAILY_LOSS_CIRCUIT_TRIPPED cannot be bypassed via recovery leg advance; owner recovery token required"
+                    )
+                if cur_status not in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
+                    raise ContractError(
+                        f"Recovery leg advance requires DAILY_QUOTA_LOCKED or PROFIT_FLOOR_LOCKED, got {cur_status}"
+                    )
+                new_leg_cap = self._compute_next_leg_loss_cap(cur_row)
+                base_key = str(pinfo["period_key"])
+                next_leg = cur_leg + 1
+                next_sdate = f"{base_key}#leg{next_leg}"
+                self._active_period_base = base_key
+                self._active_leg = next_leg
+                self._leg_max_loss_cap_usd = new_leg_cap
+                self._persist_meta(conn, ts_str)
+                start_eq = Decimal(str(cur_row["starting_equity"]))
+                next_row = self._load_or_init_row(
+                    next_sdate,
+                    starting_equity=start_eq if start_eq > Decimal("0") else None,
+                    ts_str=ts_str,
+                    conn=conn,
+                    max_loss_override=new_leg_cap,
+                )
+                next_row["max_loss_override_usd"] = decimal_text(new_leg_cap)
+                next_row["updated_at"] = ts_str
+                self._save_row_and_event(
+                    next_row,
+                    event_kind=f"ADVANCE_RECOVERY_LEG:{next_leg}",
+                    delta_pnl_usd="0",
+                    conn=conn,
+                )
+                conn.commit()
+                return self._format_snapshot(
+                    next_row, session_cadence=self._session_cadence, active_leg=next_leg
+                )
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _compute_next_leg_loss_cap(self, prior_row: Mapping[str, Any]) -> Decimal:
+        start_eq = Decimal(str(prior_row["starting_equity"]))
+        start_pos = start_eq if start_eq > Decimal("0") else None
+        _, _, configured_max_loss = self._effective_targets(start_pos)
+        prior_pnl = max(Decimal("0.00"), Decimal(str(prior_row["realized_net_pnl_usd"])))
+        giveback_30 = _q2(prior_pnl * DEFAULT_RECOVERY_LEG_GIVEBACK_RATIO)
+        return min(configured_max_loss, max(MIN_RECOVERY_LEG_LOSS_FLOOR_USD, giveback_30))
+
+    def _effective_targets(
+        self,
+        starting_equity: Decimal | None,
+        *,
+        max_loss_override: Decimal | None = None,
+    ) -> tuple[Decimal, Decimal, Decimal]:
         with self._lock:
             soft = self._soft_quota_usd
             hard = self._hard_quota_usd
@@ -252,7 +588,20 @@ class DailyQuotaGovernanceStore:
             if max_loss_pct is not None:
                 pct_loss = _q2(starting_equity * max_loss_pct)
                 max_loss = max(Decimal("1.00"), min(max_loss, pct_loss))
+        if max_loss_override is not None and max_loss_override > Decimal("0"):
+            max_loss = min(max_loss, _q2(max_loss_override))
         return soft, hard, max_loss
+
+    @staticmethod
+    def _row_loss_override(row: Mapping[str, Any]) -> Decimal | None:
+        raw_ov = row.get("max_loss_override_usd")
+        if raw_ov in (None, ""):
+            return None
+        try:
+            dec = Decimal(str(raw_ov))
+            return dec if dec > Decimal("0") else None
+        except Exception:
+            return None
 
     def _ratchet_metrics(self, row: Mapping[str, Any], soft: Decimal) -> tuple[Decimal, Decimal, bool, Decimal]:
         pnl = Decimal(str(row["realized_net_pnl_usd"]))
@@ -265,7 +614,9 @@ class DailyQuotaGovernanceStore:
 
     def _compute_status(self, row: Mapping[str, Any]) -> tuple[str, str | None]:
         start_eq = Decimal(str(row["starting_equity"])) if Decimal(str(row["starting_equity"])) > 0 else None
-        soft, hard, max_loss = self._effective_targets(start_eq)
+        soft, hard, max_loss = self._effective_targets(
+            start_eq, max_loss_override=self._row_loss_override(row)
+        )
         pnl = Decimal(str(row["realized_net_pnl_usd"]))
         consec = int(row["consecutive_losses"])
         peak_pnl, _, ratchet_armed, protected_floor_usd = self._ratchet_metrics(row, soft)
@@ -284,6 +635,104 @@ class DailyQuotaGovernanceStore:
             return QUOTA_STATUS_SOFT, f"Daily soft quota reached ({decimal_text(pnl)} >= {decimal_text(soft)} USD); risk halved"
         return QUOTA_STATUS_OPEN, None
 
+    @staticmethod
+    def _select_session_row_static(
+        conn: sqlite3.Connection,
+        session_key: str,
+        *,
+        has_peak: bool,
+        has_ov: bool,
+    ) -> Any:
+        if has_peak and has_ov:
+            return conn.execute(
+                "SELECT session_key, session_date, scope_id, starting_equity, realized_net_pnl_usd, "
+                "peak_realized_pnl_usd, closed_trades, win_count, loss_count, consecutive_losses, "
+                "status, lock_reason, updated_at, max_loss_override_usd "
+                "FROM daily_quota_sessions WHERE session_key = ?",
+                (session_key,),
+            ).fetchone()
+        if has_peak:
+            return conn.execute(
+                "SELECT session_key, session_date, scope_id, starting_equity, realized_net_pnl_usd, "
+                "peak_realized_pnl_usd, closed_trades, win_count, loss_count, consecutive_losses, "
+                "status, lock_reason, updated_at, NULL "
+                "FROM daily_quota_sessions WHERE session_key = ?",
+                (session_key,),
+            ).fetchone()
+        return conn.execute(
+            "SELECT session_key, session_date, scope_id, starting_equity, realized_net_pnl_usd, "
+            "'0', closed_trades, win_count, loss_count, consecutive_losses, "
+            "status, lock_reason, updated_at, NULL "
+            "FROM daily_quota_sessions WHERE session_key = ?",
+            (session_key,),
+        ).fetchone()
+
+    def _find_legacy_asia_seed(
+        self,
+        session_date: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+        has_peak_col: bool = True,
+        has_override_col: bool = True,
+    ) -> dict[str, Any] | None:
+        """Carry live Asia row YYYY-MM-DD into YYYY-MM-DD-ASIA when updated inside [22:00Z, 07:00Z)."""
+        if not (session_date.endswith("-ASIA") and len(session_date) == 15):
+            return None
+        anchor_str = session_date[:-5]
+        try:
+            anchor_dt = datetime.fromisoformat(f"{anchor_str}T00:00:00+00:00")
+        except ValueError:
+            return None
+        asia_start = anchor_dt - timedelta(hours=2)
+        asia_end = anchor_dt + timedelta(hours=7)
+        legacy_key = f"{self._scope_id}:{anchor_str}"
+        target_key = f"{self._scope_id}:{session_date}"
+
+        if conn is None:
+            cand = self._days.get(legacy_key)
+            if cand is None:
+                return None
+            try:
+                upd_dt = datetime.fromisoformat(str(cand["updated_at"]).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if not (asia_start <= upd_dt < asia_end):
+                return None
+            cloned = dict(cand)
+            cloned["session_key"] = target_key
+            cloned["session_date"] = session_date
+            return cloned
+
+        db_row = self._select_session_row_static(
+            conn, legacy_key, has_peak=has_peak_col, has_ov=has_override_col
+        )
+        if db_row is None:
+            return None
+        try:
+            upd_dt = datetime.fromisoformat(str(db_row[12]).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if not (asia_start <= upd_dt < asia_end):
+            return None
+        loaded_pnl = Decimal(str(db_row[4]))
+        loaded_peak = _q2(max(Decimal(str(db_row[5] or "0")), loaded_pnl, Decimal("0")))
+        return {
+            "session_key": target_key,
+            "session_date": session_date,
+            "scope_id": str(db_row[2]),
+            "starting_equity": str(db_row[3]),
+            "realized_net_pnl_usd": str(db_row[4]),
+            "peak_realized_pnl_usd": decimal_text(loaded_peak),
+            "closed_trades": int(db_row[6]),
+            "win_count": int(db_row[7]),
+            "loss_count": int(db_row[8]),
+            "consecutive_losses": int(db_row[9]),
+            "status": str(db_row[10]),
+            "lock_reason": db_row[11],
+            "updated_at": str(db_row[12]),
+            "max_loss_override_usd": None if db_row[13] in (None, "") else str(db_row[13]),
+        }
+
     def _load_or_init_row(
         self,
         session_date: str,
@@ -291,11 +740,17 @@ class DailyQuotaGovernanceStore:
         starting_equity: Decimal | None,
         ts_str: str,
         conn: sqlite3.Connection | None = None,
+        max_loss_override: Decimal | None = None,
     ) -> dict[str, Any]:
         key = f"{self._scope_id}:{session_date}"
+        ov_str = None if max_loss_override is None else decimal_text(_q2(max_loss_override))
         if conn is None:
             row = self._days.get(key)
             if row is None:
+                seeded = self._find_legacy_asia_seed(session_date, conn=None)
+                if seeded is not None:
+                    self._days[key] = seeded
+                    return seeded
                 start_val = decimal_text(_q2(starting_equity)) if starting_equity is not None else "0"
                 row = {
                     "session_key": key,
@@ -311,47 +766,68 @@ class DailyQuotaGovernanceStore:
                     "status": QUOTA_STATUS_OPEN,
                     "lock_reason": None,
                     "updated_at": ts_str,
+                    "max_loss_override_usd": ov_str,
                 }
                 self._days[key] = row
-            elif Decimal(str(row["starting_equity"])) <= 0 and starting_equity is not None and starting_equity > 0:
-                row["starting_equity"] = decimal_text(_q2(starting_equity))
+            else:
+                if Decimal(str(row["starting_equity"])) <= 0 and starting_equity is not None and starting_equity > 0:
+                    row["starting_equity"] = decimal_text(_q2(starting_equity))
+                if ov_str is not None and row.get("max_loss_override_usd") in (None, ""):
+                    row["max_loss_override_usd"] = ov_str
             return row
 
         db_row = conn.execute(
             "SELECT session_key, session_date, scope_id, starting_equity, realized_net_pnl_usd, "
             "peak_realized_pnl_usd, closed_trades, win_count, loss_count, consecutive_losses, "
-            "status, lock_reason, updated_at "
+            "status, lock_reason, updated_at, max_loss_override_usd "
             "FROM daily_quota_sessions WHERE session_key = ?",
             (key,),
         ).fetchone()
         if db_row is None:
-            start_val = decimal_text(_q2(starting_equity)) if starting_equity is not None else "0"
-            row = {
-                "session_key": key,
-                "session_date": session_date,
-                "scope_id": self._scope_id,
-                "starting_equity": start_val,
-                "realized_net_pnl_usd": "0",
-                "peak_realized_pnl_usd": "0",
-                "closed_trades": 0,
-                "win_count": 0,
-                "loss_count": 0,
-                "consecutive_losses": 0,
-                "status": QUOTA_STATUS_OPEN,
-                "lock_reason": None,
-                "updated_at": ts_str,
-            }
+            seeded = self._find_legacy_asia_seed(session_date, conn=conn)
+            if seeded is not None:
+                row = seeded
+            else:
+                start_val = decimal_text(_q2(starting_equity)) if starting_equity is not None else "0"
+                row = {
+                    "session_key": key,
+                    "session_date": session_date,
+                    "scope_id": self._scope_id,
+                    "starting_equity": start_val,
+                    "realized_net_pnl_usd": "0",
+                    "peak_realized_pnl_usd": "0",
+                    "closed_trades": 0,
+                    "win_count": 0,
+                    "loss_count": 0,
+                    "consecutive_losses": 0,
+                    "status": QUOTA_STATUS_OPEN,
+                    "lock_reason": None,
+                    "updated_at": ts_str,
+                    "max_loss_override_usd": ov_str,
+                }
             conn.execute(
                 """
                 INSERT INTO daily_quota_sessions (
                     session_key, session_date, scope_id, starting_equity, realized_net_pnl_usd,
                     peak_realized_pnl_usd, closed_trades, win_count, loss_count, consecutive_losses,
-                    status, lock_reason, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, lock_reason, updated_at, max_loss_override_usd
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    key, session_date, self._scope_id, row["starting_equity"], "0",
-                    "0", 0, 0, 0, 0, QUOTA_STATUS_OPEN, None, ts_str,
+                    key,
+                    session_date,
+                    self._scope_id,
+                    row["starting_equity"],
+                    row["realized_net_pnl_usd"],
+                    row["peak_realized_pnl_usd"],
+                    row["closed_trades"],
+                    row["win_count"],
+                    row["loss_count"],
+                    row["consecutive_losses"],
+                    row["status"],
+                    row["lock_reason"],
+                    row["updated_at"],
+                    row.get("max_loss_override_usd"),
                 ),
             )
             return row
@@ -371,12 +847,19 @@ class DailyQuotaGovernanceStore:
             "status": db_row[10],
             "lock_reason": db_row[11],
             "updated_at": db_row[12],
+            "max_loss_override_usd": None if db_row[13] in (None, "") else str(db_row[13]),
         }
         if Decimal(str(row["starting_equity"])) <= 0 and starting_equity is not None and starting_equity > 0:
             row["starting_equity"] = decimal_text(_q2(starting_equity))
             conn.execute(
                 "UPDATE daily_quota_sessions SET starting_equity = ? WHERE session_key = ?",
                 (row["starting_equity"], key),
+            )
+        if ov_str is not None and row.get("max_loss_override_usd") in (None, ""):
+            row["max_loss_override_usd"] = ov_str
+            conn.execute(
+                "UPDATE daily_quota_sessions SET max_loss_override_usd = ? WHERE session_key = ?",
+                (ov_str, key),
             )
         return row
 
@@ -407,13 +890,22 @@ class DailyQuotaGovernanceStore:
             UPDATE daily_quota_sessions SET
                 starting_equity = ?, realized_net_pnl_usd = ?, peak_realized_pnl_usd = ?,
                 closed_trades = ?, win_count = ?, loss_count = ?, consecutive_losses = ?,
-                status = ?, lock_reason = ?, updated_at = ?
+                status = ?, lock_reason = ?, updated_at = ?, max_loss_override_usd = ?
             WHERE session_key = ?
             """,
             (
-                row["starting_equity"], row["realized_net_pnl_usd"], row.get("peak_realized_pnl_usd", "0"),
-                row["closed_trades"], row["win_count"], row["loss_count"], row["consecutive_losses"],
-                row["status"], row["lock_reason"], row["updated_at"], row["session_key"],
+                row["starting_equity"],
+                row["realized_net_pnl_usd"],
+                row.get("peak_realized_pnl_usd", "0"),
+                row["closed_trades"],
+                row["win_count"],
+                row["loss_count"],
+                row["consecutive_losses"],
+                row["status"],
+                row["lock_reason"],
+                row["updated_at"],
+                row.get("max_loss_override_usd"),
+                row["session_key"],
             ),
         )
         conn.execute(
@@ -423,26 +915,46 @@ class DailyQuotaGovernanceStore:
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                row["session_key"], event_kind, delta_pnl_usd, row["status"],
-                row["updated_at"], prev_sha, ev_sha,
+                row["session_key"],
+                event_kind,
+                delta_pnl_usd,
+                row["status"],
+                row["updated_at"],
+                prev_sha,
+                ev_sha,
             ),
         )
 
-    def observe_day_start(self, starting_equity: Decimal, *, now: datetime | None = None) -> dict[str, Any]:
+    def observe_day_start(
+        self,
+        starting_equity: Decimal,
+        *,
+        now: datetime | None = None,
+        in_recovery_mode: bool = False,
+    ) -> dict[str, Any]:
         decimal_value(starting_equity, "starting_equity", positive=True)
         ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
         ts_str = ts.isoformat().replace("+00:00", "Z")
-        sdate = session_date_for(ts)
         with self._lock:
             if self._path is None:
-                row = self._load_or_init_row(sdate, starting_equity=starting_equity, ts_str=ts_str)
-                return self._format_snapshot(row)
+                sdate, _, act_leg, leg_cap = self._resolve_session_target(
+                    ts, in_recovery_mode=in_recovery_mode
+                )
+                row = self._load_or_init_row(
+                    sdate, starting_equity=starting_equity, ts_str=ts_str, max_loss_override=leg_cap
+                )
+                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                row = self._load_or_init_row(sdate, starting_equity=starting_equity, ts_str=ts_str, conn=conn)
+                sdate, _, act_leg, leg_cap = self._resolve_session_target(
+                    ts, in_recovery_mode=in_recovery_mode
+                )
+                row = self._load_or_init_row(
+                    sdate, starting_equity=starting_equity, ts_str=ts_str, conn=conn, max_loss_override=leg_cap
+                )
                 conn.commit()
-                return self._format_snapshot(row)
+                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
             except Exception:
                 if conn.in_transaction:
                     conn.rollback()
@@ -458,26 +970,36 @@ class DailyQuotaGovernanceStore:
         ticket: str,
         starting_equity: Decimal | None = None,
         now: datetime | None = None,
+        in_recovery_mode: bool = False,
     ) -> dict[str, Any]:
         pnl_dec = decimal_value(pnl_usd, "pnl_usd")
         identifier(symbol, "symbol")
         identifier(ticket, "ticket")
         ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
         ts_str = ts.isoformat().replace("+00:00", "Z")
-        sdate = session_date_for(ts)
         with self._lock:
             if self._path is None:
-                row = self._load_or_init_row(sdate, starting_equity=starting_equity, ts_str=ts_str)
+                sdate, _, act_leg, leg_cap = self._resolve_session_target(
+                    ts, in_recovery_mode=in_recovery_mode
+                )
+                row = self._load_or_init_row(
+                    sdate, starting_equity=starting_equity, ts_str=ts_str, max_loss_override=leg_cap
+                )
                 self._apply_trade(row, pnl_dec, ts_str)
-                return self._format_snapshot(row)
+                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                row = self._load_or_init_row(sdate, starting_equity=starting_equity, ts_str=ts_str, conn=conn)
+                sdate, _, act_leg, leg_cap = self._resolve_session_target(
+                    ts, in_recovery_mode=in_recovery_mode
+                )
+                row = self._load_or_init_row(
+                    sdate, starting_equity=starting_equity, ts_str=ts_str, conn=conn, max_loss_override=leg_cap
+                )
                 self._apply_trade(row, pnl_dec, ts_str)
                 self._save_row_and_event(row, event_kind="REALIZED_TRADE", delta_pnl_usd=decimal_text(_q2(pnl_dec)), conn=conn)
                 conn.commit()
-                return self._format_snapshot(row)
+                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
             except Exception:
                 if conn.in_transaction:
                     conn.rollback()
@@ -518,10 +1040,11 @@ class DailyQuotaGovernanceStore:
         *,
         now: datetime | None = None,
         starting_equity: Decimal | None = None,
+        in_recovery_mode: bool = False,
     ) -> tuple[bool, str | None, Decimal]:
         if kind not in (ActionKind.OPEN, ActionKind.ADD):
             return True, None, Decimal("1")
-        snap = self.snapshot(now=now, starting_equity=starting_equity)
+        snap = self.peek_snapshot(now=now, starting_equity=starting_equity, in_recovery_mode=in_recovery_mode)
         status = snap["status"]
         if status == QUOTA_STATUS_LOCKED:
             return False, QUOTA_STATUS_LOCKED, Decimal("0")
@@ -575,6 +1098,7 @@ class DailyQuotaGovernanceStore:
         recovery_verifier: Any | None = None,
         recovery_token: str | None = None,
         now: datetime | None = None,
+        in_recovery_mode: bool = False,
     ) -> dict[str, Any]:
         identifier(owner_request_id, "owner_request_id")
         if not isinstance(reason, str) or not reason.strip():
@@ -588,26 +1112,35 @@ class DailyQuotaGovernanceStore:
             now=ts,
         )
         ts_str = ts.isoformat().replace("+00:00", "Z")
-        sdate = session_date_for(ts)
         with self._lock:
             if self._path is None:
-                row = self._load_or_init_row(sdate, starting_equity=None, ts_str=ts_str)
+                sdate, _, act_leg, leg_cap = self._resolve_session_target(
+                    ts, in_recovery_mode=in_recovery_mode
+                )
+                row = self._load_or_init_row(
+                    sdate, starting_equity=None, ts_str=ts_str, max_loss_override=leg_cap
+                )
                 row["status"] = QUOTA_STATUS_OPEN
                 row["consecutive_losses"] = 0
                 row["lock_reason"] = f"OWNER_UNLOCKED:{owner_request_id}"
                 row["updated_at"] = ts_str
-                return self._format_snapshot(row)
+                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                row = self._load_or_init_row(sdate, starting_equity=None, ts_str=ts_str, conn=conn)
+                sdate, _, act_leg, leg_cap = self._resolve_session_target(
+                    ts, in_recovery_mode=in_recovery_mode
+                )
+                row = self._load_or_init_row(
+                    sdate, starting_equity=None, ts_str=ts_str, conn=conn, max_loss_override=leg_cap
+                )
                 row["status"] = QUOTA_STATUS_OPEN
                 row["consecutive_losses"] = 0
                 row["lock_reason"] = f"OWNER_UNLOCKED:{owner_request_id}"
                 row["updated_at"] = ts_str
                 self._save_row_and_event(row, event_kind=f"OWNER_UNLOCK:{owner_request_id}", delta_pnl_usd="0", conn=conn)
                 conn.commit()
-                return self._format_snapshot(row)
+                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
             except Exception:
                 if conn.in_transaction:
                     conn.rollback()
@@ -654,10 +1187,18 @@ class DailyQuotaGovernanceStore:
                 self._daily_quota_pct = dp
         return self.snapshot(now=now)
 
-    def _format_snapshot(self, row: Mapping[str, Any]) -> dict[str, Any]:
+    def _format_snapshot(
+        self,
+        row: Mapping[str, Any],
+        *,
+        session_cadence: str | None = None,
+        active_leg: int = 1,
+    ) -> dict[str, Any]:
         start_eq = Decimal(str(row["starting_equity"]))
         start_pos = start_eq if start_eq > Decimal("0") else None
-        soft, hard, max_loss = self._effective_targets(start_pos)
+        soft, hard, max_loss = self._effective_targets(
+            start_pos, max_loss_override=self._row_loss_override(row)
+        )
         pnl = Decimal(str(row["realized_net_pnl_usd"]))
         with localcontext() as ctx:
             ctx.prec = 28
@@ -670,6 +1211,7 @@ class DailyQuotaGovernanceStore:
             if status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED, QUOTA_STATUS_LOSS_TRIPPED)
             else (Decimal("0.50") if status == QUOTA_STATUS_SOFT else Decimal("1"))
         )
+        eff_cad = session_cadence if session_cadence is not None else self._session_cadence
         return {
             "schema": "cas-forex.daily-quota/1",
             "session_date": str(row["session_date"]),
@@ -678,6 +1220,8 @@ class DailyQuotaGovernanceStore:
             "new_risk_allowed": status in (QUOTA_STATUS_OPEN, QUOTA_STATUS_SOFT),
             "lock_reason": row["lock_reason"],
             "quota_mode": self._quota_mode,
+            "session_cadence": eff_cad,
+            "active_session_leg": max(1, int(active_leg)),
             "starting_equity_usd": decimal_text(start_eq),
             "realized_net_pnl_usd": decimal_text(pnl),
             "peak_realized_pnl_usd": decimal_text(peak_pnl),
@@ -699,20 +1243,202 @@ class DailyQuotaGovernanceStore:
             "updated_at": str(row["updated_at"]),
         }
 
-    def snapshot(self, *, now: datetime | None = None, starting_equity: Decimal | None = None) -> dict[str, Any]:
+    def peek_snapshot(
+        self,
+        *,
+        now: datetime | None = None,
+        starting_equity: Decimal | None = None,
+        in_recovery_mode: bool = False,
+    ) -> dict[str, Any]:
+        """Strictly read-only snapshot (0 SQLite DDL/DML writes; PRAGMA data_version unchanged)."""
         ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
         ts_str = ts.isoformat().replace("+00:00", "Z")
-        sdate = session_date_for(ts)
+        with self._lock:
+            eff_cad = self._session_cadence
+            eff_base = self._active_period_base
+            eff_leg = self._active_leg
+            eff_cap = self._leg_max_loss_cap_usd
+
+            if self._path is None:
+                sdate, _, act_leg, leg_cap = self._resolve_session_target(
+                    ts,
+                    in_recovery_mode=in_recovery_mode,
+                    cadence_override=eff_cad,
+                    active_base_override=eff_base,
+                    active_leg_override=eff_leg,
+                    leg_cap_override=eff_cap,
+                )
+                key = f"{self._scope_id}:{sdate}"
+                mem_row = self._days.get(key)
+                if mem_row is None:
+                    mem_row = self._find_legacy_asia_seed(sdate, conn=None)
+                if mem_row is None:
+                    start_val = decimal_text(_q2(starting_equity)) if starting_equity is not None else "0"
+                    mem_row = {
+                        "session_key": key,
+                        "session_date": sdate,
+                        "scope_id": self._scope_id,
+                        "starting_equity": start_val,
+                        "realized_net_pnl_usd": "0",
+                        "peak_realized_pnl_usd": "0",
+                        "closed_trades": 0,
+                        "win_count": 0,
+                        "loss_count": 0,
+                        "consecutive_losses": 0,
+                        "status": QUOTA_STATUS_OPEN,
+                        "lock_reason": None,
+                        "updated_at": ts_str,
+                        "max_loss_override_usd": None if leg_cap is None else decimal_text(_q2(leg_cap)),
+                    }
+                return self._format_snapshot(mem_row, session_cadence=eff_cad, active_leg=act_leg)
+
+            if not self._path.is_file():
+                sdate, _, act_leg, leg_cap = self._resolve_session_target(
+                    ts,
+                    in_recovery_mode=in_recovery_mode,
+                    cadence_override=eff_cad,
+                    active_base_override=eff_base,
+                    active_leg_override=eff_leg,
+                    leg_cap_override=eff_cap,
+                )
+                start_val = decimal_text(_q2(starting_equity)) if starting_equity is not None else "0"
+                ephemeral = {
+                    "session_key": f"{self._scope_id}:{sdate}",
+                    "session_date": sdate,
+                    "scope_id": self._scope_id,
+                    "starting_equity": start_val,
+                    "realized_net_pnl_usd": "0",
+                    "peak_realized_pnl_usd": "0",
+                    "closed_trades": 0,
+                    "win_count": 0,
+                    "loss_count": 0,
+                    "consecutive_losses": 0,
+                    "status": QUOTA_STATUS_OPEN,
+                    "lock_reason": None,
+                    "updated_at": ts_str,
+                    "max_loss_override_usd": None if leg_cap is None else decimal_text(_q2(leg_cap)),
+                }
+                return self._format_snapshot(ephemeral, session_cadence=eff_cad, active_leg=act_leg)
+
+            conn = sqlite3.connect(str(self._path), timeout=5.0, isolation_level=None)
+            try:
+                tables = {
+                    str(r[0])
+                    for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                if not self._meta_loaded and "daily_quota_meta" in tables:
+                    mrow = conn.execute(
+                        "SELECT session_cadence, active_period_base, active_leg, leg_max_loss_cap_usd "
+                        "FROM daily_quota_meta WHERE scope_id = ?",
+                        (self._scope_id,),
+                    ).fetchone()
+                    if mrow is not None:
+                        saved_cad = str(mrow[0] or "").strip().upper()
+                        if not self._explicit_cadence_arg and saved_cad in VALID_SESSION_CADENCES:
+                            eff_cad = saved_cad
+                        eff_base = str(mrow[1]) if mrow[1] not in (None, "") else None
+                        eff_leg = max(1, int(mrow[2] or 1))
+                        eff_cap = Decimal(str(mrow[3])) if mrow[3] not in (None, "") else None
+
+                sdate, _, act_leg, leg_cap = self._resolve_session_target(
+                    ts,
+                    in_recovery_mode=in_recovery_mode,
+                    cadence_override=eff_cad,
+                    active_base_override=eff_base,
+                    active_leg_override=eff_leg,
+                    leg_cap_override=eff_cap,
+                )
+                key = f"{self._scope_id}:{sdate}"
+                db_dict: dict[str, Any] | None = None
+                if "daily_quota_sessions" in tables:
+                    cols = {
+                        str(c[1])
+                        for c in conn.execute("PRAGMA table_info(daily_quota_sessions)").fetchall()
+                    }
+                    has_peak = "peak_realized_pnl_usd" in cols
+                    has_ov = "max_loss_override_usd" in cols
+                    db_row = self._select_session_row_static(
+                        conn, key, has_peak=has_peak, has_ov=has_ov
+                    )
+                    if db_row is not None:
+                        loaded_pnl = Decimal(str(db_row[4]))
+                        loaded_peak = _q2(max(Decimal(str(db_row[5] or "0")), loaded_pnl, Decimal("0")))
+                        db_dict = {
+                            "session_key": db_row[0],
+                            "session_date": db_row[1],
+                            "scope_id": db_row[2],
+                            "starting_equity": db_row[3],
+                            "realized_net_pnl_usd": db_row[4],
+                            "peak_realized_pnl_usd": decimal_text(loaded_peak),
+                            "closed_trades": int(db_row[6]),
+                            "win_count": int(db_row[7]),
+                            "loss_count": int(db_row[8]),
+                            "consecutive_losses": int(db_row[9]),
+                            "status": db_row[10],
+                            "lock_reason": db_row[11],
+                            "updated_at": db_row[12],
+                            "max_loss_override_usd": None if db_row[13] in (None, "") else str(db_row[13]),
+                        }
+                        if Decimal(str(db_dict["starting_equity"])) <= 0 and starting_equity is not None and starting_equity > 0:
+                            db_dict["starting_equity"] = decimal_text(_q2(starting_equity))
+                        if leg_cap is not None and db_dict.get("max_loss_override_usd") in (None, ""):
+                            db_dict["max_loss_override_usd"] = decimal_text(_q2(leg_cap))
+                    else:
+                        db_dict = self._find_legacy_asia_seed(
+                            sdate, conn=conn, has_peak_col=has_peak, has_override_col=has_ov
+                        )
+
+                if db_dict is None:
+                    start_val = decimal_text(_q2(starting_equity)) if starting_equity is not None else "0"
+                    db_dict = {
+                        "session_key": key,
+                        "session_date": sdate,
+                        "scope_id": self._scope_id,
+                        "starting_equity": start_val,
+                        "realized_net_pnl_usd": "0",
+                        "peak_realized_pnl_usd": "0",
+                        "closed_trades": 0,
+                        "win_count": 0,
+                        "loss_count": 0,
+                        "consecutive_losses": 0,
+                        "status": QUOTA_STATUS_OPEN,
+                        "lock_reason": None,
+                        "updated_at": ts_str,
+                        "max_loss_override_usd": None if leg_cap is None else decimal_text(_q2(leg_cap)),
+                    }
+                return self._format_snapshot(db_dict, session_cadence=eff_cad, active_leg=act_leg)
+            finally:
+                conn.close()
+
+    def snapshot(
+        self,
+        *,
+        now: datetime | None = None,
+        starting_equity: Decimal | None = None,
+        in_recovery_mode: bool = False,
+    ) -> dict[str, Any]:
+        ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        ts_str = ts.isoformat().replace("+00:00", "Z")
         with self._lock:
             if self._path is None:
-                row = self._load_or_init_row(sdate, starting_equity=starting_equity, ts_str=ts_str)
-                return self._format_snapshot(row)
+                sdate, _, act_leg, leg_cap = self._resolve_session_target(
+                    ts, in_recovery_mode=in_recovery_mode
+                )
+                row = self._load_or_init_row(
+                    sdate, starting_equity=starting_equity, ts_str=ts_str, max_loss_override=leg_cap
+                )
+                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                row = self._load_or_init_row(sdate, starting_equity=starting_equity, ts_str=ts_str, conn=conn)
+                sdate, _, act_leg, leg_cap = self._resolve_session_target(
+                    ts, in_recovery_mode=in_recovery_mode
+                )
+                row = self._load_or_init_row(
+                    sdate, starting_equity=starting_equity, ts_str=ts_str, conn=conn, max_loss_override=leg_cap
+                )
                 conn.commit()
-                return self._format_snapshot(row)
+                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
             except Exception:
                 if conn.in_transaction:
                     conn.rollback()
