@@ -260,6 +260,19 @@ function setup(projection, state) {
 
 const pct = (share) => { const n = Number(share); return Number.isFinite(n) ? `${Math.round(n * 10000) / 100}%` : 'Unknown'; };
 
+function renderChainStatusBadge(status) {
+  if (status === 'BROKER_OFFLINE') {
+    return '<span class="tag status-offline" data-broker-status="BROKER_OFFLINE"><span class="state-rule" aria-hidden="true"></span>OFFLINE</span>';
+  }
+  if (status === 'ACTIVE') {
+    return '<span class="tag status-active" data-broker-status="ACTIVE"><span class="state-rule" aria-hidden="true"></span>ACTIVE</span>';
+  }
+  if (status === 'FAILED' || status === 'FROZEN' || status === 'LIVE_FORBIDDEN') {
+    return `<span class="tag tag-warning status-failed" data-broker-status="${e(status)}"><span class="state-rule" aria-hidden="true"></span>${e(status)}</span>`;
+  }
+  return `<span class="tag tag-warning" data-broker-status="${e(status)}"><span class="state-rule" aria-hidden="true"></span>${e(status)}</span>`;
+}
+
 /** 03 Setup card: Broker & MetaTrader 5 routing (demo only). Static preview when no loopback routing is attached. */
 export function renderBrokerRoutingPanel(routing) {
   const r = routing && typeof routing === 'object' && Array.isArray(routing.chain) ? routing : STATIC_BROKER_ROUTING;
@@ -273,10 +286,14 @@ export function renderBrokerRoutingPanel(routing) {
   const foot = isLive
     ? 'Live execution mode: two-key owner authorization is active; demo servers are refused to prevent mixing funds. No credentials are shown or stored in this page.'
     : 'Demo-only lock: live servers (Hugo PRO5, LHFXSA-Live, api-fxtrade.oanda.com) are refused in code. No credentials are shown or stored in this page.';
-  const chain = r.chain.map((item) => `<div class="stage-row broker-row" data-broker-id="${e(item.brokerId)}"><div><span class="stage-letter">${e(item.priority)}</span><h3>${e(item.brokerId)} · ${e(item.label)}</h3><p>${e(item.role)} · ${e(item.platform)} · ${e(item.server)} · ${e(item.leverage)} ${e(item.accountType)}</p></div>${tag(item.status, item.status !== 'ACTIVE')}</div>`).join('');
+  const chain = r.chain.map((item) => `<div class="stage-row broker-row" data-broker-id="${e(item.brokerId)}"><div><span class="stage-letter">${e(item.priority)}</span><h3>${e(item.brokerId)} · ${e(item.label)}</h3><p>${e(item.role)} · ${e(item.platform)} · ${e(item.server)} · ${e(item.leverage)} ${e(item.accountType)}</p></div>${renderChainStatusBadge(item.status)}</div>`).join('');
+  const hasOffline = Boolean(s.equityIncomplete || (s.offlineBrokers && s.offlineBrokers.length > 0) || r.chain.some((c) => c.status === 'BROKER_OFFLINE'));
+  const onlineEqMeta = hasOffline && s.onlineEquity
+    ? meta('Online deployable equity', `$${s.onlineEquity} (offline broker excluded — not a loss)`)
+    : '';
   return `<section class="panel broker-routing-panel" aria-labelledby="broker-routing-title"><div class="section-heading"><div><p class="eyebrow">${eyebrow}</p><h2 id="broker-routing-title">Broker &amp; MetaTrader 5 Routing</h2></div>${modeTag}</div>
     <p class="panel-copy">${lead}</p>
-    <dl class="metadata">${meta('Execution mode', isLive ? 'LIVE (two-key armed)' : 'DEMO (default locked)')}${meta('Active platform', r.platform)}${meta('Routing source', r.connected ? 'Loopback broker routing (read only)' : 'Static preview (not connected)')}${meta('Primary broker', r.primaryBroker)}${meta('Active broker', r.activeBroker)}${meta('MT5 transport', r.transportMode)}${meta('Safety valve', `${r.valve.controller} · ${r.valve.parameters} params · threshold ${r.valve.threshold}`)}</dl>
+    <dl class="metadata">${meta('Execution mode', isLive ? 'LIVE (two-key armed)' : 'DEMO (default locked)')}${meta('Active platform', r.platform)}${meta('Routing source', r.connected ? 'Loopback broker routing (read only)' : 'Static preview (not connected)')}${meta('Primary broker', r.primaryBroker)}${meta('Active broker', r.activeBroker)}${meta('MT5 transport', r.transportMode)}${meta('Safety valve', `${r.valve.controller} · ${r.valve.parameters} params · threshold ${r.valve.threshold}`)}${onlineEqMeta}</dl>
     <div class="broker-chain" aria-label="Broker priority chain">${chain}</div>
     <dl class="metadata" aria-label="Dual-shield barbell">${meta('Quote-truth shield', `${s.majorBps} bps majors / ${s.crossBps} bps crosses vs ${s.reference} · spread ≤ ${s.spreadMultiple}x`)}${meta('Barbell allocation', `${pct(s.reserveShare)} OANDA reserve · ${pct(s.hugoswayShare)} Hugo's Way · ${pct(s.lhfxShare)} LHFX`)}${meta('Stop-loss risk cap', `${s.maxStopRiskPct}% of total equity`)}${meta('Safe harbor', `${s.safeHarbor} ${s.safeHarborLeverage} · ${s.degradations} recent degradations`)}${meta('Protective offsets', s.offsetPlanner ? 'Delta-neutral OANDA hedge plan if an MT5 terminal freezes' : 'Unavailable')}</dl>
     <p class="quiet-note">${foot}</p>

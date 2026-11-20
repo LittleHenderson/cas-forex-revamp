@@ -4,7 +4,7 @@
 
 export const MAX_BROKER_ROUTING_BYTES = 65536;
 const BROKER_IDS = Object.freeze(['HUGOSWAY_MT5', 'LHFX_MT5', 'OANDA_PRACTICE', 'OANDA_LIVE']);
-const STATUS_WORDS = Object.freeze(['ACTIVE', 'STANDBY', 'NOT_CONFIGURED', 'FAILED', 'DISCONNECTED', 'FROZEN', 'LIVE_FORBIDDEN', 'NOT_CONNECTED']);
+const STATUS_WORDS = Object.freeze(['ACTIVE', 'STANDBY', 'NOT_CONFIGURED', 'FAILED', 'DISCONNECTED', 'BROKER_OFFLINE', 'FROZEN', 'LIVE_FORBIDDEN', 'NOT_CONNECTED']);
 
 const str = (value, fallback = 'Unknown', maxLen = 200) => (
   typeof value === 'string' && value.length > 0 && value.length <= maxLen ? value : fallback
@@ -78,6 +78,7 @@ export const STATIC_BROKER_ROUTING = Object.freeze({
     reference: 'OANDA_PRACTICE', majorBps: '15', crossBps: '25', spreadMultiple: '3.0',
     reserveShare: '0.80', hugoswayShare: '0.12', lhfxShare: '0.08', maxStopRiskPct: '1.00',
     safeHarbor: 'OANDA_PRACTICE', safeHarborLeverage: '1:50', degradations: '0', offsetPlanner: true, totalEquity: null,
+    offlineBrokers: Object.freeze([]), onlineEquity: null, equityIncomplete: false,
   }),
   liveReadiness: STATIC_LIVE_READINESS,
 });
@@ -105,12 +106,22 @@ function normalizeShield(doc) {
   const degradations = Array.isArray(harbor.recent_degradations) ? harbor.recent_degradations.length : 0;
   const rawEq = shield.allocation?.total_equity;
   const totalEquity = typeof rawEq === 'string' && /^-?[0-9]+(\.[0-9]+)?$/.test(rawEq) ? rawEq : null;
+  const rawOnlineEq = shield.allocation?.online_equity;
+  const onlineEquity = typeof rawOnlineEq === 'string' && /^-?[0-9]+(\.[0-9]+)?$/.test(rawOnlineEq) ? rawOnlineEq : totalEquity;
+  const offlineBrokers = Object.freeze(
+    Array.isArray(shield.allocation?.offline_brokers)
+      ? shield.allocation.offline_brokers.filter((b) => typeof b === 'string' && BROKER_IDS.includes(b))
+      : [],
+  );
+  const equityIncomplete = typeof shield.allocation?.equity_incomplete === 'boolean'
+    ? shield.allocation.equity_incomplete
+    : offlineBrokers.length > 0;
   return Object.freeze({
     reference: str(oracle.reference_source), majorBps: str(oracle.max_divergence_bps_major), crossBps: str(oracle.max_divergence_bps_cross),
     spreadMultiple: str(oracle.max_oanda_spread_multiple), reserveShare: str(barbell.oanda_reserve_share), hugoswayShare: str(barbell.hugosway_share),
     lhfxShare: str(barbell.lhfx_share), maxStopRiskPct: str(barbell.max_stop_loss_equity_risk_pct), safeHarbor: str(harbor.broker_id),
     safeHarborLeverage: str(harbor.leverage), degradations: String(degradations), offsetPlanner: Boolean(shield.offset_planner),
-    totalEquity,
+    totalEquity, offlineBrokers, onlineEquity, equityIncomplete,
   });
 }
 

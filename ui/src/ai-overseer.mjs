@@ -470,12 +470,39 @@ function normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operating
   const defaultSwept = vaultSweepsPausedForRecovery ? '0' : bankSweepReservedUsd;
   const vaultSwept50PctUsd = numStr(bs?.vault_swept_50pct_usd, defaultSwept);
   const vaultRetained50PctUsd = numStr(bs?.vault_retained_50pct_usd, bankSweepReservedUsd);
+  const offlineBrokers = Object.freeze(
+    Array.isArray(bs?.offline_brokers)
+      ? bs.offline_brokers.map((b) => str(b, '', 48)).filter(Boolean)
+      : [],
+  );
+  const offlineBrokerLabels = Object.freeze(offlineBrokers.map((id) => friendlyBrokerLabel(id)));
+  const equityIncompleteBrokersOffline = typeof bs?.equity_incomplete_brokers_offline === 'boolean'
+    ? bs.equity_incomplete_brokers_offline
+    : offlineBrokers.length > 0;
+  const defaultOnlineEquity = doc?.deployable_equity_usd !== undefined && doc?.deployable_equity_usd !== null
+    ? numStr(doc.deployable_equity_usd, currentTotalEquityUsd)
+    : currentTotalEquityUsd;
+  const onlineEquityUsd = bs?.online_equity_usd !== undefined && bs?.online_equity_usd !== null
+    ? numStr(bs.online_equity_usd, defaultOnlineEquity)
+    : defaultOnlineEquity;
+  let offlineBrokerNotice = null;
+  if (typeof bs?.offline_broker_notice === 'string' && bs.offline_broker_notice.trim().length > 0) {
+    offlineBrokerNotice = str(bs.offline_broker_notice.trim(), '', 400);
+  } else if (equityIncompleteBrokersOffline || offlineBrokers.length > 0) {
+    const names = offlineBrokerLabels.length > 0 ? offlineBrokerLabels.join(' & ') : 'One or more broker terminals';
+    offlineBrokerNotice = `${names} is currently disconnected. Unreachable broker equity is excluded from active trade sizing and drawdown — this is a connection pause, NOT a trading loss.`;
+  }
   return Object.freeze({
     schema: 'cas-forex.banked-session/1',
     accountingBasis: str(bs?.accounting_basis, 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT', 80),
     sessionDate,
     initialCapitalUsd,
     currentTotalEquityUsd,
+    onlineEquityUsd,
+    offlineBrokers,
+    offlineBrokerLabels,
+    offlineBrokerNotice,
+    equityIncompleteBrokersOffline,
     netSurplusUsd,
     netSurplusPct,
     deficitToPrincipalUsd,
@@ -623,6 +650,11 @@ export const STATIC_AI_TRADER = Object.freeze({
     sessionDate: 'Unknown',
     initialCapitalUsd: '300000',
     currentTotalEquityUsd: '300000',
+    onlineEquityUsd: '300000',
+    offlineBrokers: Object.freeze([]),
+    offlineBrokerLabels: Object.freeze([]),
+    offlineBrokerNotice: null,
+    equityIncompleteBrokersOffline: false,
     netSurplusUsd: '0',
     netSurplusPct: '0',
     deficitToPrincipalUsd: '0',
@@ -677,6 +709,11 @@ export const STATIC_AI_TRADER = Object.freeze({
   sessionVaultReserved50PctUsd: '0',
   initialCapitalUsd: '300000',
   currentTotalEquityUsd: '300000',
+  onlineEquityUsd: '300000',
+  offlineBrokers: Object.freeze([]),
+  offlineBrokerLabels: Object.freeze([]),
+  offlineBrokerNotice: null,
+  equityIncompleteBrokersOffline: false,
   netSurplusUsd: '0',
   netSurplusPct: '0',
   deficitToPrincipalUsd: '0',
@@ -856,6 +893,11 @@ export function normalizeAiTrader(doc) {
     sessionVaultReserved50PctUsd: bankedSession.sessionVaultReserved50PctUsd,
     initialCapitalUsd: bankedSession.initialCapitalUsd,
     currentTotalEquityUsd: bankedSession.currentTotalEquityUsd,
+    onlineEquityUsd: bankedSession.onlineEquityUsd,
+    offlineBrokers: bankedSession.offlineBrokers,
+    offlineBrokerLabels: bankedSession.offlineBrokerLabels,
+    offlineBrokerNotice: bankedSession.offlineBrokerNotice,
+    equityIncompleteBrokersOffline: bankedSession.equityIncompleteBrokersOffline,
     netSurplusUsd: bankedSession.netSurplusUsd,
     netSurplusPct: bankedSession.netSurplusPct,
     deficitToPrincipalUsd: bankedSession.deficitToPrincipalUsd,
@@ -1411,6 +1453,44 @@ export function renderBankedProfitsHeroBanner(state) {
     card1Sub = `Equity ${formatExactUsd(bs.currentTotalEquityUsd)} vs ${principalFormatted} Principal · True surplus above High-Water Mark`;
   }
 
+  const routingOfflineIds = [
+    ...(Array.isArray(state?.brokerRouting?.shield?.offlineBrokers) ? state.brokerRouting.shield.offlineBrokers : []),
+    ...(Array.isArray(state?.brokerRouting?.chain)
+      ? state.brokerRouting.chain.filter((c) => c?.status === 'BROKER_OFFLINE').map((c) => c.brokerId)
+      : []),
+  ];
+  const mergedOfflineIds = [...new Set([...(bs.offlineBrokers ?? []), ...routingOfflineIds].filter(Boolean))];
+  const hasOfflineBroker = Boolean(
+    bs.equityIncompleteBrokersOffline
+    || state?.brokerRouting?.shield?.equityIncomplete
+    || mergedOfflineIds.length > 0,
+  );
+  const mergedOfflineLabels = mergedOfflineIds.map((id) => friendlyBrokerLabel(id));
+  const onlineDeployableRaw = bs.onlineEquityUsd
+    ?? state?.brokerRouting?.shield?.onlineEquity
+    ?? (trader.deployableEquityUsd && compareDecimalStrings(trader.deployableEquityUsd, '0') > 0
+      ? trader.deployableEquityUsd
+      : bs.currentTotalEquityUsd);
+  let offlineBannerHtml = '';
+  if (hasOfflineBroker) {
+    const labelSummary = mergedOfflineLabels.length > 0
+      ? mergedOfflineLabels.join(' · ')
+      : 'MT5 Terminal';
+    const offlineHeadline = mergedOfflineLabels.length > 1
+      ? `BROKERS OFFLINE (${labelSummary}) — NOT A TRADING LOSS`
+      : `BROKER OFFLINE (${labelSummary}) — NOT A TRADING LOSS`;
+    const offlineCopy = bs.offlineBrokerNotice
+      || `${mergedOfflineLabels.join(' & ') || 'One or more broker terminals'} is currently disconnected. Unreachable broker equity is excluded from active trade sizing and drawdown — this is a connection pause, NOT a trading loss.`;
+    offlineBannerHtml = `<div class="offline-broker-banner" data-offline-broker-banner="true" role="status">
+      <div class="offline-broker-banner-head">
+        <span class="status-offline" data-offline-pill="true">OFFLINE</span>
+        <strong>${esc(offlineHeadline)}</strong>
+      </div>
+      <p class="offline-broker-banner-copy">${esc(offlineCopy)} <strong>Online deployable equity: ${esc(formatExactUsd(onlineDeployableRaw))}</strong></p>
+    </div>`;
+    card1Sub = `${card1Sub} · Online deployable equity: ${formatExactUsd(onlineDeployableRaw)} (${labelSummary} offline — NOT a loss)`;
+  }
+
   const card2Eyebrow = isUnderwater
     ? '2 · Session Recovery Today (Internal Ledger)'
     : '2 · Session Realized Net P&amp;L (Today · Internal Ledger)';
@@ -1454,6 +1534,7 @@ export function renderBankedProfitsHeroBanner(state) {
       </div>
       <div class="last-real-trade-strip" data-last-real-trade-strip="true">${lastTradeStripBody}</div>
     </div>
+    ${offlineBannerHtml}
     <div class="banked-hero-head">
       <div>
         <p class="eyebrow">PRINCIPAL HIGH-WATER MARK &amp; INTERNAL VAULT LEDGER · ZERO-SCROLL SCOREBOARD</p>

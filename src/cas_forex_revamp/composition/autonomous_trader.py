@@ -513,6 +513,7 @@ class AutonomousAiTrader:
         self._last_vault_sync_error: str | None = None
         self._cached_vault_init_cap: Decimal | None = None
         self._cached_settled_disbursed_usd: Decimal = Decimal("0.00")
+        self._cold_offline_baseline_eq: dict[tuple[str, ...], Decimal] = {}
         self._explicit_initial_capital_usd: Decimal | None = (
             decimal_value(Decimal(initial_capital_usd), "initial_capital_usd", positive=True).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
@@ -610,6 +611,48 @@ class AutonomousAiTrader:
             return None
         return dial.snapshot()
 
+    def _router_equity_bundle_unlocked(self) -> dict[str, Any]:
+        equities = self._router.equities()
+        total_eq = self._router.barbell.total_equity(equities)
+        offline_ids = (
+            list(self._router.offline_brokers())
+            if callable(getattr(self._router, "offline_brokers", None))
+            else []
+        )
+        online_eq_map = (
+            self._router.online_equities()
+            if callable(getattr(self._router, "online_equities", None))
+            else dict(equities)
+        )
+        online_total_eq = self._router.barbell.total_equity(online_eq_map)
+        if callable(getattr(self._router, "effective_drawdown_state", None)):
+            eff_dd_eq, eff_dd_peak, _ = self._router.effective_drawdown_state(equities=equities)
+        else:
+            eff_dd_eq = total_eq
+            eff_dd_peak = self._router.peak_equity() or total_eq
+        return {
+            "equities": equities,
+            "total_eq": total_eq,
+            "online_equities": online_eq_map,
+            "online_total_eq": online_total_eq,
+            "offline_brokers": offline_ids,
+            "eff_dd_eq": eff_dd_eq,
+            "eff_dd_peak": eff_dd_peak if eff_dd_peak is not None else eff_dd_eq,
+        }
+
+    @staticmethod
+    def _format_offline_broker_notice(offline_ids: list[str], online_eq_q: Decimal) -> str | None:
+        if not offline_ids:
+            return None
+        labels = [friendly_broker_label(b) for b in offline_ids]
+        names_text = ", ".join(labels)
+        verb = "is" if len(labels) == 1 else "are"
+        return (
+            f"{names_text} ({', '.join(offline_ids)}) {verb} currently offline. "
+            f"Trading size uses verified online funds only (${decimal_text(online_eq_q)}); "
+            f"unreachable offline funds are not a trading loss."
+        )
+
     def _resolve_master_dial_summary_unlocked(
         self,
         *,
@@ -618,6 +661,7 @@ class AutonomousAiTrader:
         peak_eq: Decimal,
         quota_snap: Mapping[str, Any],
         raw_dial: Mapping[str, Any] | None,
+        dd_curr_eq: Decimal | None = None,
     ) -> dict[str, Any] | None:
         if raw_dial is None:
             return None
@@ -626,9 +670,10 @@ class AutonomousAiTrader:
             if total_eq > Decimal("0")
             else (self._explicit_initial_capital_usd or REFERENCE_CAPITAL_USD)
         )
+        eff_curr = dd_curr_eq if dd_curr_eq is not None else total_eq
         raw_dd = (
-            compute_drawdown_pct(total_eq, peak_eq)
-            if (peak_eq > Decimal("0") and total_eq > Decimal("0"))
+            compute_drawdown_pct(eff_curr, peak_eq)
+            if (peak_eq > Decimal("0") and eff_curr > Decimal("0"))
             else Decimal("0")
         )
         dd_q = max(Decimal("0"), raw_dd.quantize(Decimal("0.000001"), rounding=ROUND_CEILING))
@@ -861,6 +906,8 @@ class AutonomousAiTrader:
         has_venue_acct = False
         for broker_id, venue in self._router.venues.items():
             if isinstance(venue, Mt5PaperBrokerVenue) and venue.account is not None:
+                if getattr(venue, "is_offline", False):
+                    continue
                 has_venue_acct = True
                 bal_sum += venue.account.balance
                 free_sum += venue.account.margin_free
@@ -1007,17 +1054,15 @@ class AutonomousAiTrader:
         """Protect open MT5 positions (50ms breakeven/trail & broker SL/TP close accounting)."""
         return self.evaluate_fast_protection(quotes=quotes, now=now)
 
-    def _fast_in_recovery_mode_unlocked(self, total_eq: Decimal) -> tuple[bool, Decimal | None]:
+    def _fast_in_recovery_mode_unlocked(
+        self,
+        total_eq: Decimal,
+        *,
+        equities: Mapping[str, Decimal] | None = None,
+    ) -> tuple[bool, Decimal | None]:
         """Zero-SQLite in-memory principal check for the 50ms stop-protection hot path."""
-        eff_cap = self._cached_vault_init_cap
-        if eff_cap is None:
-            eff_cap = self._resolve_initial_capital_usd({}, allow_vault_io=False)
-        if eff_cap is None:
-            return False, None
-        econ_eq = (total_eq + self._cached_settled_disbursed_usd).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
-        return econ_eq < eff_cap, eff_cap
+        ps_fast = self._principal_surplus_metrics(total_eq, equities=equities)
+        return bool(ps_fast["in_recovery_mode"]), ps_fast["configured_initial_capital_usd"]
 
     def evaluate_fast_protection(
         self,
@@ -1033,10 +1078,12 @@ class AutonomousAiTrader:
         with self._lock:
             if self._governance_mode == GOVERNANCE_STOPPED:
                 return actions
-            equities = self._router.equities()
-            total_eq = self._router.barbell.total_equity(equities)
-            peak_eq = self._router.peak_equity() or total_eq
-            in_rec_fast, fast_init_cap = self._fast_in_recovery_mode_unlocked(total_eq)
+            eq_bundle_fast = self._router_equity_bundle_unlocked()
+            equities = eq_bundle_fast["equities"]
+            total_eq = eq_bundle_fast["total_eq"]
+            eff_dd_eq_fast = eq_bundle_fast["eff_dd_eq"]
+            peak_eq = eq_bundle_fast["eff_dd_peak"]
+            in_rec_fast, fast_init_cap = self._fast_in_recovery_mode_unlocked(total_eq, equities=equities)
             _, _, risk_mult = self._quota.evaluate_new_risk(
                 ActionKind.OPEN,
                 now=ts,
@@ -1053,6 +1100,8 @@ class AutonomousAiTrader:
                     venue.probe()
                 except Exception as exc:
                     logger.warning("fast protection probe failed for %s: %s", broker_id, type(exc).__name__)
+                    continue
+                if getattr(venue, "is_offline", False):
                     continue
 
                 for pos in venue.positions:
@@ -1160,7 +1209,7 @@ class AutonomousAiTrader:
                             reason=f"Instant {new_stage} tightening SL to {decimal_text(candidate_sl)}",
                             bid=bid,
                             ask=ask,
-                            total_eq=total_eq,
+                            total_eq=eff_dd_eq_fast,
                             peak_eq=peak_eq,
                             position_side=pos.side,
                             now=ts,
@@ -1200,8 +1249,11 @@ class AutonomousAiTrader:
                             if not safe_ticket or not safe_ticket[0].isalnum():
                                 safe_ticket = f"tkt-{safe_ticket}"[:64]
                             try:
-                                eq_post = self._router.barbell.total_equity(self._router.equities())
-                                in_rec_post, cap_post = self._fast_in_recovery_mode_unlocked(eq_post)
+                                eq_map_post = self._router.equities()
+                                eq_post = self._router.barbell.total_equity(eq_map_post)
+                                in_rec_post, cap_post = self._fast_in_recovery_mode_unlocked(
+                                    eq_post, equities=eq_map_post
+                                )
                                 q_closed = self._quota.record_realized_trade(
                                     pnl_dec,
                                     symbol=sym_closed,
@@ -1357,11 +1409,22 @@ class AutonomousAiTrader:
         stop_dist = abs(entry - sl_price)
         if stop_dist <= Decimal("0") or total_equity <= Decimal("0"):
             raise ContractError("non-positive stop distance or equity for sizing")
+        online_eq_map = (
+            self._router.online_equities()
+            if callable(getattr(self._router, "online_equities", None))
+            else self._router.equities()
+        )
         eff_eq = (
-            self._router.barbell.effective_total_equity(self._router.equities())
+            self._router.barbell.effective_total_equity(online_eq_map)
             if hasattr(self._router.barbell, "effective_total_equity")
             else total_equity
         )
+        if (
+            eff_eq <= Decimal("0")
+            and callable(getattr(self._router, "offline_brokers", None))
+            and self._router.offline_brokers()
+        ):
+            raise ContractError("no online verified broker equity available for sizing")
         sizing_equity = min(total_equity, eff_eq) if eff_eq > Decimal("0") else total_equity
         constitutional_max_budget = (sizing_equity * MAX_CONSTITUTIONAL_STOP_RISK_PCT) / Decimal("100")
         budget = min(
@@ -1375,7 +1438,7 @@ class AutonomousAiTrader:
             if isinstance(venue, Mt5PaperBrokerVenue):
                 if first_mt5 is None:
                     first_mt5 = venue
-                if venue.account is not None and active_mt5 is None:
+                if venue.account is not None and not getattr(venue, "is_offline", False) and active_mt5 is None:
                     active_mt5 = (bid_id, venue)
         calc_venue = active_mt5[1] if active_mt5 is not None else first_mt5
         if calc_venue is not None:
@@ -1494,10 +1557,11 @@ class AutonomousAiTrader:
             cand_dial = (
                 self._resolve_master_dial_summary_unlocked(
                     regime=regime_name,
-                    total_eq=total_eq,
+                    total_eq=deployable_eq if deployable_eq > Decimal("0") else total_eq,
                     peak_eq=peak_eq if peak_eq is not None else total_eq,
                     quota_snap=quota_snap or {},
                     raw_dial=raw_dial,
+                    dd_curr_eq=total_eq,
                 )
                 if raw_dial is not None
                 else None
@@ -1686,6 +1750,7 @@ class AutonomousAiTrader:
         total_eq: Decimal,
         *,
         v_snap: Mapping[str, Any] | None = None,
+        equities: Mapping[str, Decimal] | None = None,
     ) -> dict[str, Any]:
         v_data: Mapping[str, Any] = v_snap if v_snap is not None else {}
         settled_disbursed_usd = (
@@ -1695,30 +1760,65 @@ class AutonomousAiTrader:
             if v_snap is not None
             else self._cached_settled_disbursed_usd
         )
+        offline_ids = (
+            list(self._router.offline_brokers())
+            if callable(getattr(self._router, "offline_brokers", None))
+            else []
+        )
+        eq_lookup: Mapping[str, Decimal] = (
+            equities
+            if equities is not None
+            else (self._router.equities() if offline_ids else {})
+        )
+        cold_unknown = tuple(
+            sorted(b for b in offline_ids if eq_lookup.get(b, Decimal("0")) <= Decimal("0"))
+        )
+        if not cold_unknown and self._cold_offline_baseline_eq:
+            self._cold_offline_baseline_eq.clear()
         eff_init_cap = self._resolve_initial_capital_usd(v_data, allow_vault_io=False)
         eq_q = total_eq.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         economic_eq = (eq_q + settled_disbursed_usd).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         if eff_init_cap is not None:
             principal_usd = eff_init_cap
-            net_surplus = (economic_eq - principal_usd).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            with localcontext() as ctx:
-                ctx.prec = 28
-                net_surplus_pct = (
-                    ((net_surplus / principal_usd) * Decimal("100")).quantize(
-                        Decimal("0.01"), rounding=ROUND_HALF_UP
+            if cold_unknown and economic_eq < principal_usd:
+                baseline_online = self._cold_offline_baseline_eq.setdefault(cold_unknown, economic_eq)
+                online_delta = (economic_eq - baseline_online).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                net_surplus = online_delta
+                with localcontext() as ctx:
+                    ctx.prec = 28
+                    net_surplus_pct = (
+                        ((net_surplus / principal_usd) * Decimal("100")).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                        if principal_usd > Decimal("0")
+                        else Decimal("0.00")
                     )
-                    if principal_usd > Decimal("0")
-                    else Decimal("0.00")
-                )
-            if net_surplus < Decimal("0.00"):
-                capital_status = CAPITAL_STATUS_RECOVERY_MODE
-                deficit_usd = (-net_surplus).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            elif net_surplus > Decimal("0.00"):
-                capital_status = CAPITAL_STATUS_IN_SURPLUS
-                deficit_usd = Decimal("0.00")
+                if online_delta < Decimal("0.00"):
+                    capital_status = CAPITAL_STATUS_RECOVERY_MODE
+                    deficit_usd = (-online_delta).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                else:
+                    capital_status = CAPITAL_STATUS_AT_PRINCIPAL
+                    deficit_usd = Decimal("0.00")
             else:
-                capital_status = CAPITAL_STATUS_AT_PRINCIPAL
-                deficit_usd = Decimal("0.00")
+                net_surplus = (economic_eq - principal_usd).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                with localcontext() as ctx:
+                    ctx.prec = 28
+                    net_surplus_pct = (
+                        ((net_surplus / principal_usd) * Decimal("100")).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                        if principal_usd > Decimal("0")
+                        else Decimal("0.00")
+                    )
+                if net_surplus < Decimal("0.00"):
+                    capital_status = CAPITAL_STATUS_RECOVERY_MODE
+                    deficit_usd = (-net_surplus).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                elif net_surplus > Decimal("0.00"):
+                    capital_status = CAPITAL_STATUS_IN_SURPLUS
+                    deficit_usd = Decimal("0.00")
+                else:
+                    capital_status = CAPITAL_STATUS_AT_PRINCIPAL
+                    deficit_usd = Decimal("0.00")
         else:
             fallback_base = self._router._initial_peak_equity if self._router._initial_peak_equity else eq_q
             principal_usd = Decimal(fallback_base).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -1760,7 +1860,7 @@ class AutonomousAiTrader:
         with self._lock:
             equities = self._router.equities()
             total_eq = self._router.barbell.total_equity(equities)
-            ps = self._principal_surplus_metrics(total_eq, v_snap=v_snap)
+            ps = self._principal_surplus_metrics(total_eq, v_snap=v_snap, equities=equities)
             dq_snap = self._quota.snapshot(
                 now=ts,
                 starting_equity=total_eq if total_eq > Decimal("0") else None,
@@ -2005,12 +2105,19 @@ class AutonomousAiTrader:
                 for s, m in markets.items()
                 if "bid" in m and "ask" in m
             }
-            equities = self._router.equities()
-            total_eq = self._router.barbell.total_equity(equities)
-            peak_eq = self._router.peak_equity() or total_eq
-            ps_cyc = self._principal_surplus_metrics(total_eq, v_snap=v_snap_cyc)
+            eq_bundle_cyc = self._router_equity_bundle_unlocked()
+            equities = eq_bundle_cyc["equities"]
+            total_eq = eq_bundle_cyc["total_eq"]
+            online_total_eq_cyc = eq_bundle_cyc["online_total_eq"]
+            eff_dd_eq_cyc = eq_bundle_cyc["eff_dd_eq"]
+            peak_eq = eq_bundle_cyc["eff_dd_peak"]
+            ps_cyc = self._principal_surplus_metrics(total_eq, v_snap=v_snap_cyc, equities=equities)
             in_rec_cyc = bool(ps_cyc["in_recovery_mode"])
-            deployable_eq = max(Decimal("0"), total_eq - pending_disb_cyc) if self._profit_vault is not None else total_eq
+            deployable_eq = (
+                max(Decimal("0"), online_total_eq_cyc - pending_disb_cyc)
+                if self._profit_vault is not None
+                else online_total_eq_cyc
+            )
             self._quota.observe_day_start(total_eq, now=ts, in_recovery_mode=in_rec_cyc)
 
             allowed, quota_veto, risk_mult = self._quota.evaluate_new_risk(
@@ -2068,10 +2175,11 @@ class AutonomousAiTrader:
 
             pre_dial = self._resolve_master_dial_summary_unlocked(
                 regime=self._last_regime,
-                total_eq=total_eq,
+                total_eq=online_total_eq_cyc if online_total_eq_cyc > Decimal("0") else total_eq,
                 peak_eq=peak_eq,
                 quota_snap=q_snap,
                 raw_dial=raw_dial_cyc,
+                dd_curr_eq=eff_dd_eq_cyc,
             )
             realized_today_pre = Decimal(str(q_snap.get("realized_net_pnl_usd", "0")))
             dial_pre_veto: str | None = None
@@ -2121,7 +2229,7 @@ class AutonomousAiTrader:
             setup = self._assess_setup_and_pyramid(
                 markets,
                 quotes_map=quotes_map,
-                total_eq=total_eq,
+                total_eq=eff_dd_eq_cyc,
                 deployable_eq=deployable_eq,
                 risk_mult=Decimal("0.50") if strong_runner_eligible else risk_mult,
                 fast_tick=fast_tick,
@@ -2169,14 +2277,15 @@ class AutonomousAiTrader:
                 in_recovery_mode=in_rec_cyc,
             )
             gear_info = self._resolve_risk_gear(
-                regime=regime_name, total_eq=total_eq, peak_eq=peak_eq, quota_snap=quota_full
+                regime=regime_name, total_eq=eff_dd_eq_cyc, peak_eq=peak_eq, quota_snap=quota_full
             )
             dial_eff = self._resolve_master_dial_summary_unlocked(
                 regime=regime_name,
-                total_eq=total_eq,
+                total_eq=online_total_eq_cyc if online_total_eq_cyc > Decimal("0") else total_eq,
                 peak_eq=peak_eq,
                 quota_snap=quota_full,
                 raw_dial=raw_dial_cyc,
+                dd_curr_eq=eff_dd_eq_cyc,
             )
             realized_today = Decimal(str(quota_full.get("realized_net_pnl_usd", "0")))
             if dial_eff is not None:
@@ -2564,12 +2673,12 @@ class AutonomousAiTrader:
                     self.result = d
                     self.intent = i
 
-            equities = self._router.equities()
-            total_eq = self._router.barbell.total_equity(equities)
-            peak_eq = self._router.peak_equity() or total_eq
+            eq_bundle_post = self._router_equity_bundle_unlocked()
+            equities = eq_bundle_post["equities"]
+            total_eq = eq_bundle_post["total_eq"]
             current_view = self._build_valve_view(
-                total_eq=total_eq,
-                peak_eq=peak_eq,
+                total_eq=eq_bundle_post["eff_dd_eq"],
+                peak_eq=eq_bundle_post["eff_dd_peak"],
                 new_risk_permission="ALLOWED",
                 management_permission="ALLOWED",
             )
@@ -3448,9 +3557,14 @@ class AutonomousAiTrader:
         raw_dial_snap = self._read_dial_snapshot_outside_lock()
         pending_disb = Decimal(str(v_snap.get("pending_disbursement_usd", "0") or "0"))
         with self._lock:
-            equities = self._router.equities()
-            total_eq = self._router.barbell.total_equity(equities)
-            ps = self._principal_surplus_metrics(total_eq, v_snap=v_snap)
+            eq_bundle_snap = self._router_equity_bundle_unlocked()
+            equities = eq_bundle_snap["equities"]
+            total_eq = eq_bundle_snap["total_eq"]
+            online_total_eq_snap = eq_bundle_snap["online_total_eq"]
+            offline_ids_snap = eq_bundle_snap["offline_brokers"]
+            eff_dd_eq_snap = eq_bundle_snap["eff_dd_eq"]
+            eff_dd_peak_snap = eq_bundle_snap["eff_dd_peak"]
+            ps = self._principal_surplus_metrics(total_eq, v_snap=v_snap, equities=equities)
             in_rec_snap = bool(ps["in_recovery_mode"])
             if hasattr(self._quota, "peek_snapshot"):
                 quota_snap = self._quota.peek_snapshot(
@@ -3483,10 +3597,12 @@ class AutonomousAiTrader:
                 sess_vault_reserved = "0"
         with self._lock:
             deployable_eq_val = (
-                max(Decimal("0"), total_eq - pending_disb)
+                max(Decimal("0"), online_total_eq_snap - pending_disb)
                 if (self._profit_vault is not None and v_snap)
-                else total_eq
+                else online_total_eq_snap
             )
+            online_eq_q_snap = online_total_eq_snap.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            offline_notice_snap = self._format_offline_broker_notice(offline_ids_snap, online_eq_q_snap)
             cad_mode = str(quota_snap.get("session_cadence", SESSION_CADENCE_AUTO))
             pinfo = session_period_info_for(ts, session_cadence=cad_mode, in_recovery_mode=in_rec_snap)
             dq_status = str(quota_snap.get("status", ""))
@@ -3545,6 +3661,10 @@ class AutonomousAiTrader:
                 "session_provenance_summary": str(realized_pnl_ledger["session_provenance_summary"]),
                 "session_by_market": list(realized_pnl_ledger["session_by_market"]),
                 "session_by_broker": list(realized_pnl_ledger["session_by_broker"]),
+                "offline_brokers": list(offline_ids_snap),
+                "offline_broker_notice": offline_notice_snap,
+                "online_equity_usd": decimal_text(online_eq_q_snap),
+                "equity_incomplete_brokers_offline": len(offline_ids_snap) > 0,
             }
             cat_snap = self._registry.catalog_snapshot()
             payload = {
@@ -3593,8 +3713,8 @@ class AutonomousAiTrader:
                 "daily_quota": quota_snap,
                 "risk_gear": self._resolve_risk_gear(
                     regime=self._last_regime,
-                    total_eq=total_eq,
-                    peak_eq=self._router.peak_equity() or total_eq,
+                    total_eq=eff_dd_eq_snap,
+                    peak_eq=eff_dd_peak_snap,
                     quota_snap=quota_snap,
                 ),
                 "open_positions": open_positions_list,
@@ -3641,9 +3761,10 @@ class AutonomousAiTrader:
             if raw_dial_snap is not None:
                 payload["aggression_dial"] = self._resolve_master_dial_summary_unlocked(
                     regime=self._last_regime,
-                    total_eq=total_eq,
-                    peak_eq=self._router.peak_equity() or total_eq,
+                    total_eq=online_total_eq_snap if online_total_eq_snap > Decimal("0") else total_eq,
+                    peak_eq=eff_dd_peak_snap,
                     quota_snap=quota_snap,
                     raw_dial=raw_dial_snap,
+                    dd_curr_eq=eff_dd_eq_snap,
                 )
             return assert_safe_ai_catalog_payload(payload)

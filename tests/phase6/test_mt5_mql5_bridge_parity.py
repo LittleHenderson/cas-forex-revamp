@@ -51,9 +51,12 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
     Mt5OrderRequest,
     Mt5OutcomeUnknownError,
     Mt5PaperBrokerVenue,
+    Mt5PreDispatchTransportError,
     Mt5SpoolBridgeTransport,
     Mt5SpoolPaperTerminalEmulator,
     Mt5TransportError,
+    STATUS_BROKER_OFFLINE,
+    SimMt5SpoolEa,
     OrderIntent,
     _SpoolReplayLedger,
     _canonical_spool_receipt_hmac_input,
@@ -547,7 +550,7 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
         # Both Mt5PaperBrokerVenue / Mt5SpoolPaperTerminalEmulator and MQL5 ExecuteRequest enforce
         # MT5_MAX_VOLUME_DEFAULT (InpMaxVolumeLots = 50.0) on OPEN and 10014 on REDUCE/CLOSE.
         self.assertIn("volume <= 0.0 || volume > InpMaxVolumeLots || sl <= 0.0", exec_fn)
-        for code in ("10013", "10014", "10016", "10017", "10036"):
+        for code in ("10013", "10014", "10016", "10017", "10031", "10036"):
             self.assertIn(f'"REJECTED", {code}, "0"', exec_fn)
         status_fn = _extract_mql5_function(self.mq5, "string StatusFor(")
         self.assertIn("TRADE_RETCODE_DONE", status_fn)
@@ -558,7 +561,7 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
         self.assertEqual(_status_for_retcode(10009, "OPEN", sdk_const), "FILLED")
         self.assertEqual(_status_for_retcode(10009, "AMEND_STOP", sdk_const), "MODIFIED")
         self.assertEqual(_status_for_retcode(10010, "OPEN", sdk_const), "PARTIAL")
-        for rej in (10013, 10014, 10016, 10017, 10019, 10036):
+        for rej in (10013, 10014, 10016, 10017, 10019, 10031, 10036):
             self.assertEqual(_status_for_retcode(rej, "OPEN", sdk_const), "REJECTED")
 
         # Exercise emulator rejection codes (10013, 10016, 10017, 10036) + Mt5PaperBrokerVenue CONFIRMED_REJECTED
@@ -865,6 +868,129 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
             self.assertEqual(rcpt2.status, "FILLED")
             last_nonce, _ = tr._nonce_ledger.load()
             self.assertEqual(last_nonce, 2)
+
+    def test_terminal_connected_offline_broker_guard_and_cached_equity_parity(self) -> None:
+        self.assertIs(SimMt5SpoolEa, Mt5SpoolPaperTerminalEmulator)
+        for global_decl in (
+            "double   g_last_connected_balance",
+            "double   g_last_connected_equity",
+            "double   g_last_connected_margin",
+            "double   g_last_connected_margin_free",
+            "bool     g_has_connected_account",
+        ):
+            self.assertIn(global_decl, self.mq5)
+
+        pub_fn = _extract_mql5_function(self.mq5, "void PublishMarket()")
+        self.assertIn("TerminalInfoInteger(TERMINAL_CONNECTED) != 0", pub_fn)
+        self.assertIn(r'\"connected\":%s', pub_fn)
+        self.assertIn('connected ? "true" : "false"', pub_fn)
+        self.assertIn("g_has_connected_account ? g_last_connected_equity", pub_fn)
+        self.assertIn("if(connected)", pub_fn)
+
+        exec_fn = _extract_mql5_function(self.mq5, "void ExecuteRequest(")
+        self.assertIn("if(TerminalInfoInteger(TERMINAL_CONNECTED) == 0)", exec_fn)
+        self.assertIn('"REJECTED", 10031, "0", "0", "0", "0", "0", "0", "BROKER_OFFLINE"', exec_fn)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            spool_h = root / "hugosway_mt5"
+            emu = SimMt5SpoolEa(
+                spool_h,
+                server="Hugosway-Demo",
+                login=7001234,
+                quotes={"EURUSD": (D("1.10000"), D("1.10010"))},
+                balance=D("89695.34"),
+                clock=lambda: T0,
+            )
+            emu.publish_market()
+            doc_online = json.loads((spool_h / "market_ticks.json").read_text(encoding="utf-8"))
+            self.assertIs(doc_online["connected"], True)
+            self.assertEqual(doc_online["account"]["equity"], "89695.34")
+            self.assertEqual(len(doc_online["ticks"]), 1)
+
+            tr = Mt5SpoolBridgeTransport(
+                spool_h,
+                sleep=emu.sleep_hook,
+                poll_interval_seconds=0.01,
+                receipt_timeout_seconds=2.0,
+            )
+            creds = Mt5Credentials(BROKER_HUGOSWAY_MT5, 7001234, "Hugosway-Demo")
+            snap_on = tr.connect(creds)
+            self.assertIs(snap_on.connected, True)
+            self.assertEqual(snap_on.equity, D("89695.34"))
+
+            # Connected -> disconnected preserves last-known positive equity & clears stale ticks
+            emu.set_connected(False)
+            emu.publish_market()
+            doc_off = json.loads((spool_h / "market_ticks.json").read_text(encoding="utf-8"))
+            self.assertIs(doc_off["connected"], False)
+            self.assertEqual(doc_off["account"]["equity"], "89695.34")
+            self.assertEqual(doc_off["ticks"], [])
+            snap_off = tr.account_info()
+            self.assertIs(snap_off.connected, False)
+            self.assertEqual(snap_off.equity, D("89695.34"))
+            with self.assertRaises(Mt5PreDispatchTransportError):
+                tr.symbol_tick("EURUSD")
+
+            # EA-level order rejection when disconnected returns retcode 10031 BROKER_OFFLINE
+            req_off = Mt5OrderRequest(
+                request_id="req-offline-10031",
+                action="OPEN",
+                symbol="EURUSD",
+                side=Side.BUY,
+                volume_lots=D("0.10"),
+                price=D("1.10010"),
+                stop_loss=D("1.09500"),
+                take_profit=None,
+                position_ticket=None,
+                deviation_points=20,
+                magic=20261116,
+                comment="offline-test",
+                created_at=T0,
+                issued_at=T0,
+                expires_at=T0 + timedelta(seconds=30),
+                broker_channel="hugosway_mt5",
+                account_login=str(creds.login),
+                server=creds.server,
+                execution_mode=EXECUTION_MODE_DEMO,
+                valve_decision_sha256="e" * 64,
+            )
+            signed_off = sign_spool_valve_admission(tr.prepare_request(req_off), spool_dir=tr.spool_dir)
+            rcpt_off = tr.send_order(signed_off)
+            self.assertFalse(rcpt_off.accepted)
+            self.assertEqual(rcpt_off.status, "REJECTED")
+            self.assertEqual(rcpt_off.retcode, 10031)
+            self.assertEqual(rcpt_off.message, STATUS_BROKER_OFFLINE)
+
+            # Backward-compatible pre-PR27 market_ticks.json without "connected" defaults to True
+            emu.set_connected(True)
+            emu.publish_market()
+            legacy_doc = json.loads((spool_h / "market_ticks.json").read_text(encoding="utf-8"))
+            del legacy_doc["connected"]
+            (spool_h / "market_ticks.json").write_text(json.dumps(legacy_doc) + "\n", encoding="utf-8")
+            self.assertIs(tr.account_info().connected, True)
+
+            # Non-boolean "connected" fails closed
+            bad_doc = dict(legacy_doc, connected="false")
+            (spool_h / "market_ticks.json").write_text(json.dumps(bad_doc) + "\n", encoding="utf-8")
+            with self.assertRaises(Mt5TransportError):
+                tr.account_info()
+
+            # Cold-start disconnected emulator emits connected=False and 0.00 equity
+            spool_cold = root / "lhfx_mt5"
+            emu_cold = SimMt5SpoolEa(
+                spool_cold,
+                server="LHFXSA-Trade",
+                login=8005678,
+                quotes={"EURUSD": (D("1.10000"), D("1.10010"))},
+                balance=D("0"),
+                connected=False,
+                clock=lambda: T0,
+            )
+            emu_cold.publish_market()
+            doc_cold = json.loads((spool_cold / "market_ticks.json").read_text(encoding="utf-8"))
+            self.assertIs(doc_cold["connected"], False)
+            self.assertEqual(doc_cold["account"]["equity"], "0")
 
 
 if __name__ == "__main__":
