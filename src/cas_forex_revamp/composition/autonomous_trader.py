@@ -456,6 +456,7 @@ class AutonomousAiTrader:
         self._open_position_meta: dict[str, dict[str, Any]] = {}
         self._recent_actions: deque[dict[str, Any]] = deque(maxlen=12)
         self._journal_initialized = False
+        self._startup_vault_synced = False
 
     def _connect_journal(self) -> sqlite3.Connection | None:
         if self._journal_path is None:
@@ -847,6 +848,8 @@ class AutonomousAiTrader:
         with self._lock:
             if self._governance_mode == GOVERNANCE_STOPPED:
                 return actions
+            if not self._startup_vault_synced and self._profit_vault is not None:
+                self.sync_session_profit_to_vault(now=ts)
             equities = self._router.equities()
             total_eq = self._router.barbell.total_equity(equities)
             peak_eq = self._router.peak_equity() or total_eq
@@ -890,23 +893,17 @@ class AutonomousAiTrader:
                                     starting_equity=total_eq if total_eq > Decimal("0") else None,
                                     now=ts,
                                 )
-                                if pnl_dec > Decimal("0") and self._profit_vault is not None:
-                                    self._profit_vault.record_realized_close(
-                                        trade_id=safe_ticket,
-                                        symbol=sym_closed,
-                                        broker_id=broker_id,
-                                        realized_net_usd=pnl_dec,
-                                        occurred_at=ts,
-                                    )
-                                    sess_net = Decimal(str(q_closed.get("realized_net_pnl_usd", "0")))
-                                    if sess_net > Decimal("0") and hasattr(
-                                        self._profit_vault, "reconcile_session_realized_profit"
-                                    ):
-                                        self._profit_vault.reconcile_session_realized_profit(
-                                            session_date=str(q_closed.get("session_date", "")),
-                                            session_realized_net_usd=sess_net,
+                                if self._profit_vault is not None:
+                                    if pnl_dec > Decimal("0"):
+                                        self._profit_vault.record_realized_close(
+                                            trade_id=safe_ticket,
+                                            symbol=sym_closed,
+                                            broker_id=broker_id,
+                                            realized_net_usd=pnl_dec,
                                             occurred_at=ts,
+                                            session_date=str(q_closed.get("session_date", "")),
                                         )
+                                    self.sync_session_profit_to_vault(now=ts)
                                 if q_closed["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
                                     self._current_focus_status = (
                                         f"RESEARCH_RESPITE: Profits Banked ({q_closed['realized_net_pnl_usd']} USD · "
@@ -1360,6 +1357,26 @@ class AutonomousAiTrader:
             self._last_evaluated_regime = best_reg
         return None
 
+    def sync_session_profit_to_vault(self, *, now: datetime | None = None) -> dict[str, Any] | None:
+        """Explicit write-path reconciliation of current session realized net P&L into ProfitSweepVault."""
+        if self._profit_vault is None or not hasattr(self._profit_vault, "reconcile_session_realized_profit"):
+            return None
+        ts = self._now(now)
+        with self._lock:
+            self._startup_vault_synced = True
+            equities = self._router.equities()
+            total_eq = self._router.barbell.total_equity(equities)
+            dq_snap = self._quota.snapshot(now=ts, starting_equity=total_eq if total_eq > Decimal("0") else None)
+            sdate = str(dq_snap.get("session_date", "")).strip()
+            if not sdate:
+                return None
+            sess_net = Decimal(str(dq_snap.get("realized_net_pnl_usd", "0")))
+            return self._profit_vault.reconcile_session_realized_profit(
+                session_date=sdate,
+                session_realized_net_usd=sess_net,
+                occurred_at=ts,
+            )
+
     def record_closed_pnl(
         self,
         pnl_usd: Decimal,
@@ -1383,7 +1400,9 @@ class AutonomousAiTrader:
                     broker_id="DUAL_SHIELD",
                     realized_net_usd=pnl_usd,
                     occurred_at=ts,
+                    session_date=str(snap.get("session_date", "")),
                 )
+                self.sync_session_profit_to_vault(now=ts)
             if snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
                 self._current_focus_status = (
                     f"RESEARCH_RESPITE: Profits Banked ({snap['realized_net_pnl_usd']} USD · "
@@ -1481,6 +1500,8 @@ class AutonomousAiTrader:
 
         # Phase 1 (under self._lock): fast stop protection + market/setup/pyramid planning
         with self._lock:
+            if not self._startup_vault_synced and self._profit_vault is not None:
+                self.sync_session_profit_to_vault(now=ts)
             self._cycle_seq += 1
             cycle_id = f"cycle-{self._cycle_seq}"
             self._last_cadence = f"{self._fast_tick_ms}ms_FAST_TICK" if fast_tick else f"STANDARD_{len(EXPANDED_MARKETS)}_MARKETS"
@@ -2129,17 +2150,20 @@ class AutonomousAiTrader:
                     )
                     order = OrderIntent.from_action_intent(intent, symbol=pos.symbol, position_ticket=pos.ticket)
                     self._router.execute_management(broker_id, order, valve_decision=dec)
-                    self._quota.record_realized_trade(
+                    q_em = self._quota.record_realized_trade(
                         pos.profit, symbol=pos.symbol, ticket=pos.ticket, starting_equity=total_eq, now=ts
                     )
-                    if pos.profit > Decimal("0") and self._profit_vault is not None:
-                        self._profit_vault.record_realized_close(
-                            trade_id=pos.ticket,
-                            symbol=pos.symbol,
-                            broker_id=broker_id,
-                            realized_net_usd=pos.profit,
-                            occurred_at=ts,
-                        )
+                    if self._profit_vault is not None:
+                        if pos.profit > Decimal("0"):
+                            self._profit_vault.record_realized_close(
+                                trade_id=pos.ticket,
+                                symbol=pos.symbol,
+                                broker_id=broker_id,
+                                realized_net_usd=pos.profit,
+                                occurred_at=ts,
+                                session_date=str(q_em.get("session_date", "")),
+                            )
+                        self.sync_session_profit_to_vault(now=ts)
                     self._open_position_meta.pop(pos.ticket, None)
                     closed_tickets.append(pos.ticket)
         snap = self.status_snapshot(now=ts)
@@ -2216,22 +2240,21 @@ class AutonomousAiTrader:
             total_eq = self._router.barbell.total_equity(equities)
             quota_snap = self._quota.snapshot(now=ts, starting_equity=total_eq if total_eq > 0 else None)
             v_snap: Mapping[str, Any] = {}
+            sess_vault_reserved = "0"
             deployable_eq_val = total_eq
+            sdate_curr = str(quota_snap.get("session_date", ""))
             if self._profit_vault is not None:
                 try:
-                    sess_net_dec = Decimal(str(quota_snap.get("realized_net_pnl_usd", "0")))
-                    if sess_net_dec > Decimal("0") and hasattr(
-                        self._profit_vault, "reconcile_session_realized_profit"
-                    ):
-                        self._profit_vault.reconcile_session_realized_profit(
-                            session_date=str(quota_snap.get("session_date", "")),
-                            session_realized_net_usd=sess_net_dec,
-                            occurred_at=ts,
-                        )
                     v_snap = self._profit_vault.snapshot()
+                    if sdate_curr and hasattr(self._profit_vault, "session_totals"):
+                        sess_vault_reserved = str(
+                            self._profit_vault.session_totals(sdate_curr).get("bank_sweep_usd", "0")
+                        )
+                    else:
+                        sess_vault_reserved = str(v_snap.get("bank_sweep_reserved_usd", "0"))
                     deployable_eq_val = self._profit_vault.deployable_equity(total_eq)
-                except Exception as exc_vsync:
-                    logger.warning("profit vault session sync/read skipped: %s", type(exc_vsync).__name__)
+                except Exception as exc_vread:
+                    logger.warning("profit vault read skipped: %s", type(exc_vread).__name__)
                     v_snap = {}
             operating_mode_val = (
                 FOCUS_MODE_RESEARCH_RESPITE
@@ -2240,7 +2263,8 @@ class AutonomousAiTrader:
             )
             banked_session = {
                 "schema": "cas-forex.banked-session/1",
-                "session_date": str(quota_snap.get("session_date", "")),
+                "accounting_basis": "INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT",
+                "session_date": sdate_curr,
                 "banked_net_pnl_usd": str(quota_snap.get("realized_net_pnl_usd", "0")),
                 "realized_pnl_pct": str(quota_snap.get("realized_pnl_pct", "0")),
                 "peak_realized_pnl_usd": str(quota_snap.get("peak_realized_pnl_usd", "0")),
@@ -2251,7 +2275,9 @@ class AutonomousAiTrader:
                 "loss_count": int(quota_snap.get("loss_count", 0)),
                 "vault_total_realized_usd": str(v_snap.get("total_realized_profit_usd", "0")),
                 "vault_swept_50pct_usd": str(v_snap.get("bank_sweep_reserved_usd", "0")),
+                "session_vault_reserved_50pct_usd": sess_vault_reserved,
                 "vault_retained_50pct_usd": str(v_snap.get("retained_trading_usd", "0")),
+                "confirmed_bank_payouts_usd": str(v_snap.get("disbursed_to_bank_usd", "0")),
                 "profits_locked_for_session": bool(
                     quota_snap.get("status") in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED)
                 ),

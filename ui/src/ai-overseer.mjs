@@ -116,8 +116,11 @@ function normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operating
   const defaultTotalRealized = compareDecimalStrings(dailyQuota.realizedNetPnlUsd, '0') > 0
     ? dailyQuota.realizedNetPnlUsd
     : '0';
+  const vaultSwept50PctUsd = numStr(bs?.vault_swept_50pct_usd, bankSweepReservedUsd);
+  const vaultRetained50PctUsd = numStr(bs?.vault_retained_50pct_usd, bankSweepReservedUsd);
   return Object.freeze({
     schema: 'cas-forex.banked-session/1',
+    accountingBasis: str(bs?.accounting_basis, 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT', 80),
     sessionDate: str(bs?.session_date, dailyQuota.sessionDate, 40),
     bankedNetPnlUsd: numStr(bs?.banked_net_pnl_usd, dailyQuota.realizedNetPnlUsd),
     realizedPnlPct: numStr(bs?.realized_pnl_pct, dailyQuota.realizedPnlPct),
@@ -128,8 +131,10 @@ function normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operating
     winCount: numStr(bs?.win_count, dailyQuota.winCount),
     lossCount: numStr(bs?.loss_count, dailyQuota.lossCount),
     vaultTotalRealizedUsd: numStr(bs?.vault_total_realized_usd, defaultTotalRealized),
-    vaultSwept50PctUsd: numStr(bs?.vault_swept_50pct_usd, bankSweepReservedUsd),
-    vaultRetained50PctUsd: numStr(bs?.vault_retained_50pct_usd, bankSweepReservedUsd),
+    vaultSwept50PctUsd,
+    sessionVaultReserved50PctUsd: numStr(bs?.session_vault_reserved_50pct_usd, vaultSwept50PctUsd),
+    vaultRetained50PctUsd,
+    confirmedBankPayoutsUsd: numStr(bs?.confirmed_bank_payouts_usd, '0'),
     profitsLockedForSession: typeof bs?.profits_locked_for_session === 'boolean' ? bs.profits_locked_for_session : lockedDefault,
     operatingMode: str(bs?.operating_mode, operatingMode, 40),
     sessionRolloverLabel: str(bs?.session_rollover_label, '17:00 America/New_York (14:00 Pacific)', 80),
@@ -239,6 +244,7 @@ export const STATIC_AI_TRADER = Object.freeze({
   }),
   bankedSession: Object.freeze({
     schema: 'cas-forex.banked-session/1',
+    accountingBasis: 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT',
     sessionDate: 'Unknown',
     bankedNetPnlUsd: '0',
     realizedPnlPct: '0',
@@ -250,12 +256,17 @@ export const STATIC_AI_TRADER = Object.freeze({
     lossCount: '0',
     vaultTotalRealizedUsd: '0',
     vaultSwept50PctUsd: '0',
+    sessionVaultReserved50PctUsd: '0',
     vaultRetained50PctUsd: '0',
+    confirmedBankPayoutsUsd: '0',
     profitsLockedForSession: false,
     operatingMode: 'ACTIVE_TRADING',
     sessionRolloverLabel: '17:00 America/New_York (14:00 Pacific)',
     nextSessionOpensUtc: null,
   }),
+  accountingBasis: 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT',
+  confirmedBankPayoutsUsd: '0',
+  sessionVaultReserved50PctUsd: '0',
   openPositions: Object.freeze([]),
   recentActions: Object.freeze([]),
 });
@@ -364,6 +375,7 @@ export function normalizeAiTrader(doc) {
     ratchetActivationUsd: numStr(q.ratchet_activation_usd, '0'),
     protectedProfitFloorUsd: numStr(q.protected_profit_floor_usd, '0'),
   });
+  const bankedSession = normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operatingMode);
   return Object.freeze({
     connected: true,
     humanRole: str(doc.human_role, 'OVERSEER_ONLY'),
@@ -409,6 +421,9 @@ export function normalizeAiTrader(doc) {
     lastRegime: str(doc.last_regime, 'TREND_IGNITION'),
     deployableEquityUsd: numStr(doc.deployable_equity_usd, '0'),
     bankSweepReservedUsd,
+    accountingBasis: bankedSession.accountingBasis,
+    confirmedBankPayoutsUsd: bankedSession.confirmedBankPayoutsUsd,
+    sessionVaultReserved50PctUsd: bankedSession.sessionVaultReserved50PctUsd,
     lastAction: str(doc.last_action, 'WAIT'),
     lastSymbol: doc.last_symbol ? str(doc.last_symbol) : 'None',
     lastReason: str(doc.last_reason, 'None'),
@@ -431,7 +446,7 @@ export function normalizeAiTrader(doc) {
       reason: str(doc.risk_gear.reason, 'Owner-bounded adaptive risk gear.', 200),
     }) : STATIC_AI_TRADER.riskGear,
     dailyQuota,
-    bankedSession: normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operatingMode),
+    bankedSession,
     openPositions: Object.freeze(openPositions),
     recentActions: Object.freeze(recentActions),
   });
@@ -638,8 +653,8 @@ export function renderBankedProfitsHeroBanner(state) {
     return `<section class="panel banked-profits-hero is-locked" data-banked-profits-locked="true" aria-label="Locked Cockpit Cloud Status">
       <div class="banked-locked-inner">
         <span class="eyebrow">24/7 CLOUD SERVER RUNNING · THIS TAB IS LOCKED</span>
-        <h2>Cockpit Locked — Unlock Above or Scan Pairing QR to View Live Banked Session Profits</h2>
-        <p>Cockpit Locked — Your 24/7 Cloud Server is running in the background, but this browser tab is not unlocked yet. Enter your 43-character Cockpit Access Key in the Unlock bar above (or click &#39;Pair Phone / Tablet (QR)&#39; on your unlocked PC and scan with your camera) to view live Banked Session Profits, 3-Broker Equity, and Gemini 4 Neon Voice Explainer.</p>
+        <h2>Cockpit Locked — Unlock Above or Scan Pairing QR to View Session Realized P&amp;L &amp; Internal Vault Reserve</h2>
+        <p>Cockpit Locked — Your 24/7 Cloud Server is running in the background, but this browser tab is not unlocked yet. Enter your 43-character Cockpit Access Key in the Unlock bar above (or click &#39;Pair Phone / Tablet (QR)&#39; on your unlocked PC and scan with your camera) to view Session Realized P&amp;L &amp; Internal Vault Reserve, 3-Broker Equity, and Gemini 4 Neon Voice Explainer.</p>
       </div>
     </section>`;
   }
@@ -650,10 +665,22 @@ export function renderBankedProfitsHeroBanner(state) {
   const isLiveArmed = state?.brokerRouting?.executionMode === 'LIVE' && state?.brokerRouting?.liveArmed === true;
   const isRespite = Boolean(bs.profitsLockedForSession || trader.respiteMode || bs.operatingMode === 'RESEARCH_RESPITE');
 
-  const treasSwept = state?.treasury?.connected ? state.treasury.bankSweepReservedUsd : '0';
-  const treasRetained = state?.treasury?.connected ? state.treasury.retainedTradingUsd : '0';
-  const sweptUsd = compareDecimalStrings(treasSwept, bs.vaultSwept50PctUsd) >= 0 ? treasSwept : bs.vaultSwept50PctUsd;
-  const retainedUsd = compareDecimalStrings(treasRetained, bs.vaultRetained50PctUsd) >= 0 ? treasRetained : bs.vaultRetained50PctUsd;
+  const sessReserveRaw = bs.sessionVaultReserved50PctUsd ?? bs.vaultSwept50PctUsd ?? '0';
+  const reserveUsd = compareDecimalStrings(sessReserveRaw, '0') === 0
+    && compareDecimalStrings(bs.bankedNetPnlUsd, '0') > 0
+    && state?.treasury?.connected
+    ? state.treasury.bankSweepReservedUsd
+    : sessReserveRaw;
+  const retainedRaw = bs.vaultRetained50PctUsd ?? '0';
+  const retainedUsd = compareDecimalStrings(retainedRaw, '0') === 0
+    && compareDecimalStrings(bs.bankedNetPnlUsd, '0') > 0
+    && state?.treasury?.connected
+    ? state.treasury.retainedTradingUsd
+    : retainedRaw;
+  const rawTreasuryDisbursed = state?.treasury?.connected
+    ? state.treasury.disbursedToBankUsd
+    : (state?.treasury && state.treasury.connected === undefined ? state.treasury.disbursedToBankUsd : undefined);
+  const confirmedPayoutsUsd = rawTreasuryDisbursed ?? bs.confirmedBankPayoutsUsd ?? '0';
 
   const pctStr = String(bs.realizedPnlPct ?? '0');
   const signedPct = pctStr.startsWith('-') || pctStr === '0' || pctStr === '0.00' ? `${pctStr}%` : `+${pctStr}%`;
@@ -665,38 +692,39 @@ export function renderBankedProfitsHeroBanner(state) {
     : `Peak Today: ${formatSignedUsd(bs.peakRealizedPnlUsd)} · Arms at ${formatExactUsd(q.ratchetActivationUsd)}`;
   const pnlNegative = compareDecimalStrings(bs.bankedNetPnlUsd, '0') < 0;
 
-  return `<section class="panel banked-profits-hero is-connected" data-banked-profits-hero="true" aria-label="Banked Profits and Session Vault Scoreboard">
+  return `<section class="panel banked-profits-hero is-connected" data-banked-profits-hero="true" aria-label="Session Realized P&amp;L and Internal Vault Reserve Scoreboard">
     <div class="banked-hero-head">
       <div>
-        <p class="eyebrow">BANKED PROFITS &amp; SESSION VAULT · ZERO-SCROLL LIVE SCOREBOARD</p>
-        <h2>Today&#39;s Banked Profits, 70% Protected Floor &amp; 50% Vault Sweep</h2>
+        <p class="eyebrow">SESSION REALIZED P&amp;L &amp; INTERNAL VAULT LEDGER · ZERO-SCROLL SCOREBOARD</p>
+        <h2>Today&#39;s Session Realized Net P&amp;L, 70% Protected Floor &amp; 50% Internal Vault Reserve</h2>
+        <p class="banked-accounting-disclaimer" data-accounting-disclaimer="true"><strong>Internal Accounting Figure — Not a Confirmed Bank Payout</strong> · Basis: <code>${esc(bs.accountingBasis ?? 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT')}</code> · Settled bank transfers appear separately under Confirmed Bank Payouts.</p>
       </div>
       <div class="banked-hero-actions">
-        <span class="exec-mode-badge ${isLiveArmed ? 'is-live-armed' : 'is-demo-mode'}">${isLiveArmed ? 'LIVE REAL-MONEY' : 'DEMO PAPER SESSION'}</span>
-        <span class="banked-status-pill ${isRespite ? 'is-respite' : 'is-active'}">${isRespite ? 'PROFITS BANKED · RESEARCH RESPITE' : 'ACTIVE SESSION P&amp;L TRACKER'}</span>
-        <button type="button" class="button button-small button-primary banked-voice-btn" data-open-voice-explainer="true">Ask / Speak to Gemini 4 Neon</button>
+        <span class="exec-mode-badge ${isLiveArmed ? 'is-live-armed' : 'is-demo-mode'}" data-session-funding-mode="${isLiveArmed ? 'LIVE' : 'DEMO_PRACTICE'}">${isLiveArmed ? 'LIVE REAL-MONEY ACCOUNT' : 'DEMO PRACTICE ACCOUNT (SIMULATED FUNDS)'}</span>
+        <span class="banked-status-pill ${isRespite ? 'is-respite' : 'is-active'}">${isRespite ? 'RESEARCH RESPITE · QUOTA LOCK ACTIVE' : 'ACTIVE SESSION P&amp;L TRACKER'}</span>
       </div>
     </div>
     <div class="banked-hero-grid">
       <article class="banked-hero-card">
-        <span class="eyebrow">1 · BANKED SESSION PROFIT (TODAY)</span>
+        <span class="eyebrow">1 · Session Realized Net P&amp;L (Today · Internal Ledger)</span>
         <div class="banked-hero-value numeric ${pnlNegative ? 'is-neg' : 'is-pos'}">${esc(formatSignedUsd(bs.bankedNetPnlUsd))}</div>
-        <p class="banked-hero-sub numeric">${esc(signedPct)} · ${esc(bs.closedTrades)} closed trades (${esc(bs.winCount)}W / ${esc(bs.lossCount)}L) · Session ${esc(bs.sessionDate)}</p>
+        <p class="banked-hero-sub numeric">${esc(signedPct)} · ${esc(bs.closedTrades)} closed trades (${esc(bs.winCount)}W / ${esc(bs.lossCount)}L) · Internal ledger figure · Session ${esc(bs.sessionDate)}</p>
       </article>
       <article class="banked-hero-card">
-        <span class="eyebrow">2 · 70% PROTECTED PROFIT FLOOR</span>
+        <span class="eyebrow">2 · 70% Protected Profit Floor (Session Rule)</span>
         <div class="banked-hero-value numeric is-pos">${esc(floorDisplay)}</div>
         <p class="banked-hero-sub numeric">${esc(floorDetail)}</p>
       </article>
       <article class="banked-hero-card">
-        <span class="eyebrow">3 · 50% / 50% PROFIT-SWEEP VAULT</span>
-        <div class="banked-hero-value numeric">${esc(formatExactUsd(sweptUsd))} Swept to Bank Vault</div>
-        <p class="banked-hero-sub numeric">${esc(formatExactUsd(retainedUsd))} Retained Compounding</p>
+        <span class="eyebrow">3 · 50% Internal Vault Reserve &amp; Confirmed Payouts</span>
+        <div class="banked-hero-value numeric">${esc(formatExactUsd(reserveUsd))} Internal Vault Reserve</div>
+        <p class="banked-hero-sub numeric">${esc(formatExactUsd(retainedUsd))} Retained Compounding · <strong class="confirmed-payout-inline">Confirmed Bank Payouts: ${esc(formatExactUsd(confirmedPayoutsUsd))}</strong></p>
       </article>
       <article class="banked-hero-card">
-        <span class="eyebrow">4 · SESSION MODE &amp; 17:00 ROLLOVER</span>
-        <div class="banked-hero-value banked-hero-mode">${isRespite ? 'RESEARCH RESPITE (0 New Risk · Observing 20 Markets)' : 'ACTIVE TRADING'}</div>
-        <p class="banked-hero-sub">Next Session Rollover: 17:00 America/New_York (14:00 PT)${bs.nextSessionOpensUtc ? ` · ${esc(bs.nextSessionOpensUtc)}` : ''}</p>
+        <span class="eyebrow">4 · Session Mode &amp; 17:00 Rollover</span>
+        <div class="banked-hero-value banked-hero-mode">${isRespite ? 'RESEARCH RESPITE · Quota Lock Active (0 New Risk · Observing 20 Markets)' : 'ACTIVE TRADING'}</div>
+        <p class="banked-hero-sub">Next Session Rollover: ${esc(bs.sessionRolloverLabel)}${bs.nextSessionOpensUtc ? ` · ${esc(bs.nextSessionOpensUtc)}` : ''}</p>
+        <div class="banked-card-cta"><button type="button" class="button button-small button-primary banked-voice-btn" data-open-voice-explainer="true">Ask / Speak to Gemini 4 Neon</button></div>
       </article>
     </div>
   </section>`;

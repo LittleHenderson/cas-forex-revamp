@@ -107,6 +107,7 @@ function buildBankedTraderDoc(withBankedSession = true) {
   if (withBankedSession) {
     doc.banked_session = {
       schema: 'cas-forex.banked-session/1',
+      accounting_basis: 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT',
       session_date: '2026-11-20',
       banked_net_pnl_usd: '4640.06',
       realized_pnl_pct: '1.66',
@@ -118,7 +119,9 @@ function buildBankedTraderDoc(withBankedSession = true) {
       loss_count: 3,
       vault_total_realized_usd: '4640.06',
       vault_swept_50pct_usd: '2320.03',
+      session_vault_reserved_50pct_usd: '2320.03',
       vault_retained_50pct_usd: '2320.03',
+      confirmed_bank_payouts_usd: '0',
       profits_locked_for_session: true,
       operating_mode: 'RESEARCH_RESPITE',
       session_rollover_label: '17:00 America/New_York (14:00 Pacific)',
@@ -255,18 +258,27 @@ test('PR20_01 ISO/IEC 18004 QR encoder passes Annex C/D vectors, finder/timing i
   assert.equal(svg.includes(sampleHandle), false, 'SVG paths must not embed raw handle text');
 });
 
-test('PR20_02 Banked Profits Hero Scoreboard normalizes banked_session and renders across Operate, Review, and Setup', () => {
+test('PR20_02 Session Realized P&L & Internal Vault Scoreboard renders truthful internal-ledger & DEMO labels across Operate, Review, and Setup', () => {
   assert.equal(formatExactUsd('4640.06'), '$4,640.06');
   assert.equal(formatSignedUsd('4640.06'), '+$4,640.06');
   assert.equal(formatSignedUsd('0'), '$0.00');
   assert.equal(formatSignedUsd('-85.5'), '-$85.50');
 
   const normWithBlock = normalizeAiTrader(buildBankedTraderDoc(true));
+  assert.equal(normWithBlock.accountingBasis, 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT');
+  assert.equal(normWithBlock.confirmedBankPayoutsUsd, '0');
+  assert.equal(normWithBlock.sessionVaultReserved50PctUsd, '2320.03');
+  assert.equal(normWithBlock.bankedSession.accountingBasis, 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT');
+  assert.equal(normWithBlock.bankedSession.confirmedBankPayoutsUsd, '0');
+  assert.equal(normWithBlock.bankedSession.sessionVaultReserved50PctUsd, '2320.03');
   assert.equal(normWithBlock.bankedSession.bankedNetPnlUsd, '4640.06');
   assert.equal(normWithBlock.bankedSession.vaultSwept50PctUsd, '2320.03');
   assert.equal(normWithBlock.bankedSession.profitsLockedForSession, true);
 
   const normFallback = normalizeAiTrader(buildBankedTraderDoc(false));
+  assert.equal(normFallback.bankedSession.accountingBasis, 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT');
+  assert.equal(normFallback.bankedSession.confirmedBankPayoutsUsd, '0');
+  assert.equal(normFallback.bankedSession.sessionVaultReserved50PctUsd, '2320.03');
   assert.equal(normFallback.bankedSession.bankedNetPnlUsd, '4640.06');
   assert.equal(normFallback.bankedSession.protectedProfitFloorUsd, '3396.91');
   assert.equal(normFallback.bankedSession.profitsLockedForSession, true);
@@ -290,22 +302,54 @@ test('PR20_02 Banked Profits Hero Scoreboard normalizes banked_session and rende
       recent_sweeps: [],
       recent_transfers: [],
     });
+    const heroOnly = renderBankedProfitsHeroBanner(state);
+    assert.equal(heroOnly.includes('BANKED SESSION PROFIT'), false);
+    assert.equal(heroOnly.includes('Swept to Bank Vault'), false);
+    assert.equal(heroOnly.includes('PROFITS BANKED'), false);
+
     const html = renderApp(state, Date.parse(time));
     assert.match(html, /data-banked-profits-hero="true"/);
+    assert.match(html, /data-accounting-disclaimer="true"/);
+    assert.ok(html.includes('Internal Accounting Figure — Not a Confirmed Bank Payout'), `Missing disclaimer on ${route}`);
+    assert.ok(html.includes('DEMO PRACTICE ACCOUNT (SIMULATED FUNDS)'), `Missing DEMO PRACTICE badge on ${route}`);
+    assert.ok(html.includes('Session Realized Net P&amp;L (Today · Internal Ledger)'));
     assert.ok(html.includes('+$4,640.06'), `Missing +$4,640.06 on ${route}`);
+    assert.ok(html.includes('+1.66% · 10 closed trades (7W / 3L) · Internal ledger figure · Session 2026-11-20'));
+    assert.ok(html.includes('70% Protected Profit Floor (Session Rule)'));
     assert.ok(html.includes('+$3,396.91'), `Missing +$3,396.91 floor on ${route}`);
     assert.ok(html.includes('Peak Today: +$4,852.73 · RATCHET ARMED'));
-    assert.ok(html.includes('$2,320.03 Swept to Bank Vault'));
+    assert.ok(html.includes('50% Internal Vault Reserve &amp; Confirmed Payouts'));
+    assert.ok(html.includes('$2,320.03 Internal Vault Reserve'));
     assert.ok(html.includes('$2,320.03 Retained Compounding'));
-    assert.ok(html.includes('10 closed trades (7W / 3L) · Session 2026-11-20'));
+    assert.ok(html.includes('Confirmed Bank Payouts: $0.00'));
+    assert.ok(html.includes('Session Mode &amp; 17:00 Rollover'));
+    assert.ok(html.includes('RESEARCH RESPITE · Quota Lock Active'));
+    assert.ok(html.includes('17:00 America/New_York'));
     assert.match(html, /data-open-voice-explainer="true"/);
     assert.equal(/\bstyle\s*=/i.test(html), false);
   }
 
-  // Locked preview renders unmistakable Locked Cockpit Notice Card
+  // Multi-day session reserve isolation & confirmed bank payout fallback
+  const day2Doc = buildBankedTraderDoc(true);
+  day2Doc.daily_quota.realized_net_pnl_usd = '300.00';
+  day2Doc.banked_session.banked_net_pnl_usd = '300.00';
+  day2Doc.banked_session.vault_swept_50pct_usd = '200.00';
+  day2Doc.banked_session.session_vault_reserved_50pct_usd = '150.00';
+  day2Doc.banked_session.vault_retained_50pct_usd = '200.00';
+  day2Doc.banked_session.confirmed_bank_payouts_usd = '125.50';
+  const day2State = displayState(fixture(), 'operate');
+  day2State.liveStreamConnected = true;
+  day2State.aiTrader = normalizeAiTrader(day2Doc);
+  const day2Hero = renderBankedProfitsHeroBanner(day2State);
+  assert.ok(day2Hero.includes('$150.00 Internal Vault Reserve'), 'Must display per-session 50% reserve without Day 1 bleed');
+  assert.ok(day2Hero.includes('Confirmed Bank Payouts: $125.50'));
+
+  // Locked preview renders truthful Session Realized P&L & Internal Vault Reserve notice
   const lockedHtml = renderBankedProfitsHeroBanner({ liveStreamConnected: false });
   assert.match(lockedHtml, /data-banked-profits-locked="true"/);
   assert.match(lockedHtml, /Your 24\/7 Cloud Server is running in the background/);
+  assert.ok(lockedHtml.includes('Session Realized P&amp;L &amp; Internal Vault Reserve'));
+  assert.equal(lockedHtml.includes('Banked Session Profits'), false);
 });
 
 test('PR20_03 02 Account snapshot populates Realized P/L even when projection.equity is non-null, and shows locked hint offline', () => {

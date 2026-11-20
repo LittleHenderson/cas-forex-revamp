@@ -877,6 +877,16 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
   gap: 12px;
   margin-bottom: 16px;
 }
+.banked-accounting-disclaimer {
+  margin: 8px 0 0;
+  padding: 6px 10px;
+  border: 1px solid var(--orange);
+  border-left-width: 4px;
+  background: var(--warning-surface);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--ink);
+}
 .banked-hero-actions {
   display: flex;
   flex-wrap: wrap;
@@ -915,9 +925,9 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
   background: var(--panel);
 }
 .banked-hero-value {
-  font-size: clamp(20px, 2vw, 27px);
+  font-size: clamp(18px, 1.8vw, 24px);
   font-weight: 800;
-  line-height: 1.2;
+  line-height: 1.25;
   color: var(--ink);
 }
 .banked-hero-value.is-pos {
@@ -927,13 +937,21 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
   color: var(--mf-red);
 }
 .banked-hero-value.banked-hero-mode {
-  font-size: 14px;
+  font-size: 13.5px;
   line-height: 1.4;
 }
 .banked-hero-sub {
   margin: 0;
   font-size: 11.5px;
+  line-height: 1.45;
   color: var(--muted);
+}
+.confirmed-payout-inline {
+  color: var(--ink);
+}
+.banked-card-cta {
+  margin-top: auto;
+  padding-top: 6px;
 }
 .qr-pairing-drawer {
   margin-bottom: 22px;
