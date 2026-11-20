@@ -857,9 +857,33 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
 .banked-profits-hero.is-connected {
   border-color: var(--mf-green);
 }
+.banked-profits-hero.is-connected.is-recovery-mode {
+  border-color: var(--orange);
+}
 .banked-profits-hero.is-locked {
   border-color: var(--orange);
   background: var(--warning-surface);
+}
+.principal-status-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 2px solid var(--ink);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.principal-status-badge.is-recovery {
+  border-color: var(--orange);
+  color: var(--orange);
+  background: var(--warning-surface);
+}
+.principal-status-badge.is-in-surplus {
+  border-color: var(--mf-green);
+  color: var(--mf-green);
+  background: rgba(22, 163, 74, 0.12);
 }
 .banked-locked-inner h2 {
   margin: 4px 0 8px;
@@ -924,6 +948,9 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
   border-top: 4px solid var(--mf-green);
   background: var(--panel);
 }
+.banked-hero-card.is-recovery-card {
+  border-top-color: var(--orange);
+}
 .banked-hero-value {
   font-size: clamp(18px, 1.8vw, 24px);
   font-weight: 800;
@@ -935,6 +962,11 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
 }
 .banked-hero-value.is-neg {
   color: var(--mf-red);
+}
+.banked-hero-value.banked-hero-paused {
+  font-size: 15px;
+  line-height: 1.35;
+  color: var(--orange);
 }
 .banked-hero-value.banked-hero-mode {
   font-size: 13.5px;
@@ -949,7 +981,27 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
 .confirmed-payout-inline {
   color: var(--ink);
 }
+.cadence-toggle-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+.cadence-toggle-btn {
+  min-height: 44px;
+  padding: 6px 10px;
+  font-size: 11px;
+  touch-action: manipulation;
+}
+.recovery-advance-btn {
+  min-height: 44px;
+  font-weight: 800;
+  touch-action: manipulation;
+}
 .banked-card-cta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-top: auto;
   padding-top: 6px;
 }

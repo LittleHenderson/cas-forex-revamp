@@ -893,7 +893,7 @@ class LoopbackCockpitServer:
                         req_route = urllib.parse.urlsplit(self.path).path
                         if not (
                             str(self.command).upper() == "POST"
-                            and req_route in ("/api/ai-overseer-action", "/api/request-control")
+                            and req_route in ("/api/ai-overseer-action", "/api/ai-trader-control", "/api/request-control")
                         ):
                             self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Ordinary cockpit connection slots full; emergency capacity reserved"})
                             return False
@@ -1199,7 +1199,7 @@ class LoopbackCockpitServer:
 
             def do_POST(self) -> None:
                 route = urllib.parse.urlsplit(self.path).path
-                is_emergency = route in ("/api/ai-overseer-action", "/api/request-control")
+                is_emergency = route in ("/api/ai-overseer-action", "/api/ai-trader-control", "/api/request-control")
                 sem = outer._emergency_sem if is_emergency else outer._worker_sem
                 if not sem.acquire(blocking=False):
                     self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Cockpit POST capacity reached"})
@@ -1277,12 +1277,24 @@ class LoopbackCockpitServer:
                         ratio_v = _Dec(str(body["sweep_ratio"])) if body.get("sweep_ratio") is not None else None
                         auto_v = bool(body["auto_sweep_enabled"]) if "auto_sweep_enabled" in body else None
                         rail_v = str(body["preferred_rail"]) if body.get("preferred_rail") is not None else None
+                        init_cap_v = (
+                            _Dec(str(body["initial_capital_usd"]))
+                            if body.get("initial_capital_usd") is not None
+                            else None
+                        )
                         with outer._commit_lease(supplied_tok, auth_epoch):
-                            updated = assert_safe_ai_catalog_payload(
-                                outer._profit_vault.set_config(
-                                    sweep_ratio=ratio_v, auto_sweep_enabled=auto_v, preferred_rail=rail_v
-                                )
+                            updated = outer._profit_vault.set_config(
+                                sweep_ratio=ratio_v,
+                                auto_sweep_enabled=auto_v,
+                                preferred_rail=rail_v,
+                                initial_capital_usd=init_cap_v,
                             )
+                            if outer._autonomous_trader is not None and (
+                                init_cap_v is not None or ratio_v is not None or auto_v is not None
+                            ):
+                                outer._autonomous_trader.sync_session_profit_to_vault()
+                                updated = outer._profit_vault.snapshot()
+                            updated = assert_safe_ai_catalog_payload(updated)
                         outer.notify_stream_updated()
                         self._write_json(HTTPStatus.OK, updated)
                     except _SessionRevokedError:
@@ -1469,6 +1481,7 @@ class LoopbackCockpitServer:
                                         "last_symbol": t_doc.get("last_symbol"),
                                         "last_reason": t_doc.get("last_reason"),
                                         "risk_gear": t_doc.get("risk_gear"),
+                                        "banked_session": t_doc.get("banked_session"),
                                         "daily_quota": {
                                             "status": dq.get("status"),
                                             "realized_net_pnl_usd": dq.get("realized_net_pnl_usd"),
@@ -1533,6 +1546,8 @@ class LoopbackCockpitServer:
                                                 or "0"
                                             ),
                                             "disbursed_to_bank_usd": str(v_doc.get("disbursed_to_bank_usd", "0")),
+                                            "confirmed_settled_disbursed_usd": str(v_doc.get("confirmed_settled_disbursed_usd", "0")),
+                                            "pending_or_unconfirmed_transfers_usd": str(v_doc.get("pending_or_unconfirmed_transfers_usd", "0")),
                                         }
                                 except Exception as exc_ctx:
                                     outer._last_routing_error = type(exc_ctx).__name__
@@ -1626,7 +1641,7 @@ class LoopbackCockpitServer:
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
-                if route == "/api/ai-overseer-action":
+                if route in ("/api/ai-overseer-action", "/api/ai-trader-control"):
                     try:
                         body = self._read_json_body()
                         if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
@@ -1659,6 +1674,11 @@ class LoopbackCockpitServer:
                             elif act == "SET_RISK_GEAR":
                                 gear_val = str(body.get("risk_gear") or "").strip().upper()
                                 res = outer._autonomous_trader.set_risk_gear_mode(gear_val, reason=reason)
+                            elif act == "ADVANCE_RECOVERY_SESSION":
+                                res = outer._autonomous_trader.advance_recovery_session(reason=reason)
+                            elif act == "SET_SESSION_CADENCE":
+                                cad_val = str(body.get("session_cadence") or body.get("cadence") or "").strip().upper()
+                                res = outer._autonomous_trader.set_session_cadence(cad_val, reason=reason)
                             elif act == "EMERGENCY_CLOSE_ALL":
                                 res = outer._autonomous_trader.emergency_close_all(reason=reason)
                             elif act in ("REARM_DRAWDOWN", "UNLOCK_QUOTA_SESSION"):
@@ -1907,6 +1927,14 @@ def run_cockpit_cli(
 
     registry.bind_thinking_depth_persister(_persist_thinking_depth)
     quota_store = runtime_state.quota_store
+    raw_init_cap_cli = str(merged.get("CAS_FOREX_INITIAL_CAPITAL_USD", "")).strip()
+    cli_init_cap = Decimal(raw_init_cap_cli) if raw_init_cap_cli else None
+    if (
+        cli_init_cap is not None
+        and runtime_state.profit_vault is not None
+        and runtime_state.profit_vault.configured_initial_capital_usd() is None
+    ):
+        runtime_state.profit_vault.set_config(initial_capital_usd=cli_init_cap)
     trader = AutonomousAiTrader(
         router=router,
         model_registry=registry,
@@ -1920,6 +1948,7 @@ def run_cockpit_cli(
         parallel_tiers=runtime_state.parallel_tiers,
         risk_gear_mode=merged.get(ENV_RISK_GEAR_MODE),
         risk_gear_path=runtime_state.state_dir / "risk_gear.json",
+        initial_capital_usd=cli_init_cap,
     )
     if not args.autonomous_ai:
         trader.stop_automation(reason="CLI launched with --no-autonomous-ai")
@@ -2051,10 +2080,17 @@ def run_cockpit_cli(
 
     poller = threading.Thread(target=_poll_loop, name="cas-forex-feed-poll", daemon=True)
     fast_poller = threading.Thread(target=_fast_tick_loop, name="cas-forex-mt5-50ms", daemon=True)
-    if args.poll_seconds > 0 and feed_client is not None:
-        poller.start()
+    # SAFETY INVARIANT: Start 50ms stop-protection thread FIRST with zero ledger I/O ahead of it!
     if args.fast_tick_ms > 0 and args.autonomous_ai and router.venues:
         fast_poller.start()
+    if args.poll_seconds > 0 and feed_client is not None:
+        poller.start()
+    if args.autonomous_ai and runtime_state.profit_vault is not None:
+        threading.Thread(
+            target=lambda: trader._attempt_startup_vault_sync_post_protection(trader._now()),
+            name="cas-forex-boot-vault-sync",
+            daemon=True,
+        ).start()
 
     print(f"CAS Forex Cockpit Execution Mode : {router.execution_mode} (live_armed={routing_summary['live_trading_armed']})")
     for row in routing_summary["chain"]:

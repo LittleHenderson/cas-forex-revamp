@@ -54,6 +54,7 @@ KRAKEN_API_HOST = "api.kraken.com"
 ENV_PROFIT_SWEEP_RATIO = "CAS_FOREX_PROFIT_SWEEP_RATIO"
 ENV_PROFIT_SWEEP_AUTO_ENABLED = "CAS_FOREX_PROFIT_SWEEP_AUTO_ENABLED"
 ENV_PROFIT_SWEEP_PREFERRED_RAIL = "CAS_FOREX_PROFIT_SWEEP_PREFERRED_RAIL"
+ENV_INITIAL_CAPITAL_USD = "CAS_FOREX_INITIAL_CAPITAL_USD"
 
 ENV_COINBASE_KEY_NAME = "CAS_FOREX_COINBASE_KEY_NAME"
 ENV_COINBASE_PRIVATE_KEY_FILE = "CAS_FOREX_COINBASE_PRIVATE_KEY_FILE"
@@ -504,6 +505,8 @@ class ProfitSweepVault:
         sweep_ratio: Decimal = DEFAULT_SWEEP_RATIO,
         auto_sweep_enabled: bool = True,
         preferred_rail: str = RAIL_BROKER_2FA_MANUAL,
+        initial_capital_usd: Decimal | None = None,
+        environ: Mapping[str, str] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(db_path, Path):
@@ -513,6 +516,21 @@ class ProfitSweepVault:
             raise ContractError("sweep_ratio must be in [0, 0.90]")
         if preferred_rail not in VALID_PAYOUT_RAILS:
             raise ContractError(f"preferred_rail must be one of {VALID_PAYOUT_RAILS}")
+        resolved_init_cap: Decimal | None = None
+        if initial_capital_usd is not None:
+            resolved_init_cap = decimal_value(
+                Decimal(initial_capital_usd), "initial_capital_usd", positive=True
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        elif environ is not None:
+            raw_init_env = str(environ.get(ENV_INITIAL_CAPITAL_USD, "")).strip()
+            if raw_init_env:
+                try:
+                    parsed_init = Decimal(raw_init_env)
+                except Exception as exc:
+                    raise ContractError(f"Invalid {ENV_INITIAL_CAPITAL_USD}={raw_init_env!r}") from exc
+                resolved_init_cap = decimal_value(
+                    parsed_init, ENV_INITIAL_CAPITAL_USD, positive=True
+                ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         _ensure_owner_dir(db_path.parent)
         self.db_path = db_path
         self.scope_id = str(scope_id).strip() or "default"
@@ -522,6 +540,7 @@ class ProfitSweepVault:
             default_ratio=sweep_ratio,
             default_auto=auto_sweep_enabled,
             default_rail=preferred_rail,
+            default_initial_capital=resolved_init_cap,
         )
 
     def _connect(self) -> sqlite3.Connection:
@@ -532,7 +551,14 @@ class ProfitSweepVault:
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
-    def _init_db(self, *, default_ratio: Decimal, default_auto: bool, default_rail: str) -> None:
+    def _init_db(
+        self,
+        *,
+        default_ratio: Decimal,
+        default_auto: bool,
+        default_rail: str,
+        default_initial_capital: Decimal | None = None,
+    ) -> None:
         with self._lock, closing(self._connect()) as conn:
             conn.executescript(
                 """
@@ -541,7 +567,8 @@ class ProfitSweepVault:
                     sweep_ratio_text TEXT NOT NULL,
                     auto_sweep_enabled INTEGER NOT NULL,
                     preferred_rail TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    initial_capital_usd_text TEXT
                 );
                 CREATE TABLE IF NOT EXISTS sweep_events (
                     trade_id TEXT NOT NULL,
@@ -614,12 +641,20 @@ class ProfitSweepVault:
                 conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bank_transfers_idem ON bank_transfers(idempotency_key) WHERE idempotency_key IS NOT NULL")
             if "error_detail" not in bt_cols:
                 conn.execute("ALTER TABLE bank_transfers ADD COLUMN error_detail TEXT")
-            row = conn.execute("SELECT scope_id FROM vault_config WHERE scope_id = ?", (self.scope_id,)).fetchone()
+            vc_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(vault_config)").fetchall()}
+            if "initial_capital_usd_text" not in vc_cols:
+                conn.execute("ALTER TABLE vault_config ADD COLUMN initial_capital_usd_text TEXT")
+            row = conn.execute(
+                "SELECT scope_id, initial_capital_usd_text FROM vault_config WHERE scope_id = ?",
+                (self.scope_id,),
+            ).fetchone()
             if row is None:
                 conn.execute(
                     """
-                    INSERT INTO vault_config(scope_id, sweep_ratio_text, auto_sweep_enabled, preferred_rail, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO vault_config(
+                        scope_id, sweep_ratio_text, auto_sweep_enabled, preferred_rail, updated_at, initial_capital_usd_text
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         self.scope_id,
@@ -627,7 +662,13 @@ class ProfitSweepVault:
                         1 if default_auto else 0,
                         default_rail,
                         _iso(self._clock()),
+                        None if default_initial_capital is None else decimal_text(default_initial_capital),
                     ),
+                )
+            elif default_initial_capital is not None and row["initial_capital_usd_text"] in (None, ""):
+                conn.execute(
+                    "UPDATE vault_config SET initial_capital_usd_text = ?, updated_at = ? WHERE scope_id = ?",
+                    (decimal_text(default_initial_capital), _iso(self._clock()), self.scope_id),
                 )
         _ensure_owner_file(self.db_path)
 
@@ -644,12 +685,97 @@ class ProfitSweepVault:
             (prev_sha, entry_sha, self.scope_id, event_type, payload_bytes.decode("utf-8"), ts),
         )
 
+    def _disbursed_total_unlocked(self, conn: sqlite3.Connection) -> Decimal:
+        disbursed = Decimal("0.00")
+        for r in conn.execute(
+            "SELECT amount_usd_text, status FROM bank_transfers WHERE scope_id = ?",
+            (self.scope_id,),
+        ):
+            if str(r["status"]) in ("SETTLED", "ACH_SUBMITTED", "RESERVED_PENDING_DISPATCH", "OUTCOME_UNKNOWN"):
+                disbursed += Decimal(str(r["amount_usd_text"]))
+        return disbursed.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def _confirmed_settled_disbursed_unlocked(self, conn: sqlite3.Connection) -> Decimal:
+        """Sum STRICTLY confirmed SETTLED external bank payouts (excludes pending/submitted/unknown)."""
+        settled = Decimal("0.00")
+        for r in conn.execute(
+            "SELECT amount_usd_text, status FROM bank_transfers WHERE scope_id = ?",
+            (self.scope_id,),
+        ):
+            if str(r["status"]) == "SETTLED":
+                settled += Decimal(str(r["amount_usd_text"]))
+        return settled.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    @staticmethod
+    def _resolve_effective_initial_capital(
+        cfg_row: sqlite3.Row | None,
+        initial_capital_usd: Decimal | None,
+    ) -> Decimal | None:
+        if initial_capital_usd is not None:
+            return decimal_value(
+                Decimal(initial_capital_usd), "initial_capital_usd", positive=True
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if cfg_row is not None and cfg_row["initial_capital_usd_text"] not in (None, ""):
+            return Decimal(str(cfg_row["initial_capital_usd_text"])).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        return None
+
+    def _select_session_sweep_rows(
+        self,
+        conn: sqlite3.Connection,
+        sdate: str,
+    ) -> list[sqlite3.Row]:
+        rows = list(
+            conn.execute(
+                "SELECT realized_net_usd_text, retained_trading_usd_text, bank_sweep_usd_text, occurred_at "
+                "FROM sweep_events WHERE scope_id = ? AND session_date = ?",
+                (self.scope_id, sdate),
+            ).fetchall()
+        )
+        if sdate.endswith("-ASIA") and len(sdate) == 15:
+            anchor_str = sdate[:-5]
+            try:
+                from datetime import timedelta as _td
+
+                anchor_dt = datetime.fromisoformat(f"{anchor_str}T00:00:00+00:00")
+                asia_start = anchor_dt - _td(hours=2)
+                asia_end = anchor_dt + _td(hours=7)
+                legacy_rows = conn.execute(
+                    "SELECT realized_net_usd_text, retained_trading_usd_text, bank_sweep_usd_text, occurred_at "
+                    "FROM sweep_events WHERE scope_id = ? AND session_date = ?",
+                    (self.scope_id, anchor_str),
+                ).fetchall()
+                for lr in legacy_rows:
+                    try:
+                        occ_dt = datetime.fromisoformat(str(lr["occurred_at"]).replace("Z", "+00:00"))
+                        if asia_start <= occ_dt < asia_end:
+                            rows.append(lr)
+                    except ValueError:
+                        continue
+            except ValueError:
+                pass
+        return rows
+
+    def configured_initial_capital_usd(self) -> Decimal | None:
+        with self._lock, closing(self._connect()) as conn:
+            cfg = conn.execute(
+                "SELECT initial_capital_usd_text FROM vault_config WHERE scope_id = ?",
+                (self.scope_id,),
+            ).fetchone()
+            if cfg is not None and cfg["initial_capital_usd_text"] not in (None, ""):
+                return Decimal(str(cfg["initial_capital_usd_text"])).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+        return None
+
     def set_config(
         self,
         *,
         sweep_ratio: Decimal | None = None,
         auto_sweep_enabled: bool | None = None,
         preferred_rail: str | None = None,
+        initial_capital_usd: Decimal | None = None,
     ) -> dict[str, Any]:
         with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -657,6 +783,11 @@ class ProfitSweepVault:
             cur_ratio = Decimal(str(row["sweep_ratio_text"])) if row else DEFAULT_SWEEP_RATIO
             cur_auto = bool(int(row["auto_sweep_enabled"])) if row else True
             cur_rail = str(row["preferred_rail"]) if row else RAIL_BROKER_2FA_MANUAL
+            cur_init_cap = (
+                Decimal(str(row["initial_capital_usd_text"]))
+                if (row and row["initial_capital_usd_text"] not in (None, ""))
+                else None
+            )
 
             new_ratio = cur_ratio if sweep_ratio is None else decimal_value(sweep_ratio, "sweep_ratio")
             if new_ratio < Decimal("0") or new_ratio > Decimal("0.90"):
@@ -665,20 +796,42 @@ class ProfitSweepVault:
             new_rail = cur_rail if preferred_rail is None else str(preferred_rail).strip()
             if new_rail not in VALID_PAYOUT_RAILS:
                 raise ContractError(f"preferred_rail must be one of {VALID_PAYOUT_RAILS}")
+            new_init_cap = (
+                cur_init_cap
+                if initial_capital_usd is None
+                else decimal_value(Decimal(initial_capital_usd), "initial_capital_usd", positive=True).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+            )
 
             ts = _iso(self._clock())
             conn.execute(
                 """
                 UPDATE vault_config
-                SET sweep_ratio_text = ?, auto_sweep_enabled = ?, preferred_rail = ?, updated_at = ?
+                SET sweep_ratio_text = ?, auto_sweep_enabled = ?, preferred_rail = ?,
+                    initial_capital_usd_text = ?, updated_at = ?
                 WHERE scope_id = ?
                 """,
-                (decimal_text(new_ratio), 1 if new_auto else 0, new_rail, ts, self.scope_id),
+                (
+                    decimal_text(new_ratio),
+                    1 if new_auto else 0,
+                    new_rail,
+                    None if new_init_cap is None else decimal_text(new_init_cap),
+                    ts,
+                    self.scope_id,
+                ),
             )
+            audit_payload: dict[str, Any] = {
+                "sweep_ratio": decimal_text(new_ratio),
+                "auto_sweep_enabled": new_auto,
+                "preferred_rail": new_rail,
+            }
+            if new_init_cap is not None:
+                audit_payload["initial_capital_usd"] = decimal_text(new_init_cap)
             self._append_audit(
                 conn,
                 "CONFIG_UPDATED",
-                {"sweep_ratio": decimal_text(new_ratio), "auto_sweep_enabled": new_auto, "preferred_rail": new_rail},
+                audit_payload,
                 ts,
             )
             conn.execute("COMMIT")
@@ -693,10 +846,19 @@ class ProfitSweepVault:
         realized_net_usd: Decimal,
         occurred_at: datetime | None = None,
         session_date: str | None = None,
+        total_equity_usd: Decimal | None = None,
+        initial_capital_usd: Decimal | None = None,
     ) -> dict[str, Any]:
         if not isinstance(trade_id, str) or not trade_id.strip():
             raise ContractError("trade_id must be a non-empty string")
         decimal_value(realized_net_usd, "realized_net_usd")
+        eq_val = (
+            decimal_value(Decimal(total_equity_usd), "total_equity_usd").quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            if total_equity_usd is not None
+            else None
+        )
         occ_dt = occurred_at or self._clock()
         ts = _iso(occ_dt)
         if session_date is not None and str(session_date).strip():
@@ -718,15 +880,50 @@ class ProfitSweepVault:
             cfg = conn.execute("SELECT * FROM vault_config WHERE scope_id = ?", (self.scope_id,)).fetchone()
             ratio = Decimal(str(cfg["sweep_ratio_text"])) if cfg else DEFAULT_SWEEP_RATIO
             auto_on = bool(int(cfg["auto_sweep_enabled"])) if cfg else True
+            eff_init_cap = self._resolve_effective_initial_capital(cfg, initial_capital_usd)
 
             if realized_net_usd > Decimal("0") and auto_on and ratio > Decimal("0"):
                 with localcontext() as ctx:
                     ctx.prec = 40
-                    bank_part = (realized_net_usd * ratio).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    unconstrained_bank = (realized_net_usd * ratio).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+            else:
+                unconstrained_bank = Decimal("0.00")
+
+            if eq_val is not None and eff_init_cap is not None:
+                settled_disbursed = self._confirmed_settled_disbursed_unlocked(conn)
+                overall_bank = Decimal("0.00")
+                for r_all in conn.execute(
+                    "SELECT bank_sweep_usd_text FROM sweep_events WHERE scope_id = ?",
+                    (self.scope_id,),
+                ):
+                    overall_bank += Decimal(str(r_all["bank_sweep_usd_text"]))
+                economic_equity = (eq_val + settled_disbursed).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                true_surplus = max(
+                    Decimal("0.00"),
+                    (economic_equity - eff_init_cap).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                )
+                if true_surplus <= Decimal("0.00"):
+                    bank_part = Decimal("0.00")
+                else:
+                    if auto_on and ratio > Decimal("0"):
+                        with localcontext() as ctx:
+                            ctx.prec = 40
+                            max_surplus_reserve = (true_surplus * ratio).quantize(
+                                Decimal("0.01"), rounding=ROUND_HALF_UP
+                            )
+                    else:
+                        max_surplus_reserve = Decimal("0.00")
+                    desired_overall_bank = max(settled_disbursed, max_surplus_reserve)
+                    headroom = max(Decimal("0.00"), desired_overall_bank - overall_bank)
+                    bank_part = min(unconstrained_bank, headroom)
                 retained_part = realized_net_usd - bank_part
             else:
-                bank_part = Decimal("0.00")
-                retained_part = realized_net_usd
+                bank_part = unconstrained_bank
+                retained_part = realized_net_usd - bank_part
 
             conn.execute(
                 """
@@ -767,14 +964,10 @@ class ProfitSweepVault:
     def session_totals(self, session_date: str) -> dict[str, str]:
         """Read-only per-session realized, retained, and internal vault reserve totals."""
         if not isinstance(session_date, str) or not session_date.strip():
-            raise ContractError("session_date must be a non-empty YYYY-MM-DD string")
+            raise ContractError("session_date must be a non-empty session identifier")
         sdate = session_date.strip()
         with self._lock, closing(self._connect()) as conn:
-            rows = conn.execute(
-                "SELECT realized_net_usd_text, retained_trading_usd_text, bank_sweep_usd_text "
-                "FROM sweep_events WHERE scope_id = ? AND session_date = ?",
-                (self.scope_id, sdate),
-            ).fetchall()
+            rows = self._select_session_sweep_rows(conn, sdate)
             s_realized = Decimal("0")
             s_retained = Decimal("0")
             s_bank = Decimal("0")
@@ -795,13 +988,22 @@ class ProfitSweepVault:
         session_date: str,
         session_realized_net_usd: Decimal,
         occurred_at: datetime | str | None = None,
+        total_equity_usd: Decimal | None = None,
+        initial_capital_usd: Decimal | None = None,
     ) -> dict[str, Any] | None:
-        """Idempotently reconcile session realized net P&L (upward, downward, or oscillating) into append-only sweep_events."""
+        """Idempotently reconcile session realized net P&L (with Principal High-Water Mark surplus gating when equity & principal are provided)."""
         if not isinstance(session_date, str) or not session_date.strip():
-            raise ContractError("session_date must be a non-empty YYYY-MM-DD string")
+            raise ContractError("session_date must be a non-empty session identifier")
         sdate = session_date.strip()
         target_net = decimal_value(Decimal(session_realized_net_usd), "session_realized_net_usd").quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        eq_val = (
+            decimal_value(Decimal(total_equity_usd), "total_equity_usd").quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            if total_equity_usd is not None
+            else None
         )
 
         if occurred_at is None:
@@ -822,11 +1024,7 @@ class ProfitSweepVault:
 
         with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            sess_rows = conn.execute(
-                "SELECT realized_net_usd_text, bank_sweep_usd_text FROM sweep_events "
-                "WHERE scope_id = ? AND session_date = ?",
-                (self.scope_id, sdate),
-            ).fetchall()
+            sess_rows = self._select_session_sweep_rows(conn, sdate)
             session_realized = Decimal("0.00")
             session_bank = Decimal("0.00")
             for r in sess_rows:
@@ -845,17 +1043,45 @@ class ProfitSweepVault:
             cfg = conn.execute("SELECT * FROM vault_config WHERE scope_id = ?", (self.scope_id,)).fetchone()
             ratio = Decimal(str(cfg["sweep_ratio_text"])) if cfg else DEFAULT_SWEEP_RATIO
             auto_on = bool(int(cfg["auto_sweep_enabled"])) if cfg else True
+            eff_init_cap = self._resolve_effective_initial_capital(cfg, initial_capital_usd)
 
-            if target_net > Decimal("0") and auto_on and ratio > Decimal("0"):
-                with localcontext() as ctx:
-                    ctx.prec = 40
-                    target_session_bank = (target_net * ratio).quantize(
-                        Decimal("0.01"), rounding=ROUND_HALF_UP
-                    )
+            if eq_val is not None and eff_init_cap is not None:
+                settled_disbursed = self._confirmed_settled_disbursed_unlocked(conn)
+                economic_equity = (eq_val + settled_disbursed).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                true_surplus = max(
+                    Decimal("0.00"),
+                    (economic_equity - eff_init_cap).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                )
+                if true_surplus <= Decimal("0.00"):
+                    desired_overall_bank = settled_disbursed
+                else:
+                    if auto_on and ratio > Decimal("0"):
+                        with localcontext() as ctx:
+                            ctx.prec = 40
+                            max_surplus_reserve = (true_surplus * ratio).quantize(
+                                Decimal("0.01"), rounding=ROUND_HALF_UP
+                            )
+                    else:
+                        max_surplus_reserve = Decimal("0.00")
+                    desired_overall_bank = max(settled_disbursed, max_surplus_reserve)
+                bank_delta = (desired_overall_bank - overall_bank).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
             else:
-                target_session_bank = Decimal("0.00")
+                if target_net > Decimal("0") and auto_on and ratio > Decimal("0"):
+                    with localcontext() as ctx:
+                        ctx.prec = 40
+                        target_session_bank = (target_net * ratio).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                else:
+                    target_session_bank = Decimal("0.00")
+                bank_delta = (target_session_bank - session_bank).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
 
-            bank_delta = (target_session_bank - session_bank).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             if overall_bank + bank_delta < Decimal("0.00"):
                 bank_delta = -overall_bank
             retained_delta = gap - bank_delta
@@ -864,13 +1090,14 @@ class ProfitSweepVault:
                 conn.execute("ROLLBACK")
                 return None
 
-            sync_prefix = f"SESSION_SYNC_{sdate}_"
+            safe_sdate = sdate.replace("#", "_")
+            sync_prefix = f"SESSION_SYNC_{safe_sdate}_"
             seq_row = conn.execute(
                 "SELECT COUNT(*) FROM sweep_events WHERE scope_id = ? AND trade_id LIKE ?",
                 (self.scope_id, f"{sync_prefix}%"),
             ).fetchone()
             seq_n = (int(seq_row[0]) if seq_row is not None else 0) + 1
-            sync_trade_id = f"SESSION_SYNC_{sdate}_{seq_n:04d}_{cents_tag}"
+            sync_trade_id = f"SESSION_SYNC_{safe_sdate}_{seq_n:04d}_{cents_tag}"
 
             conn.execute(
                 """
@@ -1352,6 +1579,8 @@ class ProfitSweepVault:
                     })
 
             disbursed = Decimal("0")
+            confirmed_settled = Decimal("0")
+            unconfirmed_active = Decimal("0")
             pending_2fa = Decimal("0")
             recent_transfers: list[dict[str, Any]] = []
             trows = conn.execute(
@@ -1360,10 +1589,15 @@ class ProfitSweepVault:
             for idx, r in enumerate(trows):
                 amt = Decimal(str(r["amount_usd_text"]))
                 st = str(r["status"])
-                if st in ("SETTLED", "ACH_SUBMITTED", "RESERVED_PENDING_DISPATCH", "OUTCOME_UNKNOWN"):
+                if st == "SETTLED":
+                    confirmed_settled += amt
                     disbursed += amt
+                elif st in ("ACH_SUBMITTED", "RESERVED_PENDING_DISPATCH", "OUTCOME_UNKNOWN"):
+                    disbursed += amt
+                    unconfirmed_active += amt
                 elif st in ("PENDING_OWNER_BROKER_2FA", "BROKER_2FA_VERIFICATION_UNKNOWN"):
                     pending_2fa += amt
+                    unconfirmed_active += amt
                 if idx < 25:
                     recent_transfers.append({
                         "transfer_id": str(r["transfer_id"]),
@@ -1380,6 +1614,11 @@ class ProfitSweepVault:
             bank_reserved_total = max(Decimal("0.00"), bank_reserved_total)
             pending_rem = max(Decimal("0.00"), bank_reserved_total - disbursed)
             ratio = Decimal(str(cfg["sweep_ratio_text"])) if cfg else DEFAULT_SWEEP_RATIO
+            cfg_init_cap = (
+                Decimal(str(cfg["initial_capital_usd_text"]))
+                if (cfg is not None and cfg["initial_capital_usd_text"] not in (None, ""))
+                else None
+            )
             return {
                 "schema": "cas-forex.profit-vault/1",
                 "scope_id": self.scope_id,
@@ -1387,10 +1626,13 @@ class ProfitSweepVault:
                 "sweep_ratio_pct": decimal_text((ratio * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
                 "auto_sweep_enabled": bool(int(cfg["auto_sweep_enabled"])) if cfg else True,
                 "preferred_rail": str(cfg["preferred_rail"]) if cfg else RAIL_BROKER_2FA_MANUAL,
+                "initial_capital_usd": None if cfg_init_cap is None else decimal_text(cfg_init_cap),
                 "total_realized_profit_usd": decimal_text(total_realized),
                 "retained_trading_usd": decimal_text(retained),
                 "bank_sweep_reserved_usd": decimal_text(bank_reserved_total),
                 "disbursed_to_bank_usd": decimal_text(disbursed),
+                "confirmed_settled_disbursed_usd": decimal_text(confirmed_settled),
+                "pending_or_unconfirmed_transfers_usd": decimal_text(unconfirmed_active),
                 "pending_2fa_confirmation_usd": decimal_text(pending_2fa),
                 "pending_disbursement_usd": decimal_text(pending_rem),
                 "recent_sweeps": recent_sweeps,

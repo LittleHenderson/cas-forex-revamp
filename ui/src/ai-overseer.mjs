@@ -20,6 +20,8 @@ const GOVERNANCE_MODES = Object.freeze(['ACTIVE', 'PAUSED_NEW_RISK', 'PAUSED', '
 const QUOTA_STATUSES = Object.freeze(['OPEN', 'SOFT_QUOTA_REACHED', 'DAILY_QUOTA_LOCKED', 'PROFIT_FLOOR_LOCKED', 'DAILY_LOSS_CIRCUIT_TRIPPED']);
 const PROTECTION_STAGES = Object.freeze(['INITIAL_SL', 'BREAKEVEN_LOCKED', 'TRAILING_ACTIVE']);
 export const RISK_GEAR_MODES = Object.freeze(['CONSERVATIVE', 'AUTO_ADAPTIVE', 'AGGRESSIVE']);
+export const CAPITAL_STATUSES = Object.freeze(['RECOVERY_MODE', 'AT_PRINCIPAL', 'IN_SURPLUS']);
+export const SESSION_CADENCE_MODES = Object.freeze(['AUTO', 'REGIONAL_RECOVERY', 'REGIONAL_8H', 'DAILY_NY']);
 const INDEX_PAIRS = Object.freeze(['NAS100', 'US30', 'SPX500', 'XAUUSD']);
 
 export function computeMarketSessions(nowMs = Date.now(), mt5TickFresh = false) {
@@ -108,6 +110,60 @@ export function formatSignedUsd(raw) {
   return `+${formatted}`;
 }
 
+function toCentsBigInt(raw) {
+  const clean = typeof raw === 'string' && /^-?[0-9]+(\.[0-9]+)?$/.test(raw.trim()) ? raw.trim() : '0';
+  const neg = clean.startsWith('-');
+  const unsigned = neg ? clean.slice(1) : clean;
+  const [intPart = '0', fracPart = ''] = unsigned.split('.');
+  const frac2 = fracPart.slice(0, 2).padEnd(2, '0');
+  let mag = BigInt(intPart) * 100n + BigInt(frac2);
+  if (fracPart.length >= 3 && fracPart[2] >= '5') {
+    mag += 1n;
+  }
+  if (mag === 0n) return 0n;
+  return neg ? -mag : mag;
+}
+
+function centsBigIntToDecimal(cents) {
+  if (cents === 0n) return '0';
+  const neg = cents < 0n;
+  const abs = neg ? -cents : cents;
+  const whole = abs / 100n;
+  const rem = abs % 100n;
+  if (rem === 0n) return `${neg ? '-' : ''}${whole}`;
+  return `${neg ? '-' : ''}${whole}.${String(rem).padStart(2, '0')}`;
+}
+
+function computePctFromCents(diffCents, baseCents) {
+  if (baseCents <= 0n || diffCents === 0n) return '0';
+  const neg = diffCents < 0n;
+  const absDiff = neg ? -diffCents : diffCents;
+  const numer = absDiff * 10000n;
+  const rem = numer % baseCents;
+  const bps = (numer / baseCents) + (rem * 2n >= baseCents ? 1n : 0n);
+  if (bps === 0n) return '0';
+  return `${neg ? '-' : ''}${bps / 100n}.${String(bps % 100n).padStart(2, '0')}`;
+}
+
+function formatSignedPct(raw) {
+  const bps = toCentsBigInt(raw);
+  if (bps === 0n) return '0.00%';
+  const neg = bps < 0n;
+  const abs = neg ? -bps : bps;
+  return `${neg ? '-' : '+'}${abs / 100n}.${String(abs % 100n).padStart(2, '0')}%`;
+}
+
+function defaultRegionWindowLabel(sessionDate, capitalStatus, sessionCadence) {
+  if (capitalStatus === 'RECOVERY_MODE' && sessionCadence !== 'DAILY_NY') {
+    const s = String(sessionDate ?? '');
+    if (s.endsWith('-ASIA')) return 'ASIA (22:00–07:00 UTC / 14:00–23:00 PT)';
+    if (s.endsWith('-LONDON')) return 'LONDON (07:00–12:00 UTC / 23:00–04:00 PT)';
+    if (s.endsWith('-NY')) return 'NEW_YORK (12:00–22:00 UTC / 04:00–14:00 PT)';
+    return 'ASIA (22:00–07:00 UTC / 14:00–23:00 PT)';
+  }
+  return 'DAILY_NY (17:00 America/New_York)';
+}
+
 function normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operatingMode) {
   const bs = doc?.banked_session && typeof doc.banked_session === 'object' && !Array.isArray(doc.banked_session)
     ? doc.banked_session
@@ -116,12 +172,71 @@ function normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operating
   const defaultTotalRealized = compareDecimalStrings(dailyQuota.realizedNetPnlUsd, '0') > 0
     ? dailyQuota.realizedNetPnlUsd
     : '0';
-  const vaultSwept50PctUsd = numStr(bs?.vault_swept_50pct_usd, bankSweepReservedUsd);
+  const sessionDate = str(bs?.session_date, dailyQuota.sessionDate, 64);
+  const confirmedBankPayoutsUsd = numStr(bs?.confirmed_bank_payouts_usd, '0');
+  const pendingUnconfirmedTransfersUsd = numStr(bs?.pending_unconfirmed_transfers_usd, '0');
+  const initialCapitalUsd = numStr(bs?.initial_capital_usd ?? doc?.initial_capital_usd, '300000');
+  const fallbackEquityUsd = compareDecimalStrings(dailyQuota.startingEquityUsd, '0') > 0
+    ? centsBigIntToDecimal(toCentsBigInt(dailyQuota.startingEquityUsd) + toCentsBigInt(dailyQuota.realizedNetPnlUsd))
+    : initialCapitalUsd;
+  const currentTotalEquityUsd = numStr(
+    bs?.current_total_equity_usd ?? doc?.current_total_equity_usd,
+    fallbackEquityUsd,
+  );
+
+  const initCents = toCentsBigInt(initialCapitalUsd);
+  const eqCents = toCentsBigInt(currentTotalEquityUsd);
+  const payoutCents = toCentsBigInt(confirmedBankPayoutsUsd);
+  const economicDiffCents = (eqCents + payoutCents) - initCents;
+  const computedSurplusUsd = centsBigIntToDecimal(economicDiffCents);
+  const computedSurplusPct = computePctFromCents(economicDiffCents, initCents);
+  const computedDeficitUsd = economicDiffCents < 0n ? centsBigIntToDecimal(-economicDiffCents) : '0';
+  const computedCapStatus = economicDiffCents < 0n
+    ? 'RECOVERY_MODE'
+    : (economicDiffCents === 0n ? 'AT_PRINCIPAL' : 'IN_SURPLUS');
+
+  const netSurplusUsd = numStr(bs?.net_surplus_usd, computedSurplusUsd);
+  const netSurplusPct = numStr(bs?.net_surplus_pct, computedSurplusPct);
+  const deficitToPrincipalUsd = numStr(bs?.deficit_to_principal_usd, computedDeficitUsd);
+  const rawCapStatus = typeof bs?.capital_status === 'string' ? bs.capital_status.trim().toUpperCase() : '';
+  const capitalStatus = CAPITAL_STATUSES.includes(rawCapStatus) ? rawCapStatus : computedCapStatus;
+  const vaultSweepsPausedForRecovery = typeof bs?.vault_sweeps_paused_for_recovery === 'boolean'
+    ? bs.vault_sweeps_paused_for_recovery
+    : (capitalStatus !== 'IN_SURPLUS');
+
+  const rawCadence = typeof (bs?.session_cadence ?? doc?.session_cadence) === 'string'
+    ? String(bs?.session_cadence ?? doc?.session_cadence).trim().toUpperCase()
+    : 'AUTO';
+  const sessionCadence = SESSION_CADENCE_MODES.includes(rawCadence) ? rawCadence : 'AUTO';
+  const rawLeg = Number(bs?.active_session_leg ?? 1);
+  const activeSessionLeg = Number.isSafeInteger(rawLeg) && rawLeg >= 1 ? rawLeg : 1;
+  const canAdvanceRecoverySession = typeof bs?.can_advance_recovery_session === 'boolean'
+    ? bs.can_advance_recovery_session
+    : (capitalStatus === 'RECOVERY_MODE' && lockedDefault);
+  const activeRegionWindow = str(
+    bs?.active_region_window,
+    defaultRegionWindowLabel(sessionDate, capitalStatus, sessionCadence),
+    120,
+  );
+
+  const defaultSwept = vaultSweepsPausedForRecovery ? '0' : bankSweepReservedUsd;
+  const vaultSwept50PctUsd = numStr(bs?.vault_swept_50pct_usd, defaultSwept);
   const vaultRetained50PctUsd = numStr(bs?.vault_retained_50pct_usd, bankSweepReservedUsd);
   return Object.freeze({
     schema: 'cas-forex.banked-session/1',
     accountingBasis: str(bs?.accounting_basis, 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT', 80),
-    sessionDate: str(bs?.session_date, dailyQuota.sessionDate, 40),
+    sessionDate,
+    initialCapitalUsd,
+    currentTotalEquityUsd,
+    netSurplusUsd,
+    netSurplusPct,
+    deficitToPrincipalUsd,
+    capitalStatus,
+    vaultSweepsPausedForRecovery,
+    sessionCadence,
+    activeSessionLeg,
+    canAdvanceRecoverySession,
+    activeRegionWindow,
     bankedNetPnlUsd: numStr(bs?.banked_net_pnl_usd, dailyQuota.realizedNetPnlUsd),
     realizedPnlPct: numStr(bs?.realized_pnl_pct, dailyQuota.realizedPnlPct),
     peakRealizedPnlUsd: numStr(bs?.peak_realized_pnl_usd, dailyQuota.peakRealizedPnlUsd),
@@ -134,10 +249,11 @@ function normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operating
     vaultSwept50PctUsd,
     sessionVaultReserved50PctUsd: numStr(bs?.session_vault_reserved_50pct_usd, vaultSwept50PctUsd),
     vaultRetained50PctUsd,
-    confirmedBankPayoutsUsd: numStr(bs?.confirmed_bank_payouts_usd, '0'),
+    confirmedBankPayoutsUsd,
+    pendingUnconfirmedTransfersUsd,
     profitsLockedForSession: typeof bs?.profits_locked_for_session === 'boolean' ? bs.profits_locked_for_session : lockedDefault,
     operatingMode: str(bs?.operating_mode, operatingMode, 40),
-    sessionRolloverLabel: str(bs?.session_rollover_label, '17:00 America/New_York (14:00 Pacific)', 80),
+    sessionRolloverLabel: str(bs?.session_rollover_label, '17:00 America/New_York (14:00 Pacific)', 120),
     nextSessionOpensUtc: bs?.next_session_opens_utc ? str(bs.next_session_opens_utc, '', 64) : null,
   });
 }
@@ -246,6 +362,17 @@ export const STATIC_AI_TRADER = Object.freeze({
     schema: 'cas-forex.banked-session/1',
     accountingBasis: 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT',
     sessionDate: 'Unknown',
+    initialCapitalUsd: '300000',
+    currentTotalEquityUsd: '300000',
+    netSurplusUsd: '0',
+    netSurplusPct: '0',
+    deficitToPrincipalUsd: '0',
+    capitalStatus: 'AT_PRINCIPAL',
+    vaultSweepsPausedForRecovery: true,
+    sessionCadence: 'AUTO',
+    activeSessionLeg: 1,
+    canAdvanceRecoverySession: false,
+    activeRegionWindow: 'DAILY_NY (17:00 America/New_York)',
     bankedNetPnlUsd: '0',
     realizedPnlPct: '0',
     peakRealizedPnlUsd: '0',
@@ -259,6 +386,7 @@ export const STATIC_AI_TRADER = Object.freeze({
     sessionVaultReserved50PctUsd: '0',
     vaultRetained50PctUsd: '0',
     confirmedBankPayoutsUsd: '0',
+    pendingUnconfirmedTransfersUsd: '0',
     profitsLockedForSession: false,
     operatingMode: 'ACTIVE_TRADING',
     sessionRolloverLabel: '17:00 America/New_York (14:00 Pacific)',
@@ -266,7 +394,19 @@ export const STATIC_AI_TRADER = Object.freeze({
   }),
   accountingBasis: 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT',
   confirmedBankPayoutsUsd: '0',
+  pendingUnconfirmedTransfersUsd: '0',
   sessionVaultReserved50PctUsd: '0',
+  initialCapitalUsd: '300000',
+  currentTotalEquityUsd: '300000',
+  netSurplusUsd: '0',
+  netSurplusPct: '0',
+  deficitToPrincipalUsd: '0',
+  capitalStatus: 'AT_PRINCIPAL',
+  vaultSweepsPausedForRecovery: true,
+  sessionCadence: 'AUTO',
+  activeSessionLeg: 1,
+  canAdvanceRecoverySession: false,
+  activeRegionWindow: 'DAILY_NY (17:00 America/New_York)',
   openPositions: Object.freeze([]),
   recentActions: Object.freeze([]),
 });
@@ -423,7 +563,19 @@ export function normalizeAiTrader(doc) {
     bankSweepReservedUsd,
     accountingBasis: bankedSession.accountingBasis,
     confirmedBankPayoutsUsd: bankedSession.confirmedBankPayoutsUsd,
+    pendingUnconfirmedTransfersUsd: bankedSession.pendingUnconfirmedTransfersUsd,
     sessionVaultReserved50PctUsd: bankedSession.sessionVaultReserved50PctUsd,
+    initialCapitalUsd: bankedSession.initialCapitalUsd,
+    currentTotalEquityUsd: bankedSession.currentTotalEquityUsd,
+    netSurplusUsd: bankedSession.netSurplusUsd,
+    netSurplusPct: bankedSession.netSurplusPct,
+    deficitToPrincipalUsd: bankedSession.deficitToPrincipalUsd,
+    capitalStatus: bankedSession.capitalStatus,
+    vaultSweepsPausedForRecovery: bankedSession.vaultSweepsPausedForRecovery,
+    sessionCadence: bankedSession.sessionCadence,
+    activeSessionLeg: bankedSession.activeSessionLeg,
+    canAdvanceRecoverySession: bankedSession.canAdvanceRecoverySession,
+    activeRegionWindow: bankedSession.activeRegionWindow,
     lastAction: str(doc.last_action, 'WAIT'),
     lastSymbol: doc.last_symbol ? str(doc.last_symbol) : 'None',
     lastReason: str(doc.last_reason, 'None'),
@@ -648,6 +800,25 @@ export function renderAiModelCatalogPanel(aiModels) {
   </section>`;
 }
 
+function resolveNextAutoWakeupLabel(bs) {
+  const nextUtc = String(bs.nextSessionOpensUtc ?? '');
+  const win = String(bs.activeRegionWindow ?? '').toUpperCase();
+  const sdate = String(bs.sessionDate ?? '').toUpperCase();
+  if (nextUtc.includes('T07:00') || win.startsWith('ASIA') || sdate.endsWith('-ASIA')) {
+    return 'London Session 07:00 UTC / 23:00 PT';
+  }
+  if (nextUtc.includes('T12:00') || win.startsWith('LONDON') || sdate.endsWith('-LONDON')) {
+    return 'New York Session 12:00 UTC / 04:00 PT';
+  }
+  if (nextUtc.includes('T22:00') || win.startsWith('NEW_YORK') || sdate.endsWith('-NY')) {
+    return 'Asia Session 22:00 UTC / 14:00 PT';
+  }
+  if (bs.sessionRolloverLabel && !bs.sessionRolloverLabel.startsWith('17:00 America/New_York')) {
+    return bs.sessionRolloverLabel;
+  }
+  return 'London Session 07:00 UTC / 23:00 PT';
+}
+
 export function renderBankedProfitsHeroBanner(state) {
   if (!state?.liveStreamConnected) {
     return `<section class="panel banked-profits-hero is-locked" data-banked-profits-locked="true" aria-label="Locked Cockpit Cloud Status">
@@ -660,27 +831,49 @@ export function renderBankedProfitsHeroBanner(state) {
   }
 
   const trader = state?.aiTrader ?? STATIC_AI_TRADER;
+  const busy = Boolean(state?.aiActionBusy);
   const q = trader.dailyQuota ?? STATIC_AI_TRADER.dailyQuota;
   const bs = trader.bankedSession ?? normalizeBankedSession(null, q, trader.bankSweepReservedUsd ?? '0', trader.operatingMode ?? 'ACTIVE_TRADING');
   const isLiveArmed = state?.brokerRouting?.executionMode === 'LIVE' && state?.brokerRouting?.liveArmed === true;
   const isRespite = Boolean(bs.profitsLockedForSession || trader.respiteMode || bs.operatingMode === 'RESEARCH_RESPITE');
+  const isUnderwater = bs.capitalStatus !== 'IN_SURPLUS';
+
+  const principalFormatted = formatExactUsd(bs.initialCapitalUsd ?? '300000');
+  const signedSurplusPct = formatSignedPct(bs.netSurplusPct ?? '0');
+  let principalBadgeClass = 'is-at-principal';
+  let principalBadgeText = `AT PRINCIPAL: $0.00 (0.00%) AT ${principalFormatted} PRINCIPAL`;
+  if (bs.capitalStatus === 'RECOVERY_MODE') {
+    principalBadgeClass = 'is-recovery';
+    principalBadgeText = `RECOVERY MODE: ${formatSignedUsd(bs.netSurplusUsd)} (${signedSurplusPct}) BELOW ${principalFormatted} PRINCIPAL`;
+  } else if (bs.capitalStatus === 'IN_SURPLUS') {
+    principalBadgeClass = 'is-in-surplus';
+    principalBadgeText = `IN SURPLUS: ${formatSignedUsd(bs.netSurplusUsd)} (${signedSurplusPct}) ABOVE ${principalFormatted} PRINCIPAL`;
+  }
 
   const sessReserveRaw = bs.sessionVaultReserved50PctUsd ?? bs.vaultSwept50PctUsd ?? '0';
   const reserveUsd = compareDecimalStrings(sessReserveRaw, '0') === 0
+    && !bs.vaultSweepsPausedForRecovery
     && compareDecimalStrings(bs.bankedNetPnlUsd, '0') > 0
     && state?.treasury?.connected
     ? state.treasury.bankSweepReservedUsd
     : sessReserveRaw;
-  const retainedRaw = bs.vaultRetained50PctUsd ?? '0';
-  const retainedUsd = compareDecimalStrings(retainedRaw, '0') === 0
-    && compareDecimalStrings(bs.bankedNetPnlUsd, '0') > 0
-    && state?.treasury?.connected
-    ? state.treasury.retainedTradingUsd
-    : retainedRaw;
-  const rawTreasuryDisbursed = state?.treasury?.connected
-    ? state.treasury.disbursedToBankUsd
-    : (state?.treasury && state.treasury.connected === undefined ? state.treasury.disbursedToBankUsd : undefined);
-  const confirmedPayoutsUsd = rawTreasuryDisbursed ?? bs.confirmedBankPayoutsUsd ?? '0';
+  const netSurplusCents = toCentsBigInt(bs.netSurplusUsd ?? '0');
+  const totalVaultSweptCents = toCentsBigInt(bs.vaultSwept50PctUsd ?? '0');
+  const surplusCompoundingUsd = netSurplusCents > 0n && netSurplusCents >= totalVaultSweptCents
+    ? centsBigIntToDecimal(netSurplusCents - totalVaultSweptCents)
+    : (bs.vaultRetained50PctUsd ?? '0');
+  const rawTreasurySettled = state?.treasury?.connected
+    ? state.treasury.confirmedSettledDisbursedUsd
+    : (state?.treasury && state.treasury.connected === undefined ? state.treasury.confirmedSettledDisbursedUsd : undefined);
+  const confirmedSettledUsd = rawTreasurySettled ?? bs.confirmedBankPayoutsUsd ?? '0';
+
+  const rawTreasuryPending = state?.treasury?.connected
+    ? state.treasury.pendingUnconfirmedTransfersUsd
+    : (state?.treasury && state.treasury.connected === undefined ? state.treasury.pendingUnconfirmedTransfersUsd : undefined);
+  const pendingUnconfirmedUsd = (rawTreasuryPending !== undefined && toCentsBigInt(rawTreasuryPending) !== 0n)
+    ? rawTreasuryPending
+    : (bs.pendingUnconfirmedTransfersUsd ?? rawTreasuryPending ?? '0');
+  const hasPendingUnconfirmed = toCentsBigInt(pendingUnconfirmedUsd) !== 0n;
 
   const pctStr = String(bs.realizedPnlPct ?? '0');
   const signedPct = pctStr.startsWith('-') || pctStr === '0' || pctStr === '0.00' ? `${pctStr}%` : `+${pctStr}%`;
@@ -691,40 +884,87 @@ export function renderBankedProfitsHeroBanner(state) {
     ? `Peak Today: ${formatSignedUsd(bs.peakRealizedPnlUsd)} · RATCHET ARMED`
     : `Peak Today: ${formatSignedUsd(bs.peakRealizedPnlUsd)} · Arms at ${formatExactUsd(q.ratchetActivationUsd)}`;
   const pnlNegative = compareDecimalStrings(bs.bankedNetPnlUsd, '0') < 0;
+  const surplusNegative = compareDecimalStrings(bs.netSurplusUsd, '0') < 0;
 
-  return `<section class="panel banked-profits-hero is-connected" data-banked-profits-hero="true" aria-label="Session Realized P&amp;L and Internal Vault Reserve Scoreboard">
+  let card1Sub = `Equity ${formatExactUsd(bs.currentTotalEquityUsd)} vs ${principalFormatted} Principal · At starting principal`;
+  if (bs.capitalStatus === 'RECOVERY_MODE') {
+    card1Sub = `Equity ${formatExactUsd(bs.currentTotalEquityUsd)} vs ${principalFormatted} Principal · ${formatExactUsd(bs.deficitToPrincipalUsd)} to breakeven`;
+  } else if (bs.capitalStatus === 'IN_SURPLUS') {
+    card1Sub = `Equity ${formatExactUsd(bs.currentTotalEquityUsd)} vs ${principalFormatted} Principal · True surplus above High-Water Mark`;
+  }
+
+  const card2Eyebrow = isUnderwater
+    ? '2 · Session Recovery Today (Internal Ledger)'
+    : '2 · Session Realized Net P&amp;L (Today · Internal Ledger)';
+  const card2Sub = isUnderwater
+    ? `Rebuilding principal — NOT surplus profit · ${bs.closedTrades} closed trades (${bs.winCount}W / ${bs.lossCount}L) · 70% Session Floor: ${floorDisplay} · ${floorDetail}`
+    : `${signedPct} · ${bs.closedTrades} closed trades (${bs.winCount}W / ${bs.lossCount}L) · Internal ledger figure · 70% Session Floor: ${floorDisplay} · ${floorDetail} · Session ${bs.sessionDate}`;
+
+  const pendingTransferHtml = hasPendingUnconfirmed
+    ? ` · <strong class="pending-transfer-inline">Pending / Unconfirmed Transfers: ${esc(formatExactUsd(pendingUnconfirmedUsd))} (excluded from surplus)</strong>`
+    : '';
+  const settledPayoutSummaryHtml = `<strong class="confirmed-payout-inline">Confirmed Settled Payouts: ${esc(formatExactUsd(confirmedSettledUsd))}</strong> <span class="quiet-note">(Confirmed Bank Payouts: ${esc(formatExactUsd(confirmedSettledUsd))})</span>${pendingTransferHtml}`;
+
+  const card3ValueHtml = bs.vaultSweepsPausedForRecovery
+    ? `Bank Vault Sweeps Paused ($0.00 until > ${esc(principalFormatted)})`
+    : `${esc(formatExactUsd(reserveUsd))} Internal Vault Reserve`;
+  const card3SubHtml = bs.vaultSweepsPausedForRecovery
+    ? `100% of recovery stays in trading capital · ${settledPayoutSummaryHtml}`
+    : `${esc(formatExactUsd(surplusCompoundingUsd))} Surplus Compounding · Internal Ledger Reserve — Not a Confirmed Bank Payout · ${settledPayoutSummaryHtml}`;
+
+  const legBadge = bs.activeSessionLeg > 1 ? ` (Leg #${esc(String(bs.activeSessionLeg))})` : '';
+  const card4ModeHtml = isRespite
+    ? `RESEARCH RESPITE · Quota Lock Active${legBadge} (0 New Risk · Observing 20 Markets)`
+    : `ACTIVE TRADING${legBadge}`;
+  const isRegionalActive = isUnderwater && bs.sessionCadence !== 'DAILY_NY';
+  const nextWakeupLabel = resolveNextAutoWakeupLabel(bs);
+  const card4ScheduleHtml = isRegionalActive
+    ? `Window: ${esc(bs.activeRegionWindow)} · Next Auto-Wakeup: ${esc(nextWakeupLabel)}${bs.nextSessionOpensUtc ? ` · ${esc(bs.nextSessionOpensUtc)}` : ''} (17:00 America/New_York once in surplus)`
+    : `Window: ${esc(bs.activeRegionWindow)} · Next Session Rollover: ${esc(bs.sessionRolloverLabel)}${bs.nextSessionOpensUtc ? ` · ${esc(bs.nextSessionOpensUtc)}` : ''}`;
+  const isRegionalBtnSelected = bs.sessionCadence === 'REGIONAL_RECOVERY' || bs.sessionCadence === 'REGIONAL_8H';
+  const advanceBtnHtml = bs.canAdvanceRecoverySession
+    ? `<button type="button" class="button button-small button-warning recovery-advance-btn" data-ai-overseer-action="ADVANCE_RECOVERY_SESSION" ${busy ? 'disabled' : ''}>Resume Next Region Session</button>`
+    : '';
+
+  return `<section class="panel banked-profits-hero is-connected ${isUnderwater ? 'is-recovery-mode' : 'is-in-surplus'}" data-banked-profits-hero="true" aria-label="Principal High-Water Mark and Session Vault Scoreboard">
     <div class="banked-hero-head">
       <div>
-        <p class="eyebrow">SESSION REALIZED P&amp;L &amp; INTERNAL VAULT LEDGER · ZERO-SCROLL SCOREBOARD</p>
-        <h2>Today&#39;s Session Realized Net P&amp;L, 70% Protected Floor &amp; 50% Internal Vault Reserve</h2>
-        <p class="banked-accounting-disclaimer" data-accounting-disclaimer="true"><strong>Internal Accounting Figure — Not a Confirmed Bank Payout</strong> · Basis: <code>${esc(bs.accountingBasis ?? 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT')}</code> · Settled bank transfers appear separately under Confirmed Bank Payouts.</p>
+        <p class="eyebrow">PRINCIPAL HIGH-WATER MARK &amp; INTERNAL VAULT LEDGER · ZERO-SCROLL SCOREBOARD</p>
+        <h2>${isUnderwater ? 'Principal Recovery Progress, 70% Session Floor &amp; High-Water Vault Gate' : 'True Surplus Above Principal, 70% Session Floor &amp; 50% Internal Vault Reserve'}</h2>
+        <p class="banked-accounting-disclaimer" data-accounting-disclaimer="true"><strong>Internal Accounting Figure — Not a Confirmed Bank Payout</strong> · Basis: <code>${esc(bs.accountingBasis ?? 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT')}</code> · Zero vault sweeps occur while total equity is at or below ${esc(principalFormatted)} starting principal.</p>
       </div>
       <div class="banked-hero-actions">
+        <span class="principal-status-badge ${principalBadgeClass}" data-principal-status-badge="${esc(bs.capitalStatus)}">${esc(principalBadgeText)}</span>
         <span class="exec-mode-badge ${isLiveArmed ? 'is-live-armed' : 'is-demo-mode'}" data-session-funding-mode="${isLiveArmed ? 'LIVE' : 'DEMO_PRACTICE'}">${isLiveArmed ? 'LIVE REAL-MONEY ACCOUNT' : 'DEMO PRACTICE ACCOUNT (SIMULATED FUNDS)'}</span>
         <span class="banked-status-pill ${isRespite ? 'is-respite' : 'is-active'}">${isRespite ? 'RESEARCH RESPITE · QUOTA LOCK ACTIVE' : 'ACTIVE SESSION P&amp;L TRACKER'}</span>
       </div>
     </div>
     <div class="banked-hero-grid">
-      <article class="banked-hero-card">
-        <span class="eyebrow">1 · Session Realized Net P&amp;L (Today · Internal Ledger)</span>
+      <article class="banked-hero-card ${isUnderwater ? 'is-recovery-card' : ''}" data-principal-surplus-card="true">
+        <span class="eyebrow">1 · Net Surplus vs Starting Capital (${esc(principalFormatted)})</span>
+        <div class="banked-hero-value numeric ${surplusNegative ? 'is-neg' : (bs.capitalStatus === 'IN_SURPLUS' ? 'is-pos' : '')}">${esc(formatSignedUsd(bs.netSurplusUsd))}</div>
+        <p class="banked-hero-sub numeric">${esc(card1Sub)}</p>
+      </article>
+      <article class="banked-hero-card ${isUnderwater ? 'is-recovery-card' : ''}">
+        <span class="eyebrow">${card2Eyebrow}</span>
         <div class="banked-hero-value numeric ${pnlNegative ? 'is-neg' : 'is-pos'}">${esc(formatSignedUsd(bs.bankedNetPnlUsd))}</div>
-        <p class="banked-hero-sub numeric">${esc(signedPct)} · ${esc(bs.closedTrades)} closed trades (${esc(bs.winCount)}W / ${esc(bs.lossCount)}L) · Internal ledger figure · Session ${esc(bs.sessionDate)}</p>
+        <p class="banked-hero-sub numeric">${esc(card2Sub)}</p>
+      </article>
+      <article class="banked-hero-card ${bs.vaultSweepsPausedForRecovery ? 'is-recovery-card' : ''}">
+        <span class="eyebrow">3 · 50% Principal High-Water Vault &amp; Confirmed Payouts</span>
+        <div class="banked-hero-value numeric ${bs.vaultSweepsPausedForRecovery ? 'banked-hero-paused' : ''}">${card3ValueHtml}</div>
+        <p class="banked-hero-sub numeric">${card3SubHtml}</p>
       </article>
       <article class="banked-hero-card">
-        <span class="eyebrow">2 · 70% Protected Profit Floor (Session Rule)</span>
-        <div class="banked-hero-value numeric is-pos">${esc(floorDisplay)}</div>
-        <p class="banked-hero-sub numeric">${esc(floorDetail)}</p>
-      </article>
-      <article class="banked-hero-card">
-        <span class="eyebrow">3 · 50% Internal Vault Reserve &amp; Confirmed Payouts</span>
-        <div class="banked-hero-value numeric">${esc(formatExactUsd(reserveUsd))} Internal Vault Reserve</div>
-        <p class="banked-hero-sub numeric">${esc(formatExactUsd(retainedUsd))} Retained Compounding · <strong class="confirmed-payout-inline">Confirmed Bank Payouts: ${esc(formatExactUsd(confirmedPayoutsUsd))}</strong></p>
-      </article>
-      <article class="banked-hero-card">
-        <span class="eyebrow">4 · Session Mode &amp; 17:00 Rollover</span>
-        <div class="banked-hero-value banked-hero-mode">${isRespite ? 'RESEARCH RESPITE · Quota Lock Active (0 New Risk · Observing 20 Markets)' : 'ACTIVE TRADING'}</div>
-        <p class="banked-hero-sub">Next Session Rollover: ${esc(bs.sessionRolloverLabel)}${bs.nextSessionOpensUtc ? ` · ${esc(bs.nextSessionOpensUtc)}` : ''}</p>
-        <div class="banked-card-cta"><button type="button" class="button button-small button-primary banked-voice-btn" data-open-voice-explainer="true">Ask / Speak to Gemini 4 Neon</button></div>
+        <span class="eyebrow">4 · Session Mode &amp; Recovery Cadence</span>
+        <div class="banked-hero-value banked-hero-mode">${card4ModeHtml}</div>
+        <p class="banked-hero-sub">${card4ScheduleHtml}</p>
+        <div class="cadence-toggle-group" role="group" aria-label="Session cadence mode">
+          <button type="button" class="button button-small cadence-toggle-btn ${bs.sessionCadence === 'AUTO' ? 'selected' : 'button-secondary'}" data-ai-session-cadence="AUTO" aria-pressed="${bs.sessionCadence === 'AUTO'}" ${busy ? 'disabled' : ''}>Auto (3-Region Recovery → 17:00 NY)</button>
+          <button type="button" class="button button-small cadence-toggle-btn ${isRegionalBtnSelected ? 'selected' : 'button-secondary'}" data-ai-session-cadence="REGIONAL_8H" aria-pressed="${isRegionalBtnSelected}" ${busy ? 'disabled' : ''}>3-Region 8h (Asia · London · NY)</button>
+          <button type="button" class="button button-small cadence-toggle-btn ${bs.sessionCadence === 'DAILY_NY' ? 'selected' : 'button-secondary'}" data-ai-session-cadence="DAILY_NY" aria-pressed="${bs.sessionCadence === 'DAILY_NY'}" ${busy ? 'disabled' : ''}>Daily 17:00 America/New_York</button>
+        </div>
+        <div class="banked-card-cta">${advanceBtnHtml}<button type="button" class="button button-small button-primary banked-voice-btn" data-open-voice-explainer="true">Ask / Speak to Gemini 4 Neon</button></div>
       </article>
     </div>
   </section>`;
