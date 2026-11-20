@@ -17,7 +17,13 @@ import {
   renderBankedProfitsHeroBanner,
   shouldAutoConnectLiveFeed,
 } from './ai-overseer.mjs';
-import { MAX_TREASURY_BYTES, mountAnalyticsCanvases, normalizeParallelTiers, normalizeTreasury } from './analytics.mjs';
+import {
+  MAX_TREASURY_BYTES,
+  mountAnalyticsCanvases,
+  normalizeParallelTiers,
+  normalizeTreasury,
+  renderEquityAndAnalyticsSection,
+} from './analytics.mjs';
 import {
   clampCapitalUsd,
   clampLotHundredths,
@@ -213,7 +219,8 @@ function rerenderAiSectionsInPlace(focusSelector = null) {
   const sy = window.scrollY || 0;
   const currentHero = root.querySelector('[data-banked-profits-hero="true"]');
   const currentOverseer = root.querySelector('.ai-overseer-panel');
-  if (!currentHero && !currentOverseer) {
+  const currentAnalytics = root.querySelector('.analytics-vault-panel');
+  if (!currentHero && !currentOverseer && !currentAnalytics) {
     render();
     return;
   }
@@ -225,8 +232,34 @@ function rerenderAiSectionsInPlace(focusSelector = null) {
     const nextOverseer = new DOMParser().parseFromString(renderAiOverseerPanel(state), 'text/html').body.firstElementChild;
     if (nextOverseer) currentOverseer.replaceWith(nextOverseer);
   }
+  if (currentAnalytics) {
+    const nextAnalytics = new DOMParser().parseFromString(renderEquityAndAnalyticsSection(state), 'text/html').body.firstElementChild;
+    if (nextAnalytics) {
+      currentAnalytics.replaceWith(nextAnalytics);
+      try { mountAnalyticsCanvases(root, state); } catch { /* Headless canvas optional. */ }
+    }
+  }
   if (focusSelector) {
     root.querySelector(focusSelector)?.focus({ preventScroll: true });
+  }
+  if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
+}
+
+function rerenderAnalyticsInPlace(focusSelector = null) {
+  const sx = window.scrollX || 0;
+  const sy = window.scrollY || 0;
+  const currentAnalytics = root.querySelector('.analytics-vault-panel');
+  if (!currentAnalytics) {
+    render();
+    return;
+  }
+  const nextAnalytics = new DOMParser().parseFromString(renderEquityAndAnalyticsSection(state), 'text/html').body.firstElementChild;
+  if (nextAnalytics) {
+    currentAnalytics.replaceWith(nextAnalytics);
+    try { mountAnalyticsCanvases(root, state); } catch { /* Headless canvas optional. */ }
+    if (focusSelector) {
+      nextAnalytics.querySelector(focusSelector)?.focus({ preventScroll: true });
+    }
   }
   if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
 }
@@ -1026,7 +1059,8 @@ root.addEventListener('click', (event) => {
   }
   if (target.dataset.inspectTrade) {
     state.inspectedTradeIdx = Math.max(0, Number(target.dataset.inspectTrade) || 0);
-    render(); return;
+    rerenderAnalyticsInPlace(`[data-inspect-trade="${state.inspectedTradeIdx}"]`);
+    return;
   }
   if (target.dataset.route) { window.location.hash = target.dataset.route; return; }
   if (target.dataset.control) { dialogContext = target.dataset.control; openDialog(renderControlDialog(target.dataset.control, state.transport), target); return; }

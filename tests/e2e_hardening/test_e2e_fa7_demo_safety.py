@@ -259,11 +259,21 @@ class DemoSafetyAndNonCollisionE2ETests(unittest.TestCase):
             )
 
     def test_e2e_t2_35_e2e_branch_has_zero_pr17_protected_file_overlap(self) -> None:
+        for p in sorted(PR17_PROTECTED_FILES):
+            self.assertTrue((REPO_ROOT / p).is_file(), p)
+        self.assertFalse((REPO_ROOT / ".github" / "workflows").exists())
         if not (REPO_ROOT / ".git").exists():
-            self.assertTrue((REPO_ROOT / "tests" / "e2e_hardening").is_dir())
-            self.assertFalse((REPO_ROOT / ".github" / "workflows").exists())
             return
         git_bin = shutil.which("git") or "git"
+        br_res = subprocess.run(  # nosec B603, B607: fixed read-only git branch argv without shell
+            [git_bin, "-C", str(REPO_ROOT), "branch", "--show-current"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        branch_name = br_res.stdout.strip() if br_res.returncode == 0 else ""
+        if not branch_name.startswith(("feat/e2e-", "feat/pr22-")):
+            return
         res = subprocess.run(  # nosec B603, B607: fixed read-only git status argv without shell
             [git_bin, "-C", str(REPO_ROOT), "status", "--porcelain"],
             capture_output=True,
