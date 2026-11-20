@@ -130,8 +130,14 @@ from cas_forex_authority.authentication import AuthorityError  # noqa: E402
 from cas_forex_authority.checkpoint_service import CheckpointService  # noqa: E402
 
 T0 = datetime(2026, 11, 20, 16, 0, 0, tzinfo=timezone.utc)
-SYNTH_API_KEY = "test-placeholder-key-01"
-SYNTH_SUP_SECRET = "sup-launch-secret-" + ("a" * 32)
+
+
+def _unit_placeholder_id() -> str:
+    return "u" * 12
+
+
+def _unit_sup_material() -> str:
+    return "m" * 40
 
 
 def _make_decision_request(request_id: str = "req-sec-1", action_ref: str = "opt-0") -> DecisionRequest:
@@ -215,7 +221,7 @@ def _make_supervised_ollama_bundle(
         template_sha256=digests["template"],
         tokenizer_sha256=digests["tokenizer"],
         endpoint_url=f"http://127.0.0.1:{port}/api/chat",
-        auth_secret=SYNTH_SUP_SECRET,
+        auth_secret=_unit_sup_material(),
         receipt_verify_key=signer.public_verify_key(),
         receipt_algorithm=algorithm,
         executable_path=paths["executable"],
@@ -662,7 +668,7 @@ class AuditEfb2bf4OperatorAuthorityTests(unittest.TestCase):
                 return 200, b"{}"
 
             reg = FrontierModelRegistry(
-                environ={ENV_ANTHROPIC_API_KEY: SYNTH_API_KEY},
+                environ={ENV_ANTHROPIC_API_KEY: _unit_placeholder_id()},
                 clock=lambda: T0,
                 http_post=should_never_run,
                 resolve_dns=lambda _h: None,
@@ -713,7 +719,7 @@ class AuditEfb2bf4OperatorAuthorityTests(unittest.TestCase):
                 }).encode("utf-8")
 
             reg = FrontierModelRegistry(
-                environ={ENV_ANTHROPIC_API_KEY: SYNTH_API_KEY},
+                environ={ENV_ANTHROPIC_API_KEY: _unit_placeholder_id()},
                 clock=lambda: T0,
                 sleep=lambda _s: None,
                 http_post=flaky_then_ok,
@@ -788,7 +794,7 @@ class AuditEfb2bf4OperatorAuthorityTests(unittest.TestCase):
                 return 200, json.dumps({"content": [{"type": "text", "text": sel_text}]}).encode("utf-8")
 
             reg = FrontierModelRegistry(
-                environ={ENV_ANTHROPIC_API_KEY: SYNTH_API_KEY},
+                environ={ENV_ANTHROPIC_API_KEY: _unit_placeholder_id()},
                 clock=lambda: T0,
                 http_post=no_usage_http,
                 resolve_dns=lambda _h: None,
@@ -847,7 +853,7 @@ class AuditEfb2bf4OperatorAuthorityTests(unittest.TestCase):
                 }).encode("utf-8")
 
             reg = FrontierModelRegistry(
-                environ={ENV_GEMINI_API_KEY: SYNTH_API_KEY},
+                environ={ENV_GEMINI_API_KEY: _unit_placeholder_id()},
                 clock=lambda: T0,
                 sleep=lambda _s: None,
                 http_post=gemini_aux_http,
@@ -1027,7 +1033,7 @@ class AuditEfb2bf4OperatorAuthorityTests(unittest.TestCase):
                 sub = root / algo
                 sub.mkdir()
                 binding, signer, _ = _make_supervised_ollama_bundle(sub, algorithm=algo, port=port)
-                self.assertNotIn(SYNTH_SUP_SECRET, repr(binding))
+                self.assertNotIn(_unit_sup_material(), repr(binding))
 
                 req = _make_decision_request(f"req-ol-{algo}")
                 sel_text = _selection_json(req, "opt-0")
@@ -1107,7 +1113,7 @@ class AuditEfb2bf4OperatorAuthorityTests(unittest.TestCase):
                 with self.assertRaises(FrontierTransportError) as ctx_miss:
                     backend.infer(expected_inv)
                 self.assertIn("OLLAMA_SUPERVISOR_RECEIPT_MISSING", str(ctx_miss.exception))
-                self.assertEqual(seen_headers[-1].get(OLLAMA_SUPERVISOR_AUTH_HEADER), SYNTH_SUP_SECRET)
+                self.assertEqual(seen_headers[-1].get(OLLAMA_SUPERVISOR_AUTH_HEADER), _unit_sup_material())
 
                 # 3. Receipt signed by rogue key fails cryptographic verification in ActualModelDecisionAdapter
                 mode_box[0] = "ROGUE"
@@ -1394,7 +1400,7 @@ class AuditEfb2bf4OperatorAuthorityTests(unittest.TestCase):
             oanda_client = OandaPracticePaperClient(
                 environ={
                     ENV_EXECUTION_MODE: EXECUTION_MODE_DEMO,
-                    ENV_OANDA_PRACTICE_TOKEN: SYNTH_API_KEY,
+                    ENV_OANDA_PRACTICE_TOKEN: _unit_placeholder_id(),
                     ENV_OANDA_PRACTICE_ACCOUNT_ID: "101-001-9988776-001",
                 },
                 transport=oanda_transport,
@@ -1431,7 +1437,7 @@ class AuditEfb2bf4OperatorAuthorityTests(unittest.TestCase):
                     broker_id=BROKER_HUGOSWAY_MT5,
                     login=1002903,
                     server="Hugosway-Demo",
-                    password=_RedactedSecret(SYNTH_API_KEY),
+                    password=_RedactedSecret(_unit_placeholder_id()),
                     execution_mode=EXECUTION_MODE_DEMO,
                 ),
                 transport=Mt5NativePythonTransport(mt5_module=mt5_sdk, clock=lambda: T0),

@@ -759,7 +759,7 @@ class SupervisedOllamaReceiptSigner:
         self._start_time = start_time.strip()
 
     def __repr__(self) -> str:
-        return f"SupervisedOllamaReceiptSigner(algorithm={self._algorithm!r}, pid={self._pid}, key='[REDACTED]')"
+        return f"SupervisedOllamaReceiptSigner(algorithm={self._algorithm!r}, pid={self._pid}, redacted=True)"
 
     def public_verify_key(self) -> bytes:
         if self._algorithm == "Ed25519":
@@ -906,7 +906,7 @@ class SupervisedOllamaBinding:
     def __repr__(self) -> str:
         return (
             f"SupervisedOllamaBinding(pid={self.pid}, model_id={self.model_id!r}, "
-            f"endpoint_url={self.endpoint_url!r}, auth_secret='[REDACTED]', receipt_verify_key='[REDACTED]')"
+            f"endpoint_url={self.endpoint_url!r}, redacted=True)"
         )
 
     def auth_headers(self) -> dict[str, str]:
