@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:parallel-tiers:1.0",
+  "title": "ParallelTierEngineSnapshot",
+  "description": "Multi-tier compounding telemetry snapshot for GET /api/parallel-tiers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "tier_count",
+    "tiers",
+    "growth_series"
+  ],
+  "properties": {
+    "schema": {
+      "const": "cas-forex.parallel-tiers/1"
+    },
+    "tier_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 16
+    },
+    "tiers": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "$ref": "#/$defs/tierAccount"
+      }
+    },
+    "growth_series": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "TIER_1_CURRENT": {
+          "$ref": "#/$defs/growthSeriesList"
+        },
+        "TIER_2_1000": {
+          "$ref": "#/$defs/growthSeriesList"
+        },
+        "TIER_3_3000": {
+          "$ref": "#/$defs/growthSeriesList"
+        },
+        "TIER_4_6000": {
+          "$ref": "#/$defs/growthSeriesList"
+        },
+        "TIER_5_300": {
+          "$ref": "#/$defs/growthSeriesList"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+    },
+    "decimal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 31,
+      "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+    },
+    "nonNegativeInt": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 32,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$"
+    },
+    "growthPoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observed_at",
+        "equity_usd",
+        "growth_pct"
+      ],
+      "properties": {
+        "observed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "equity_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "growth_pct": {
+          "$ref": "#/$defs/decimal"
+        }
+      }
+    },
+    "growthSeriesList": {
+      "type": "array",
+      "maxItems": 120,
+      "items": {
+        "$ref": "#/$defs/growthPoint"
+      }
+    },
+    "tierAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tier_id",
+        "label",
+        "color_class",
+        "starting_capital_usd",
+        "balance_usd",
+        "equity_usd",
+        "net_gain_usd",
+        "growth_pct",
+        "peak_equity_usd",
+        "drawdown_pct",
+        "open_positions",
+        "closed_trades",
+        "win_count",
+        "loss_count",
+        "win_rate_pct",
+        "profit_factor",
+        "bank_sweep_reserved_usd",
+        "retained_trading_usd",
+        "last_skip_reason",
+        "updated_at"
+      ],
+      "properties": {
+        "tier_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "color_class": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 64,
+          "pattern": "^tier-[a-z0-9-]+$"
+        },
+        "starting_capital_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "balance_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "equity_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "net_gain_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "growth_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "peak_equity_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "drawdown_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "open_positions": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "closed_trades": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "win_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "loss_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "win_rate_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "profit_factor": {
+          "anyOf": [
+            {
+              "const": "INF"
+            },
+            {
+              "$ref": "#/$defs/decimal"
+            }
+          ]
+        },
+        "bank_sweep_reserved_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "retained_trading_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "last_skip_reason": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 240
+            }
+          ]
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    }
+  }
+}

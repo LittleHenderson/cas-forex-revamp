@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 from threading import RLock
 from typing import Any
 import uuid
@@ -48,10 +49,14 @@ from cas_forex_revamp.contracts import (
     decimal_text,
 )
 from cas_forex_revamp.contracts.commands import ActionIntent
-from cas_forex_revamp.contracts.primitives import decimal_value, utc_time
+from cas_forex_revamp.contracts.primitives import decimal_value, parse_decimal, utc_time
 from cas_forex_revamp.operator.decisions import DecisionProposal
 from cas_forex_revamp.treasury.profit_sweep import ProfitSweepVault
-from cas_forex_revamp.valve.daily_quota import DailyQuotaGovernanceStore
+from cas_forex_revamp.valve.daily_quota import (
+    QUOTA_STATUS_LOCKED,
+    QUOTA_STATUS_LOSS_TRIPPED,
+    DailyQuotaGovernanceStore,
+)
 from cas_forex_revamp.valve.tks_meta_valve_controller import (
     DEFAULT_MAX_DRAWDOWN_PCT,
     ForexMetaValveGate,
@@ -94,12 +99,52 @@ def _iso(dt: datetime) -> str:
     return utc_time(dt, "timestamp").isoformat().replace("+00:00", "Z")
 
 
+def _parse_positive_signal_decimal(raw: Any, field: str) -> Decimal:
+    if isinstance(raw, Decimal):
+        return decimal_value(raw, field, positive=True)
+    if isinstance(raw, str):
+        return decimal_value(parse_decimal(raw.strip(), field), field, positive=True)
+    raise ContractError(f"{field} requires a positive Decimal or plain decimal string")
+
+
 def _tick_size(symbol: str) -> Decimal:
     if symbol in INDEX_INSTRUMENTS:
         return Decimal("0.01")
     if symbol.endswith("JPY"):
         return Decimal("0.001")
     return Decimal("0.00001")
+
+
+def _is_symlink_or_reparse(path: Path, st: os.stat_result) -> bool:
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    if getattr(st, "st_reparse_tag", 0) != 0:
+        return True
+    return hasattr(path, "is_junction") and bool(path.is_junction())
+
+
+def apply_verified_directory_mode(path: str | Path, dir_mode: int = 0o755) -> Path:
+    """Verify target is a real non-symlink directory via os.lstat before applying restrictive permissions."""
+    if (dir_mode & 0o022) != 0:
+        raise ContractError(f"directory mode {oct(dir_mode)} must not grant group or other write permissions")
+    target = Path(path)
+    st = os.lstat(target)
+    if _is_symlink_or_reparse(target, st) or not stat.S_ISDIR(st.st_mode):
+        raise ContractError(f"parallel-tier directory path must be a real directory, not a file or symlink: {target}")
+    os.chmod(target, dir_mode)  # nosec B103: owner-only verified directory mode after lstat + S_ISDIR
+    return target
+
+
+def apply_verified_regular_file_mode(path: str | Path, file_mode: int = 0o600) -> Path:
+    """Verify target is a real non-symlink regular file via os.lstat before applying restrictive permissions."""
+    if (file_mode & 0o066) != 0:
+        raise ContractError(f"file mode {oct(file_mode)} must not grant group or other read/write permissions")
+    target = Path(path)
+    st = os.lstat(target)
+    if _is_symlink_or_reparse(target, st) or not stat.S_ISREG(st.st_mode):
+        raise ContractError(f"parallel-tier file path must be a real regular file, not a directory or symlink: {target}")
+    os.chmod(target, file_mode)  # nosec B103: owner-only verified regular file mode after lstat + S_ISREG
+    return target
 
 
 class _TierProposal:
@@ -188,8 +233,7 @@ class ParallelTierEngine:
         if not isinstance(valve_gate, ForexMetaValveGate):
             raise ContractError("valve_gate must be a ForexMetaValveGate")
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        if os.name == "posix":
-            os.chmod(db_path.parent, 0o700)  # nosec B103: owner-only 0o700 parallel-tier state directory
+        apply_verified_directory_mode(db_path.parent, dir_mode=0o700)
         self.db_path = db_path
         self._valve = valve_gate
         self._specs = tuple(specs)
@@ -215,108 +259,129 @@ class ParallelTierEngine:
 
     def _init_db(self, *, sweep_ratio: Decimal) -> None:
         with self._lock, closing(self._connect()) as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS tier_accounts (
-                    tier_id TEXT PRIMARY KEY,
-                    label TEXT NOT NULL,
-                    color_class TEXT NOT NULL,
-                    starting_capital_usd TEXT NOT NULL,
-                    balance_usd TEXT NOT NULL,
-                    equity_usd TEXT NOT NULL,
-                    peak_equity_usd TEXT NOT NULL,
-                    realized_net_usd TEXT NOT NULL,
-                    win_count INTEGER NOT NULL,
-                    loss_count INTEGER NOT NULL,
-                    gross_profit_usd TEXT NOT NULL,
-                    gross_loss_usd TEXT NOT NULL,
-                    last_skip_reason TEXT,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS tier_positions (
-                    ticket TEXT PRIMARY KEY,
-                    tier_id TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    units TEXT NOT NULL,
-                    entry_price TEXT NOT NULL,
-                    stop_loss TEXT NOT NULL,
-                    take_profit TEXT,
-                    peak_favorable TEXT NOT NULL,
-                    protection_stage TEXT NOT NULL,
-                    entry_commission_usd TEXT NOT NULL,
-                    leg_index INTEGER NOT NULL,
-                    opened_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS tier_closed_trades (
-                    trade_id TEXT PRIMARY KEY,
-                    tier_id TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    units TEXT NOT NULL,
-                    entry_price TEXT NOT NULL,
-                    exit_price TEXT NOT NULL,
-                    commission_usd TEXT NOT NULL,
-                    net_pnl_usd TEXT NOT NULL,
-                    close_reason TEXT NOT NULL,
-                    opened_at TEXT NOT NULL,
-                    closed_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS tier_equity_history (
-                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tier_id TEXT NOT NULL,
-                    observed_at TEXT NOT NULL,
-                    equity_usd TEXT NOT NULL,
-                    growth_pct TEXT NOT NULL
-                );
-                """
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS tier_accounts (
+                        tier_id TEXT PRIMARY KEY,
+                        label TEXT NOT NULL,
+                        color_class TEXT NOT NULL,
+                        starting_capital_usd TEXT NOT NULL,
+                        balance_usd TEXT NOT NULL,
+                        equity_usd TEXT NOT NULL,
+                        peak_equity_usd TEXT NOT NULL,
+                        realized_net_usd TEXT NOT NULL,
+                        win_count INTEGER NOT NULL,
+                        loss_count INTEGER NOT NULL,
+                        gross_profit_usd TEXT NOT NULL,
+                        gross_loss_usd TEXT NOT NULL,
+                        last_skip_reason TEXT,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS tier_positions (
+                        ticket TEXT PRIMARY KEY,
+                        tier_id TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        units TEXT NOT NULL,
+                        entry_price TEXT NOT NULL,
+                        stop_loss TEXT NOT NULL,
+                        take_profit TEXT,
+                        peak_favorable TEXT NOT NULL,
+                        protection_stage TEXT NOT NULL,
+                        entry_commission_usd TEXT NOT NULL,
+                        leg_index INTEGER NOT NULL,
+                        opened_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS tier_closed_trades (
+                        trade_id TEXT PRIMARY KEY,
+                        tier_id TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        units TEXT NOT NULL,
+                        entry_price TEXT NOT NULL,
+                        exit_price TEXT NOT NULL,
+                        commission_usd TEXT NOT NULL,
+                        net_pnl_usd TEXT NOT NULL,
+                        close_reason TEXT NOT NULL,
+                        opened_at TEXT NOT NULL,
+                        closed_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS tier_equity_history (
+                        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tier_id TEXT NOT NULL,
+                        observed_at TEXT NOT NULL,
+                        equity_usd TEXT NOT NULL,
+                        growth_pct TEXT NOT NULL
+                    )
+                    """
+                )
+                cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(tier_accounts)").fetchall()}
+                if "color_class" not in cols:
+                    conn.execute("ALTER TABLE tier_accounts ADD COLUMN color_class TEXT NOT NULL DEFAULT 'tier-300k'")
+                    if "color_token" in cols:
+                        conn.execute("UPDATE tier_accounts SET color_class = color_token")
+                ts = _iso(self._clock())
+                for spec in self._specs:
+                    row = conn.execute("SELECT tier_id FROM tier_accounts WHERE tier_id = ?", (spec.tier_id,)).fetchone()
+                    if row is None:
+                        start_txt = decimal_text(spec.starting_capital_usd)
+                        conn.execute(
+                            """
+                            INSERT INTO tier_accounts(
+                                tier_id, label, color_class, starting_capital_usd, balance_usd,
+                                equity_usd, peak_equity_usd, realized_net_usd, win_count, loss_count,
+                                gross_profit_usd, gross_loss_usd, last_skip_reason, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, '0', 0, 0, '0', '0', NULL, ?)
+                            """,
+                            (spec.tier_id, spec.label, spec.color_class, start_txt, start_txt, start_txt, start_txt, ts),
+                        )
+                        conn.execute(
+                            "INSERT INTO tier_equity_history(tier_id, observed_at, equity_usd, growth_pct) VALUES (?, ?, ?, '0')",
+                            (spec.tier_id, ts, start_txt),
+                        )
+                conn.execute("COMMIT")
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+
+        vault_db = self.db_path.parent / f"{self.db_path.stem}_vault.sqlite3"
+        for spec in self._specs:
+            scope = f"tier:{spec.tier_id}"
+            self._peak_store.observe_equity(
+                scope,
+                current_equity=spec.starting_capital_usd,
+                opening_balance=spec.starting_capital_usd,
+                now=self._clock(),
             )
-            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(tier_accounts)").fetchall()}
-            if "color_class" not in cols:
-                conn.execute("ALTER TABLE tier_accounts ADD COLUMN color_class TEXT NOT NULL DEFAULT 'tier-300k'")
-                if "color_token" in cols:
-                    conn.execute("UPDATE tier_accounts SET color_class = color_token")
-            ts = _iso(self._clock())
-            vault_db = self.db_path.parent / f"{self.db_path.stem}_vault.sqlite3"
-            for spec in self._specs:
-                row = conn.execute("SELECT tier_id FROM tier_accounts WHERE tier_id = ?", (spec.tier_id,)).fetchone()
-                if row is None:
-                    start_txt = decimal_text(spec.starting_capital_usd)
-                    conn.execute(
-                        """
-                        INSERT INTO tier_accounts(
-                            tier_id, label, color_class, starting_capital_usd, balance_usd,
-                            equity_usd, peak_equity_usd, realized_net_usd, win_count, loss_count,
-                            gross_profit_usd, gross_loss_usd, last_skip_reason, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, '0', 0, 0, '0', '0', NULL, ?)
-                        """,
-                        (spec.tier_id, spec.label, spec.color_class, start_txt, start_txt, start_txt, start_txt, ts),
-                    )
-                    conn.execute(
-                        "INSERT INTO tier_equity_history(tier_id, observed_at, equity_usd, growth_pct) VALUES (?, ?, ?, '0')",
-                        (spec.tier_id, ts, start_txt),
-                    )
-                scope = f"tier:{spec.tier_id}"
-                self._peak_store.observe_equity(
-                    scope,
-                    current_equity=spec.starting_capital_usd,
-                    opening_balance=spec.starting_capital_usd,
-                    now=self._clock(),
-                )
-                self._quotas[spec.tier_id] = DailyQuotaGovernanceStore(
-                    path=self.db_path,
-                    scope_id=scope,
-                    quota_mode="PCT",
-                    daily_quota_pct=Decimal("0.025"),
-                    soft_quota_usd=Decimal("500"),
-                    hard_quota_usd=Decimal("1000"),
-                    max_loss_pct=Decimal("0.03"),
-                )
-                self._vaults[spec.tier_id] = ProfitSweepVault(
-                    vault_db, scope_id=scope, sweep_ratio=sweep_ratio, clock=self._clock
-                )
-        if os.name == "posix" and self.db_path.exists():
-            os.chmod(self.db_path, 0o600)  # nosec B103: owner-only 0o600 parallel-tier SQLite DB
+            self._quotas[spec.tier_id] = DailyQuotaGovernanceStore(
+                path=self.db_path,
+                scope_id=scope,
+                quota_mode="PCT",
+                daily_quota_pct=Decimal("0.025"),
+                soft_quota_usd=Decimal("500"),
+                hard_quota_usd=Decimal("1000"),
+                max_loss_pct=Decimal("0.03"),
+            )
+            self._vaults[spec.tier_id] = ProfitSweepVault(
+                vault_db, scope_id=scope, sweep_ratio=sweep_ratio, clock=self._clock
+            )
+        if self.db_path.exists():
+            apply_verified_regular_file_mode(self.db_path, file_mode=0o600)
 
     def _entry_commission(self, symbol: str, units: Decimal) -> Decimal:
         csize = self._calc.contract_size_for(symbol)
@@ -384,178 +449,238 @@ class ParallelTierEngine:
         ts_dt = utc_time(now or self._clock(), "now")
         ts = _iso(ts_dt)
 
+        validated_quotes: dict[str, tuple[Decimal, Decimal]] = {}
+        for q_sym, q_pair in quotes.items():
+            if not isinstance(q_pair, (tuple, list)) or len(q_pair) != 2:
+                raise ContractError(f"quotes[{q_sym!r}] must be a (bid, ask) pair")
+            q_bid = decimal_value(q_pair[0], f"quotes[{q_sym}].bid", positive=True)
+            q_ask = decimal_value(q_pair[1], f"quotes[{q_sym}].ask", positive=True)
+            if q_ask < q_bid:
+                raise ContractError(f"quotes[{q_sym}] has ask < bid")
+            validated_quotes[q_sym] = (q_bid, q_ask)
+        quotes = validated_quotes
+
+        sig_sym = ""
+        sig_side: Side | None = None
+        sig_sl: Decimal | None = None
+        sig_tp: Decimal | None = None
+        sig_regime = "TREND_IGNITION"
+        if signal is not None:
+            if not isinstance(signal, Mapping):
+                raise ContractError("signal must be a mapping")
+            sig_sym = str(signal.get("symbol") or "")
+            raw_side = signal.get("side")
+            side_text = "BUY" if raw_side is None else str(raw_side)
+            try:
+                sig_side = Side(side_text)
+            except ValueError as exc:
+                raise ContractError(f"invalid signal side {raw_side!r}") from exc
+            if sig_sym in quotes:
+                sig_sl = _parse_positive_signal_decimal(signal.get("stop_price"), "signal.stop_price")
+                raw_tp = signal.get("take_profit_price")
+                sig_tp = _parse_positive_signal_decimal(raw_tp, "signal.take_profit_price") if raw_tp is not None else None
+                sig_regime = str(signal.get("regime") or "TREND_IGNITION")
+
         with self._lock, closing(self._connect()) as conn:
             for spec in self._specs:
                 tid = spec.tier_id
-                acct = conn.execute("SELECT * FROM tier_accounts WHERE tier_id = ?", (tid,)).fetchone()
-                if acct is None:
-                    continue
-                balance = Decimal(str(acct["balance_usd"]))
-                positions = conn.execute("SELECT * FROM tier_positions WHERE tier_id = ?", (tid,)).fetchall()
+                pending_closes: list[tuple[str, str, str, Decimal, Decimal]] = []
                 open_unrealized = Decimal("0")
                 used_margin = Decimal("0")
+                balance = Decimal("0")
 
-                # 1. Mark-to-market, fast protection, and SL/TP exits on real bid/ask
-                for pos in positions:
-                    sym = str(pos["symbol"])
-                    if sym not in quotes:
+                # Tx 1: Atomic close / fast-protection updates for this tier (never spans external DB stores)
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    acct = conn.execute("SELECT * FROM tier_accounts WHERE tier_id = ?", (tid,)).fetchone()
+                    if acct is None:
+                        conn.execute("ROLLBACK")
                         continue
-                    bid, ask = quotes[sym]
-                    side = Side(str(pos["side"]))
-                    units = Decimal(str(pos["units"]))
-                    entry_p = Decimal(str(pos["entry_price"]))
-                    sl_p = Decimal(str(pos["stop_loss"]))
-                    tp_p = Decimal(str(pos["take_profit"])) if pos["take_profit"] is not None else None
-                    exit_px = bid if side is Side.BUY else ask
+                    balance = Decimal(str(acct["balance_usd"]))
+                    positions = conn.execute("SELECT * FROM tier_positions WHERE tier_id = ?", (tid,)).fetchall()
 
-                    # Check resting SL/TP trigger first
-                    hit_reason: str | None = None
-                    fill_exit = exit_px
-                    if side is Side.BUY:
-                        if exit_px <= sl_p:
-                            hit_reason = "STOP_LOSS"
-                            fill_exit = min(exit_px, sl_p)
-                        elif tp_p is not None and ask >= tp_p:
-                            hit_reason = "TAKE_PROFIT"
-                            fill_exit = tp_p
-                    else:
-                        if exit_px >= sl_p:
-                            hit_reason = "STOP_LOSS"
-                            fill_exit = max(exit_px, sl_p)
-                        elif tp_p is not None and bid <= tp_p:
-                            hit_reason = "TAKE_PROFIT"
-                            fill_exit = tp_p
+                    # 1. Mark-to-market, fast protection, and SL/TP exits on real bid/ask
+                    for pos in positions:
+                        sym = str(pos["symbol"])
+                        if sym not in quotes:
+                            continue
+                        bid, ask = quotes[sym]
+                        side = Side(str(pos["side"]))
+                        units = Decimal(str(pos["units"]))
+                        entry_p = Decimal(str(pos["entry_price"]))
+                        sl_p = Decimal(str(pos["stop_loss"]))
+                        tp_p = Decimal(str(pos["take_profit"])) if pos["take_profit"] is not None else None
+                        exit_px = bid if side is Side.BUY else ask
 
-                    _, q_ccy = Mt5MarginCalculator.split_symbol(sym)
-                    conv = self._calc.conversion_rate(q_ccy, quotes)
+                        # Check resting SL/TP trigger first
+                        hit_reason: str | None = None
+                        fill_exit = exit_px
+                        if side is Side.BUY:
+                            if exit_px <= sl_p:
+                                hit_reason = "STOP_LOSS"
+                                fill_exit = min(exit_px, sl_p)
+                            elif tp_p is not None and exit_px >= tp_p:
+                                hit_reason = "TAKE_PROFIT"
+                                fill_exit = tp_p
+                        else:
+                            if exit_px >= sl_p:
+                                hit_reason = "STOP_LOSS"
+                                fill_exit = max(exit_px, sl_p)
+                            elif tp_p is not None and exit_px <= tp_p:
+                                hit_reason = "TAKE_PROFIT"
+                                fill_exit = tp_p
 
-                    if hit_reason is not None:
+                        _, q_ccy = Mt5MarginCalculator.split_symbol(sym)
+                        conv = self._calc.conversion_rate(q_ccy, quotes)
+
+                        if hit_reason is not None:
+                            with localcontext() as ctx:
+                                ctx.prec = 40
+                                raw_pnl = ((fill_exit - entry_p) if side is Side.BUY else (entry_p - fill_exit)) * units * conv
+                                exit_comm = self._entry_commission(sym, units)
+                                entry_comm = Decimal(str(pos["entry_commission_usd"]))
+                                total_comm = entry_comm + exit_comm
+                                net_pnl = (raw_pnl - exit_comm).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                            balance = balance + net_pnl
+                            conn.execute("DELETE FROM tier_positions WHERE ticket = ?", (str(pos["ticket"]),))
+                            conn.execute(
+                                """
+                                INSERT INTO tier_closed_trades(
+                                    trade_id, tier_id, symbol, side, units, entry_price, exit_price,
+                                    commission_usd, net_pnl_usd, close_reason, opened_at, closed_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    f"ttr-{uuid.uuid4().hex[:14]}",
+                                    tid,
+                                    sym,
+                                    side.value,
+                                    decimal_text(units),
+                                    decimal_text(entry_p),
+                                    decimal_text(fill_exit),
+                                    decimal_text(total_comm),
+                                    decimal_text(net_pnl),
+                                    hit_reason,
+                                    str(pos["opened_at"]),
+                                    ts,
+                                ),
+                            )
+                            win_inc = 1 if net_pnl >= Decimal("0") else 0
+                            loss_inc = 0 if net_pnl >= Decimal("0") else 1
+                            gp = Decimal(str(acct["gross_profit_usd"])) + (net_pnl if net_pnl > 0 else Decimal("0"))
+                            gl = Decimal(str(acct["gross_loss_usd"])) + ((-net_pnl) if net_pnl < 0 else Decimal("0"))
+                            rl = Decimal(str(acct["realized_net_usd"])) + net_pnl
+                            conn.execute(
+                                """
+                                UPDATE tier_accounts SET balance_usd = ?, realized_net_usd = ?,
+                                    win_count = win_count + ?, loss_count = loss_count + ?,
+                                    gross_profit_usd = ?, gross_loss_usd = ?, updated_at = ?
+                                WHERE tier_id = ?
+                                """,
+                                (
+                                    decimal_text(balance),
+                                    decimal_text(rl),
+                                    win_inc,
+                                    loss_inc,
+                                    decimal_text(gp),
+                                    decimal_text(gl),
+                                    ts,
+                                    tid,
+                                ),
+                            )
+                            pending_closes.append((f"{tid}:{pos['ticket']}", sym, str(pos["ticket"]), net_pnl, balance))
+                            acct = conn.execute("SELECT * FROM tier_accounts WHERE tier_id = ?", (tid,)).fetchone()
+                            continue
+
+                        # Fast protection: Snap-to-Breakeven & Monotonic Trailing Stop
+                        prev_peak = Decimal(str(pos["peak_favorable"]))
+                        cur_px = bid if side is Side.BUY else ask
+                        peak = max(prev_peak, cur_px) if side is Side.BUY else min(prev_peak, cur_px)
+                        excursion = (peak - entry_p) if side is Side.BUY else (entry_p - peak)
+                        t_sz = _tick_size(sym)
+                        be_trig = Decimal("10.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("120")
+                        be_off = Decimal("1.50") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("10")
+                        trail_act = Decimal("22.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("220")
+                        trail_dist = Decimal("14.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("140")
+
+                        new_sl = sl_p
+                        new_stage = str(pos["protection_stage"])
+                        if excursion >= be_trig:
+                            cand_be = (entry_p + be_off if side is Side.BUY else entry_p - be_off).quantize(t_sz, rounding=ROUND_HALF_UP)
+                            if side is Side.BUY and cand_be < bid - t_sz and cand_be > new_sl:
+                                new_sl = cand_be
+                                new_stage = "BREAKEVEN_LOCKED"
+                            elif side is Side.SELL and cand_be > ask + t_sz and cand_be < new_sl:
+                                new_sl = cand_be
+                                new_stage = "BREAKEVEN_LOCKED"
+                        if excursion >= trail_act:
+                            cand_tr = (peak - trail_dist if side is Side.BUY else peak + trail_dist).quantize(t_sz, rounding=ROUND_HALF_UP)
+                            if side is Side.BUY and cand_tr < bid - t_sz and cand_tr > new_sl:
+                                new_sl = cand_tr
+                                new_stage = "TRAILING_PROFIT"
+                            elif side is Side.SELL and cand_tr > ask + t_sz and cand_tr < new_sl:
+                                new_sl = cand_tr
+                                new_stage = "TRAILING_PROFIT"
+                        if new_sl != sl_p or peak != prev_peak or new_stage != str(pos["protection_stage"]):
+                            conn.execute(
+                                "UPDATE tier_positions SET stop_loss = ?, peak_favorable = ?, protection_stage = ? WHERE ticket = ?",
+                                (decimal_text(new_sl), decimal_text(peak), new_stage, str(pos["ticket"])),
+                            )
+
                         with localcontext() as ctx:
                             ctx.prec = 40
-                            raw_pnl = ((fill_exit - entry_p) if side is Side.BUY else (entry_p - fill_exit)) * units * conv
-                            exit_comm = self._entry_commission(sym, units)
-                            entry_comm = Decimal(str(pos["entry_commission_usd"]))
-                            total_comm = entry_comm + exit_comm
-                            net_pnl = (raw_pnl - exit_comm).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                            upnl = (
+                                ((cur_px - entry_p) if side is Side.BUY else (entry_p - cur_px)) * units * conv
+                            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        open_unrealized += upnl
+                        used_margin += self._calc.required_margin(sym, side, units, quotes)
 
-                        balance = balance + net_pnl
-                        conn.execute("DELETE FROM tier_positions WHERE ticket = ?", (str(pos["ticket"]),))
-                        conn.execute(
-                            """
-                            INSERT INTO tier_closed_trades(
-                                trade_id, tier_id, symbol, side, units, entry_price, exit_price,
-                                commission_usd, net_pnl_usd, close_reason, opened_at, closed_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                f"ttr-{uuid.uuid4().hex[:14]}",
-                                tid,
-                                sym,
-                                side.value,
-                                decimal_text(units),
-                                decimal_text(entry_p),
-                                decimal_text(fill_exit),
-                                decimal_text(total_comm),
-                                decimal_text(net_pnl),
-                                hit_reason,
-                                str(pos["opened_at"]),
-                                ts,
-                            ),
-                        )
-                        win_inc = 1 if net_pnl >= Decimal("0") else 0
-                        loss_inc = 0 if net_pnl >= Decimal("0") else 1
-                        gp = Decimal(str(acct["gross_profit_usd"])) + (net_pnl if net_pnl > 0 else Decimal("0"))
-                        gl = Decimal(str(acct["gross_loss_usd"])) + ((-net_pnl) if net_pnl < 0 else Decimal("0"))
-                        rl = Decimal(str(acct["realized_net_usd"])) + net_pnl
-                        conn.execute(
-                            """
-                            UPDATE tier_accounts SET balance_usd = ?, realized_net_usd = ?,
-                                win_count = win_count + ?, loss_count = loss_count + ?,
-                                gross_profit_usd = ?, gross_loss_usd = ?, updated_at = ?
-                            WHERE tier_id = ?
-                            """,
-                            (
-                                decimal_text(balance),
-                                decimal_text(rl),
-                                win_inc,
-                                loss_inc,
-                                decimal_text(gp),
-                                decimal_text(gl),
-                                ts,
-                                tid,
-                            ),
-                        )
-                        self._vaults[tid].record_realized_close(
-                            trade_id=f"{tid}:{pos['ticket']}",
-                            symbol=sym,
-                            broker_id=tid,
-                            realized_net_usd=net_pnl,
-                            occurred_at=ts_dt,
-                        )
-                        self._quotas[tid].record_realized_trade(
-                            net_pnl, symbol=sym, ticket=str(pos["ticket"]), starting_equity=balance, now=ts_dt
-                        )
-                        acct = conn.execute("SELECT * FROM tier_accounts WHERE tier_id = ?", (tid,)).fetchone()
-                        continue
+                    conn.execute("COMMIT")
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
 
-                    # Fast protection: Snap-to-Breakeven & Monotonic Trailing Stop
-                    prev_peak = Decimal(str(pos["peak_favorable"]))
-                    cur_px = bid if side is Side.BUY else ask
-                    peak = max(prev_peak, cur_px) if side is Side.BUY else min(prev_peak, cur_px)
-                    excursion = (peak - entry_p) if side is Side.BUY else (entry_p - peak)
-                    t_sz = _tick_size(sym)
-                    be_trig = Decimal("10.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("120")
-                    be_off = Decimal("1.50") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("10")
-                    trail_act = Decimal("22.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("220")
-                    trail_dist = Decimal("14.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("140")
-
-                    new_sl = sl_p
-                    new_stage = str(pos["protection_stage"])
-                    if excursion >= be_trig:
-                        cand_be = (entry_p + be_off if side is Side.BUY else entry_p - be_off).quantize(t_sz, rounding=ROUND_HALF_UP)
-                        if side is Side.BUY and cand_be < bid - t_sz and cand_be > new_sl:
-                            new_sl = cand_be
-                            new_stage = "BREAKEVEN_LOCKED"
-                        elif side is Side.SELL and cand_be > ask + t_sz and cand_be < new_sl:
-                            new_sl = cand_be
-                            new_stage = "BREAKEVEN_LOCKED"
-                    if excursion >= trail_act:
-                        cand_tr = (peak - trail_dist if side is Side.BUY else peak + trail_dist).quantize(t_sz, rounding=ROUND_HALF_UP)
-                        if side is Side.BUY and cand_tr < bid - t_sz and cand_tr > new_sl:
-                            new_sl = cand_tr
-                            new_stage = "TRAILING_PROFIT"
-                        elif side is Side.SELL and cand_tr > ask + t_sz and cand_tr < new_sl:
-                            new_sl = cand_tr
-                            new_stage = "TRAILING_PROFIT"
-                    if new_sl != sl_p or peak != prev_peak or new_stage != str(pos["protection_stage"]):
-                        conn.execute(
-                            "UPDATE tier_positions SET stop_loss = ?, peak_favorable = ?, protection_stage = ? WHERE ticket = ?",
-                            (decimal_text(new_sl), decimal_text(peak), new_stage, str(pos["ticket"])),
-                        )
-
-                    with localcontext() as ctx:
-                        ctx.prec = 40
-                        upnl = ((cur_px - entry_p) if side is Side.BUY else (entry_p - cur_px)) * units * conv
-                    open_unrealized += upnl
-                    used_margin += self._calc.required_margin(sym, side, units, quotes)
+                # Propagate committed closes to external stores outside any write transaction on self.db_path
+                for close_trade_id, close_sym, close_ticket, net_pnl, post_balance in pending_closes:
+                    self._vaults[tid].record_realized_close(
+                        trade_id=close_trade_id,
+                        symbol=close_sym,
+                        broker_id=tid,
+                        realized_net_usd=net_pnl,
+                        occurred_at=ts_dt,
+                    )
+                    self._quotas[tid].record_realized_trade(
+                        net_pnl, symbol=close_sym, ticket=close_ticket, starting_equity=post_balance, now=ts_dt
+                    )
 
                 equity = balance + open_unrealized
+                if equity > Decimal("0"):
+                    self._quotas[tid].observe_day_start(equity, now=ts_dt)
                 pk_val = self._peak_store.observe_equity(
                     f"tier:{tid}", current_equity=equity, opening_balance=spec.starting_capital_usd, now=ts_dt
                 )
                 deployable = self._vaults[tid].deployable_equity(equity)
                 free_margin = max(Decimal("0"), equity - used_margin)
 
-                # 2. Evaluate optional entry or House-Money ADD signal per tier independently
-                if signal is not None:
-                    sym = str(signal.get("symbol") or "")
-                    side = Side(str(signal.get("side") or "BUY"))
+                # 2. Evaluate optional entry or House-Money ADD signal per tier independently (outside write tx)
+                has_signal_quote = False
+                skip_reason: str | None = None
+                pending_entry: tuple[Any, ...] | None = None
+                entry_comm = Decimal("0")
+                if signal is not None and sig_side is not None:
+                    sym = sig_sym
+                    side = sig_side
                     if sym in quotes:
+                        if sig_sl is None:
+                            raise ContractError("signal.stop_price is required")
+                        has_signal_quote = True
                         bid, ask = quotes[sym]
                         entry_px = ask if side is Side.BUY else bid
-                        sl_p = Decimal(str(signal["stop_price"]))
-                        tp_p = Decimal(str(signal["take_profit_price"])) if signal.get("take_profit_price") is not None else None
-                        regime = str(signal.get("regime") or "TREND_IGNITION")
+                        sl_p = sig_sl
+                        tp_p = sig_tp
+                        regime = sig_regime
 
                         existing_rows = conn.execute(
                             "SELECT * FROM tier_positions WHERE tier_id = ? AND symbol = ? AND side = ? ORDER BY leg_index ASC",
@@ -567,16 +692,23 @@ class ParallelTierEngine:
                         allowed_q, q_reason, q_mult = self._quotas[tid].evaluate_new_risk(
                             req_kind, now=ts_dt, starting_equity=equity
                         )
-                        skip_reason: str | None = None
-                        # Strong-trend runner override on ADD if earlier legs are BREAKEVEN_LOCKED
-                        if not allowed_q and is_add and regime == "STRONG_TREND":
-                            allowed_q = True
-                            q_mult = Decimal("0.50")
+                        # Strong-trend runner override on ADD when daily profit quota is locked (never bypass loss circuit)
+                        if not allowed_q and q_reason == QUOTA_STATUS_LOCKED and is_add and regime == "STRONG_TREND":
+                            q_snap = self._quotas[tid].snapshot(now=ts_dt, starting_equity=equity)
+                            q_pnl = Decimal(str(q_snap["realized_net_pnl_usd"]))
+                            q_max_loss = Decimal(str(q_snap["max_daily_loss_usd"]))
+                            q_consec = int(q_snap["consecutive_losses"])
+                            q_max_consec = int(q_snap["max_consecutive_losses"])
+                            if q_pnl <= -q_max_loss or q_consec >= q_max_consec:
+                                q_reason = QUOTA_STATUS_LOSS_TRIPPED
+                            else:
+                                allowed_q = True
+                                q_mult = Decimal("0.50")
 
                         if not allowed_q:
-                            skip_reason = str(q_reason)
+                            skip_reason = f"DAILY_QUOTA ({q_reason})"
                         else:
-                            qty, size_skip = self._compute_tier_quantity(
+                            qty, sz_err = self._compute_tier_quantity(
                                 tier_id=tid,
                                 symbol=sym,
                                 side=side,
@@ -588,7 +720,7 @@ class ParallelTierEngine:
                                 risk_multiplier=q_mult,
                             )
                             if qty is None:
-                                skip_reason = size_skip
+                                skip_reason = sz_err or "SIZING_SKIP"
                             else:
                                 if is_add:
                                     legs = [
@@ -605,6 +737,9 @@ class ParallelTierEngine:
                                     ]
                                     _, q_ccy = Mt5MarginCalculator.split_symbol(sym)
                                     conv = self._calc.conversion_rate(q_ccy, quotes)
+                                    conv_q = conv.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP).normalize()
+                                    if conv_q <= Decimal("0"):
+                                        conv_q = Decimal("0.000001")
                                     pyr = evaluate_house_money_pyramid_leg(
                                         symbol=sym,
                                         side=side,
@@ -613,12 +748,11 @@ class ParallelTierEngine:
                                         new_leg_entry=entry_px,
                                         new_leg_stop=sl_p,
                                         new_leg_units=qty,
-                                        quote_to_usd=conv,
+                                        quote_to_usd=conv_q,
                                     )
                                     if not pyr.allowed:
-                                        skip_reason = pyr.reason
+                                        skip_reason = f"PYRAMID_BLOCKED ({pyr.reason})"
                                 if skip_reason is None:
-                                    # Evaluate independent ForexMetaValveGate per tier
                                     inv_json = json.dumps([
                                         {
                                             "ticket": str(r["ticket"]),
@@ -634,6 +768,13 @@ class ParallelTierEngine:
                                         "position_inventory": inv_json,
                                         "peak_equity": decimal_text(pk_val),
                                         "max_drawdown_pct": decimal_text(DEFAULT_MAX_DRAWDOWN_PCT),
+                                        "current_market": [
+                                            {
+                                                "instrument_id": sym,
+                                                "bid": decimal_text(bid),
+                                                "ask": decimal_text(ask),
+                                            }
+                                        ],
                                     }
                                     uid = uuid.uuid4().hex[:10]
                                     act_ref = f"tier-{tid.lower()}-{uid}"
@@ -672,7 +813,7 @@ class ParallelTierEngine:
                                         expires_at=st_ref.valid_until,
                                         quantity=qty,
                                         side=side,
-                                        limit_price=entry_px if not is_add else None,
+                                        limit_price=None,
                                         stop_price=sl_p,
                                         take_profit_price=tp_p,
                                         target_id=parent_tkt,
@@ -691,55 +832,72 @@ class ParallelTierEngine:
                                     )
                                     dec = self._valve.evaluate(prop, current_view=t_view, now=ts_dt)
                                     if not dec.admitted:
-                                        skip_reason = f"VALVE_REFUSED ({dec.refusal_reason or dec.valve_mode})"
+                                        refusal_detail = (
+                                            ",".join(dec.hard_veto_reasons)
+                                            if dec.hard_veto_reasons
+                                            else f"{dec.valve_mode}:mlp_score={dec.mlp_score:.6f}<{dec.threshold:.6f}"
+                                        )
+                                        skip_reason = f"VALVE_REFUSED ({refusal_detail})"
                                     else:
                                         entry_comm = self._entry_commission(sym, qty)
-                                        balance = balance - entry_comm
-                                        equity = balance + open_unrealized
                                         new_ticket = f"{tid}-{uuid.uuid4().hex[:10]}"
-                                        conn.execute(
-                                            """
-                                            INSERT INTO tier_positions(
-                                                ticket, tier_id, symbol, side, units, entry_price,
-                                                stop_loss, take_profit, peak_favorable, protection_stage,
-                                                entry_commission_usd, leg_index, opened_at
-                                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'INITIAL_SL', ?, ?, ?)
-                                            """,
-                                            (
-                                                new_ticket,
-                                                tid,
-                                                sym,
-                                                side.value,
-                                                decimal_text(qty),
-                                                decimal_text(entry_px),
-                                                decimal_text(sl_p),
-                                                None if tp_p is None else decimal_text(tp_p),
-                                                decimal_text(entry_px),
-                                                decimal_text(entry_comm),
-                                                len(existing_rows) + 1,
-                                                ts,
-                                            ),
+                                        pending_entry = (
+                                            new_ticket,
+                                            tid,
+                                            sym,
+                                            side.value,
+                                            decimal_text(qty),
+                                            decimal_text(entry_px),
+                                            decimal_text(sl_p),
+                                            None if tp_p is None else decimal_text(tp_p),
+                                            decimal_text(entry_px),
+                                            decimal_text(entry_comm),
+                                            len(existing_rows) + 1,
+                                            ts,
                                         )
+
+                # Tx 2: Atomic entry insert + skip reason + MTM account update + equity history
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if pending_entry is not None:
+                        balance = balance - entry_comm
+                        equity = balance + open_unrealized
+                        conn.execute(
+                            """
+                            INSERT INTO tier_positions(
+                                ticket, tier_id, symbol, side, units, entry_price,
+                                stop_loss, take_profit, peak_favorable, protection_stage,
+                                entry_commission_usd, leg_index, opened_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'INITIAL_SL', ?, ?, ?)
+                            """,
+                            pending_entry,
+                        )
+                    if has_signal_quote:
                         conn.execute("UPDATE tier_accounts SET last_skip_reason = ? WHERE tier_id = ?", (skip_reason, tid))
 
-                with localcontext() as ctx:
-                    ctx.prec = 40
-                    growth_pct = (((equity - spec.starting_capital_usd) / spec.starting_capital_usd) * Decimal("100")).quantize(
-                        Decimal("0.01"), rounding=ROUND_HALF_UP
-                    )
-                conn.execute(
-                    "UPDATE tier_accounts SET balance_usd = ?, equity_usd = ?, peak_equity_usd = ?, updated_at = ? WHERE tier_id = ?",
-                    (decimal_text(balance), decimal_text(equity), decimal_text(pk_val), ts, tid),
-                )
-                last_h = conn.execute(
-                    "SELECT equity_usd FROM tier_equity_history WHERE tier_id = ? ORDER BY seq DESC LIMIT 1",
-                    (tid,),
-                ).fetchone()
-                if last_h is None or Decimal(str(last_h["equity_usd"])) != equity:
+                    with localcontext() as ctx:
+                        ctx.prec = 40
+                        growth_pct = (((equity - spec.starting_capital_usd) / spec.starting_capital_usd) * Decimal("100")).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
                     conn.execute(
-                        "INSERT INTO tier_equity_history(tier_id, observed_at, equity_usd, growth_pct) VALUES (?, ?, ?, ?)",
-                        (tid, ts, decimal_text(equity), decimal_text(growth_pct)),
+                        "UPDATE tier_accounts SET balance_usd = ?, equity_usd = ?, peak_equity_usd = ?, updated_at = ? WHERE tier_id = ?",
+                        (decimal_text(balance), decimal_text(equity), decimal_text(pk_val), ts, tid),
                     )
+                    last_h = conn.execute(
+                        "SELECT equity_usd FROM tier_equity_history WHERE tier_id = ? ORDER BY seq DESC LIMIT 1",
+                        (tid,),
+                    ).fetchone()
+                    if last_h is None or Decimal(str(last_h["equity_usd"])) != equity:
+                        conn.execute(
+                            "INSERT INTO tier_equity_history(tier_id, observed_at, equity_usd, growth_pct) VALUES (?, ?, ?, ?)",
+                            (tid, ts, decimal_text(equity), decimal_text(growth_pct)),
+                        )
+                    conn.execute("COMMIT")
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
         return self.snapshot()
 
     def snapshot(self) -> dict[str, Any]:

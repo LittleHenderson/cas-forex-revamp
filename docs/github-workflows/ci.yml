@@ -49,8 +49,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Run strict-CSP Node UI test suite
-        run: node --test tests/ui/*.test.mjs
+      - name: Run ui/package.json script & strict-CSP Node UI + integration discovery suites
+        run: |
+          npm --prefix ui test
+          node --test tests/ui/*.test.mjs tests/e2e_hardening/e2e_explainer_csp.test.mjs tests/integration/node/discovery.test.mjs
 
   python-unit-suites:
     name: Python Unit & Contract Suites
@@ -75,6 +77,8 @@ jobs:
               "operational/measurement/source",
               "operational/custody/source",
               "operational/policy-inheritance02/source",
+              "source_runtime",
+              "tests/integration",
           ]
           suites = [
               ("tests/contracts", ["tests/contracts"] + base_paths),
@@ -90,6 +94,9 @@ jobs:
               ("tests/phase3", ["tests/phase3"] + base_paths),
               ("tests/phase4", ["tests/phase4"] + base_paths),
               ("tests/phase5", ["tests/phase5"] + base_paths),
+              ("tests/security", ["tests/security"] + base_paths),
+              ("tests/integration", ["tests/integration"] + base_paths),
+              ("tests/e2e_hardening", base_paths),
           ]
           if pathlib.Path("tests/phase6").is_dir():
               suites.append(("tests/phase6", ["tests/phase6"] + base_paths))
@@ -98,10 +105,10 @@ jobs:
               print(f"=== Running {suite_dir} ===", flush=True)
               env = dict(os.environ)
               env["PYTHONPATH"] = os.pathsep.join(py_paths)
-              res = subprocess.run(
-                  [sys.executable, "-m", "unittest", "discover", "-s", suite_dir, "-p", "test_*.py"],
-                  env=env,
-              )
+              cmd = [sys.executable, "-m", "unittest", "discover", "-s", suite_dir, "-p", "test_*.py"]
+              if (pathlib.Path(suite_dir) / "__init__.py").is_file():
+                  cmd.extend(["-t", "."])
+              res = subprocess.run(cmd, env=env)
               if res.returncode != 0:
                   sys.exit(f"Suite failed: {suite_dir}")
           print("All deterministic Python suites PASSED.")

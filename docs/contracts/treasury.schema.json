@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:treasury:1.0",
+  "title": "ProfitSweepVaultSnapshot",
+  "description": "50/50 Profit Sweep Bank Vault snapshot for GET /api/treasury.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "scope_id",
+    "sweep_ratio",
+    "sweep_ratio_pct",
+    "auto_sweep_enabled",
+    "preferred_rail",
+    "total_realized_profit_usd",
+    "retained_trading_usd",
+    "bank_sweep_reserved_usd",
+    "disbursed_to_bank_usd",
+    "pending_2fa_confirmation_usd",
+    "pending_disbursement_usd",
+    "recent_sweeps",
+    "recent_transfers"
+  ],
+  "properties": {
+    "schema": {
+      "const": "cas-forex.profit-vault/1"
+    },
+    "scope_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "sweep_ratio": {
+      "$ref": "#/$defs/decimal"
+    },
+    "sweep_ratio_pct": {
+      "$ref": "#/$defs/decimal"
+    },
+    "auto_sweep_enabled": {
+      "type": "boolean"
+    },
+    "preferred_rail": {
+      "$ref": "#/$defs/rail"
+    },
+    "total_realized_profit_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "retained_trading_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "bank_sweep_reserved_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "disbursed_to_bank_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "pending_2fa_confirmation_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "pending_disbursement_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "recent_sweeps": {
+      "type": "array",
+      "maxItems": 25,
+      "items": {
+        "$ref": "#/$defs/sweepEvent"
+      }
+    },
+    "recent_transfers": {
+      "type": "array",
+      "maxItems": 25,
+      "items": {
+        "$ref": "#/$defs/bankTransfer"
+      }
+    },
+    "initial_capital_usd": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/decimal"
+        }
+      ]
+    },
+    "confirmed_settled_disbursed_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "pending_or_unconfirmed_transfers_usd": {
+      "$ref": "#/$defs/decimal"
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+    },
+    "decimal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 31,
+      "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 32,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$"
+    },
+    "symbol": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 16,
+      "pattern": "^[A-Z0-9._-]{3,16}$"
+    },
+    "rail": {
+      "enum": [
+        "BROKER_2FA_MANUAL",
+        "COINBASE_ACH",
+        "KRAKEN_ACH"
+      ]
+    },
+    "sweepEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trade_id",
+        "symbol",
+        "broker_id",
+        "realized_net_usd",
+        "retained_trading_usd",
+        "bank_sweep_usd",
+        "occurred_at"
+      ],
+      "properties": {
+        "trade_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "symbol": {
+          "$ref": "#/$defs/symbol"
+        },
+        "broker_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "realized_net_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "retained_trading_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "bank_sweep_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "occurred_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    },
+    "bankTransfer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transfer_id",
+        "rail",
+        "broker_id",
+        "destination_bank_id",
+        "amount_usd",
+        "status",
+        "provider_tx_id",
+        "created_at",
+        "settled_at"
+      ],
+      "properties": {
+        "transfer_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "rail": {
+          "$ref": "#/$defs/rail"
+        },
+        "broker_id": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/identifier"
+            }
+          ]
+        },
+        "destination_bank_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "amount_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "status": {
+          "enum": [
+            "PENDING_OWNER_BROKER_2FA",
+            "BROKER_2FA_VERIFICATION_UNKNOWN",
+            "SETTLED",
+            "RESERVED_PENDING_DISPATCH",
+            "OUTCOME_UNKNOWN",
+            "ACH_SUBMITTED"
+          ]
+        },
+        "provider_tx_id": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            }
+          ]
+        },
+        "created_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "settled_at": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/timestamp"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

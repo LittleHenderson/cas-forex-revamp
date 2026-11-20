@@ -20,6 +20,7 @@ Pure Python standard library only (zero external runtime dependencies inside air
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -146,14 +147,173 @@ def _safe_decimal(value: Any) -> Decimal | None:
     return parsed if parsed.is_finite() else None
 
 
+_BOM_AND_WS = "\ufeff\u00a0 \t\r\n\v\f"
+_UNAVAILABLE_ACCOUNTING_TOKENS = frozenset(
+    {
+        "null",
+        "unavailable",
+        "",
+        "nan",
+        "-nan",
+        "+nan",
+        "snan",
+        "-snan",
+        "+snan",
+        "n/a",
+        "none",
+        "undefined",
+        "nil",
+        "inf",
+        "-inf",
+        "+inf",
+        "infinity",
+        "-infinity",
+        "+infinity",
+    }
+)
+_NUMERIC_ACCOUNTING_FIELDS = frozenset({"balance", "equity", "available_margin", "peak_equity"})
+
+
+def _strip_bom_and_ws(value: str) -> str:
+    while True:
+        nxt = value.strip(_BOM_AND_WS).strip()
+        if nxt == value:
+            return nxt
+        value = nxt
+
+
+def _unwrap_observed_json(raw: Any, max_depth: int = 4) -> dict[str, Any] | list[Any] | None:
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, tuple):
+        return list(raw)
+    if not isinstance(raw, str):
+        return None
+    cur: Any = raw
+    for _ in range(max_depth):
+        if not isinstance(cur, str):
+            break
+        s = _strip_bom_and_ws(cur)
+        if not s or s[0] not in ("{", "[", '"'):
+            return None
+        try:
+            cur = json.loads(s)
+        except (ValueError, TypeError):
+            return None
+        if isinstance(cur, (dict, list)):
+            return cur
+    return cur if isinstance(cur, (dict, list)) else None
+
+
+def _is_unavailable_accounting_value(
+    value: Any,
+    *,
+    allow_list: bool = True,
+    require_list: bool = False,
+) -> bool:
+    if require_list:
+        if isinstance(value, (list, tuple)):
+            return False
+        if isinstance(value, str):
+            return not isinstance(_unwrap_observed_json(value), list)
+        return True
+    if value is None or isinstance(value, bool):
+        return True
+    if isinstance(value, (int, float, Decimal)):
+        return _safe_decimal(value) is None
+    if isinstance(value, (list, tuple)):
+        return not allow_list
+    if isinstance(value, dict):
+        if "amount" not in value and "value" not in value:
+            return True
+        inner = value["amount"] if "amount" in value else value["value"]
+        if _is_unavailable_accounting_value(inner, allow_list=False):
+            return True
+        norm_inner = _strip_bom_and_ws(inner) if isinstance(inner, str) else inner
+        return _safe_decimal(norm_inner) is None
+    if isinstance(value, str):
+        s = _strip_bom_and_ws(value)
+        for _ in range(8):
+            if not (len(s) >= 2 and s[0] == '"' and s[-1] == '"'):
+                break
+            try:
+                unwrapped = json.loads(s)
+            except (ValueError, TypeError):
+                nxt = _strip_bom_and_ws(s[1:-1])
+                if nxt == s:
+                    break
+                s = nxt
+                continue
+            if isinstance(unwrapped, str):
+                s = _strip_bom_and_ws(unwrapped)
+            elif isinstance(unwrapped, dict):
+                return _is_unavailable_accounting_value(unwrapped, allow_list=allow_list)
+            elif isinstance(unwrapped, list):
+                return not allow_list
+            elif unwrapped is None or isinstance(unwrapped, bool):
+                return True
+            elif isinstance(unwrapped, (int, float)):
+                return _safe_decimal(unwrapped) is None
+            else:
+                return True
+        if s.startswith("{") or s.startswith("["):
+            try:
+                parsed = json.loads(s)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                return _is_unavailable_accounting_value(parsed, allow_list=allow_list)
+            if isinstance(parsed, list):
+                return not allow_list
+        if s.lower() in _UNAVAILABLE_ACCOUNTING_TOKENS:
+            return True
+        return _safe_decimal(s) is None
+    if hasattr(value, "amount"):
+        return _is_unavailable_accounting_value(getattr(value, "amount"), allow_list=False)
+    return True
+
+
 def _extract_money_decimal(value: Any) -> Decimal | None:
     """Extract a finite Decimal from a plain scalar/string or typed Money wire dict."""
-    if value is None or value == "UNAVAILABLE":
+    if _is_unavailable_accounting_value(value, allow_list=False):
         return None
+    if isinstance(value, str):
+        s = _strip_bom_and_ws(value)
+        for _ in range(8):
+            if not (len(s) >= 2 and s[0] == '"' and s[-1] == '"'):
+                break
+            try:
+                unwrapped = json.loads(s)
+            except (ValueError, TypeError):
+                nxt = _strip_bom_and_ws(s[1:-1])
+                if nxt == s:
+                    break
+                s = nxt
+                continue
+            if isinstance(unwrapped, str):
+                s = _strip_bom_and_ws(unwrapped)
+            elif isinstance(unwrapped, (dict, int, float)):
+                return _extract_money_decimal(unwrapped)
+            else:
+                return None
+        if s.startswith("{"):
+            try:
+                parsed = json.loads(s)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                return _extract_money_decimal(parsed)
+        return _safe_decimal(s)
     if isinstance(value, dict):
-        if "amount" not in value:
+        if "amount" in value:
+            raw_amt = value.get("amount")
+        elif "value" in value:
+            raw_amt = value.get("value")
+        else:
             return None
-        return _safe_decimal(value.get("amount"))
+        if isinstance(raw_amt, str):
+            raw_amt = _strip_bom_and_ws(raw_amt)
+        return _safe_decimal(raw_amt)
     if hasattr(value, "amount"):
         return _safe_decimal(getattr(value, "amount"))
     return _safe_decimal(value)
@@ -446,7 +606,11 @@ class PeakEquityStore:
                 conn.close()
 
 
-def _proposal_scope_id(proposal: Any, current_view: dict[str, Any] | None) -> str:
+def _proposal_scope_id(proposal: Any, current_view: Mapping[str, Any] | None) -> str:
+    if isinstance(current_view, Mapping):
+        vs = current_view.get("scope_id")
+        if isinstance(vs, str) and vs.strip():
+            return vs.strip()
     req = getattr(proposal, "request", None)
     state = getattr(req, "state", None)
     scope = getattr(state, "scope", None)
@@ -454,7 +618,7 @@ def _proposal_scope_id(proposal: Any, current_view: dict[str, Any] | None) -> st
     run = getattr(scope, "run_id", None)
     if isinstance(acct, str) and acct and isinstance(run, str) and run:
         return f"{acct}:{run}"
-    if isinstance(current_view, dict):
+    if isinstance(current_view, Mapping):
         va = current_view.get("account_id")
         vp = current_view.get("plan_id")
         if isinstance(va, str) and va:
@@ -471,31 +635,54 @@ def _extract_fact_accounting(request: Any) -> tuple[Decimal | None, Decimal | No
     bal_eq: Decimal | None = None
     peak_eq: Decimal | None = None
     explicit_peak = False
+    invalid_cur_eq = False
+    invalid_peak_eq = False
     for f in getattr(request, "facts", ()):
         label = getattr(f, "label", "")
         raw_val = getattr(f, "value", "")
         fid = getattr(f, "fact_id", "")
-        parsed_json: Any = raw_val
-        if isinstance(raw_val, str) and (raw_val.startswith("{") or raw_val.startswith('"') or raw_val in ("null",)):
-            try:
-                parsed_json = json.loads(raw_val)
-            except (ValueError, TypeError):
-                parsed_json = raw_val
-        if label == "equity" or fid.startswith("observed-equity"):
-            cur_eq = _extract_money_decimal(parsed_json)
-        elif label == "balance" or fid.startswith("observed-balance"):
-            bal_eq = _extract_money_decimal(parsed_json)
-        elif label == "peak_equity" or fid.startswith("observed-peak_equity"):
+        label_lower = _strip_bom_and_ws(label).lower() if isinstance(label, str) else ""
+        if label_lower == "equity" or fid.startswith("observed-equity"):
+            cand_eq = _extract_money_decimal(raw_val)
+            if cand_eq is None:
+                invalid_cur_eq = True
+            else:
+                cur_eq = cand_eq if cur_eq is None else min(cur_eq, cand_eq)
+        elif label_lower == "balance" or fid.startswith("observed-balance"):
+            cand_bal = _extract_money_decimal(raw_val)
+            if cand_bal is not None:
+                bal_eq = cand_bal if bal_eq is None else max(bal_eq, cand_bal)
+        elif label_lower == "peak_equity" or fid.startswith("observed-peak_equity"):
             explicit_peak = True
-            peak_eq = _extract_money_decimal(parsed_json)
-        elif fid.startswith("observed-") and isinstance(parsed_json, dict):
-            if "equity" in parsed_json and cur_eq is None:
-                cur_eq = _extract_money_decimal(parsed_json.get("equity"))
-            if "balance" in parsed_json and bal_eq is None:
-                bal_eq = _extract_money_decimal(parsed_json.get("balance"))
-            if "peak_equity" in parsed_json:
-                explicit_peak = True
-                peak_eq = _extract_money_decimal(parsed_json.get("peak_equity"))
+            cand_peak = _extract_money_decimal(raw_val)
+            if cand_peak is None:
+                invalid_peak_eq = True
+            else:
+                peak_eq = cand_peak if peak_eq is None else max(peak_eq, cand_peak)
+        elif fid.startswith("observed-") or label_lower == "account":
+            parsed_json = _unwrap_observed_json(raw_val)
+            if isinstance(parsed_json, dict):
+                if "equity" in parsed_json:
+                    cand_eq = _extract_money_decimal(parsed_json.get("equity"))
+                    if cand_eq is None:
+                        invalid_cur_eq = True
+                    else:
+                        cur_eq = cand_eq if cur_eq is None else min(cur_eq, cand_eq)
+                if "balance" in parsed_json:
+                    cand_bal = _extract_money_decimal(parsed_json.get("balance"))
+                    if cand_bal is not None:
+                        bal_eq = cand_bal if bal_eq is None else max(bal_eq, cand_bal)
+                if "peak_equity" in parsed_json:
+                    explicit_peak = True
+                    cand_peak = _extract_money_decimal(parsed_json.get("peak_equity"))
+                    if cand_peak is None:
+                        invalid_peak_eq = True
+                    else:
+                        peak_eq = cand_peak if peak_eq is None else max(peak_eq, cand_peak)
+    if invalid_cur_eq:
+        cur_eq = None
+    if invalid_peak_eq:
+        peak_eq = None
     return cur_eq, bal_eq, peak_eq, explicit_peak
 
 
@@ -553,13 +740,18 @@ def extract_cognitive_valve_features(text: str, prompt: str = "") -> list[float]
 def extract_forex_valve_features(
     proposal: Any,
     *,
-    current_view: dict[str, Any] | None = None,
-    policy: dict[str, Any] | None = None,
+    current_view: Mapping[str, Any] | None = None,
+    policy: Mapping[str, Any] | None = None,
     now: datetime | None = None,
     max_drawdown_pct: Decimal | str | None = DEFAULT_MAX_DRAWDOWN_PCT,
     peak_equity_store: PeakEquityStore | None = None,
 ) -> tuple[list[float], list[str]]:
     """Extract 8-D safety feature vector and deterministic hard-veto reasons."""
+    if policy is None and isinstance(current_view, Mapping) and "policy" in current_view and current_view["policy"] is not None:
+        if not isinstance(current_view["policy"], Mapping):
+            raise ContractError("current_view['policy'] must be a mapping")
+        policy = current_view["policy"]
+
     request = proposal.request
     result = proposal.result
     intent = proposal.intent
@@ -573,24 +765,71 @@ def extract_forex_valve_features(
     if current_view is not None:
         for k in req_fields:
             val = current_view.get(k)
-            if val is None or val == "UNAVAILABLE":
+            if _is_unavailable_accounting_value(
+                val,
+                allow_list=(k not in _NUMERIC_ACCOUNTING_FIELDS),
+                require_list=(k == "position_inventory"),
+            ):
                 missing_count += 1
     else:
-        fact_map = {f.label: f.value for f in request.facts}
+        fact_map = {
+            _strip_bom_and_ws(f.label).lower(): f.value
+            for f in request.facts
+            if isinstance(f.label, str)
+        }
         for k in req_fields:
-            if k in fact_map and (fact_map[k] in ("null", '"UNAVAILABLE"', "UNAVAILABLE")):
+            k_lower = k.lower()
+            if k_lower in fact_map and _is_unavailable_accounting_value(
+                fact_map[k_lower],
+                allow_list=(k not in _NUMERIC_ACCOUNTING_FIELDS),
+                require_list=(k == "position_inventory"),
+            ):
                 missing_count += 1
+        has_account_fact = False
+        covered_req_fields: set[str] = set()
         for f in request.facts:
-            if "margin" in f.label.lower() and ("null" in f.value.lower() or "unavailable" in f.value.lower()):
+            f_label_lower = _strip_bom_and_ws(f.label).lower() if isinstance(f.label, str) else ""
+            f_val_str = f.value if isinstance(f.value, str) else ""
+            if "margin" in f_label_lower and ("null" in f_val_str.lower() or "unavailable" in f_val_str.lower()):
                 missing_count = max(missing_count, 1)
-            if f.fact_id.startswith("observed-") and f.value.startswith("{"):
-                try:
-                    obs_obj = json.loads(f.value)
-                except (ValueError, TypeError):
-                    obs_obj = {}
-                if isinstance(obs_obj, dict):
-                    if "available_margin" in obs_obj and (obs_obj["available_margin"] is None or obs_obj["available_margin"] == "UNAVAILABLE"):
+            for k in req_fields:
+                k_lower = k.lower()
+                if f_label_lower == k_lower or f.fact_id == f"observed-{k}" or f.fact_id.startswith(f"observed-{k}-"):
+                    if _is_unavailable_accounting_value(
+                        f.value,
+                        allow_list=(k not in _NUMERIC_ACCOUNTING_FIELDS),
+                        require_list=(k == "position_inventory"),
+                    ):
                         missing_count = max(missing_count, 1)
+                    else:
+                        covered_req_fields.add(k)
+            is_account_fact = (
+                f.fact_id == "observed-account"
+                or f.fact_id.startswith("observed-account-")
+                or f_label_lower == "account"
+            )
+            if is_account_fact:
+                has_account_fact = True
+                obs_acct = _unwrap_observed_json(f.value)
+                if not isinstance(obs_acct, dict) or len(obs_acct) == 0:
+                    missing_count = max(missing_count, 1)
+            if f.fact_id.startswith("observed-") or f_label_lower == "account":
+                obs_obj = _unwrap_observed_json(f.value)
+                if isinstance(obs_obj, dict):
+                    for k in req_fields:
+                        if k in obs_obj:
+                            if _is_unavailable_accounting_value(
+                                obs_obj[k],
+                                allow_list=(k not in _NUMERIC_ACCOUNTING_FIELDS),
+                                require_list=(k == "position_inventory"),
+                            ):
+                                missing_count = max(missing_count, 1)
+                            else:
+                                covered_req_fields.add(k)
+        if has_account_fact:
+            missing_account_fields = sum(1 for k in req_fields if k not in covered_req_fields)
+            if missing_account_fields > 0:
+                missing_count = max(missing_count, missing_account_fields)
     missing_ratio = _clamp01(missing_count / max(1, len(req_fields)))
     if intent is not None and missing_count > 0:
         vetoes.append("MISSING_REQUIRED_ACCOUNTING")
@@ -599,7 +838,7 @@ def extract_forex_valve_features(
     # WAIT (intent is None) and risk-reducing/protective management (REDUCE, CLOSE, AMEND_STOP, CANCEL_ORDER)
     # remain available during drawdown.
     if intent is not None and intent.kind in (ActionKind.OPEN, ActionKind.ADD):
-        pol_dict = policy if isinstance(policy, dict) else {}
+        pol_dict = policy if isinstance(policy, Mapping) else {}
         dd_threshold: Decimal | None
         dd_invalid = False
         if "max_drawdown_pct" in pol_dict:
@@ -676,11 +915,9 @@ def extract_forex_valve_features(
                     vetoes.append("MANAGEMENT_NOT_ALLOWED")
         if current_view is None:
             for f in request.facts:
-                if f.fact_id.startswith("observed-") and f.value.startswith("{"):
-                    try:
-                        obs_obj = json.loads(f.value)
-                    except (ValueError, TypeError):
-                        obs_obj = {}
+                f_label_lower = _strip_bom_and_ws(f.label).lower() if isinstance(f.label, str) else ""
+                if f.fact_id.startswith("observed-") or f_label_lower == "account":
+                    obs_obj = _unwrap_observed_json(f.value)
                     if isinstance(obs_obj, dict):
                         if intent.kind in (ActionKind.OPEN, ActionKind.ADD) and obs_obj.get("new_risk") is False:
                             perm_violation = 1.0
@@ -733,21 +970,180 @@ def extract_forex_valve_features(
 
     # 6. Protective stop and resting take-profit geometry checks
     stop_deficit = 0.0
-    obs_bid = obs_ask = obs_pos_side = None
+    obs_bid: Decimal | None = None
+    obs_ask: Decimal | None = None
+    obs_pos_side: str | None = None
+    obs_prev_stop: Decimal | None = None
+    obs_pos_ambiguous = False
+    raw_intent_inst = getattr(intent, "instrument_id", None) if intent is not None else None
+    intent_inst = str(raw_intent_inst).strip().upper() if raw_intent_inst is not None and str(raw_intent_inst).strip() != "" else None
+    raw_intent_target = getattr(intent, "target_id", None) if intent is not None else None
+    intent_target = str(raw_intent_target).strip() if raw_intent_target is not None and str(raw_intent_target).strip() != "" else None
+
+    def _consume_market_list(items: list[Any] | tuple[Any, ...]) -> None:
+        nonlocal obs_bid, obs_ask
+        chosen: dict[str, Any] | None = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            raw_inst = item.get("instrument_id")
+            if raw_inst is None or str(raw_inst).strip() == "":
+                raw_inst = item.get("symbol")
+            item_inst = str(raw_inst).strip().upper() if raw_inst is not None and str(raw_inst).strip() != "" else None
+            if intent_inst is not None and item_inst is not None and item_inst == intent_inst:
+                chosen = item
+                break
+            if chosen is None and (intent_inst is None or item_inst is None):
+                chosen = item
+        if chosen is not None:
+            if obs_bid is None:
+                obs_bid = _safe_decimal(chosen.get("bid"))
+            if obs_ask is None:
+                obs_ask = _safe_decimal(chosen.get("ask"))
+
+    def _consume_position_list(items: list[Any] | tuple[Any, ...]) -> None:
+        nonlocal obs_pos_side, obs_prev_stop, obs_pos_ambiguous
+        chosen: dict[str, Any] | None = None
+        dict_count = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            dict_count += 1
+            raw_inst = item.get("instrument_id")
+            if raw_inst is None or str(raw_inst).strip() == "":
+                raw_inst = item.get("symbol")
+            item_inst = str(raw_inst).strip().upper() if raw_inst is not None and str(raw_inst).strip() != "" else None
+            if intent_inst is not None and item_inst is not None and item_inst != intent_inst:
+                continue
+            item_id: str | None = None
+            for id_key in ("position_id", "position_ticket", "id", "ticket", "order_id"):
+                cand_id = item.get(id_key)
+                if cand_id is not None and str(cand_id).strip() != "":
+                    item_id = str(cand_id).strip()
+                    break
+            if intent_target is not None and item_id is not None and item_id == intent_target:
+                chosen = item
+                break
+            if chosen is None and len(items) == 1 and (intent_target is None or item_id is None):
+                chosen = item
+        if chosen is None and dict_count > 0:
+            obs_pos_ambiguous = True
+        if chosen is not None:
+            raw_s = chosen.get("position_side") or chosen.get("side")
+            if obs_pos_side is None and isinstance(raw_s, str):
+                norm_s = raw_s.strip().upper()
+                if norm_s in ("BUY", "SELL"):
+                    obs_pos_side = norm_s
+            if obs_prev_stop is None:
+                for sk in ("stop_price", "stop", "stop_loss", "prev_stop", "previous_stop_price", "current_stop", "current_stop_price", "sl"):
+                    cand = _safe_decimal(chosen.get(sk))
+                    if cand is not None:
+                        obs_prev_stop = cand
+                        break
+
+    def _consume_obs_dict(
+        obs_meta: dict[str, Any],
+        *,
+        allow_market: bool = True,
+        allow_positions: bool = True,
+    ) -> None:
+        nonlocal obs_bid, obs_ask, obs_pos_side, obs_prev_stop, obs_pos_ambiguous
+        raw_inst = obs_meta.get("instrument_id")
+        if raw_inst is None or str(raw_inst).strip() == "":
+            raw_inst = obs_meta.get("symbol")
+        item_inst = str(raw_inst).strip().upper() if raw_inst is not None and str(raw_inst).strip() != "" else None
+        inst_matches = intent_inst is None or item_inst is None or item_inst == intent_inst
+        if allow_market and inst_matches:
+            if obs_bid is None:
+                obs_bid = _safe_decimal(obs_meta.get("bid"))
+            if obs_ask is None:
+                obs_ask = _safe_decimal(obs_meta.get("ask"))
+
+        if allow_positions:
+            item_id: str | None = None
+            for id_key in ("position_id", "position_ticket", "id", "ticket", "order_id"):
+                cand_id = obs_meta.get(id_key)
+                if cand_id is not None and str(cand_id).strip() != "":
+                    item_id = str(cand_id).strip()
+                    break
+            pos_stop_keys = (
+                "prev_stop",
+                "previous_stop_price",
+                "current_stop_price",
+                "current_stop",
+                "stop_price",
+                "stop",
+                "stop_loss",
+                "sl",
+            )
+            target_matches = intent_target is None or item_id is None or item_id == intent_target
+            if inst_matches and target_matches:
+                if obs_pos_side is None:
+                    for sk in ("position_side", "side"):
+                        raw_s = obs_meta.get(sk)
+                        if isinstance(raw_s, str):
+                            norm_s = raw_s.strip().upper()
+                            if norm_s in ("BUY", "SELL"):
+                                obs_pos_side = norm_s
+                                break
+                if obs_prev_stop is None:
+                    for pk in pos_stop_keys:
+                        cand = _safe_decimal(obs_meta.get(pk))
+                        if cand is not None:
+                            obs_prev_stop = cand
+                            break
+            elif any(k in obs_meta for k in ("position_side", "side", *pos_stop_keys)):
+                obs_pos_ambiguous = True
+
+        if allow_market:
+            for mk in ("current_market", "market"):
+                mv = _unwrap_observed_json(obs_meta.get(mk))
+                if isinstance(mv, (list, tuple)):
+                    _consume_market_list(mv)
+        if allow_positions:
+            for pk in ("position_inventory", "positions"):
+                pv = _unwrap_observed_json(obs_meta.get(pk))
+                if isinstance(pv, (list, tuple)):
+                    _consume_position_list(pv)
+
+    cv_has_market = False
+    cv_has_positions = False
+    if isinstance(current_view, Mapping):
+        _consume_obs_dict(current_view)
+        cv_has_market = (obs_bid is not None or obs_ask is not None) or any(
+            isinstance(mv, (list, tuple)) and len(mv) > 0
+            for mv in (_unwrap_observed_json(current_view.get(mk)) for mk in ("current_market", "market"))
+        )
+        cv_has_positions = (obs_pos_side is not None or obs_prev_stop is not None or obs_pos_ambiguous) or any(
+            isinstance(pv, (list, tuple)) and any(isinstance(it, dict) for it in pv)
+            for pv in (_unwrap_observed_json(current_view.get(pk)) for pk in ("position_inventory", "positions"))
+        )
+
     for f in request.facts:
-        if f.fact_id.startswith("observed-") and f.value.startswith("{"):
-            try:
-                obs_meta = json.loads(f.value)
-            except (ValueError, TypeError):
-                obs_meta = None
+        f_label_lower = _strip_bom_and_ws(f.label).lower() if isinstance(f.label, str) else ""
+        if f.fact_id.startswith("observed-") or f_label_lower == "account":
+            obs_meta = _unwrap_observed_json(f.value)
             if isinstance(obs_meta, dict):
-                obs_bid = obs_bid or _safe_decimal(obs_meta.get("bid"))
-                obs_ask = obs_ask or _safe_decimal(obs_meta.get("ask"))
-                if obs_meta.get("position_side") in ("BUY", "SELL"):
-                    obs_pos_side = str(obs_meta.get("position_side"))
-                elif obs_meta.get("side") in ("BUY", "SELL"):
-                    obs_pos_side = str(obs_meta.get("side"))
-    tp_p = _safe_decimal(getattr(intent, "take_profit_price", None)) if intent is not None else None
+                _consume_obs_dict(
+                    obs_meta,
+                    allow_market=not cv_has_market,
+                    allow_positions=not cv_has_positions,
+                )
+            elif isinstance(obs_meta, (list, tuple)):
+                if f.fact_id.startswith("observed-current_market") or f.fact_id.startswith("observed-market"):
+                    if not cv_has_market:
+                        _consume_market_list(obs_meta)
+                elif f.fact_id.startswith("observed-position_inventory") or f.fact_id.startswith("observed-positions"):
+                    if not cv_has_positions:
+                        _consume_position_list(obs_meta)
+                else:
+                    if not cv_has_market and any(isinstance(it, dict) and ("bid" in it or "ask" in it) for it in obs_meta):
+                        _consume_market_list(obs_meta)
+                    if not cv_has_positions and any(isinstance(it, dict) and any(k in it for k in ("side", "position_side", "stop_price", "stop", "stop_loss")) for it in obs_meta):
+                        _consume_position_list(obs_meta)
+
+    raw_tp = getattr(intent, "take_profit_price", None) if intent is not None else None
+    tp_p = _safe_decimal(raw_tp) if intent is not None else None
     if intent is not None and intent.kind in (ActionKind.OPEN, ActionKind.ADD):
         stop_p = _safe_decimal(intent.stop_price)
         limit_p = _safe_decimal(intent.limit_price)
@@ -755,15 +1151,22 @@ def extract_forex_valve_features(
         if stop_p is None or stop_p <= Decimal("0"):
             stop_deficit = 1.0
             vetoes.append("MISSING_PROTECTIVE_STOP")
-        elif limit_p is not None:
-            if side_val == "BUY" and stop_p >= limit_p:
+        elif side_val == "BUY":
+            marketable_buy = limit_p is None or (obs_ask is not None and limit_p >= obs_ask)
+            if (limit_p is not None and stop_p >= limit_p) or (
+                marketable_buy and obs_bid is not None and stop_p >= obs_bid
+            ):
                 stop_deficit = 1.0
                 vetoes.append("INVERTED_BUY_PROTECTIVE_STOP")
-            elif side_val == "SELL" and stop_p <= limit_p:
+        elif side_val == "SELL":
+            marketable_sell = limit_p is None or (obs_bid is not None and limit_p <= obs_bid)
+            if (limit_p is not None and stop_p <= limit_p) or (
+                marketable_sell and obs_ask is not None and stop_p <= obs_ask
+            ):
                 stop_deficit = 1.0
                 vetoes.append("INVERTED_SELL_PROTECTIVE_STOP")
-        if tp_p is not None:
-            if tp_p <= Decimal("0"):
+        if raw_tp is not None:
+            if tp_p is None or tp_p <= Decimal("0"):
                 stop_deficit = 1.0
                 vetoes.append("INVALID_TAKE_PROFIT_PRICE")
             elif side_val == "BUY" and (
@@ -780,18 +1183,60 @@ def extract_forex_valve_features(
             ):
                 stop_deficit = 1.0
                 vetoes.append("INVERTED_SELL_TAKE_PROFIT")
-    elif intent is not None and intent.kind is ActionKind.AMEND_STOP and tp_p is not None:
-        stop_p = _safe_decimal(intent.stop_price)
-        amend_side = obs_pos_side or (intent.side.value if hasattr(intent.side, "value") else (None if intent.side is None else str(intent.side)))
-        if tp_p <= Decimal("0"):
+    elif intent is not None and intent.kind is ActionKind.AMEND_STOP:
+        raw_stop = getattr(intent, "stop_price", None)
+        stop_p = _safe_decimal(raw_stop)
+        if obs_pos_side is not None:
+            raw_amend_side: str | None = obs_pos_side
+        elif obs_pos_ambiguous:
+            raw_amend_side = None
+        else:
+            raw_amend_side = (
+                intent.side.value
+                if hasattr(intent.side, "value")
+                else (None if intent.side is None else str(intent.side))
+            )
+        amend_side = raw_amend_side.upper() if isinstance(raw_amend_side, str) else None
+        if raw_stop is None:
             stop_deficit = 1.0
-            vetoes.append("INVALID_TAKE_PROFIT_PRICE")
-        elif amend_side == "BUY" and ((stop_p is not None and tp_p <= stop_p) or (obs_ask is not None and tp_p <= obs_ask)):
+            vetoes.append("MISSING_PROTECTIVE_STOP")
+        elif stop_p is None or stop_p <= Decimal("0"):
             stop_deficit = 1.0
-            vetoes.append("INVERTED_BUY_TAKE_PROFIT")
-        elif amend_side == "SELL" and ((stop_p is not None and tp_p >= stop_p) or (obs_bid is not None and tp_p >= obs_bid)):
-            stop_deficit = 1.0
-            vetoes.append("INVERTED_SELL_TAKE_PROFIT")
+            vetoes.append("INVALID_PROTECTIVE_STOP")
+        else:
+            if amend_side == "BUY":
+                if obs_bid is not None and stop_p >= obs_bid:
+                    stop_deficit = 1.0
+                    vetoes.append("INVERTED_BUY_PROTECTIVE_STOP")
+                elif obs_prev_stop is not None and obs_prev_stop > Decimal("0") and stop_p < obs_prev_stop:
+                    stop_deficit = 1.0
+                    vetoes.append("LOOSENED_BUY_PROTECTIVE_STOP")
+            elif amend_side == "SELL":
+                if obs_ask is not None and stop_p <= obs_ask:
+                    stop_deficit = 1.0
+                    vetoes.append("INVERTED_SELL_PROTECTIVE_STOP")
+                elif obs_prev_stop is not None and obs_prev_stop > Decimal("0") and stop_p > obs_prev_stop:
+                    stop_deficit = 1.0
+                    vetoes.append("LOOSENED_SELL_PROTECTIVE_STOP")
+            elif obs_bid is not None or obs_ask is not None or obs_pos_ambiguous or obs_prev_stop is not None:
+                stop_deficit = 1.0
+                vetoes.append("MISSING_POSITION_SIDE")
+        if raw_tp is not None:
+            if tp_p is None or tp_p <= Decimal("0"):
+                stop_deficit = 1.0
+                vetoes.append("INVALID_TAKE_PROFIT_PRICE")
+            elif amend_side == "BUY" and (
+                (stop_p is not None and stop_p > Decimal("0") and tp_p <= stop_p)
+                or (obs_ask is not None and tp_p <= obs_ask)
+            ):
+                stop_deficit = 1.0
+                vetoes.append("INVERTED_BUY_TAKE_PROFIT")
+            elif amend_side == "SELL" and (
+                (stop_p is not None and stop_p > Decimal("0") and tp_p >= stop_p)
+                or (obs_bid is not None and tp_p >= obs_bid)
+            ):
+                stop_deficit = 1.0
+                vetoes.append("INVERTED_SELL_TAKE_PROFIT")
 
     # 7. Quote / state staleness ratio
     staleness = 0.0
@@ -823,6 +1268,15 @@ def extract_forex_valve_features(
     return vec, vetoes
 
 
+def _finite_float(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ContractError(f"{field} must be a finite numeric value")
+    out = float(value)
+    if not math.isfinite(out):
+        raise ContractError(f"{field} must be finite")
+    return out
+
+
 class TKSMetaValveController:
     """Deterministic 8 -> 16 (tanh) -> 1 (sigmoid) MLP controller (161 parameters)."""
 
@@ -837,13 +1291,23 @@ class TKSMetaValveController:
         feature_names: tuple[str, ...] = FOREX_FEATURE_NAMES,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        if len(w1) != 16 or any(len(row) != 8 for row in w1) or len(b1) != 16 or len(w2) != 16:
+        if (
+            not isinstance(w1, (list, tuple))
+            or not isinstance(b1, (list, tuple))
+            or not isinstance(w2, (list, tuple))
+            or len(w1) != 16
+            or any(not isinstance(row, (list, tuple)) or len(row) != 8 for row in w1)
+            or len(b1) != 16
+            or len(w2) != 16
+        ):
             raise ContractError("TKSMetaValveController requires exact 8->16->1 weight geometry (161 params)")
-        self.w1 = [[float(v) for v in row] for row in w1]
-        self.b1 = [float(v) for v in b1]
-        self.w2 = [float(v) for v in w2]
-        self.b2 = float(b2)
-        self.threshold = float(threshold)
+        self.w1 = [[_finite_float(v, f"w1[{i}][{j}]") for j, v in enumerate(row)] for i, row in enumerate(w1)]
+        self.b1 = [_finite_float(v, f"b1[{i}]") for i, v in enumerate(b1)]
+        self.w2 = [_finite_float(v, f"w2[{i}]") for i, v in enumerate(w2)]
+        self.b2 = _finite_float(b2, "b2")
+        self.threshold = _finite_float(threshold, "threshold")
+        if not (0.0 < self.threshold < 1.0):
+            raise ContractError("TKSMetaValveController threshold must satisfy 0.0 < threshold < 1.0")
         self.feature_names = tuple(feature_names)
         self.metadata = dict(metadata or {})
 
@@ -877,10 +1341,11 @@ class TKSMetaValveController:
         return sha256(canonical_bytes(core)).hexdigest()
 
     def forward(self, x: list[float]) -> float:
-        if len(x) != 8:
+        if not isinstance(x, (list, tuple)) or len(x) != 8:
             raise ContractError("TKSMetaValveController requires an 8-element feature vector")
+        vec = [_finite_float(x_j, f"x[{j}]") for j, x_j in enumerate(x)]
         hidden = [
-            math.tanh(sum(w_ij * x_j for w_ij, x_j in zip(row, x)) + bias)
+            math.tanh(sum(w_ij * x_j for w_ij, x_j in zip(row, vec)) + bias)
             for row, bias in zip(self.w1, self.b1)
         ]
         logit = sum(w_i * h_i for w_i, h_i in zip(self.w2, hidden)) + self.b2
@@ -894,6 +1359,11 @@ class TKSMetaValveController:
     @classmethod
     def load_weights(cls, path: Path) -> "TKSMetaValveController":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ContractError("TKSMetaValveController weights payload must be a JSON object")
+        param_cnt = data.get("parameter_count")
+        if type(param_cnt) is not int or param_cnt != 161:
+            raise ContractError("TKSMetaValveController weights payload parameter_count must equal 161")
         return cls(
             w1=data["w1"],
             b1=data["b1"],
@@ -938,11 +1408,18 @@ class ForexMetaValveGate:
         self,
         proposal: Any,
         *,
-        current_view: dict[str, Any] | None = None,
-        policy: dict[str, Any] | None = None,
+        current_view: Mapping[str, Any] | None = None,
+        policy: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> ValveDecision:
-        eff_policy = policy if policy is not None else self.default_policy
+        if policy is not None:
+            eff_policy = policy
+        elif isinstance(current_view, Mapping) and "policy" in current_view and current_view["policy"] is not None:
+            if not isinstance(current_view["policy"], Mapping):
+                raise ContractError("current_view['policy'] must be a mapping")
+            eff_policy = current_view["policy"]
+        else:
+            eff_policy = self.default_policy
         vec, vetoes = extract_forex_valve_features(
             proposal,
             current_view=current_view,
@@ -993,8 +1470,8 @@ class ForexMetaValveGate:
         self,
         proposal: Any,
         *,
-        current_view: dict[str, Any] | None = None,
-        policy: dict[str, Any] | None = None,
+        current_view: Mapping[str, Any] | None = None,
+        policy: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> ValveDecision:
         dec = self.evaluate(proposal, current_view=current_view, policy=policy, now=now)

@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from decimal import Decimal
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
+from enum import StrEnum
 from hashlib import sha256
 import ipaddress
 import json
@@ -29,13 +30,14 @@ import re
 import socket
 import ssl
 from threading import Lock
-from typing import Any, Callable, Mapping
+import time
+from typing import Any, Callable, Mapping, TypeVar
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from cas_forex_revamp.contracts import ContractError, canonical_bytes, content_digest, decimal_text
-from cas_forex_revamp.contracts.primitives import integer, utc_time
+from cas_forex_revamp.contracts.primitives import decimal_value, integer, utc_time
 
 from .decisions import OperatorUnavailable
 from .model import (
@@ -130,9 +132,129 @@ _SENSITIVE_KEY_WORDS = frozenset({"password", "passwd", "token", "secret", "logi
 class FrontierTransportError(OperatorUnavailable):
     """Raised when a frontier or offline fallback AI request fails closed."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = bool(retryable)
+
+
+class FrontierCircuitOpenError(FrontierTransportError):
+    """Raised fast when a provider circuit breaker is OPEN or a HALF_OPEN probe is active."""
+
+    def __init__(self, message: str, *, provider: str = "") -> None:
+        super().__init__(message, status_code=None, retryable=False)
+        self.provider = provider
+
 
 class FrontierConfigurationError(ContractError):
     """Raised on invalid model selection, host allowlist breach, or malformed provider settings."""
+
+
+class CircuitBreakerState(StrEnum):
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+
+class FrontierOperationKind(StrEnum):
+    READ_INFERENCE = "READ_INFERENCE"
+    READ_SCOUT = "READ_SCOUT"
+    READ_EXPLAINER = "READ_EXPLAINER"
+    UNSAFE_WRITE = "UNSAFE_WRITE"
+
+
+_IDEMPOTENT_READ_OPERATIONS = frozenset({
+    FrontierOperationKind.READ_INFERENCE,
+    FrontierOperationKind.READ_SCOUT,
+    FrontierOperationKind.READ_EXPLAINER,
+})
+_HTTP_STATUS_RE = re.compile(r"\bHTTP(?:\s+status)?\s+(\d{3})\b")
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitBreakerConfig:
+    failure_threshold: int = 3
+    cooldown_seconds: Decimal = Decimal("30")
+
+    def __post_init__(self) -> None:
+        integer(self.failure_threshold, "failure_threshold", minimum=1)
+        decimal_value(self.cooldown_seconds, "cooldown_seconds", positive=True)
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    max_attempts: int = 3
+    base_delay_seconds: Decimal = Decimal("0.05")
+    max_delay_seconds: Decimal = Decimal("0.50")
+
+    def __post_init__(self) -> None:
+        integer(self.max_attempts, "max_attempts", minimum=1)
+        if self.max_attempts > 10:
+            raise FrontierConfigurationError("max_attempts must be <= 10")
+        decimal_value(self.base_delay_seconds, "base_delay_seconds", positive=False)
+        decimal_value(self.max_delay_seconds, "max_delay_seconds", positive=False)
+        if self.base_delay_seconds < 0 or self.max_delay_seconds < self.base_delay_seconds:
+            raise FrontierConfigurationError("RetryPolicy requires 0 <= base_delay_seconds <= max_delay_seconds")
+
+
+FRONTIER_PROVIDERS: tuple[str, ...] = (
+    "anthropic",
+    "gemini_decision",
+    "gemini",
+    "openai",
+    "deepseek",
+    "ollama",
+)
+
+# Exact integer pricing in micro-USD (1 USD = 1,000,000 micro-USD) per 1,000,000 units:
+# (input_micro_usd_per_1m, output_micro_usd_per_1m). Local qwen3:0.6b fallback is strictly (0, 0).
+MODEL_PRICING_MICRO_USD_PER_1M: dict[str, tuple[int, int]] = {
+    "claude-fable-5.2": (3_000_000, 15_000_000),
+    "claude-fable": (3_000_000, 15_000_000),
+    "claude-5.5": (15_000_000, 75_000_000),
+    "gemini-decision-1": (100_000, 400_000),
+    "gemini-carbon": (1_250_000, 10_000_000),
+    "gemini-argon": (300_000, 2_500_000),
+    "openai-astra": (2_500_000, 10_000_000),
+    "deepseek-flash-1017": (270_000, 1_100_000),
+    "qwen3:0.6b": (0, 0),
+}
+
+
+def compute_call_cost_pico_usd(
+    model_id: str,
+    *,
+    input_units: int,
+    output_units: int,
+    pricing_micro_usd_per_1m: Mapping[str, tuple[int, int]] | None = None,
+) -> int:
+    """Return exact integer pico-USD (10^-12 USD) for a call with zero float arithmetic."""
+    table = pricing_micro_usd_per_1m if pricing_micro_usd_per_1m is not None else MODEL_PRICING_MICRO_USD_PER_1M
+    if model_id not in table:
+        raise FrontierConfigurationError(f"missing pricing entry for model {model_id!r}")
+    in_rate, out_rate = table[model_id]
+    in_u = integer(input_units, "input_units", minimum=0)
+    out_u = integer(output_units, "output_units", minimum=0)
+    in_r = integer(in_rate, "input_micro_usd_per_1m", minimum=0)
+    out_r = integer(out_rate, "output_micro_usd_per_1m", minimum=0)
+    return (in_u * in_r) + (out_u * out_r)
+
+
+def pico_usd_to_micro_usd(pico_usd: int) -> int:
+    clean_pico = integer(pico_usd, "pico_usd", minimum=0)
+    return int((Decimal(clean_pico) / Decimal(1_000_000)).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def pico_usd_to_decimal_text(pico_usd: int) -> str:
+    clean_pico = integer(pico_usd, "pico_usd", minimum=0)
+    return decimal_text(Decimal(clean_pico) / Decimal(1_000_000_000_000))
 
 
 class _RedactedSecret:
@@ -162,10 +284,18 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Refuse HTTP redirects on outbound AI API calls (anti-SSRF / key exfiltration guard)."""
 
     def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
-        raise FrontierTransportError(f"HTTP redirect {code} refused for outbound AI request")
+        raise FrontierTransportError(
+            f"HTTP redirect {code} refused for outbound AI request",
+            status_code=int(code),
+            retryable=False,
+        )
 
     def http_error_301(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
-        raise FrontierTransportError(f"HTTP redirect {code} refused for outbound AI request")
+        raise FrontierTransportError(
+            f"HTTP redirect {code} refused for outbound AI request",
+            status_code=int(code),
+            retryable=False,
+        )
 
     http_error_302 = http_error_301
     http_error_303 = http_error_301
@@ -460,11 +590,19 @@ def default_frontier_https_post(
             status = int(getattr(resp, "status", 200))
             raw = resp.read(max_wire_bytes + 1)
     except urllib.error.HTTPError as exc:
-        raise FrontierTransportError(f"frontier AI HTTP status {exc.code}") from None
+        code = int(exc.code)
+        raise FrontierTransportError(
+            f"frontier AI HTTP status {code}",
+            status_code=code,
+            retryable=(code == 429 or 500 <= code <= 599),
+        ) from None
     except FrontierTransportError:
         raise
     except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
-        raise FrontierTransportError(f"frontier AI connection error: {type(exc).__name__}") from None
+        raise FrontierTransportError(
+            f"frontier AI connection error: {type(exc).__name__}",
+            retryable=True,
+        ) from None
     finally:
         req.headers.clear()
         req.unredirected_hdrs.clear()
@@ -491,11 +629,22 @@ def default_ollama_loopback_post(
             status = int(getattr(resp, "status", 200))
             raw = resp.read(max_wire_bytes + 1)
     except urllib.error.HTTPError as exc:
-        raise FrontierTransportError(f"Ollama fallback HTTP status {exc.code}") from None
+        code = int(exc.code)
+        raise FrontierTransportError(
+            f"Ollama fallback HTTP status {code}",
+            status_code=code,
+            retryable=(code == 429 or 500 <= code <= 599),
+        ) from None
     except FrontierTransportError:
         raise
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise FrontierTransportError(f"Ollama fallback unavailable: {type(exc).__name__}") from None
+        raise FrontierTransportError(
+            f"Ollama fallback unavailable: {type(exc).__name__}",
+            retryable=True,
+        ) from None
+    finally:
+        req.headers.clear()
+        req.unredirected_hdrs.clear()
     if len(raw) > max_wire_bytes:
         raise FrontierTransportError("Ollama fallback response exceeded byte limit")
     return status, raw
@@ -555,6 +704,8 @@ def _extract_gemini_decision_selection(
         prob_raw = head["probabilities"].get(raw_choice)
     try:
         prob = Decimal(str(prob_raw if prob_raw is not None else "0.50"))
+        if not prob.is_finite():
+            raise ValueError("non-finite probability")
     except Exception:
         prob = Decimal("0.50")
     if prob < Decimal("0.01"):
@@ -609,7 +760,8 @@ def _extract_provider_text_and_usage(
                     text = blk.get("text")
                     break
         usage = doc.get("usage") if type(doc.get("usage")) is dict else {}
-        out_tok = int(usage.get("output_tokens", max(1, len(str(text or "").encode("utf-8")) // 4)))
+        cand_out = _safe_non_neg_int(usage.get("output_tokens"))
+        out_tok = cand_out if cand_out is not None else max(1, len(str(text or "").encode("utf-8")) // 4)
     elif provider == "gemini":
         cands = doc.get("candidates")
         if type(cands) is not list or not cands:
@@ -628,7 +780,8 @@ def _extract_provider_text_and_usage(
                         text = part.get("text")
                         break
         meta = doc.get("usageMetadata") if type(doc.get("usageMetadata")) is dict else {}
-        out_tok = int(meta.get("candidatesTokenCount", max(1, len(str(text or "").encode("utf-8")) // 4)))
+        cand_out = _safe_non_neg_int(meta.get("candidatesTokenCount"))
+        out_tok = cand_out if cand_out is not None else max(1, len(str(text or "").encode("utf-8")) // 4)
     elif provider in ("openai", "deepseek"):
         choices = doc.get("choices")
         if type(choices) is not list or not choices:
@@ -636,17 +789,365 @@ def _extract_provider_text_and_usage(
         msg = choices[0].get("message") if type(choices[0]) is dict else None
         text = msg.get("content") if type(msg) is dict else None
         usage = doc.get("usage") if type(doc.get("usage")) is dict else {}
-        out_tok = int(usage.get("completion_tokens", max(1, len(str(text or "").encode("utf-8")) // 4)))
+        cand_out = _safe_non_neg_int(usage.get("completion_tokens"))
+        out_tok = cand_out if cand_out is not None else max(1, len(str(text or "").encode("utf-8")) // 4)
     elif provider == "ollama":
         msg = doc.get("message") if type(doc.get("message")) is dict else {}
         text = msg.get("content", doc.get("response"))
-        out_tok = int(doc.get("eval_count", max(1, len(str(text or "").encode("utf-8")) // 4)))
+        cand_out = _safe_non_neg_int(doc.get("eval_count"))
+        out_tok = cand_out if cand_out is not None else max(1, len(str(text or "").encode("utf-8")) // 4)
     else:
         raise FrontierConfigurationError(f"unsupported provider {provider!r}")
 
     if not isinstance(text, str) or not text.strip():
         raise FrontierTransportError(f"{provider} returned empty selection text")
     return _strip_optional_json_fence(text), max(1, out_tok), None
+
+
+def _safe_non_neg_int(value: Any) -> int | None:
+    if type(value) is int and value >= 0:
+        return value
+    return None
+
+
+def _extract_provider_input_units(
+    provider: str,
+    doc: Mapping[str, Any],
+    *,
+    fallback_input_units: int,
+) -> int:
+    if provider == "anthropic":
+        usage = doc.get("usage")
+        if isinstance(usage, Mapping):
+            base = _safe_non_neg_int(usage.get("input_tokens"))
+            if base is not None:
+                cache_create = _safe_non_neg_int(usage.get("cache_creation_input_tokens")) or 0
+                cache_read = _safe_non_neg_int(usage.get("cache_read_input_tokens")) or 0
+                return base + cache_create + cache_read
+    elif provider in ("gemini", "gemini_decision"):
+        meta = doc.get("usageMetadata")
+        if isinstance(meta, Mapping):
+            prompt_cnt = _safe_non_neg_int(meta.get("promptTokenCount"))
+            if prompt_cnt is not None:
+                return prompt_cnt
+        if provider == "gemini_decision":
+            usage = doc.get("usage")
+            if isinstance(usage, Mapping):
+                for key in ("input_tokens", "prompt_tokens"):
+                    cnt = _safe_non_neg_int(usage.get(key))
+                    if cnt is not None:
+                        return cnt
+    elif provider in ("openai", "deepseek"):
+        usage = doc.get("usage")
+        if isinstance(usage, Mapping):
+            prompt_cnt = _safe_non_neg_int(usage.get("prompt_tokens"))
+            if prompt_cnt is not None:
+                return prompt_cnt
+    elif provider == "ollama":
+        prompt_cnt = _safe_non_neg_int(doc.get("prompt_eval_count"))
+        if prompt_cnt is not None:
+            return prompt_cnt
+    return max(0, int(fallback_input_units))
+
+
+def _is_retryable_http_status(status_code: int) -> bool:
+    return status_code == 429 or 500 <= status_code <= 599
+
+
+def _classify_transport_error(exc: FrontierTransportError) -> tuple[bool, int | None, bool]:
+    """Return (retryable, status_code, availability_failure) for a FrontierTransportError."""
+    if isinstance(exc, FrontierCircuitOpenError):
+        return False, None, False
+    if exc.status_code is not None:
+        code = int(exc.status_code)
+        if 300 <= code < 400:
+            return False, code, False
+        retryable = _is_retryable_http_status(code)
+        return retryable, code, retryable
+    if exc.retryable:
+        return True, None, True
+    msg = str(exc)
+    if (
+        "refused non-public IP" in msg
+        or "HTTP redirect" in msg
+        or "exceeded byte limit" in msg
+        or "requires CAS_FOREX_" in msg
+    ):
+        return False, None, False
+    m = _HTTP_STATUS_RE.search(msg)
+    if m is not None:
+        code = int(m.group(1))
+        if 300 <= code < 400:
+            return False, code, False
+        retryable = _is_retryable_http_status(code)
+        return retryable, code, retryable
+    if "connection error" in msg or "unavailable" in msg:
+        return True, None, True
+    if "JSON" in msg or "missing" in msg or "empty" in msg or "non-JSON" in msg:
+        return False, None, True
+    return False, None, False
+
+
+def _deterministic_jitter_seconds(
+    *,
+    provider: str,
+    idempotency_key: str,
+    attempt: int,
+    base_delay: Decimal,
+    max_delay: Decimal,
+) -> Decimal:
+    if base_delay <= 0 or max_delay <= 0:
+        return Decimal("0")
+    exp = min(max_delay, base_delay * (Decimal(2) ** max(0, attempt - 1)))
+    digest_bytes = sha256(f"{provider}:{idempotency_key}:{attempt}".encode("utf-8")).digest()
+    frac = Decimal(int.from_bytes(digest_bytes[:4], "big")) / Decimal(0xFFFFFFFF)
+    delay = exp * (Decimal("0.5") + Decimal("0.5") * frac)
+    return delay.quantize(Decimal("0.000001"))
+
+
+@dataclass(slots=True)
+class _ProviderBreakerSlot:
+    state: CircuitBreakerState = CircuitBreakerState.CLOSED
+    consecutive_failures: int = 0
+    open_trips: int = 0
+    opened_at: datetime | None = None
+    cooldown_until: datetime | None = None
+    half_open_in_flight: bool = False
+    last_error: str | None = None
+
+
+class ProviderCircuitBreaker:
+    """Thread-safe per-provider circuit breaker (CLOSED -> OPEN -> HALF_OPEN)."""
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        config: CircuitBreakerConfig | None = None,
+        providers: tuple[str, ...] = FRONTIER_PROVIDERS,
+    ) -> None:
+        self._clock = clock or _utc_now
+        self._config = config or CircuitBreakerConfig()
+        self._lock = Lock()
+        self._slots: dict[str, _ProviderBreakerSlot] = {p: _ProviderBreakerSlot() for p in providers}
+
+    def _slot(self, provider: str) -> _ProviderBreakerSlot:
+        slot = self._slots.get(provider)
+        if slot is None:
+            slot = _ProviderBreakerSlot()
+            self._slots[provider] = slot
+        return slot
+
+    def before_call(self, provider: str) -> bool:
+        """Check breaker state before I/O. Returns True if caller holds the single HALF_OPEN probe."""
+        with self._lock:
+            now = utc_time(self._clock(), "circuit_clock")
+            slot = self._slot(provider)
+            if slot.state == CircuitBreakerState.CLOSED:
+                return False
+            if slot.state == CircuitBreakerState.OPEN:
+                if slot.cooldown_until is not None and now < slot.cooldown_until:
+                    raise FrontierCircuitOpenError(
+                        f"provider {provider!r} circuit is OPEN until {slot.cooldown_until.isoformat()}",
+                        provider=provider,
+                    )
+                slot.state = CircuitBreakerState.HALF_OPEN
+                slot.half_open_in_flight = True
+                return True
+            if slot.half_open_in_flight:
+                raise FrontierCircuitOpenError(
+                    f"provider {provider!r} circuit HALF_OPEN probe already in flight",
+                    provider=provider,
+                )
+            slot.half_open_in_flight = True
+            return True
+
+    def record_success(self, provider: str) -> None:
+        with self._lock:
+            slot = self._slot(provider)
+            slot.state = CircuitBreakerState.CLOSED
+            slot.consecutive_failures = 0
+            slot.opened_at = None
+            slot.cooldown_until = None
+            slot.half_open_in_flight = False
+            slot.last_error = None
+
+    def record_failure(
+        self,
+        provider: str,
+        *,
+        reason: str,
+        availability_failure: bool = True,
+    ) -> None:
+        with self._lock:
+            now = utc_time(self._clock(), "circuit_clock")
+            slot = self._slot(provider)
+            was_half_open = slot.state == CircuitBreakerState.HALF_OPEN
+            slot.half_open_in_flight = False
+            slot.last_error = str(reason)[:160]
+            if not was_half_open and not availability_failure:
+                return
+            slot.consecutive_failures += 1
+            if was_half_open or slot.consecutive_failures >= self._config.failure_threshold:
+                cooldown_us = int(
+                    (self._config.cooldown_seconds * Decimal(1_000_000)).to_integral_value(rounding=ROUND_HALF_UP)
+                )
+                slot.state = CircuitBreakerState.OPEN
+                slot.opened_at = now
+                slot.cooldown_until = now + timedelta(microseconds=cooldown_us)
+                slot.open_trips += 1
+
+    def release_probe_on_abort(self, provider: str) -> None:
+        with self._lock:
+            slot = self._slot(provider)
+            if slot.state == CircuitBreakerState.HALF_OPEN and slot.half_open_in_flight:
+                slot.half_open_in_flight = False
+
+    def state_of(self, provider: str) -> CircuitBreakerState:
+        with self._lock:
+            return self._slot(provider).state
+
+    def snapshot(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return {
+                provider: {
+                    "state": slot.state.value,
+                    "consecutive_failures": slot.consecutive_failures,
+                    "open_trips": slot.open_trips,
+                    "opened_at": slot.opened_at.isoformat() if slot.opened_at is not None else None,
+                    "cooldown_until": slot.cooldown_until.isoformat() if slot.cooldown_until is not None else None,
+                    "half_open_in_flight": slot.half_open_in_flight,
+                    "last_error": slot.last_error,
+                }
+                for provider, slot in self._slots.items()
+            }
+
+
+def execute_resilient_frontier_call(
+    *,
+    operation_kind: FrontierOperationKind,
+    provider: str,
+    circuit_breaker: ProviderCircuitBreaker,
+    retry_policy: RetryPolicy,
+    clock: Callable[[], datetime],
+    sleep: Callable[[float], None],
+    budget_seconds: Decimal,
+    idempotency_key: str,
+    attempt_fn: Callable[[float], _T],
+    manage_breaker: bool = True,
+    is_probe_override: bool | None = None,
+) -> _T:
+    """Execute a frontier call with circuit breaker, bounded deterministic retry (READ_* only), and budget cap."""
+    if not isinstance(operation_kind, FrontierOperationKind):
+        raise FrontierConfigurationError(f"unsupported FrontierOperationKind {operation_kind!r}")
+    decimal_value(budget_seconds, "budget_seconds", positive=True)
+
+    if manage_breaker:
+        is_probe = circuit_breaker.before_call(provider)
+    else:
+        is_probe = bool(is_probe_override)
+
+    # Strict safety invariant: NEVER retry UNSAFE_WRITE or HALF_OPEN probes.
+    if operation_kind not in _IDEMPOTENT_READ_OPERATIONS or is_probe:
+        effective_max_attempts = 1
+    else:
+        effective_max_attempts = retry_policy.max_attempts
+
+    start_now = utc_time(clock(), "resilient_start")
+    budget_us = int((budget_seconds * Decimal(1_000_000)).to_integral_value(rounding=ROUND_HALF_UP))
+    deadline = start_now + timedelta(microseconds=max(1, budget_us))
+    breaker_settled = not manage_breaker
+    last_exc: FrontierTransportError | None = None
+
+    try:
+        for attempt in range(1, effective_max_attempts + 1):
+            now = utc_time(clock(), "resilient_attempt")
+            rem_s = (deadline - now).total_seconds()
+            if rem_s <= 0.0 and attempt > 1:
+                break
+            attempt_timeout = max(0.001, min(float(budget_seconds), rem_s if rem_s > 0.0 else float(budget_seconds)))
+            try:
+                result = attempt_fn(attempt_timeout)
+            except FrontierTransportError as exc:
+                last_exc = exc
+                retryable, _, availability_failure = _classify_transport_error(exc)
+                if retryable and attempt < effective_max_attempts:
+                    delay_s = _deterministic_jitter_seconds(
+                        provider=provider,
+                        idempotency_key=idempotency_key,
+                        attempt=attempt,
+                        base_delay=retry_policy.base_delay_seconds,
+                        max_delay=retry_policy.max_delay_seconds,
+                    )
+                    now_before_sleep = utc_time(clock(), "resilient_backoff")
+                    rem_before_sleep = Decimal(str((deadline - now_before_sleep).total_seconds()))
+                    if rem_before_sleep <= delay_s or rem_before_sleep <= Decimal("0"):
+                        break
+                    if delay_s > 0:
+                        sleep(float(delay_s))
+                    now_after_sleep = utc_time(clock(), "resilient_after_sleep")
+                    if now_after_sleep >= deadline:
+                        break
+                    continue
+                if manage_breaker:
+                    circuit_breaker.record_failure(
+                        provider,
+                        reason=str(exc),
+                        availability_failure=availability_failure,
+                    )
+                    breaker_settled = True
+                raise
+            except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+                wrapped = FrontierTransportError(
+                    f"frontier AI connection error: {type(exc).__name__}",
+                    retryable=True,
+                )
+                last_exc = wrapped
+                if attempt < effective_max_attempts:
+                    delay_s = _deterministic_jitter_seconds(
+                        provider=provider,
+                        idempotency_key=idempotency_key,
+                        attempt=attempt,
+                        base_delay=retry_policy.base_delay_seconds,
+                        max_delay=retry_policy.max_delay_seconds,
+                    )
+                    now_before_sleep = utc_time(clock(), "resilient_backoff")
+                    rem_before_sleep = Decimal(str((deadline - now_before_sleep).total_seconds()))
+                    if rem_before_sleep <= delay_s or rem_before_sleep <= Decimal("0"):
+                        break
+                    if delay_s > 0:
+                        sleep(float(delay_s))
+                    now_after_sleep = utc_time(clock(), "resilient_after_sleep")
+                    if now_after_sleep >= deadline:
+                        break
+                    continue
+                if manage_breaker:
+                    circuit_breaker.record_failure(
+                        provider,
+                        reason=str(wrapped),
+                        availability_failure=True,
+                    )
+                    breaker_settled = True
+                raise wrapped from None
+
+            if manage_breaker:
+                circuit_breaker.record_success(provider)
+                breaker_settled = True
+            return result
+
+        final_exc = last_exc if last_exc is not None else FrontierTransportError("frontier call exceeded call budget", retryable=True)
+        _, _, availability_failure = _classify_transport_error(final_exc)
+        if manage_breaker and not breaker_settled:
+            circuit_breaker.record_failure(
+                provider,
+                reason=str(final_exc),
+                availability_failure=availability_failure,
+            )
+            breaker_settled = True
+        raise final_exc
+    finally:
+        if manage_breaker and is_probe and not breaker_settled:
+            circuit_breaker.release_probe_on_abort(provider)
 
 
 def _build_provider_payload(
@@ -880,6 +1381,10 @@ class FrontierChatBackend(ModelBackend):
         timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
         max_wire_bytes: int = MAX_PROVIDER_WIRE_BYTES,
         min_probability: Decimal = DEFAULT_MIN_DECISION_PROBABILITY,
+        sleep: Callable[[float], None] | None = None,
+        circuit_breaker: ProviderCircuitBreaker | None = None,
+        retry_policy: RetryPolicy | None = None,
+        usage_recorder: Callable[[str, int, int], None] | None = None,
     ) -> None:
         self._entry = entry
         self._api_slug = api_slug
@@ -887,11 +1392,15 @@ class FrontierChatBackend(ModelBackend):
         self._secret = secret
         self._verifier = verifier
         self._clock = clock or _utc_now
+        self._sleep = sleep or time.sleep
         self._http_post = http_post
         self._resolve_dns = resolve_dns
         self._timeout = float(timeout_seconds)
         self._max_wire_bytes = integer(max_wire_bytes, "max_wire_bytes", minimum=1024)
         self._min_probability = min_probability
+        self._circuit_breaker = circuit_breaker if circuit_breaker is not None else ProviderCircuitBreaker(clock=self._clock)
+        self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
+        self._usage_recorder = usage_recorder
         self._seq = 0
         self._lock = Lock()
         self._decide_404: bool = False
@@ -907,19 +1416,36 @@ class FrontierChatBackend(ModelBackend):
         return _count_bytes_tokens(invocation)
 
     def _dispatch_http(self, url: str, headers: dict[str, str], body: bytes, timeout: float) -> tuple[int, bytes]:
-        if self._http_post is not None:
-            return self._http_post(url, dict(headers), body, timeout, self._max_wire_bytes)
-        if self._entry.provider == "ollama":
-            return default_ollama_loopback_post(url, dict(headers), body, timeout, self._max_wire_bytes)
-        return default_frontier_https_post(
-            url,
-            dict(headers),
-            body,
-            timeout,
-            self._max_wire_bytes,
-            expected_host=self._entry.allowed_host,
-            resolve_dns=self._resolve_dns,
-        )
+        try:
+            if self._http_post is not None:
+                return self._http_post(url, dict(headers), body, timeout, self._max_wire_bytes)
+            if self._entry.provider == "ollama":
+                return default_ollama_loopback_post(url, dict(headers), body, timeout, self._max_wire_bytes)
+            return default_frontier_https_post(
+                url,
+                dict(headers),
+                body,
+                timeout,
+                self._max_wire_bytes,
+                expected_host=self._entry.allowed_host,
+                resolve_dns=self._resolve_dns,
+            )
+        except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+            raise FrontierTransportError(
+                f"frontier AI connection error: {type(exc).__name__}",
+                retryable=True,
+            ) from None
+
+    def _dispatch_checked(self, url: str, headers: dict[str, str], body: bytes, timeout: float) -> tuple[int, bytes]:
+        status, raw = self._dispatch_http(url, headers, body, timeout)
+        if status < 200 or status >= 300:
+            retryable = _is_retryable_http_status(int(status))
+            raise FrontierTransportError(
+                f"{self._entry.display_name} returned HTTP status {status}",
+                status_code=int(status),
+                retryable=retryable,
+            )
+        return status, raw
 
     def infer(self, invocation: ModelInvocation) -> InferenceReply:
         if invocation.system_policy != SYSTEM_POLICY or invocation.output_schema_id != OUTPUT_SCHEMA_ID:
@@ -929,70 +1455,177 @@ class FrontierChatBackend(ModelBackend):
 
         started_at = utc_time(self._clock(), "started_at")
         input_tokens = self.count_input_tokens(invocation)
-        timeout_s = min(self._timeout, float(invocation.budget.max_seconds_per_call))
-        extract_provider = self._entry.provider
-        if self._entry.provider == "gemini_decision":
-            if self._secret is None:
-                raise FrontierTransportError(f"{self._entry.display_name} requires {self._entry.credential_env}")
-            clean_slug = self._api_slug.removeprefix("models/")
-            status = 404
-            raw = b""
-            with self._lock:
-                skip_decide = self._decide_404
-            if clean_slug.startswith("gemini-decision") and not skip_decide:
-                url, headers, body = _build_provider_payload(self._entry, self._api_slug, invocation, self._secret)
-                try:
-                    status, raw = self._dispatch_http(url, headers, body, min(timeout_s, 4.0))
-                except FrontierTransportError as exc:
-                    if "HTTP status 404" not in str(exc):
-                        raise
-                    status, raw = 404, b""
-                finally:
-                    headers.clear()
-                if status == 404:
-                    with self._lock:
-                        self._decide_404 = True
-            if status == 404 or not clean_slug.startswith("gemini-decision"):
-                fb_candidates = (
-                    ("gemini-2.5-flash", "gemini-3.8-flash")
-                    if clean_slug == "gemini-decision-1"
-                    else (clean_slug,)
-                )
-                for idx_fb, fb_slug in enumerate(fb_candidates):
-                    fb_url, fb_hdrs, fb_body = _build_gemini_fast_json_payload(
-                        clean_slug=fb_slug,
-                        system_text=invocation.system_policy,
-                        user_text=invocation.packet_json,
-                        max_tokens=invocation.budget.max_generated_tokens_per_call,
-                        secret=self._secret,
-                        allowed_host=self._entry.allowed_host,
-                    )
-                    try:
-                        status, raw = self._dispatch_http(fb_url, fb_hdrs, fb_body, timeout_s)
-                    except FrontierTransportError as exc:
-                        if idx_fb + 1 < len(fb_candidates) and "HTTP status 404" in str(exc):
-                            status, raw = 404, b""
-                            continue
-                        raise
-                    finally:
-                        fb_hdrs.clear()
-                    if status != 404 or idx_fb + 1 == len(fb_candidates):
-                        break
-                extract_provider = "gemini"
-        else:
-            url, headers, body = _build_provider_payload(self._entry, self._api_slug, invocation, self._secret)
-            try:
-                status, raw = self._dispatch_http(url, headers, body, timeout_s)
-            finally:
-                headers.clear()
-
-        if status < 200 or status >= 300:
-            raise FrontierTransportError(f"{self._entry.display_name} returned HTTP status {status}")
-
-        doc = _decode_json_dict(raw, max_bytes=self._max_wire_bytes)
-        selection_text, generated_tokens, prob = _extract_provider_text_and_usage(
-            extract_provider, doc, invocation, min_probability=self._min_probability
+        inv_sha = content_digest(invocation)
+        timeout_dec = min(
+            Decimal(str(self._timeout)),
+            Decimal(str(invocation.budget.max_seconds_per_call)),
         )
+        if timeout_dec <= 0:
+            timeout_dec = Decimal("0.001")
+
+        # Validate credential presence before opening/tripping circuit breaker.
+        if self._entry.provider == "gemini_decision" and self._secret is None:
+            raise FrontierTransportError(f"{self._entry.display_name} requires {self._entry.credential_env}")
+        if self._entry.provider in ("anthropic", "gemini", "openai", "deepseek") and self._secret is None:
+            raise FrontierTransportError(f"{self._entry.display_name} requires {self._entry.credential_env}")
+
+        extract_provider = self._entry.provider
+        is_probe = self._circuit_breaker.before_call(self._entry.provider)
+        breaker_settled = False
+
+        try:
+            if self._entry.provider == "gemini_decision":
+                clean_slug = self._api_slug.removeprefix("models/")
+                status = 404
+                raw = b""
+                with self._lock:
+                    skip_decide = self._decide_404
+                if clean_slug.startswith("gemini-decision") and not skip_decide:
+                    def _attempt_decide(t_out: float) -> tuple[int, bytes]:
+                        u, hdrs, b = _build_provider_payload(self._entry, self._api_slug, invocation, self._secret)
+                        try:
+                            return self._dispatch_checked(u, hdrs, b, min(t_out, 4.0))
+                        finally:
+                            hdrs.clear()
+
+                    try:
+                        status, raw = execute_resilient_frontier_call(
+                            operation_kind=FrontierOperationKind.READ_INFERENCE,
+                            provider=self._entry.provider,
+                            circuit_breaker=self._circuit_breaker,
+                            retry_policy=self._retry_policy,
+                            clock=self._clock,
+                            sleep=self._sleep,
+                            budget_seconds=min(timeout_dec, Decimal("4")),
+                            idempotency_key=f"{inv_sha}:decide",
+                            attempt_fn=_attempt_decide,
+                            manage_breaker=False,
+                            is_probe_override=is_probe,
+                        )
+                    except FrontierTransportError as exc:
+                        _, err_code, availability_failure = _classify_transport_error(exc)
+                        if err_code == 404:
+                            status, raw = 404, b""
+                        else:
+                            self._circuit_breaker.record_failure(
+                                self._entry.provider,
+                                reason=str(exc),
+                                availability_failure=availability_failure,
+                            )
+                            breaker_settled = True
+                            raise
+                    if status == 404:
+                        with self._lock:
+                            self._decide_404 = True
+
+                if status == 404 or not clean_slug.startswith("gemini-decision"):
+                    fb_candidates = (
+                        ("gemini-2.5-flash", "gemini-3.8-flash")
+                        if clean_slug == "gemini-decision-1"
+                        else (clean_slug,)
+                    )
+                    for idx_fb, fb_slug in enumerate(fb_candidates):
+                        def _attempt_fb(t_out: float, slug_choice: str = fb_slug) -> tuple[int, bytes]:
+                            fb_url, fb_hdrs, fb_body = _build_gemini_fast_json_payload(
+                                clean_slug=slug_choice,
+                                system_text=invocation.system_policy,
+                                user_text=invocation.packet_json,
+                                max_tokens=invocation.budget.max_generated_tokens_per_call,
+                                secret=self._secret,
+                                allowed_host=self._entry.allowed_host,
+                            )
+                            try:
+                                return self._dispatch_checked(fb_url, fb_hdrs, fb_body, t_out)
+                            finally:
+                                fb_hdrs.clear()
+
+                        try:
+                            status, raw = execute_resilient_frontier_call(
+                                operation_kind=FrontierOperationKind.READ_INFERENCE,
+                                provider=self._entry.provider,
+                                circuit_breaker=self._circuit_breaker,
+                                retry_policy=self._retry_policy,
+                                clock=self._clock,
+                                sleep=self._sleep,
+                                budget_seconds=timeout_dec,
+                                idempotency_key=f"{inv_sha}:fb:{fb_slug}",
+                                attempt_fn=_attempt_fb,
+                                manage_breaker=False,
+                                is_probe_override=is_probe,
+                            )
+                        except FrontierTransportError as exc:
+                            _, err_code, availability_failure = _classify_transport_error(exc)
+                            if idx_fb + 1 < len(fb_candidates) and err_code == 404:
+                                status, raw = 404, b""
+                                continue
+                            self._circuit_breaker.record_failure(
+                                self._entry.provider,
+                                reason=str(exc),
+                                availability_failure=availability_failure,
+                            )
+                            breaker_settled = True
+                            raise
+                        if status != 404 or idx_fb + 1 == len(fb_candidates):
+                            break
+                    extract_provider = "gemini"
+            else:
+                def _attempt_primary(t_out: float) -> tuple[int, bytes]:
+                    u, hdrs, b = _build_provider_payload(self._entry, self._api_slug, invocation, self._secret)
+                    try:
+                        return self._dispatch_checked(u, hdrs, b, t_out)
+                    finally:
+                        hdrs.clear()
+
+                try:
+                    status, raw = execute_resilient_frontier_call(
+                        operation_kind=FrontierOperationKind.READ_INFERENCE,
+                        provider=self._entry.provider,
+                        circuit_breaker=self._circuit_breaker,
+                        retry_policy=self._retry_policy,
+                        clock=self._clock,
+                        sleep=self._sleep,
+                        budget_seconds=timeout_dec,
+                        idempotency_key=inv_sha,
+                        attempt_fn=_attempt_primary,
+                        manage_breaker=False,
+                        is_probe_override=is_probe,
+                    )
+                except FrontierTransportError as exc:
+                    _, _, availability_failure = _classify_transport_error(exc)
+                    self._circuit_breaker.record_failure(
+                        self._entry.provider,
+                        reason=str(exc),
+                        availability_failure=availability_failure,
+                    )
+                    breaker_settled = True
+                    raise
+
+            try:
+                doc = _decode_json_dict(raw, max_bytes=self._max_wire_bytes)
+                selection_text, generated_tokens, prob = _extract_provider_text_and_usage(
+                    extract_provider, doc, invocation, min_probability=self._min_probability
+                )
+            except FrontierTransportError as exc:
+                self._circuit_breaker.record_failure(
+                    self._entry.provider,
+                    reason=str(exc),
+                    availability_failure=True,
+                )
+                breaker_settled = True
+                raise
+
+            self._circuit_breaker.record_success(self._entry.provider)
+            breaker_settled = True
+        finally:
+            if is_probe and not breaker_settled:
+                self._circuit_breaker.release_probe_on_abort(self._entry.provider)
+
+        metered_input_units = _extract_provider_input_units(
+            extract_provider, doc, fallback_input_units=input_tokens
+        )
+        if self._usage_recorder is not None:
+            self._usage_recorder(self._entry.model_id, metered_input_units, generated_tokens)
+
         self.last_decision_probability = prob
         completed_at = utc_time(self._clock(), "completed_at")
         if completed_at < started_at:
@@ -1001,7 +1634,6 @@ class FrontierChatBackend(ModelBackend):
         with self._lock:
             self._seq += 1
             seq = self._seq
-        inv_sha = content_digest(invocation)
         receipt_id = f"rcpt-{self._entry.provider}-{seq}-{inv_sha[:12]}"
         reply = InferenceReply(
             raw_selection_json=selection_text,
@@ -1028,6 +1660,10 @@ class FrontierModelRegistry:
         http_post: FrontierHttpCallable | None = None,
         ollama_http_post: FrontierHttpCallable | None = None,
         resolve_dns: Callable[[str], None] | None = None,
+        sleep: Callable[[float], None] | None = None,
+        circuit_breaker_config: CircuitBreakerConfig | None = None,
+        retry_policy: RetryPolicy | None = None,
+        pricing_micro_usd_per_1m: Mapping[str, tuple[int, int]] | None = None,
     ) -> None:
         if not isinstance(environ, Mapping):
             raise FrontierConfigurationError("environ must be a key-value Mapping")
@@ -1037,9 +1673,26 @@ class FrontierModelRegistry:
             if isinstance(k, str) and k.startswith("CAS_FOREX_") and isinstance(v, str)
         }
         self._clock = clock or _utc_now
+        self._sleep = sleep or time.sleep
         self._http_post = http_post
         self._ollama_http_post = ollama_http_post
         self._resolve_dns = resolve_dns
+        self._circuit_breaker_config = circuit_breaker_config or CircuitBreakerConfig()
+        self._retry_policy = retry_policy or RetryPolicy()
+        self._breakers = ProviderCircuitBreaker(
+            clock=self._clock,
+            config=self._circuit_breaker_config,
+        )
+        raw_pricing = pricing_micro_usd_per_1m if pricing_micro_usd_per_1m is not None else MODEL_PRICING_MICRO_USD_PER_1M
+        self._pricing: dict[str, tuple[int, int]] = {}
+        for entry in FRONTIER_MODEL_CATALOG:
+            pair = raw_pricing.get(entry.model_id, MODEL_PRICING_MICRO_USD_PER_1M[entry.model_id])
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise FrontierConfigurationError(f"invalid pricing tuple for {entry.model_id!r}")
+            self._pricing[entry.model_id] = (
+                integer(pair[0], "input_micro_usd_per_1m", minimum=0),
+                integer(pair[1], "output_micro_usd_per_1m", minimum=0),
+            )
         self._verifier = FrontierReceiptVerifier()
         self._lock = Lock()
         self._secrets: dict[str, _RedactedSecret] = {}
@@ -1054,13 +1707,22 @@ class FrontierModelRegistry:
         for entry in FRONTIER_MODEL_CATALOG:
             raw_slug = self._env.get(entry.slug_env, "").strip() or entry.default_slug
             self._slugs[entry.model_id] = _validate_slug(raw_slug, entry.slug_env)
-            self._stats[entry.model_id] = {"calls": 0, "last_latency_ms": None, "last_status": "IDLE"}
+            self._stats[entry.model_id] = {
+                "calls": 0,
+                "last_latency_ms": None,
+                "last_status": "IDLE",
+                "input_units": 0,
+                "output_units": 0,
+                "spend_pico_usd": 0,
+            }
 
         self._ollama_fallback_enabled = _truthy(self._env.get(ENV_OLLAMA_FALLBACK_ENABLED))
         raw_prob = self._env.get(ENV_DECISION_MIN_PROBABILITY, "").strip()
         if raw_prob:
             try:
                 self._min_probability = Decimal(raw_prob)
+                if not self._min_probability.is_finite():
+                    raise ValueError("non-finite min_probability")
             except Exception as exc:
                 raise FrontierConfigurationError("invalid CAS_FOREX_DECISION_MIN_PROBABILITY") from exc
             if not (Decimal("0.01") <= self._min_probability <= Decimal("0.99")):
@@ -1252,6 +1914,10 @@ class FrontierModelRegistry:
             http_post=transport,
             resolve_dns=self._resolve_dns,
             min_probability=self._min_probability,
+            sleep=self._sleep,
+            circuit_breaker=self._breakers,
+            retry_policy=self._retry_policy,
+            usage_recorder=self._record_usage,
         )
         return spec, backend, self._verifier
 
@@ -1280,107 +1946,207 @@ class FrontierModelRegistry:
 
         def _post(u: str, h: dict[str, str], b: bytes, timeout_s: float = 8.0) -> tuple[int, bytes]:
             try:
-                if self._http_post is not None:
-                    return self._http_post(u, dict(h), b, timeout_s, MAX_PROVIDER_WIRE_BYTES)
-                return default_frontier_https_post(
-                    u, dict(h), b, timeout_s, MAX_PROVIDER_WIRE_BYTES,
-                    expected_host=entry.allowed_host, resolve_dns=self._resolve_dns,
-                )
+                try:
+                    if self._http_post is not None:
+                        st, resp_raw = self._http_post(u, dict(h), b, timeout_s, MAX_PROVIDER_WIRE_BYTES)
+                    else:
+                        st, resp_raw = default_frontier_https_post(
+                            u, dict(h), b, timeout_s, MAX_PROVIDER_WIRE_BYTES,
+                            expected_host=entry.allowed_host, resolve_dns=self._resolve_dns,
+                        )
+                except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+                    raise FrontierTransportError(
+                        f"frontier AI connection error: {type(exc).__name__}",
+                        retryable=True,
+                    ) from None
+                if st < 200 or st >= 300:
+                    raise FrontierTransportError(
+                        f"Gemini Decision 1 returned HTTP status {st}",
+                        status_code=int(st),
+                        retryable=_is_retryable_http_status(int(st)),
+                    )
+                return st, resp_raw
             finally:
                 h.clear()
 
         clean_slug = self._slugs["gemini-decision-1"].removeprefix("models/")
-        t0 = _utc_now()
+        t0 = utc_time(self._clock(), "scout_start")
         status = 404
         raw = b""
         used_generate = False
-        with self._lock:
-            skip_decide = self._decide_404
-        if clean_slug.startswith("gemini-decision") and not skip_decide:
-            url = _validate_frontier_https_url(entry.endpoint_template.format(slug=clean_slug), expected_host=entry.allowed_host)
-            headers = {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "x-goog-api-key": secret.reveal_for_header(),
-            }
-            body = canonical_bytes({
-                "model": f"models/{clean_slug}",
-                "batch_questions": questions[:1000],
-                "zero_output_tokens": True,
-            })
-            try:
-                status, raw = _post(url, headers, body, 4.0)
-            except FrontierTransportError as exc:
-                if "HTTP status 404" not in str(exc):
-                    raise
-                status, raw = 404, b""
-            if status == 404:
-                with self._lock:
-                    self._decide_404 = True
-        if status == 404 or not clean_slug.startswith("gemini-decision"):
-            fb_candidates = (
-                ("gemini-2.5-flash", "gemini-3.8-flash")
-                if clean_slug == "gemini-decision-1"
-                else (clean_slug,)
-            )
-            fb_sys = (
-                "Screen candidate forex/index setups quickly and respond ONLY with valid JSON: "
-                '{"decisions":[{"market":"SYMBOL","choice":"WAIT or exact choice","probability":"0.01-0.99"}]}.'
-            )
-            fb_user = canonical_bytes({"min_probability": decimal_text(gate_prob), "candidates": questions[:1000]}).decode("utf-8")
-            for idx_fb, fb_slug in enumerate(fb_candidates):
-                fb_url, fb_hdrs, fb_body = _build_gemini_fast_json_payload(
-                    clean_slug=fb_slug,
-                    system_text=fb_sys,
-                    user_text=fb_user,
-                    max_tokens=512,
-                    secret=secret,
-                    allowed_host=entry.allowed_host,
-                )
-                try:
-                    status, raw = _post(fb_url, fb_hdrs, fb_body, 8.0)
-                except FrontierTransportError as exc:
-                    if idx_fb + 1 < len(fb_candidates) and "HTTP status 404" in str(exc):
-                        status, raw = 404, b""
-                        continue
-                    raise
-                used_generate = True
-                if status != 404 or idx_fb + 1 == len(fb_candidates):
-                    break
+        is_probe = self._breakers.before_call(entry.provider)
+        breaker_settled = False
+        scout_idem = content_digest({"questions": questions[:1000], "slug": clean_slug})
 
-        latency_ms = max(1, int((_utc_now() - t0).total_seconds() * 1000))
-        if status < 200 or status >= 300:
-            raise FrontierTransportError(f"Gemini Decision 1 scout returned HTTP {status}")
-        doc = _decode_json_dict(raw)
-        if used_generate and "decisions" not in doc and "candidates" in doc:
-            doc = _decode_json_dict(_extract_gemini_cand_text(doc).encode("utf-8"))
-        raw_decisions = doc.get("decisions") if isinstance(doc.get("decisions"), list) else [doc]
-        parsed: list[dict[str, Any]] = []
-        best_prob = Decimal("0")
-        best_market: str | None = None
-        for idx, item in enumerate(raw_decisions):
-            if not isinstance(item, dict):
-                continue
-            mkt = str(item.get("market") or (questions[idx].get("market") if idx < len(questions) else "UNKNOWN"))
-            choice = str(item.get("choice") or "WAIT")
+        try:
+            with self._lock:
+                skip_decide = self._decide_404
+            if clean_slug.startswith("gemini-decision") and not skip_decide:
+                url = _validate_frontier_https_url(entry.endpoint_template.format(slug=clean_slug), expected_host=entry.allowed_host)
+                body = canonical_bytes({
+                    "model": f"models/{clean_slug}",
+                    "batch_questions": questions[:1000],
+                    "zero_output_tokens": True,
+                })
+
+                def _attempt_scout_decide(t_out: float) -> tuple[int, bytes]:
+                    headers = {
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "x-goog-api-key": secret.reveal_for_header(),
+                    }
+                    return _post(url, headers, body, min(t_out, 4.0))
+
+                try:
+                    status, raw = execute_resilient_frontier_call(
+                        operation_kind=FrontierOperationKind.READ_SCOUT,
+                        provider=entry.provider,
+                        circuit_breaker=self._breakers,
+                        retry_policy=self._retry_policy,
+                        clock=self._clock,
+                        sleep=self._sleep,
+                        budget_seconds=Decimal("4"),
+                        idempotency_key=f"{scout_idem}:decide",
+                        attempt_fn=_attempt_scout_decide,
+                        manage_breaker=False,
+                        is_probe_override=is_probe,
+                    )
+                except FrontierTransportError as exc:
+                    _, err_code, availability_failure = _classify_transport_error(exc)
+                    if err_code == 404:
+                        status, raw = 404, b""
+                    else:
+                        self._breakers.record_failure(
+                            entry.provider,
+                            reason=str(exc),
+                            availability_failure=availability_failure,
+                        )
+                        breaker_settled = True
+                        raise
+                if status == 404:
+                    with self._lock:
+                        self._decide_404 = True
+
+            if status == 404 or not clean_slug.startswith("gemini-decision"):
+                fb_candidates = (
+                    ("gemini-2.5-flash", "gemini-3.8-flash")
+                    if clean_slug == "gemini-decision-1"
+                    else (clean_slug,)
+                )
+                fb_sys = (
+                    "Screen candidate forex/index setups quickly and respond ONLY with valid JSON: "
+                    '{"decisions":[{"market":"SYMBOL","choice":"WAIT or exact choice","probability":"0.01-0.99"}]}.'
+                )
+                fb_user = canonical_bytes({"min_probability": decimal_text(gate_prob), "candidates": questions[:1000]}).decode("utf-8")
+                for idx_fb, fb_slug in enumerate(fb_candidates):
+                    def _attempt_scout_fb(t_out: float, slug_choice: str = fb_slug) -> tuple[int, bytes]:
+                        fb_url, fb_hdrs, fb_body = _build_gemini_fast_json_payload(
+                            clean_slug=slug_choice,
+                            system_text=fb_sys,
+                            user_text=fb_user,
+                            max_tokens=512,
+                            secret=secret,
+                            allowed_host=entry.allowed_host,
+                        )
+                        return _post(fb_url, fb_hdrs, fb_body, t_out)
+
+                    try:
+                        status, raw = execute_resilient_frontier_call(
+                            operation_kind=FrontierOperationKind.READ_SCOUT,
+                            provider=entry.provider,
+                            circuit_breaker=self._breakers,
+                            retry_policy=self._retry_policy,
+                            clock=self._clock,
+                            sleep=self._sleep,
+                            budget_seconds=Decimal("8"),
+                            idempotency_key=f"{scout_idem}:fb:{fb_slug}",
+                            attempt_fn=_attempt_scout_fb,
+                            manage_breaker=False,
+                            is_probe_override=is_probe,
+                        )
+                    except FrontierTransportError as exc:
+                        _, err_code, availability_failure = _classify_transport_error(exc)
+                        if idx_fb + 1 < len(fb_candidates) and err_code == 404:
+                            status, raw = 404, b""
+                            continue
+                        self._breakers.record_failure(
+                            entry.provider,
+                            reason=str(exc),
+                            availability_failure=availability_failure,
+                        )
+                        breaker_settled = True
+                        raise
+                    used_generate = True
+                    if status != 404 or idx_fb + 1 == len(fb_candidates):
+                        break
+
             try:
-                prob = Decimal(str(item.get("probability", "0.50")))
-            except Exception:
-                prob = Decimal("0.50")
-            if prob < Decimal("0.01"):
-                prob = Decimal("0.01")
-            elif prob > Decimal("0.99"):
-                prob = Decimal("0.99")
-            admitted = choice != "WAIT" and prob >= gate_prob
-            parsed.append({
-                "market": mkt,
-                "choice": choice,
-                "probability": decimal_text(prob),
-                "admitted": admitted,
-            })
-            if admitted and prob > best_prob:
-                best_prob = prob
-                best_market = mkt
+                outer_doc = _decode_json_dict(raw)
+                if used_generate and "decisions" not in outer_doc and "candidates" in outer_doc:
+                    doc = _decode_json_dict(_extract_gemini_cand_text(outer_doc).encode("utf-8"))
+                else:
+                    doc = outer_doc
+                if "decisions" in doc and not isinstance(doc.get("decisions"), list):
+                    raise FrontierTransportError("Gemini scout response 'decisions' must be a list")
+                raw_decisions = doc.get("decisions") if isinstance(doc.get("decisions"), list) else [doc]
+                parsed: list[dict[str, Any]] = []
+                best_prob = Decimal("0")
+                best_market: str | None = None
+                for idx, item in enumerate(raw_decisions):
+                    if not isinstance(item, dict):
+                        continue
+                    mkt = str(item.get("market") or (questions[idx].get("market") if idx < len(questions) else "UNKNOWN"))
+                    choice = str(item.get("choice") or "WAIT")
+                    raw_item_prob = item.get("probability", "0.50")
+                    try:
+                        prob = Decimal(str(raw_item_prob if raw_item_prob is not None else "0.50"))
+                        if not prob.is_finite():
+                            raise ValueError("non-finite probability")
+                    except Exception:
+                        prob = Decimal("0.50")
+                    if prob < Decimal("0.01"):
+                        prob = Decimal("0.01")
+                    elif prob > Decimal("0.99"):
+                        prob = Decimal("0.99")
+                    admitted = choice != "WAIT" and prob >= gate_prob
+                    parsed.append({
+                        "market": mkt,
+                        "choice": choice,
+                        "probability": decimal_text(prob),
+                        "admitted": admitted,
+                    })
+                    if admitted and prob > best_prob:
+                        best_prob = prob
+                        best_market = mkt
+            except FrontierTransportError as exc:
+                self._breakers.record_failure(
+                    entry.provider,
+                    reason=str(exc),
+                    availability_failure=True,
+                )
+                breaker_settled = True
+                raise
+
+            self._breakers.record_success(entry.provider)
+            breaker_settled = True
+        finally:
+            if is_probe and not breaker_settled:
+                self._breakers.release_probe_on_abort(entry.provider)
+
+        t1 = utc_time(self._clock(), "scout_end")
+        latency_ms = max(1, int((t1 - t0).total_seconds() * 1000))
+        scout_in_fallback = max(1, (len(canonical_bytes({"questions": questions[:1000]})) + 3) // 4)
+        scout_in_units = _extract_provider_input_units(
+            "gemini" if used_generate else "gemini_decision",
+            outer_doc,
+            fallback_input_units=scout_in_fallback,
+        )
+        scout_out_units = 0
+        if used_generate:
+            umeta = outer_doc.get("usageMetadata") if isinstance(outer_doc.get("usageMetadata"), Mapping) else {}
+            cand_cnt = _safe_non_neg_int(umeta.get("candidatesTokenCount"))
+            scout_out_units = cand_cnt if cand_cnt is not None else max(1, len(raw) // 4)
+        self._record_usage("gemini-decision-1", scout_in_units, scout_out_units)
 
         self.record_call("gemini-decision-1", latency_ms=latency_ms, status="SCOUT_OK")
         summary = {
@@ -1397,6 +2163,29 @@ class FrontierModelRegistry:
             self._last_scout = summary
         return summary
 
+    def _record_usage(
+        self,
+        model_id: str,
+        input_units: int,
+        output_units: int,
+    ) -> None:
+        """Record metered units and exact pico-USD spend without altering call counts."""
+        if model_id not in _CATALOG_BY_ID:
+            return
+        in_u = integer(input_units, "input_units", minimum=0)
+        out_u = integer(output_units, "output_units", minimum=0)
+        pico = compute_call_cost_pico_usd(
+            model_id,
+            input_units=in_u,
+            output_units=out_u,
+            pricing_micro_usd_per_1m=self._pricing,
+        )
+        with self._lock:
+            st = self._stats[model_id]
+            st["input_units"] = int(st["input_units"]) + in_u
+            st["output_units"] = int(st["output_units"]) + out_u
+            st["spend_pico_usd"] = int(st["spend_pico_usd"]) + pico
+
     def record_call(
         self,
         model_id: str,
@@ -1404,15 +2193,29 @@ class FrontierModelRegistry:
         latency_ms: int,
         status: str,
         reasoning_effort: str | None = None,
+        input_units: int = 0,
+        output_units: int = 0,
     ) -> None:
         if model_id not in _CATALOG_BY_ID:
             return
         clean_lat = max(0, int(latency_ms))
+        in_u = integer(input_units, "input_units", minimum=0)
+        out_u = integer(output_units, "output_units", minimum=0)
+        pico = compute_call_cost_pico_usd(
+            model_id,
+            input_units=in_u,
+            output_units=out_u,
+            pricing_micro_usd_per_1m=self._pricing,
+        ) if (in_u > 0 or out_u > 0) else 0
         with self._lock:
             st = self._stats[model_id]
             st["calls"] = int(st["calls"]) + 1
             st["last_latency_ms"] = clean_lat
             st["last_status"] = str(status)[:40]
+            if in_u > 0 or out_u > 0:
+                st["input_units"] = int(st["input_units"]) + in_u
+                st["output_units"] = int(st["output_units"]) + out_u
+                st["spend_pico_usd"] = int(st["spend_pico_usd"]) + pico
             self._last_latency_ms = clean_lat
             if reasoning_effort is not None:
                 self._last_effective_effort = str(reasoning_effort).lower()
@@ -1495,20 +2298,58 @@ class FrontierModelRegistry:
                     "thinkingConfig": {"thinkingLevel": "LOW"},
                 },
             })
-            timeout_s = 25.0
+            timeout_s = Decimal("25")
+            neon_idem = content_digest({
+                "model_id": neon_slug,
+                "question": prompt_q,
+                "pkt": pkt_str,
+                "has_audio": clean_audio_b64 is not None,
+            })
+
+            def _attempt_neon(t_out: float) -> tuple[int, bytes]:
+                req_hdrs = dict(headers)
+                try:
+                    try:
+                        if self._http_post is not None:
+                            st, resp_raw = self._http_post(url, dict(req_hdrs), body_bytes, t_out, MAX_EXPLAINER_RESPONSE_BYTES)
+                        else:
+                            st, resp_raw = default_frontier_https_post(
+                                url,
+                                dict(req_hdrs),
+                                body_bytes,
+                                t_out,
+                                MAX_EXPLAINER_RESPONSE_BYTES,
+                                expected_host="generativelanguage.googleapis.com",
+                                resolve_dns=self._resolve_dns,
+                            )
+                    except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+                        raise FrontierTransportError(
+                            f"frontier AI connection error: {type(exc).__name__}",
+                            retryable=True,
+                        ) from None
+                    if st < 200 or st >= 300:
+                        raise FrontierTransportError(
+                            f"{neon_display} returned HTTP status {st}",
+                            status_code=int(st),
+                            retryable=_is_retryable_http_status(int(st)),
+                        )
+                    return st, resp_raw
+                finally:
+                    req_hdrs.clear()
+
             try:
-                if self._http_post is not None:
-                    status, raw = self._http_post(url, dict(headers), body_bytes, timeout_s, MAX_EXPLAINER_RESPONSE_BYTES)
-                else:
-                    status, raw = default_frontier_https_post(
-                        url,
-                        dict(headers),
-                        body_bytes,
-                        timeout_s,
-                        MAX_EXPLAINER_RESPONSE_BYTES,
-                        expected_host="generativelanguage.googleapis.com",
-                        resolve_dns=self._resolve_dns,
-                    )
+                status, raw = execute_resilient_frontier_call(
+                    operation_kind=FrontierOperationKind.READ_EXPLAINER,
+                    provider="gemini",
+                    circuit_breaker=self._breakers,
+                    retry_policy=self._retry_policy,
+                    clock=self._clock,
+                    sleep=self._sleep,
+                    budget_seconds=timeout_s,
+                    idempotency_key=neon_idem,
+                    attempt_fn=_attempt_neon,
+                    manage_breaker=True,
+                )
                 if 200 <= status < 300:
                     doc = _decode_json_dict(raw, max_bytes=MAX_EXPLAINER_RESPONSE_BYTES)
                     txt = _extract_gemini_cand_text(doc)
@@ -1541,6 +2382,11 @@ class FrontierModelRegistry:
                             out_neon["spoken_question"] = spoken_q
                         return assert_safe_ai_catalog_payload(out_neon)
                 fallback_reason = f"HTTP_{status}"
+            except FrontierTransportError as exc_neon:
+                if exc_neon.status_code is not None:
+                    fallback_reason = f"HTTP_{exc_neon.status_code}"
+                else:
+                    fallback_reason = type(exc_neon).__name__
             except Exception as exc_neon:
                 fallback_reason = type(exc_neon).__name__
             finally:
@@ -1587,27 +2433,68 @@ class FrontierModelRegistry:
                 budget=SimpleNamespace(max_generated_tokens_per_call=768),
                 seed=None,
             )
-            url, headers, body = _build_provider_payload(chosen_entry, api_slug, inv, secret)
             fallback_reason = "LOCAL_READ_ONLY_FALLBACK"
+            explainer_idem = content_digest({"model_id": chosen_entry.model_id, "question": clean_q, "pkt": pkt})
+
+            def _attempt_explainer(t_out: float) -> tuple[int, bytes]:
+                u, hdrs, b = _build_provider_payload(chosen_entry, api_slug, inv, secret)
+                try:
+                    try:
+                        if self._http_post is not None and chosen_entry.provider != "ollama":
+                            st, resp_raw = self._http_post(u, dict(hdrs), b, t_out, MAX_PROVIDER_WIRE_BYTES)
+                        elif chosen_entry.provider == "ollama":
+                            if self._ollama_http_post is not None:
+                                st, resp_raw = self._ollama_http_post(u, dict(hdrs), b, t_out, MAX_PROVIDER_WIRE_BYTES)
+                            elif self._http_post is not None:
+                                st, resp_raw = self._http_post(u, dict(hdrs), b, t_out, MAX_PROVIDER_WIRE_BYTES)
+                            else:
+                                st, resp_raw = default_ollama_loopback_post(u, dict(hdrs), b, t_out, MAX_PROVIDER_WIRE_BYTES)
+                        else:
+                            st, resp_raw = default_frontier_https_post(
+                                u,
+                                dict(hdrs),
+                                b,
+                                t_out,
+                                MAX_PROVIDER_WIRE_BYTES,
+                                expected_host=chosen_entry.allowed_host,
+                                resolve_dns=self._resolve_dns,
+                            )
+                    except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+                        raise FrontierTransportError(
+                            f"frontier AI connection error: {type(exc).__name__}",
+                            retryable=True,
+                        ) from None
+                    if st < 200 or st >= 300:
+                        raise FrontierTransportError(
+                            f"{chosen_entry.display_name} returned HTTP status {st}",
+                            status_code=int(st),
+                            retryable=_is_retryable_http_status(int(st)),
+                        )
+                    return st, resp_raw
+                finally:
+                    hdrs.clear()
+
             try:
-                if self._http_post is not None:
-                    status, raw = self._http_post(url, dict(headers), body, 12.0, MAX_PROVIDER_WIRE_BYTES)
-                elif chosen_entry.provider == "ollama":
-                    status, raw = default_ollama_loopback_post(url, dict(headers), body, 12.0, MAX_PROVIDER_WIRE_BYTES)
-                else:
-                    status, raw = default_frontier_https_post(
-                        url,
-                        dict(headers),
-                        body,
-                        12.0,
-                        MAX_PROVIDER_WIRE_BYTES,
-                        expected_host=chosen_entry.allowed_host,
-                        resolve_dns=self._resolve_dns,
-                    )
+                status, raw = execute_resilient_frontier_call(
+                    operation_kind=FrontierOperationKind.READ_EXPLAINER,
+                    provider=chosen_entry.provider,
+                    circuit_breaker=self._breakers,
+                    retry_policy=self._retry_policy,
+                    clock=self._clock,
+                    sleep=self._sleep,
+                    budget_seconds=Decimal("10"),
+                    idempotency_key=explainer_idem,
+                    attempt_fn=_attempt_explainer,
+                    manage_breaker=True,
+                )
                 if 200 <= status < 300:
                     doc = _decode_json_dict(raw, max_bytes=MAX_PROVIDER_WIRE_BYTES)
-                    txt, _, _ = _extract_provider_text_and_usage(
+                    txt, out_units, _ = _extract_provider_text_and_usage(
                         chosen_entry.provider, doc, inv, min_probability=self._min_probability
+                    )
+                    in_fallback = max(1, (len(EXPLAINER_SYSTEM_PROMPT.encode("utf-8")) + len(pkt.encode("utf-8")) + 3) // 4)
+                    in_units = _extract_provider_input_units(
+                        chosen_entry.provider, doc, fallback_input_units=in_fallback
                     )
                     ans_text = txt
                     try:
@@ -1618,6 +2505,7 @@ class FrontierModelRegistry:
                         ans_text = txt
                     ans_text = " ".join(str(ans_text).strip().split())[:2000]
                     if ans_text:
+                        self._record_usage(chosen_entry.model_id, in_units, out_units)
                         return assert_safe_ai_catalog_payload({
                             "schema": "cas-forex.explainer-answer/1",
                             "question": eff_q_fallback,
@@ -1631,8 +2519,6 @@ class FrontierModelRegistry:
                         })
             except Exception as exc_exp:
                 fallback_reason = type(exc_exp).__name__
-            finally:
-                headers.clear()
 
         focus_txt = str(summary_obj.get("current_focus_status") or "Scanning all 20 markets under ForexMetaValveGate.")
         mode_txt = str(summary_obj.get("execution_mode") or "DEMO")
@@ -1706,19 +2592,56 @@ class FrontierModelRegistry:
                     },
                 },
             })
+            tts_idem = content_digest({
+                "tts_slug": tts_slug,
+                "voice": clean_voice,
+                "text": cleaned_text,
+            })
+
+            def _attempt_tts(t_out: float) -> tuple[int, bytes]:
+                req_hdrs = dict(headers)
+                try:
+                    try:
+                        if self._http_post is not None:
+                            st, resp_raw = self._http_post(url, dict(req_hdrs), body_bytes, t_out, MAX_TTS_WIRE_BYTES)
+                        else:
+                            st, resp_raw = default_frontier_https_post(
+                                url,
+                                dict(req_hdrs),
+                                body_bytes,
+                                t_out,
+                                MAX_TTS_WIRE_BYTES,
+                                expected_host="generativelanguage.googleapis.com",
+                                resolve_dns=self._resolve_dns,
+                            )
+                    except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+                        raise FrontierTransportError(
+                            f"frontier AI connection error: {type(exc).__name__}",
+                            retryable=True,
+                        ) from None
+                    if st < 200 or st >= 300:
+                        raise FrontierTransportError(
+                            f"Gemini TTS ({tts_slug}) returned HTTP status {st}",
+                            status_code=int(st),
+                            retryable=_is_retryable_http_status(int(st)),
+                        )
+                    return st, resp_raw
+                finally:
+                    req_hdrs.clear()
+
             try:
-                if self._http_post is not None:
-                    status, raw = self._http_post(url, dict(headers), body_bytes, 25.0, MAX_TTS_WIRE_BYTES)
-                else:
-                    status, raw = default_frontier_https_post(
-                        url,
-                        dict(headers),
-                        body_bytes,
-                        25.0,
-                        MAX_TTS_WIRE_BYTES,
-                        expected_host="generativelanguage.googleapis.com",
-                        resolve_dns=self._resolve_dns,
-                    )
+                status, raw = execute_resilient_frontier_call(
+                    operation_kind=FrontierOperationKind.READ_EXPLAINER,
+                    provider="gemini",
+                    circuit_breaker=self._breakers,
+                    retry_policy=self._retry_policy,
+                    clock=self._clock,
+                    sleep=self._sleep,
+                    budget_seconds=Decimal("25"),
+                    idempotency_key=tts_idem,
+                    attempt_fn=_attempt_tts,
+                    manage_breaker=True,
+                )
                 if 200 <= status < 300:
                     doc = _decode_json_dict(raw, max_bytes=MAX_TTS_WIRE_BYTES)
                     cands = doc.get("candidates")
@@ -1759,6 +2682,11 @@ class FrontierModelRegistry:
                     safe_reason = "EMPTY_AUDIO_PAYLOAD"
                 else:
                     safe_reason = f"HTTP_{status}"
+            except FrontierTransportError as exc_tts:
+                if exc_tts.status_code is not None:
+                    safe_reason = f"HTTP_{exc_tts.status_code}"
+                else:
+                    safe_reason = type(exc_tts).__name__
             except Exception as exc_tts:
                 safe_reason = type(exc_tts).__name__
             finally:
@@ -1787,19 +2715,43 @@ class FrontierModelRegistry:
             scout_enabled = self._fast_scout_enabled
             last_scout = dict(self._last_scout) if self._last_scout is not None else None
             stats_copy = {k: dict(v) for k, v in self._stats.items()}
+        breakers_snap = self._breakers.snapshot()
 
         active_entry = _CATALOG_BY_ID[active_id]
         active_ready = self._is_entry_ready(active_entry)
         frontier_ready_count = sum(1 for e in FRONTIER_MODEL_CATALOG if not e.is_fallback and self._is_entry_ready(e))
         items: list[dict[str, Any]] = []
+        total_in_units = 0
+        total_out_units = 0
+        total_pico_usd = 0
+        provider_acc: dict[str, dict[str, int]] = {
+            p: {"input_units": 0, "output_units": 0, "spend_pico_usd": 0}
+            for p in FRONTIER_PROVIDERS
+        }
+
         for entry in FRONTIER_MODEL_CATALOG:
             st = stats_copy[entry.model_id]
+            in_u = int(st["input_units"])
+            out_u = int(st["output_units"])
+            pico_u = int(st["spend_pico_usd"])
+            total_in_units += in_u
+            total_out_units += out_u
+            total_pico_usd += pico_u
+            p_acc = provider_acc.setdefault(
+                entry.provider,
+                {"input_units": 0, "output_units": 0, "spend_pico_usd": 0},
+            )
+            p_acc["input_units"] += in_u
+            p_acc["output_units"] += out_u
+            p_acc["spend_pico_usd"] += pico_u
+
             ready = self._is_entry_ready(entry)
             is_active = entry.model_id == active_id
             if is_active:
                 availability = "ACTIVE_READY" if ready else ("OFFLINE_FALLBACK_DISABLED" if entry.is_fallback else "AWAITING_PROVIDER_KEY")
             else:
                 availability = "READY" if ready else ("OFFLINE_FALLBACK_ONLY" if entry.is_fallback else "KEY_NOT_SET")
+            cb_state = breakers_snap.get(entry.provider, {}).get("state", CircuitBreakerState.CLOSED.value)
             items.append({
                 "rank": entry.rank,
                 "model_id": entry.model_id,
@@ -1817,7 +2769,24 @@ class FrontierModelRegistry:
                 "calls": int(st["calls"]),
                 "last_latency_ms": st["last_latency_ms"],
                 "last_status": st["last_status"],
+                "input_units": in_u,
+                "output_units": out_u,
+                "total_units": in_u + out_u,
+                "spend_micro_usd": pico_usd_to_micro_usd(pico_u),
+                "spend_usd": pico_usd_to_decimal_text(pico_u),
+                "circuit_state": cb_state,
             })
+
+        provider_spend = {
+            prov: {
+                "input_units": p_acc["input_units"],
+                "output_units": p_acc["output_units"],
+                "total_units": p_acc["input_units"] + p_acc["output_units"],
+                "spend_micro_usd": pico_usd_to_micro_usd(p_acc["spend_pico_usd"]),
+                "spend_usd": pico_usd_to_decimal_text(p_acc["spend_pico_usd"]),
+            }
+            for prov, p_acc in provider_acc.items()
+        }
 
         return {
             "schema": "cas-forex.ai-models/1",
@@ -1841,6 +2810,13 @@ class FrontierModelRegistry:
             "min_decision_probability": decimal_text(self._min_probability),
             "last_scout": last_scout,
             "valve_required": True,
+            "total_input_units": total_in_units,
+            "total_output_units": total_out_units,
+            "total_units": total_in_units + total_out_units,
+            "total_spend_micro_usd": pico_usd_to_micro_usd(total_pico_usd),
+            "total_spend_usd": pico_usd_to_decimal_text(total_pico_usd),
+            "provider_spend": provider_spend,
+            "circuit_breakers": breakers_snap,
             "models": items,
         }
 

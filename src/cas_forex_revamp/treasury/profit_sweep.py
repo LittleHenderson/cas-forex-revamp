@@ -22,6 +22,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import sqlite3
 import stat
@@ -37,11 +38,12 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 from cas_forex_revamp.contracts import ContractError, canonical_bytes, decimal_text
-from cas_forex_revamp.contracts.primitives import decimal_value, utc_time
+from cas_forex_revamp.contracts.primitives import decimal_value, identifier, utc_time
 
 DEFAULT_SWEEP_RATIO = Decimal("0.50")
 MAX_OFFRAMP_WIRE_BYTES = 2 * 1024 * 1024
 GENESIS_AUDIT_SHA256 = "0" * 64
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 RAIL_BROKER_2FA_MANUAL = "BROKER_2FA_MANUAL"
 RAIL_COINBASE_ACH = "COINBASE_ACH"
@@ -79,6 +81,10 @@ def _utc_now() -> datetime:
 
 def _iso(dt: datetime) -> str:
     return utc_time(dt, "timestamp").isoformat().replace("+00:00", "Z")
+
+
+def _reject_nonfinite_json(token: str) -> Any:
+    raise ValueError(f"non-finite JSON constant {token!r}")
 
 
 def _b64url(data: bytes) -> str:
@@ -533,7 +539,7 @@ class ProfitSweepVault:
                 ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         _ensure_owner_dir(db_path.parent)
         self.db_path = db_path
-        self.scope_id = str(scope_id).strip() or "default"
+        self.scope_id = identifier(scope_id, "scope_id")
         self._clock = clock or _utc_now
         self._lock = RLock()
         self._init_db(
@@ -545,11 +551,15 @@ class ProfitSweepVault:
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=5.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            return conn
+        except Exception:
+            conn.close()
+            raise
 
     def _init_db(
         self,
@@ -1158,19 +1168,29 @@ class ProfitSweepVault:
         destination_bank_label: str = "OWNER_LINKED_BANK",
     ) -> dict[str, Any]:
         """Queue an owner-2FA-gated broker withdrawal against accrued Bank Vault reserve."""
-        decimal_value(amount_usd, "amount_usd", positive=True)
+        amt_q = decimal_value(amount_usd, "amount_usd", positive=True).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        if amt_q <= Decimal("0"):
+            raise ContractError("amount_usd must be >= $0.01")
         if not owner_request_id or not reason:
             raise ContractError("owner_request_id and reason are required")
-        verifier.verify_and_consume(recovery_token, expected_scope="TREASURY_SWEEP", owner_request_id=owner_request_id, now=self._clock())
         transfer_id = f"tr2fa-{uuid.uuid4().hex[:16]}"
+        verifier.verify_and_consume(
+            recovery_token,
+            expected_scope="TREASURY_SWEEP",
+            target_ref=transfer_id,
+            owner_request_id=owner_request_id,
+            now=self._clock(),
+        )
         ts = _iso(self._clock())
         with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             pending = self._pending_disbursement_unlocked(conn)
-            if amount_usd > pending:
+            if amt_q > pending:
                 conn.execute("ROLLBACK")
                 raise ContractError(
-                    f"Requested sweep ${decimal_text(amount_usd)} exceeds pending Bank Vault ${decimal_text(pending)}"
+                    f"Requested sweep ${decimal_text(amt_q)} exceeds pending Bank Vault ${decimal_text(pending)}"
                 )
             conn.execute(
                 """
@@ -1185,7 +1205,7 @@ class ProfitSweepVault:
                     RAIL_BROKER_2FA_MANUAL,
                     str(broker_id),
                     str(destination_bank_label),
-                    decimal_text(amount_usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+                    decimal_text(amt_q),
                     "PENDING_OWNER_BROKER_2FA",
                     None,
                     str(owner_request_id),
@@ -1197,7 +1217,7 @@ class ProfitSweepVault:
             self._append_audit(
                 conn,
                 "BROKER_2FA_WITHDRAWAL_REQUESTED",
-                {"transfer_id": transfer_id, "broker_id": str(broker_id), "amount_usd": decimal_text(amount_usd)},
+                {"transfer_id": transfer_id, "broker_id": str(broker_id), "amount_usd": decimal_text(amt_q)},
                 ts,
             )
             conn.execute("COMMIT")
@@ -1357,8 +1377,11 @@ class ProfitSweepVault:
         retry_transfer_id: str | None = None,
     ) -> dict[str, Any]:
         """Atomically reserve funds & durable idempotency intent BEFORE dispatching ACH payout (Finding [9])."""
-        decimal_value(amount_usd, "amount_usd", positive=True)
-        amt_q = amount_usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        amt_q = decimal_value(amount_usd, "amount_usd", positive=True).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        if amt_q <= Decimal("0"):
+            raise ContractError("amount_usd must be >= $0.01")
         if rail not in (RAIL_COINBASE_ACH, RAIL_KRAKEN_ACH):
             raise OfframpSecurityError(f"Unsupported automated ACH rail {rail!r}")
         if rail == RAIL_COINBASE_ACH:
@@ -1373,17 +1396,23 @@ class ProfitSweepVault:
                 raise OfframpSecurityError("KrakenOfframpClient is not configured")
             dest_bank = kraken_client.linked_bank_account_id
 
+        retry_ref = str(retry_transfer_id).strip() if retry_transfer_id is not None and str(retry_transfer_id).strip() else None
+        planned_transfer_id = retry_ref if retry_ref is not None else f"trach-{uuid.uuid4().hex[:16]}"
         verifier.verify_and_consume(
-            recovery_token, expected_scope="TREASURY_SWEEP", owner_request_id=owner_request_id, now=self._clock()
+            recovery_token,
+            expected_scope="TREASURY_SWEEP",
+            target_ref=planned_transfer_id,
+            owner_request_id=owner_request_id,
+            now=self._clock(),
         )
 
         ts_reserve = _iso(self._clock())
         with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            if retry_transfer_id is not None and str(retry_transfer_id).strip():
+            if retry_ref is not None:
                 existing = conn.execute(
                     "SELECT * FROM bank_transfers WHERE transfer_id = ? AND scope_id = ?",
-                    (str(retry_transfer_id).strip(), self.scope_id),
+                    (retry_ref, self.scope_id),
                 ).fetchone()
                 if existing is None:
                     conn.execute("ROLLBACK")
@@ -1394,6 +1423,9 @@ class ProfitSweepVault:
                 if str(existing["rail"]) != rail or Decimal(str(existing["amount_usd_text"])) != amt_q:
                     conn.execute("ROLLBACK")
                     raise ContractError("Retry transfer rail/amount does not match persisted intent")
+                if str(existing["destination_bank_id"]) != dest_bank:
+                    conn.execute("ROLLBACK")
+                    raise OfframpSecurityError("Retry transfer destination_bank_id does not match persisted intent")
                 transfer_id = str(existing["transfer_id"])
                 eff_idem = str(existing["idempotency_key"] or f"ach-{transfer_id}")
                 conn.execute(
@@ -1408,7 +1440,7 @@ class ProfitSweepVault:
                     raise ContractError(
                         f"Requested ACH payout ${decimal_text(amt_q)} exceeds pending Bank Vault ${decimal_text(pending)}"
                     )
-                transfer_id = f"trach-{uuid.uuid4().hex[:16]}"
+                transfer_id = planned_transfer_id
                 eff_idem = (
                     str(idempotency_key).strip()
                     if idempotency_key is not None and str(idempotency_key).strip()
@@ -1545,7 +1577,14 @@ class ProfitSweepVault:
         for r in conn.execute(
             "SELECT amount_usd_text, status FROM bank_transfers WHERE scope_id = ?", (self.scope_id,)
         ):
-            if str(r["status"]) in ("SETTLED", "ACH_SUBMITTED", "RESERVED_PENDING_DISPATCH", "OUTCOME_UNKNOWN"):
+            if str(r["status"]) in (
+                "SETTLED",
+                "ACH_SUBMITTED",
+                "RESERVED_PENDING_DISPATCH",
+                "OUTCOME_UNKNOWN",
+                "PENDING_OWNER_BROKER_2FA",
+                "BROKER_2FA_VERIFICATION_UNKNOWN",
+            ):
                 disbursed += Decimal(str(r["amount_usd_text"]))
         rem = swept - disbursed
         return rem if rem > Decimal("0") else Decimal("0.00")
@@ -1638,3 +1677,160 @@ class ProfitSweepVault:
                 "recent_sweeps": recent_sweeps,
                 "recent_transfers": recent_transfers,
             }
+
+    def verify_audit_chain(self) -> dict[str, object]:
+        """Verify the full SHA-256 hash chain and contiguous sequence of ``vault_audit`` (fail closed)."""
+        expected_prev = GENESIS_AUDIT_SHA256
+        last_hash = GENESIS_AUDIT_SHA256
+        expected_seq = 1
+        checked_rows = 0
+
+        with self._lock:
+            try:
+                with closing(self._connect()) as conn:
+                    in_tx = False
+                    try:
+                        conn.execute("BEGIN")
+                        in_tx = True
+                        rows = conn.execute(
+                            """
+                            SELECT seq, prev_sha256, entry_sha256, scope_id, event_type, payload_json, created_at
+                            FROM vault_audit
+                            ORDER BY seq ASC
+                            """
+                        ).fetchall()
+                        has_seq_tbl = (
+                            conn.execute(
+                                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'"
+                            ).fetchone()
+                            is not None
+                        )
+                        seq_row = (
+                            conn.execute(
+                                "SELECT seq FROM sqlite_sequence WHERE name = 'vault_audit'"
+                            ).fetchone()
+                            if has_seq_tbl
+                            else None
+                        )
+                    finally:
+                        if in_tx and conn.in_transaction:
+                            conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                return {
+                    "valid": False,
+                    "checked_rows": 0,
+                    "broken_at_id": 1,
+                    "last_hash": GENESIS_AUDIT_SHA256,
+                }
+
+        for row in rows:
+            raw_seq = row["seq"]
+            if type(raw_seq) is not int or raw_seq <= 0:
+                return {
+                    "valid": False,
+                    "checked_rows": checked_rows + 1,
+                    "broken_at_id": raw_seq if type(raw_seq) is int else expected_seq,
+                    "last_hash": last_hash,
+                }
+            if raw_seq != expected_seq:
+                broken_id = expected_seq if raw_seq > expected_seq else raw_seq
+                return {
+                    "valid": False,
+                    "checked_rows": checked_rows + 1,
+                    "broken_at_id": broken_id,
+                    "last_hash": last_hash,
+                }
+
+            checked_rows += 1
+            prev_sha = row["prev_sha256"]
+            entry_sha = row["entry_sha256"]
+            row_scope = row["scope_id"]
+            event_type = row["event_type"]
+            payload_json = row["payload_json"]
+            created_at = row["created_at"]
+
+            if (
+                type(prev_sha) is not str
+                or type(entry_sha) is not str
+                or type(row_scope) is not str
+                or not row_scope.strip()
+                or type(event_type) is not str
+                or not event_type.strip()
+                or type(payload_json) is not str
+                or type(created_at) is not str
+                or not created_at.strip()
+                or _SHA256_HEX_RE.fullmatch(prev_sha) is None
+                or _SHA256_HEX_RE.fullmatch(entry_sha) is None
+            ):
+                return {
+                    "valid": False,
+                    "checked_rows": checked_rows,
+                    "broken_at_id": raw_seq,
+                    "last_hash": last_hash,
+                }
+
+            if prev_sha != expected_prev:
+                return {
+                    "valid": False,
+                    "checked_rows": checked_rows,
+                    "broken_at_id": raw_seq,
+                    "last_hash": last_hash,
+                }
+
+            try:
+                payload_bytes = payload_json.encode("utf-8")
+                parsed_payload = json.loads(payload_json, parse_constant=_reject_nonfinite_json)
+                if type(parsed_payload) is not dict or canonical_bytes(parsed_payload) != payload_bytes:
+                    return {
+                        "valid": False,
+                        "checked_rows": checked_rows,
+                        "broken_at_id": raw_seq,
+                        "last_hash": last_hash,
+                    }
+                recomputed = sha256(
+                    f"{prev_sha}|{row_scope}|{event_type}|".encode("utf-8")
+                    + payload_bytes
+                    + f"|{created_at}".encode("utf-8")
+                ).hexdigest()
+            except (ValueError, TypeError, UnicodeError, ContractError):
+                return {
+                    "valid": False,
+                    "checked_rows": checked_rows,
+                    "broken_at_id": raw_seq,
+                    "last_hash": last_hash,
+                }
+
+            if recomputed != entry_sha:
+                return {
+                    "valid": False,
+                    "checked_rows": checked_rows,
+                    "broken_at_id": raw_seq,
+                    "last_hash": last_hash,
+                }
+
+            expected_prev = entry_sha
+            last_hash = entry_sha
+            expected_seq += 1
+
+        if seq_row is not None:
+            recorded_max = seq_row["seq"]
+            actual_max = expected_seq - 1
+            if type(recorded_max) is not int or recorded_max != actual_max:
+                broken_tail = (
+                    actual_max + 1
+                    if (type(recorded_max) is int and recorded_max > actual_max)
+                    else actual_max
+                )
+                return {
+                    "valid": False,
+                    "checked_rows": checked_rows,
+                    "broken_at_id": broken_tail,
+                    "last_hash": last_hash,
+                }
+
+        return {
+            "valid": True,
+            "checked_rows": checked_rows,
+            "broken_at_id": None,
+            "last_hash": last_hash,
+        }

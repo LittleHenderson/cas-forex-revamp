@@ -32,7 +32,7 @@ from cas_forex_revamp.composition.trend_regime import (
     evaluate_correlation_cap,
     evaluate_house_money_pyramid_leg,
 )
-from cas_forex_revamp.contracts import ActionKind, Side, canonical_bytes, content_digest, decimal_text
+from cas_forex_revamp.contracts import ActionKind, ContractError, Side, canonical_bytes, content_digest, decimal_text
 from cas_forex_revamp.operator.frontier_backends import (
     FrontierModelRegistry,
     assert_safe_ai_catalog_payload,
@@ -51,6 +51,7 @@ from cas_forex_revamp.treasury import (
     CoinbaseOfframpClient,
     KrakenOfframpClient,
     OfframpSecurityError,
+    OfframpTransportError,
     ProfitSweepVault,
     RAIL_COINBASE_ACH,
     RAIL_KRAKEN_ACH,
@@ -243,6 +244,147 @@ class ProfitExpansionTests(unittest.TestCase):
             self.assertEqual(out_kr["provider_tx_id"], "KRK-777")
             self.assertEqual(out_kr["vault"]["pending_disbursement_usd"], "100")
 
+    def test_concurrent_2fa_and_ach_reserve_cannot_overallocate_vault(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            vault = ProfitSweepVault(Path(td) / "vault.sqlite3", clock=lambda: T0)
+            vault.record_realized_close(
+                trade_id="t-conc-1", symbol="NAS100", broker_id=BROKER_HUGOSWAY_MT5, realized_net_usd=D("200.00")
+            )
+            rec = OwnerRecoveryVerifier(db_path=Path(td) / "rec.sqlite3", clock=lambda: T0)
+
+            ach_calls = []
+            def krk_http(method, url, headers, body, timeout):
+                ach_calls.append((method, url))
+                return 200, json.dumps({"error": [], "result": {"refid": "KRK-CONC-1"}}).encode("utf-8")
+
+            krk = KrakenOfframpClient(
+                api_key="krk-pub-01",
+                api_secret_b64=base64.b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii"),
+                linked_bank_key="BankACH-Owner",
+                http_call=krk_http,
+                resolve_dns=lambda _h: ["104.16.0.1"],
+                clock=lambda: T0,
+            )
+
+            # 0. Sub-cent ACH amount (< $0.005) must fail BEFORE token consumption or DB insertion
+            t0 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            with self.assertRaises(ContractError):
+                vault.execute_offramp_ach_payout(
+                    rail=RAIL_KRAKEN_ACH,
+                    amount_usd=D("0.004"),
+                    owner_request_id="req-conc-ach-subcent",
+                    reason="sub-cent ach",
+                    verifier=rec,
+                    recovery_token=t0,
+                    kraken_client=krk,
+                )
+            self.assertEqual(vault.snapshot()["recent_transfers"], [])
+            self.assertEqual(ach_calls, [])
+
+            # 1. Queue $60.00 2FA withdrawal reusing unconsumed t0 -> PENDING_OWNER_BROKER_2FA
+            t1 = t0
+            req1 = vault.request_broker_2fa_withdrawal(
+                broker_id=BROKER_HUGOSWAY_MT5,
+                amount_usd=D("60.00"),
+                owner_request_id="req-conc-2fa-1",
+                reason="first 2fa reserve",
+                verifier=rec,
+                recovery_token=t1,
+                destination_bank_label="OWNER_BANK_A",
+            )
+            self.assertEqual(req1["status"], "PENDING_OWNER_BROKER_2FA")
+            self.assertEqual(req1["vault"]["pending_2fa_confirmation_usd"], "60")
+            self.assertEqual(req1["vault"]["pending_disbursement_usd"], "100")
+
+            # 2. Second 2FA or ACH > $40.00 must be rejected without calling HTTP transport
+            t2 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            with self.assertRaises(ContractError):
+                vault.request_broker_2fa_withdrawal(
+                    broker_id=BROKER_HUGOSWAY_MT5,
+                    amount_usd=D("40.01"),
+                    owner_request_id="req-conc-2fa-2",
+                    reason="over-allocate 2fa",
+                    verifier=rec,
+                    recovery_token=t2,
+                    destination_bank_label="OWNER_BANK_A",
+                )
+
+            t3 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            with self.assertRaises(ContractError):
+                vault.execute_offramp_ach_payout(
+                    rail=RAIL_KRAKEN_ACH,
+                    amount_usd=D("40.01"),
+                    owner_request_id="req-conc-ach-over",
+                    reason="over-allocate ach",
+                    verifier=rec,
+                    recovery_token=t3,
+                    kraken_client=krk,
+                )
+            self.assertEqual(ach_calls, [])
+
+            # 3. Transition $60 transfer to BROKER_2FA_VERIFICATION_UNKNOWN -> still locks $60
+            t4 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=req1["transfer_id"], now=T0)
+            with self.assertRaises(OfframpSecurityError):
+                vault.confirm_broker_2fa_withdrawal(
+                    transfer_id=req1["transfer_id"],
+                    provider_tx_id="ptx-pending-1",
+                    owner_request_id="req-conc-confirm-pending",
+                    verifier=rec,
+                    recovery_token=t4,
+                    provider_verifier=lambda _b, _tx: {"status": "PENDING"},
+                )
+
+            t5 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            with self.assertRaises(ContractError):
+                vault.execute_offramp_ach_payout(
+                    rail=RAIL_KRAKEN_ACH,
+                    amount_usd=D("40.01"),
+                    owner_request_id="req-conc-ach-over2",
+                    reason="over-allocate ach during unknown",
+                    verifier=rec,
+                    recovery_token=t5,
+                    kraken_client=krk,
+                )
+            self.assertEqual(ach_calls, [])
+
+            # 4. Remaining $40.00 ACH succeeds, leaving $0.00 allocatable
+            t6 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            out_ach = vault.execute_offramp_ach_payout(
+                rail=RAIL_KRAKEN_ACH,
+                amount_usd=D("40.00"),
+                owner_request_id="req-conc-ach-exact",
+                reason="remaining bank vault",
+                verifier=rec,
+                recovery_token=t6,
+                kraken_client=krk,
+            )
+            self.assertEqual(out_ach["status"], "ACH_SUBMITTED")
+            self.assertEqual(len(ach_calls), 1)
+
+            t7 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            with self.assertRaises(ContractError):
+                vault.request_broker_2fa_withdrawal(
+                    broker_id=BROKER_HUGOSWAY_MT5,
+                    amount_usd=D("0.01"),
+                    owner_request_id="req-conc-2fa-exhausted",
+                    reason="exhausted vault",
+                    verifier=rec,
+                    recovery_token=t7,
+                    destination_bank_label="OWNER_BANK_A",
+                )
+            t8 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            with self.assertRaises(ContractError):
+                vault.execute_offramp_ach_payout(
+                    rail=RAIL_KRAKEN_ACH,
+                    amount_usd=D("0.01"),
+                    owner_request_id="req-conc-ach-exhausted",
+                    reason="exhausted vault ach",
+                    verifier=rec,
+                    recovery_token=t8,
+                    kraken_client=krk,
+                )
+            self.assertEqual(len(ach_calls), 1)
+
     def test_parallel_tiers_all_5_accounts_and_lot_floor_skip(self) -> None:
         gate = load_default_forex_valve_gate()
         with tempfile.TemporaryDirectory() as td:
@@ -395,6 +537,112 @@ class ProfitExpansionTests(unittest.TestCase):
             self.assertLess(elapsed_s, 0.5)
             release.set()
             th.join(timeout=3.0)
+
+    def test_vault_scope_id_target_ref_and_ach_retry_destination_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for bad_scope in ("", "a|b", "bad scope", " leading"):
+                with self.assertRaises(ContractError):
+                    ProfitSweepVault(root / "bad.sqlite3", scope_id=bad_scope, clock=lambda: T0)
+
+            vault = ProfitSweepVault(root / "vault.sqlite3", scope_id="main-scope", clock=lambda: T0)
+            vault.record_realized_close(
+                trade_id="t-guard-1", symbol="EURUSD", broker_id=BROKER_HUGOSWAY_MT5, realized_net_usd=D("400.00")
+            )
+            rec = OwnerRecoveryVerifier(db_path=root / "rec.sqlite3", clock=lambda: T0)
+
+            # Token bound to unrelated target_ref must be rejected on both 2FA withdrawal and ACH payout
+            tok_other_2fa = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref="tr2fa-other", now=T0)
+            with self.assertRaises(ContractError):
+                vault.request_broker_2fa_withdrawal(
+                    broker_id=BROKER_HUGOSWAY_MT5,
+                    amount_usd=D("50.00"),
+                    owner_request_id="req-bad-ref-1",
+                    reason="target mismatch test",
+                    verifier=rec,
+                    recovery_token=tok_other_2fa,
+                )
+
+            def krk_fail(_m, _u, _h, _b, _t):
+                return 503, b"service unavailable"
+
+            krk_orig = KrakenOfframpClient(
+                api_key="krk-pub-01",
+                api_secret_b64=base64.b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii"),
+                linked_bank_key="bank-ORIGINAL",
+                http_call=krk_fail,
+                resolve_dns=lambda _h: ["104.16.0.1"],
+                clock=lambda: T0,
+            )
+            tok_other_ach = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref="trach-other", now=T0)
+            with self.assertRaises(ContractError):
+                vault.execute_offramp_ach_payout(
+                    rail=RAIL_KRAKEN_ACH,
+                    amount_usd=D("50.00"),
+                    owner_request_id="req-bad-ref-2",
+                    reason="target mismatch ach",
+                    verifier=rec,
+                    recovery_token=tok_other_ach,
+                    kraken_client=krk_orig,
+                )
+
+            # Create OUTCOME_UNKNOWN transfer bound to bank-ORIGINAL
+            tok_init = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            with self.assertRaises(OfframpTransportError):
+                vault.execute_offramp_ach_payout(
+                    rail=RAIL_KRAKEN_ACH,
+                    amount_usd=D("50.00"),
+                    owner_request_id="req-orig-1",
+                    reason="initial ach 503",
+                    verifier=rec,
+                    recovery_token=tok_init,
+                    kraken_client=krk_orig,
+                )
+            tid = str(vault.snapshot()["recent_transfers"][0]["transfer_id"])
+
+            # Retrying with a different destination_bank_id MUST raise OfframpSecurityError
+            krk_hijack = KrakenOfframpClient(
+                api_key="krk-pub-01",
+                api_secret_b64=base64.b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii"),
+                linked_bank_key="bank-HIJACKED",
+                http_call=lambda *_a: (200, json.dumps({"error": [], "result": {"refid": "KRK-HIJ"}}).encode("utf-8")),
+                resolve_dns=lambda _h: ["104.16.0.1"],
+                clock=lambda: T0,
+            )
+            tok_retry_bad = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=tid, now=T0)
+            with self.assertRaises(OfframpSecurityError):
+                vault.execute_offramp_ach_payout(
+                    rail=RAIL_KRAKEN_ACH,
+                    amount_usd=D("50.00"),
+                    owner_request_id="req-retry-hijack",
+                    reason="destination mismatch",
+                    verifier=rec,
+                    recovery_token=tok_retry_bad,
+                    kraken_client=krk_hijack,
+                    retry_transfer_id=tid,
+                )
+
+            # Retrying with exact target_ref=tid and matching destination_bank_id succeeds
+            krk_ok = KrakenOfframpClient(
+                api_key="krk-pub-01",
+                api_secret_b64=base64.b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii"),
+                linked_bank_key="bank-ORIGINAL",
+                http_call=lambda *_a: (200, json.dumps({"error": [], "result": {"refid": "KRK-OK"}}).encode("utf-8")),
+                resolve_dns=lambda _h: ["104.16.0.1"],
+                clock=lambda: T0,
+            )
+            tok_retry_ok = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=tid, now=T0)
+            res = vault.execute_offramp_ach_payout(
+                rail=RAIL_KRAKEN_ACH,
+                amount_usd=D("50.00"),
+                owner_request_id="req-retry-ok",
+                reason="retry matching bank",
+                verifier=rec,
+                recovery_token=tok_retry_ok,
+                kraken_client=krk_ok,
+                retry_transfer_id=tid,
+            )
+            self.assertEqual(res["status"], "ACH_SUBMITTED")
 
 
 if __name__ == "__main__":
