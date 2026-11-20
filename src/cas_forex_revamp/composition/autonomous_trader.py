@@ -56,6 +56,7 @@ from cas_forex_revamp.valve.daily_quota import (
     DailyQuotaGovernanceStore,
     QUOTA_STATUS_LOCKED,
     QUOTA_STATUS_LOSS_TRIPPED,
+    QUOTA_STATUS_PROFIT_FLOOR_LOCKED,
     QUOTA_STATUS_SOFT,
 )
 from cas_forex_revamp.valve.tks_meta_valve_controller import (
@@ -97,6 +98,9 @@ GOVERNANCE_ACTIVE = "ACTIVE"
 GOVERNANCE_PAUSED_NEW_RISK = "PAUSED_NEW_RISK"
 GOVERNANCE_STOPPED = "STOPPED"
 GOVERNANCE_MODES = (GOVERNANCE_ACTIVE, GOVERNANCE_PAUSED_NEW_RISK, GOVERNANCE_STOPPED)
+
+FOCUS_MODE_RESEARCH_RESPITE = "RESEARCH_RESPITE"
+OPERATING_MODE_ACTIVE_TRADING = "ACTIVE_TRADING"
 
 FEED_MT5_FAST_SPOOL = "MT5_DIRECT_SPOOL_50MS"
 FEED_PUBLIC_FALLBACK = "PUBLIC_15S_FALLBACK"
@@ -424,6 +428,7 @@ class AutonomousAiTrader:
         self._last_evaluated_symbol: str | None = None
         self._last_evaluated_regime: str | None = None
         self._top_watch_symbol: str | None = None
+        self._current_focus_status: str | None = None
         self._last_valve_score: str | None = None
         self._last_scout: dict[str, Any] | None = None
         self._last_error: str | None = None
@@ -862,13 +867,27 @@ class AutonomousAiTrader:
                             if not safe_ticket or not safe_ticket[0].isalnum():
                                 safe_ticket = f"tkt-{safe_ticket}"[:64]
                             try:
-                                self._quota.record_realized_trade(
+                                q_closed = self._quota.record_realized_trade(
                                     pnl_dec,
                                     symbol=sym_closed,
                                     ticket=safe_ticket,
                                     starting_equity=total_eq if total_eq > Decimal("0") else None,
                                     now=ts,
                                 )
+                                if pnl_dec > Decimal("0") and self._profit_vault is not None:
+                                    self._profit_vault.record_realized_close(
+                                        trade_id=safe_ticket,
+                                        symbol=sym_closed,
+                                        broker_id=broker_id,
+                                        realized_net_usd=pnl_dec,
+                                        occurred_at=ts,
+                                    )
+                                if q_closed["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
+                                    self._current_focus_status = (
+                                        f"RESEARCH_RESPITE: Profits Banked ({q_closed['realized_net_pnl_usd']} USD · "
+                                        f"Floor {q_closed['protected_profit_floor_usd']} USD) · "
+                                        f"Observing {self._top_watch_symbol or '20 MARKETS'}"
+                                    )
                             except ContractError as exc:
                                 logger.warning(
                                     "fast protection close accounting skipped for %s: %s",
@@ -1340,9 +1359,60 @@ class AutonomousAiTrader:
                     realized_net_usd=pnl_usd,
                     occurred_at=ts,
                 )
+            if snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
+                self._current_focus_status = (
+                    f"RESEARCH_RESPITE: Profits Banked ({snap['realized_net_pnl_usd']} USD · "
+                    f"Floor {snap['protected_profit_floor_usd']} USD) · "
+                    f"Observing {self._top_watch_symbol or '20 MARKETS'}"
+                )
             if not snap["new_risk_allowed"]:
                 self._governance_reason = str(snap["lock_reason"] or snap["status"])
         return snap
+
+    def _observe_markets_readonly(
+        self,
+        markets: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        ordered_syms = list(INDEX_INSTRUMENTS) + [s for s in markets if s not in INDEX_INSTRUMENTS]
+        best_ratio = Decimal("-1")
+        best_sym: str | None = None
+        best_reg: str | None = None
+        for sym in ordered_syms:
+            info = markets.get(sym)
+            if not info:
+                continue
+            try:
+                bid = Decimal(str(info["bid"]))
+                ask = Decimal(str(info["ask"]))
+            except (KeyError, ValueError, TypeError, ArithmeticError):
+                continue
+            if ask <= bid:
+                continue
+            spread = ask - bid
+            hist = list(self._tick_history.get(sym, ()))
+            if len(hist) < 3:
+                if best_sym is None:
+                    best_sym = sym
+                    best_reg = "OBSERVING"
+                continue
+            params = self._protection_cfg(sym, Decimal("0.50"))
+            mids = [(b + a) / Decimal("2") for b, a in hist[-50:]]
+            reg_res = self._trend_detector.classify(
+                mids=mids,
+                spread=spread,
+                normal_sl_distance=params["sl_distance"],
+            )
+            move_ratio = abs(mids[-1] - mids[0]) / max(spread, Decimal("0.000000001"))
+            if move_ratio > best_ratio:
+                best_ratio = move_ratio
+                best_sym = sym
+                best_reg = reg_res.regime
+        if best_sym is not None:
+            self._top_watch_symbol = best_sym
+            self._last_evaluated_symbol = best_sym
+            if best_reg is not None:
+                self._last_evaluated_regime = best_reg
+        return best_sym, best_reg
 
     def run_fast_tick_cycle(
         self,
@@ -1406,14 +1476,53 @@ class AutonomousAiTrader:
             allowed, quota_veto, risk_mult = self._quota.evaluate_new_risk(
                 ActionKind.OPEN, now=ts, starting_equity=total_eq
             )
-            quota_status = self._quota.snapshot(now=ts, starting_equity=total_eq if total_eq > 0 else None)["status"]
-            strong_runner_eligible = (
-                self._governance_mode == GOVERNANCE_ACTIVE
-                and not allowed
-                and quota_status == QUOTA_STATUS_LOCKED
-            )
+            q_snap = self._quota.snapshot(now=ts, starting_equity=total_eq if total_eq > 0 else None)
+            quota_status = q_snap["status"]
+            if quota_status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
+                obs_sym, obs_reg = self._observe_markets_readonly(markets)
+                top_sym = obs_sym or self._top_watch_symbol
+                respite_status = (
+                    f"RESEARCH_RESPITE: Profits Banked ({q_snap['realized_net_pnl_usd']} USD · "
+                    f"Floor {q_snap['protected_profit_floor_usd']} USD) · Observing {top_sym or '20 MARKETS'}"
+                )
+                self._current_focus_status = respite_status
+                self._last_action = FOCUS_MODE_RESEARCH_RESPITE
+                self._last_symbol = obs_sym
+                self._last_reason = respite_status
+                self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                if self._parallel_tiers is not None and quotes_map:
+                    self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
+                respite_note = {
+                    "cycle_id": cycle_id,
+                    "observed_at": _iso(ts),
+                    "kind": FOCUS_MODE_RESEARCH_RESPITE,
+                    "action": FOCUS_MODE_RESEARCH_RESPITE,
+                    "symbol": obs_sym,
+                    "regime": obs_reg,
+                    "reason": respite_status[:200],
+                    "detail": respite_status[:200],
+                }
+                self._recent_actions.appendleft(respite_note)
+                report = {
+                    "schema": "cas-forex.ai-cycle/1",
+                    "cycle_id": cycle_id,
+                    "observed_at": _iso(ts),
+                    "model_id": self._registry.active_model_id,
+                    "cadence": self._last_cadence,
+                    "operating_mode": FOCUS_MODE_RESEARCH_RESPITE,
+                    "respite_mode": True,
+                    "action": FOCUS_MODE_RESEARCH_RESPITE,
+                    "symbol": obs_sym,
+                    "reason": respite_status,
+                    "valve_score": self._last_valve_score,
+                    "protection_updates": prot_updates,
+                }
+                self._append_journal_cycle(report)
+                return report
 
-            if self._governance_mode != GOVERNANCE_ACTIVE or (not allowed and not strong_runner_eligible):
+            strong_runner_eligible = False
+
+            if self._governance_mode != GOVERNANCE_ACTIVE or not allowed:
                 wait_reason = quota_veto if not allowed else f"Overseer governance is {self._governance_mode}"
                 if not allowed:
                     self._veto_count += 1
@@ -1998,6 +2107,14 @@ class AutonomousAiTrader:
                     self._quota.record_realized_trade(
                         pos.profit, symbol=pos.symbol, ticket=pos.ticket, starting_equity=total_eq, now=ts
                     )
+                    if pos.profit > Decimal("0") and self._profit_vault is not None:
+                        self._profit_vault.record_realized_close(
+                            trade_id=pos.ticket,
+                            symbol=pos.symbol,
+                            broker_id=broker_id,
+                            realized_net_usd=pos.profit,
+                            occurred_at=ts,
+                        )
                     self._open_position_meta.pop(pos.ticket, None)
                     closed_tickets.append(pos.ticket)
         snap = self.status_snapshot(now=ts)
@@ -2081,8 +2198,14 @@ class AutonomousAiTrader:
                 "governance_reason": self._governance_reason,
                 "effective_status": (
                     quota_snap["status"]
-                    if quota_snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_LOSS_TRIPPED)
+                    if quota_snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED, QUOTA_STATUS_LOSS_TRIPPED)
                     else self._governance_mode
+                ),
+                "respite_mode": quota_snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED),
+                "operating_mode": (
+                    FOCUS_MODE_RESEARCH_RESPITE
+                    if quota_snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED)
+                    else OPERATING_MODE_ACTIVE_TRADING
                 ),
                 "fast_tick_ms": int(self._fast_tick_ms),
                 "cadence": self._last_cadence,
@@ -2132,13 +2255,21 @@ class AutonomousAiTrader:
                 "observed_at": _iso(ts),
             }
             open_vals = list(self._open_position_meta.values())
-            if open_vals:
+            in_respite_snap = quota_snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED)
+            if in_respite_snap:
+                top_obs = self._top_watch_symbol or self._last_evaluated_symbol
+                focus_sym = str(top_obs or EXPANDED_MARKETS[0])
+                focus_status = (
+                    f"RESEARCH_RESPITE: Profits Banked ({quota_snap['realized_net_pnl_usd']} USD · "
+                    f"Floor {quota_snap['protected_profit_floor_usd']} USD) · Observing {top_obs or '20 MARKETS'}"
+                )
+            elif open_vals:
                 first_pos = open_vals[0]
                 focus_sym = str(first_pos.get("symbol") or "NAS100")
                 focus_side = str(first_pos.get("side") or "BUY")
                 focus_stage = str(first_pos.get("protection_stage") or "INITIAL_SL")
                 focus_status = f"IN TRADE: {focus_sym} ({focus_side} · {focus_stage})"
-            elif self._last_symbol is not None and self._last_action not in ("WAIT", "VETOED"):
+            elif self._last_symbol is not None and self._last_action not in ("WAIT", "VETOED", FOCUS_MODE_RESEARCH_RESPITE):
                 focus_sym = str(self._last_symbol)
                 focus_status = f"AI EXECUTING: {focus_sym} ({self._last_action})"
             elif self._last_evaluated_symbol is not None:
@@ -2148,6 +2279,7 @@ class AutonomousAiTrader:
             else:
                 focus_sym = str(self._top_watch_symbol or EXPANDED_MARKETS[0])
                 focus_status = f"SCANNING {len(EXPANDED_MARKETS)} MARKETS · Top Watch: {focus_sym}"
+            self._current_focus_status = focus_status
             payload["current_focus_symbol"] = focus_sym
             payload["current_focus_status"] = focus_status
             payload["market_sessions"] = compute_market_sessions_status(

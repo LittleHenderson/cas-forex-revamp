@@ -31,11 +31,24 @@ ENV_DAILY_QUOTA_MODE = "CAS_FOREX_DAILY_QUOTA_MODE"
 ENV_DAILY_MAX_LOSS_USD = "CAS_FOREX_DAILY_MAX_LOSS_USD"
 ENV_DAILY_MAX_LOSS_PCT = "CAS_FOREX_DAILY_MAX_LOSS_PCT"
 ENV_MAX_CONSECUTIVE_LOSSES = "CAS_FOREX_MAX_CONSECUTIVE_LOSSES"
+ENV_PROFIT_RATCHET_ACTIVATION_RATIO = "CAS_FOREX_PROFIT_RATCHET_ACTIVATION_RATIO"
+ENV_PROFIT_RATCHET_FLOOR_RATIO = "CAS_FOREX_PROFIT_RATCHET_FLOOR_RATIO"
+
+DEFAULT_PROFIT_RATCHET_ACTIVATION_RATIO = Decimal("0.50")
+DEFAULT_PROFIT_RATCHET_FLOOR_RATIO = Decimal("0.70")
 
 QUOTA_STATUS_OPEN = "OPEN"
 QUOTA_STATUS_SOFT = "SOFT_QUOTA_REACHED"
 QUOTA_STATUS_LOCKED = "DAILY_QUOTA_LOCKED"
+QUOTA_STATUS_PROFIT_FLOOR_LOCKED = "PROFIT_FLOOR_LOCKED"
 QUOTA_STATUS_LOSS_TRIPPED = "DAILY_LOSS_CIRCUIT_TRIPPED"
+VALID_QUOTA_STATUSES = (
+    QUOTA_STATUS_OPEN,
+    QUOTA_STATUS_SOFT,
+    QUOTA_STATUS_LOCKED,
+    QUOTA_STATUS_PROFIT_FLOOR_LOCKED,
+    QUOTA_STATUS_LOSS_TRIPPED,
+)
 
 QUOTA_MODES = ("USD", "PCT", "COMPOUND_CAPPED")
 GENESIS_SHA256 = "0" * 64
@@ -76,6 +89,8 @@ class DailyQuotaGovernanceStore:
         max_loss_usd: Decimal = Decimal("500.00"),
         max_loss_pct: Decimal | None = Decimal("0.03"),
         max_consecutive_losses: int = 3,
+        ratchet_activation_ratio: Decimal = DEFAULT_PROFIT_RATCHET_ACTIVATION_RATIO,
+        ratchet_floor_ratio: Decimal = DEFAULT_PROFIT_RATCHET_FLOOR_RATIO,
         owner_verifier: Any | None = None,
     ) -> None:
         self._path = Path(path) if path is not None else None
@@ -108,6 +123,14 @@ class DailyQuotaGovernanceStore:
         if self._max_loss_pct is not None and self._max_loss_pct >= Decimal("1"):
             raise ContractError("max_loss_pct must be strictly below 1.0")
         self._max_consecutive_losses = integer(max_consecutive_losses, "max_consecutive_losses", minimum=1)
+        act_r = decimal_value(Decimal(ratchet_activation_ratio), "ratchet_activation_ratio", positive=True)
+        if act_r > Decimal("1"):
+            raise ContractError("ratchet_activation_ratio must be in (0, 1]")
+        flr_r = decimal_value(Decimal(ratchet_floor_ratio), "ratchet_floor_ratio", positive=True)
+        if flr_r >= Decimal("1"):
+            raise ContractError("ratchet_floor_ratio must be strictly in (0, 1)")
+        self._ratchet_activation_ratio = act_r
+        self._ratchet_floor_ratio = flr_r
 
     @classmethod
     def from_environ(
@@ -126,6 +149,8 @@ class DailyQuotaGovernanceStore:
         mloss_raw = str(environ.get(ENV_DAILY_MAX_LOSS_USD, "")).strip() or "500.00"
         mlpct_raw = str(environ.get(ENV_DAILY_MAX_LOSS_PCT, "")).strip() or "0.03"
         consec_raw = str(environ.get(ENV_MAX_CONSECUTIVE_LOSSES, "")).strip() or "3"
+        act_raw = str(environ.get(ENV_PROFIT_RATCHET_ACTIVATION_RATIO, "")).strip() or "0.50"
+        flr_raw = str(environ.get(ENV_PROFIT_RATCHET_FLOOR_RATIO, "")).strip() or "0.70"
         try:
             soft = Decimal(soft_raw)
             hard = Decimal(hard_raw)
@@ -133,6 +158,8 @@ class DailyQuotaGovernanceStore:
             mloss = Decimal(mloss_raw)
             mlpct = Decimal(mlpct_raw) if mlpct_raw else None
             consec = int(consec_raw)
+            act_ratio = Decimal(act_raw)
+            flr_ratio = Decimal(flr_raw)
         except Exception as exc:
             raise ContractError("invalid daily quota environment configuration") from exc
         return cls(
@@ -145,6 +172,8 @@ class DailyQuotaGovernanceStore:
             max_loss_usd=mloss,
             max_loss_pct=mlpct,
             max_consecutive_losses=consec,
+            ratchet_activation_ratio=act_ratio,
+            ratchet_floor_ratio=flr_ratio,
         )
 
     @property
@@ -167,6 +196,7 @@ class DailyQuotaGovernanceStore:
                     scope_id TEXT NOT NULL,
                     starting_equity TEXT NOT NULL,
                     realized_net_pnl_usd TEXT NOT NULL,
+                    peak_realized_pnl_usd TEXT NOT NULL DEFAULT '0',
                     closed_trades INTEGER NOT NULL,
                     win_count INTEGER NOT NULL,
                     loss_count INTEGER NOT NULL,
@@ -177,6 +207,14 @@ class DailyQuotaGovernanceStore:
                 )
                 """
             )
+            existing_cols = {
+                str(col_row[1])
+                for col_row in conn.execute("PRAGMA table_info(daily_quota_sessions)").fetchall()
+            }
+            if "peak_realized_pnl_usd" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE daily_quota_sessions ADD COLUMN peak_realized_pnl_usd TEXT NOT NULL DEFAULT '0'"
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS daily_quota_events (
@@ -216,13 +254,28 @@ class DailyQuotaGovernanceStore:
                 max_loss = max(Decimal("1.00"), min(max_loss, pct_loss))
         return soft, hard, max_loss
 
+    def _ratchet_metrics(self, row: Mapping[str, Any], soft: Decimal) -> tuple[Decimal, Decimal, bool, Decimal]:
+        pnl = Decimal(str(row["realized_net_pnl_usd"]))
+        raw_peak = Decimal(str(row.get("peak_realized_pnl_usd", "0")))
+        peak_pnl = _q2(max(raw_peak, pnl, Decimal("0")))
+        activation_usd = _q2(soft * self._ratchet_activation_ratio)
+        if peak_pnl >= activation_usd:
+            return peak_pnl, activation_usd, True, _q2(peak_pnl * self._ratchet_floor_ratio)
+        return peak_pnl, activation_usd, False, Decimal("0.00")
+
     def _compute_status(self, row: Mapping[str, Any]) -> tuple[str, str | None]:
         start_eq = Decimal(str(row["starting_equity"])) if Decimal(str(row["starting_equity"])) > 0 else None
         soft, hard, max_loss = self._effective_targets(start_eq)
         pnl = Decimal(str(row["realized_net_pnl_usd"]))
         consec = int(row["consecutive_losses"])
+        peak_pnl, _, ratchet_armed, protected_floor_usd = self._ratchet_metrics(row, soft)
         if pnl >= hard:
             return QUOTA_STATUS_LOCKED, f"Daily profit quota reached ({decimal_text(pnl)} >= {decimal_text(hard)} USD)"
+        if ratchet_armed and pnl <= protected_floor_usd:
+            return (
+                QUOTA_STATUS_PROFIT_FLOOR_LOCKED,
+                f"Protected daily profit floor locked ({decimal_text(pnl)} <= {decimal_text(protected_floor_usd)} USD from {decimal_text(peak_pnl)} USD peak)",
+            )
         if pnl <= -max_loss:
             return QUOTA_STATUS_LOSS_TRIPPED, f"Daily max loss reached ({decimal_text(pnl)} <= -{decimal_text(max_loss)} USD)"
         if consec >= self._max_consecutive_losses:
@@ -250,6 +303,7 @@ class DailyQuotaGovernanceStore:
                     "scope_id": self._scope_id,
                     "starting_equity": start_val,
                     "realized_net_pnl_usd": "0",
+                    "peak_realized_pnl_usd": "0",
                     "closed_trades": 0,
                     "win_count": 0,
                     "loss_count": 0,
@@ -265,7 +319,8 @@ class DailyQuotaGovernanceStore:
 
         db_row = conn.execute(
             "SELECT session_key, session_date, scope_id, starting_equity, realized_net_pnl_usd, "
-            "closed_trades, win_count, loss_count, consecutive_losses, status, lock_reason, updated_at "
+            "peak_realized_pnl_usd, closed_trades, win_count, loss_count, consecutive_losses, "
+            "status, lock_reason, updated_at "
             "FROM daily_quota_sessions WHERE session_key = ?",
             (key,),
         ).fetchone()
@@ -277,6 +332,7 @@ class DailyQuotaGovernanceStore:
                 "scope_id": self._scope_id,
                 "starting_equity": start_val,
                 "realized_net_pnl_usd": "0",
+                "peak_realized_pnl_usd": "0",
                 "closed_trades": 0,
                 "win_count": 0,
                 "loss_count": 0,
@@ -289,28 +345,32 @@ class DailyQuotaGovernanceStore:
                 """
                 INSERT INTO daily_quota_sessions (
                     session_key, session_date, scope_id, starting_equity, realized_net_pnl_usd,
-                    closed_trades, win_count, loss_count, consecutive_losses, status, lock_reason, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    peak_realized_pnl_usd, closed_trades, win_count, loss_count, consecutive_losses,
+                    status, lock_reason, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     key, session_date, self._scope_id, row["starting_equity"], "0",
-                    0, 0, 0, 0, QUOTA_STATUS_OPEN, None, ts_str,
+                    "0", 0, 0, 0, 0, QUOTA_STATUS_OPEN, None, ts_str,
                 ),
             )
             return row
+        loaded_pnl = Decimal(str(db_row[4]))
+        loaded_peak = _q2(max(Decimal(str(db_row[5] or "0")), loaded_pnl, Decimal("0")))
         row = {
             "session_key": db_row[0],
             "session_date": db_row[1],
             "scope_id": db_row[2],
             "starting_equity": db_row[3],
             "realized_net_pnl_usd": db_row[4],
-            "closed_trades": int(db_row[5]),
-            "win_count": int(db_row[6]),
-            "loss_count": int(db_row[7]),
-            "consecutive_losses": int(db_row[8]),
-            "status": db_row[9],
-            "lock_reason": db_row[10],
-            "updated_at": db_row[11],
+            "peak_realized_pnl_usd": decimal_text(loaded_peak),
+            "closed_trades": int(db_row[6]),
+            "win_count": int(db_row[7]),
+            "loss_count": int(db_row[8]),
+            "consecutive_losses": int(db_row[9]),
+            "status": db_row[10],
+            "lock_reason": db_row[11],
+            "updated_at": db_row[12],
         }
         if Decimal(str(row["starting_equity"])) <= 0 and starting_equity is not None and starting_equity > 0:
             row["starting_equity"] = decimal_text(_q2(starting_equity))
@@ -345,14 +405,15 @@ class DailyQuotaGovernanceStore:
         conn.execute(
             """
             UPDATE daily_quota_sessions SET
-                starting_equity = ?, realized_net_pnl_usd = ?, closed_trades = ?, win_count = ?,
-                loss_count = ?, consecutive_losses = ?, status = ?, lock_reason = ?, updated_at = ?
+                starting_equity = ?, realized_net_pnl_usd = ?, peak_realized_pnl_usd = ?,
+                closed_trades = ?, win_count = ?, loss_count = ?, consecutive_losses = ?,
+                status = ?, lock_reason = ?, updated_at = ?
             WHERE session_key = ?
             """,
             (
-                row["starting_equity"], row["realized_net_pnl_usd"], row["closed_trades"], row["win_count"],
-                row["loss_count"], row["consecutive_losses"], row["status"], row["lock_reason"],
-                row["updated_at"], row["session_key"],
+                row["starting_equity"], row["realized_net_pnl_usd"], row.get("peak_realized_pnl_usd", "0"),
+                row["closed_trades"], row["win_count"], row["loss_count"], row["consecutive_losses"],
+                row["status"], row["lock_reason"], row["updated_at"], row["session_key"],
             ),
         )
         conn.execute(
@@ -426,7 +487,10 @@ class DailyQuotaGovernanceStore:
 
     def _apply_trade(self, row: dict[str, Any], pnl_dec: Decimal, ts_str: str) -> None:
         new_pnl = _q2(Decimal(str(row["realized_net_pnl_usd"])) + pnl_dec)
+        prev_peak = Decimal(str(row.get("peak_realized_pnl_usd", "0")))
+        new_peak = _q2(max(prev_peak, new_pnl, Decimal("0")))
         row["realized_net_pnl_usd"] = decimal_text(new_pnl)
+        row["peak_realized_pnl_usd"] = decimal_text(new_peak)
         row["closed_trades"] = int(row["closed_trades"]) + 1
         if pnl_dec >= Decimal("0"):
             row["win_count"] = int(row["win_count"]) + 1
@@ -435,11 +499,13 @@ class DailyQuotaGovernanceStore:
             row["loss_count"] = int(row["loss_count"]) + 1
             row["consecutive_losses"] = int(row["consecutive_losses"]) + 1
         row["updated_at"] = ts_str
-        # Respect locked/tripped hysteresis once triggered unless explicitly unlocked or daily gain hits hard quota.
+        # Respect locked/floor-locked/tripped hysteresis once triggered unless explicitly unlocked or daily gain hits hard quota.
         prev_status = row["status"]
         new_status, new_reason = self._compute_status(row)
         if prev_status == QUOTA_STATUS_LOCKED:
             row["status"] = QUOTA_STATUS_LOCKED
+        elif prev_status == QUOTA_STATUS_PROFIT_FLOOR_LOCKED and new_status != QUOTA_STATUS_LOCKED:
+            row["status"] = QUOTA_STATUS_PROFIT_FLOOR_LOCKED
         elif prev_status == QUOTA_STATUS_LOSS_TRIPPED and new_status != QUOTA_STATUS_LOCKED:
             row["status"] = QUOTA_STATUS_LOSS_TRIPPED
         else:
@@ -459,6 +525,9 @@ class DailyQuotaGovernanceStore:
         status = snap["status"]
         if status == QUOTA_STATUS_LOCKED:
             return False, QUOTA_STATUS_LOCKED, Decimal("0")
+        if status == QUOTA_STATUS_PROFIT_FLOOR_LOCKED:
+            lock_rsn = str(snap.get("lock_reason") or QUOTA_STATUS_PROFIT_FLOOR_LOCKED)
+            return False, lock_rsn, Decimal("0")
         if status == QUOTA_STATUS_LOSS_TRIPPED:
             return False, QUOTA_STATUS_LOSS_TRIPPED, Decimal("0")
         if status == QUOTA_STATUS_SOFT:
@@ -595,7 +664,12 @@ class DailyQuotaGovernanceStore:
             pnl_pct = Decimal("0") if start_pos is None else (pnl / start_pos * Decimal("100")).quantize(Decimal("0.01"))
             progress_pct = Decimal("0") if hard <= Decimal("0") else max(Decimal("0"), min(Decimal("100"), (pnl / hard * Decimal("100")).quantize(Decimal("0.1"))))
         status = str(row["status"])
-        risk_mult = Decimal("0") if status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_LOSS_TRIPPED) else (Decimal("0.50") if status == QUOTA_STATUS_SOFT else Decimal("1"))
+        peak_pnl, activation_usd, ratchet_armed, protected_floor_usd = self._ratchet_metrics(row, soft)
+        risk_mult = (
+            Decimal("0")
+            if status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED, QUOTA_STATUS_LOSS_TRIPPED)
+            else (Decimal("0.50") if status == QUOTA_STATUS_SOFT else Decimal("1"))
+        )
         return {
             "schema": "cas-forex.daily-quota/1",
             "session_date": str(row["session_date"]),
@@ -606,6 +680,10 @@ class DailyQuotaGovernanceStore:
             "quota_mode": self._quota_mode,
             "starting_equity_usd": decimal_text(start_eq),
             "realized_net_pnl_usd": decimal_text(pnl),
+            "peak_realized_pnl_usd": decimal_text(peak_pnl),
+            "ratchet_armed": bool(ratchet_armed),
+            "ratchet_activation_usd": decimal_text(activation_usd),
+            "protected_profit_floor_usd": decimal_text(protected_floor_usd),
             "realized_pnl_pct": decimal_text(pnl_pct),
             "soft_quota_usd": decimal_text(soft),
             "hard_quota_usd": decimal_text(hard),

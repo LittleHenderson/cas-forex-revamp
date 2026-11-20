@@ -17,7 +17,7 @@ export const PRIORITY_AI_MODELS = Object.freeze([
 ]);
 
 const GOVERNANCE_MODES = Object.freeze(['ACTIVE', 'PAUSED_NEW_RISK', 'PAUSED', 'STOPPED', 'STANDBY']);
-const QUOTA_STATUSES = Object.freeze(['OPEN', 'SOFT_QUOTA_REACHED', 'DAILY_QUOTA_LOCKED', 'DAILY_LOSS_CIRCUIT_TRIPPED']);
+const QUOTA_STATUSES = Object.freeze(['OPEN', 'SOFT_QUOTA_REACHED', 'DAILY_QUOTA_LOCKED', 'PROFIT_FLOOR_LOCKED', 'DAILY_LOSS_CIRCUIT_TRIPPED']);
 const PROTECTION_STAGES = Object.freeze(['INITIAL_SL', 'BREAKEVEN_LOCKED', 'TRAILING_ACTIVE']);
 export const RISK_GEAR_MODES = Object.freeze(['CONSERVATIVE', 'AUTO_ADAPTIVE', 'AGGRESSIVE']);
 const INDEX_PAIRS = Object.freeze(['NAS100', 'US30', 'SPX500', 'XAUUSD']);
@@ -112,6 +112,8 @@ export const STATIC_AI_TRADER = Object.freeze({
   governanceMode: 'STANDBY',
   governanceReason: 'AI trader standby (not attached). Connect loopback live server to observe AI autonomy.',
   effectiveStatus: 'STANDBY',
+  respiteMode: false,
+  operatingMode: 'ACTIVE_TRADING',
   fastTickMs: '50',
   cadence: '50ms_FAST_TICK',
   marketsEvaluated: '20',
@@ -166,6 +168,10 @@ export const STATIC_AI_TRADER = Object.freeze({
     lossCount: '0',
     consecutiveLosses: '0',
     maxConsecutiveLosses: '3',
+    peakRealizedPnlUsd: '0',
+    ratchetArmed: false,
+    ratchetActivationUsd: '0',
+    protectedProfitFloorUsd: '0',
   }),
   openPositions: Object.freeze([]),
   recentActions: Object.freeze([]),
@@ -254,6 +260,8 @@ export function normalizeAiTrader(doc) {
     governanceMode: govMode,
     governanceReason: str(doc.governance_reason, 'Autonomous loop active.'),
     effectiveStatus: str(doc.effective_status, govMode),
+    respiteMode: Boolean(doc.respite_mode),
+    operatingMode: str(doc.operating_mode, 'ACTIVE_TRADING', 40),
     fastTickMs: numStr(doc.fast_tick_ms, '50'),
     cadence: str(doc.cadence, '50ms_FAST_TICK'),
     marketsEvaluated: numStr(doc.markets_evaluated, '20'),
@@ -332,6 +340,10 @@ export function normalizeAiTrader(doc) {
       lossCount: numStr(q.loss_count, '0'),
       consecutiveLosses: numStr(q.consecutive_losses, '0'),
       maxConsecutiveLosses: numStr(q.max_consecutive_losses, '3'),
+      peakRealizedPnlUsd: numStr(q.peak_realized_pnl_usd, '0'),
+      ratchetArmed: Boolean(q.ratchet_armed),
+      ratchetActivationUsd: numStr(q.ratchet_activation_usd, '0'),
+      protectedProfitFloorUsd: numStr(q.protected_profit_floor_usd, '0'),
     }),
     openPositions: Object.freeze(openPositions),
     recentActions: Object.freeze(recentActions),
@@ -410,11 +422,26 @@ export function renderAiOverseerPanel(state) {
   const trader = state?.aiTrader ?? STATIC_AI_TRADER;
   const models = state?.aiModels ?? STATIC_AI_MODELS;
   const busy = Boolean(state?.aiActionBusy);
-  const q = trader.dailyQuota;
+  const q = trader.dailyQuota ?? STATIC_AI_TRADER.dailyQuota;
   const pctRaw = Number(q.quotaProgressPct);
   const pctVal = Number.isFinite(pctRaw) ? Math.max(0, Math.min(100, pctRaw)) : 0;
-  const quotaWarning = q.status === 'DAILY_QUOTA_LOCKED' || q.status === 'DAILY_LOSS_CIRCUIT_TRIPPED';
-  const modeWarning = !trader.connected || trader.governanceMode !== 'ACTIVE' || quotaWarning;
+  const profitBankedLocked = q.status === 'DAILY_QUOTA_LOCKED' || q.status === 'PROFIT_FLOOR_LOCKED';
+  const isRespiteBanked = Boolean(trader.respiteMode) || profitBankedLocked;
+  const lossTripped = q.status === 'DAILY_LOSS_CIRCUIT_TRIPPED';
+  const quotaTagClass = lossTripped ? ' tag-warning' : (profitBankedLocked ? ' tag-profit-locked' : '');
+  const modeWarning = !trader.connected || (trader.governanceMode !== 'ACTIVE' && !isRespiteBanked) || lossTripped;
+
+  const peakUsd = q.peakRealizedPnlUsd ?? '0';
+  const floorUsd = q.protectedProfitFloorUsd ?? '0';
+  const actUsd = q.ratchetActivationUsd ?? '0';
+  const ratchetArmed = Boolean(q.ratchetArmed);
+  const ratchetPill = ratchetArmed
+    ? '<span class="ratchet-pill is-armed">RATCHET ARMED</span>'
+    : `<span class="ratchet-pill">Unhandcuffed (arms at $${esc(actUsd)})</span>`;
+  const profitRatchetRow = `<div class="profit-ratchet-row numeric" data-profit-ratchet-bar="true"><span>Peak Today: $${esc(peakUsd)}</span><span>Protected Floor (70%): $${esc(floorUsd)}</span>${ratchetPill}</div>`;
+  const respiteBadge = isRespiteBanked
+    ? '<span class="respite-banked-badge" data-research-respite-badge="true">RESEARCH RESPITE · PROFITS BANKED (0 New Risk · Observing Markets)</span>'
+    : '';
 
   const modelOptions = models.models.map((m) => {
     const selected = m.modelId === models.activeModelId ? ' selected' : '';
@@ -450,8 +477,9 @@ export function renderAiOverseerPanel(state) {
       <div><p class="eyebrow">HUMAN AS OVERSEER · ${esc(trader.marketsEvaluated)} MARKETS (${esc(trader.fastTickMs)}ms MT5 FAST-TICK)</p><h2>Autonomous AI Trader &amp; Daily Quota</h2></div>
       <div class="market-chart-badges">
         ${connectBtn}
+        ${respiteBadge}
         ${workingPill}
-        <span class="tag${modeWarning ? ' tag-warning' : ''}" data-ai-status="${esc(trader.effectiveStatus)}"><span class="state-rule" aria-hidden="true"></span>${esc(trader.connected ? trader.effectiveStatus : 'AI standby (not attached)')}</span>
+        <span class="tag${modeWarning ? ' tag-warning' : (profitBankedLocked ? ' tag-profit-locked' : '')}" data-ai-status="${esc(trader.effectiveStatus)}"><span class="state-rule" aria-hidden="true"></span>${esc(trader.connected ? trader.effectiveStatus : 'AI standby (not attached)')}</span>
         <span class="tag"><span class="state-rule" aria-hidden="true"></span>${esc(trader.valveController)} · ${esc(trader.valveParameters)} params</span>
       </div>
     </div>
@@ -470,9 +498,10 @@ export function renderAiOverseerPanel(state) {
       <div class="ai-quota-block">
         <div class="quota-header">
           <strong>Daily Profit Quota &amp; Loss Circuit Breaker (${esc(q.quotaMode)})</strong>
-          <span class="tag${quotaWarning ? ' tag-warning' : ''}" data-daily-quota-status="${esc(q.status)}"><span class="state-rule" aria-hidden="true"></span>${esc(q.status)}</span>
+          <span class="tag${quotaTagClass}" data-daily-quota-status="${esc(q.status)}"><span class="state-rule" aria-hidden="true"></span>${esc(q.status)}</span>
         </div>
         <progress class="quota-progress" value="${esc(pctVal)}" max="100" aria-label="Daily quota progress percent">${esc(pctVal)}%</progress>
+        ${profitRatchetRow}
         <p class="quiet-note numeric">Realized today: $${esc(q.realizedNetPnlUsd)} (${esc(q.realizedPnlPct)}%) · Soft $${esc(q.softQuotaUsd)} (0.5x risk) / Hard $${esc(q.hardQuotaUsd)} lock · Max daily loss $${esc(q.maxDailyLossUsd)} · Streak ${esc(q.consecutiveLosses)}/${esc(q.maxConsecutiveLosses)} · Risk mult ${esc(q.riskMultiplier)}x</p>
       </div>
     </div>
