@@ -695,6 +695,17 @@ class ProfitSweepVault:
                 disbursed += Decimal(str(r["amount_usd_text"]))
         return disbursed.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
+    def _confirmed_settled_disbursed_unlocked(self, conn: sqlite3.Connection) -> Decimal:
+        """Sum STRICTLY confirmed SETTLED external bank payouts (excludes pending/submitted/unknown)."""
+        settled = Decimal("0.00")
+        for r in conn.execute(
+            "SELECT amount_usd_text, status FROM bank_transfers WHERE scope_id = ?",
+            (self.scope_id,),
+        ):
+            if str(r["status"]) == "SETTLED":
+                settled += Decimal(str(r["amount_usd_text"]))
+        return settled.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
     @staticmethod
     def _resolve_effective_initial_capital(
         cfg_row: sqlite3.Row | None,
@@ -881,14 +892,14 @@ class ProfitSweepVault:
                 unconstrained_bank = Decimal("0.00")
 
             if eq_val is not None and eff_init_cap is not None:
-                disbursed_total = self._disbursed_total_unlocked(conn)
+                settled_disbursed = self._confirmed_settled_disbursed_unlocked(conn)
                 overall_bank = Decimal("0.00")
                 for r_all in conn.execute(
                     "SELECT bank_sweep_usd_text FROM sweep_events WHERE scope_id = ?",
                     (self.scope_id,),
                 ):
                     overall_bank += Decimal(str(r_all["bank_sweep_usd_text"]))
-                economic_equity = (eq_val + disbursed_total).quantize(
+                economic_equity = (eq_val + settled_disbursed).quantize(
                     Decimal("0.01"), rounding=ROUND_HALF_UP
                 )
                 true_surplus = max(
@@ -906,7 +917,7 @@ class ProfitSweepVault:
                             )
                     else:
                         max_surplus_reserve = Decimal("0.00")
-                    desired_overall_bank = max(disbursed_total, max_surplus_reserve)
+                    desired_overall_bank = max(settled_disbursed, max_surplus_reserve)
                     headroom = max(Decimal("0.00"), desired_overall_bank - overall_bank)
                     bank_part = min(unconstrained_bank, headroom)
                 retained_part = realized_net_usd - bank_part
@@ -1035,8 +1046,8 @@ class ProfitSweepVault:
             eff_init_cap = self._resolve_effective_initial_capital(cfg, initial_capital_usd)
 
             if eq_val is not None and eff_init_cap is not None:
-                disbursed_total = self._disbursed_total_unlocked(conn)
-                economic_equity = (eq_val + disbursed_total).quantize(
+                settled_disbursed = self._confirmed_settled_disbursed_unlocked(conn)
+                economic_equity = (eq_val + settled_disbursed).quantize(
                     Decimal("0.01"), rounding=ROUND_HALF_UP
                 )
                 true_surplus = max(
@@ -1044,7 +1055,7 @@ class ProfitSweepVault:
                     (economic_equity - eff_init_cap).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
                 )
                 if true_surplus <= Decimal("0.00"):
-                    desired_overall_bank = disbursed_total
+                    desired_overall_bank = settled_disbursed
                 else:
                     if auto_on and ratio > Decimal("0"):
                         with localcontext() as ctx:
@@ -1054,7 +1065,7 @@ class ProfitSweepVault:
                             )
                     else:
                         max_surplus_reserve = Decimal("0.00")
-                    desired_overall_bank = max(disbursed_total, max_surplus_reserve)
+                    desired_overall_bank = max(settled_disbursed, max_surplus_reserve)
                 bank_delta = (desired_overall_bank - overall_bank).quantize(
                     Decimal("0.01"), rounding=ROUND_HALF_UP
                 )
@@ -1568,6 +1579,8 @@ class ProfitSweepVault:
                     })
 
             disbursed = Decimal("0")
+            confirmed_settled = Decimal("0")
+            unconfirmed_active = Decimal("0")
             pending_2fa = Decimal("0")
             recent_transfers: list[dict[str, Any]] = []
             trows = conn.execute(
@@ -1576,10 +1589,15 @@ class ProfitSweepVault:
             for idx, r in enumerate(trows):
                 amt = Decimal(str(r["amount_usd_text"]))
                 st = str(r["status"])
-                if st in ("SETTLED", "ACH_SUBMITTED", "RESERVED_PENDING_DISPATCH", "OUTCOME_UNKNOWN"):
+                if st == "SETTLED":
+                    confirmed_settled += amt
                     disbursed += amt
+                elif st in ("ACH_SUBMITTED", "RESERVED_PENDING_DISPATCH", "OUTCOME_UNKNOWN"):
+                    disbursed += amt
+                    unconfirmed_active += amt
                 elif st in ("PENDING_OWNER_BROKER_2FA", "BROKER_2FA_VERIFICATION_UNKNOWN"):
                     pending_2fa += amt
+                    unconfirmed_active += amt
                 if idx < 25:
                     recent_transfers.append({
                         "transfer_id": str(r["transfer_id"]),
@@ -1613,6 +1631,8 @@ class ProfitSweepVault:
                 "retained_trading_usd": decimal_text(retained),
                 "bank_sweep_reserved_usd": decimal_text(bank_reserved_total),
                 "disbursed_to_bank_usd": decimal_text(disbursed),
+                "confirmed_settled_disbursed_usd": decimal_text(confirmed_settled),
+                "pending_or_unconfirmed_transfers_usd": decimal_text(unconfirmed_active),
                 "pending_2fa_confirmation_usd": decimal_text(pending_2fa),
                 "pending_disbursement_usd": decimal_text(pending_rem),
                 "recent_sweeps": recent_sweeps,

@@ -307,7 +307,8 @@ test('PR21_02 Underwater RECOVERY_MODE ($282,258.15 vs $300,000.00) pauses vault
     assert.ok(html.includes('50% Principal High-Water Vault &amp; Confirmed Payouts'));
     assert.ok(html.includes('Bank Vault Sweeps Paused ($0.00 until > $300,000.00)'));
     assert.ok(html.includes('100% of recovery stays in trading capital'));
-    assert.ok(html.includes('Confirmed Bank Payouts: $0.00'));
+    assert.ok(html.includes('Confirmed Settled Payouts: $0.00'));
+    assert.equal(html.includes('Pending / Unconfirmed Transfers:'), false);
     assert.equal(html.includes('Internal Vault Reserve</div>'), false, 'Underwater recovery must never claim positive vault reserve');
 
     // Card 4: Automatic 3-Region wakeup + cadence toggles + 1-click Resume Next Region Session
@@ -357,15 +358,16 @@ test('PR21_03 Above-Principal IN_SURPLUS ($304,000.00 vs $300,000.00) sweeps 50%
   assert.ok(hero.includes('$2,000.00 Internal Vault Reserve'));
   assert.ok(hero.includes('$2,000.00 Surplus Compounding'));
   assert.ok(hero.includes('Internal Ledger Reserve — Not a Confirmed Bank Payout'));
-  assert.ok(hero.includes('Confirmed Bank Payouts: $0.00'));
+  assert.ok(hero.includes('Confirmed Settled Payouts: $0.00'));
   assert.ok(hero.includes('17:00 America/New_York'));
   assert.equal(hero.includes('ADVANCE_RECOVERY_SESSION'), false, 'Recovery session advance must be hidden when IN_SURPLUS');
   assert.equal(/\bstyle\s*=/i.test(hero), false);
 });
 
-test('PR21_04 app.mjs & styles.css wire /api/ai-trader-control, in-place zero-jump rerender, 44px touch targets, and strict CSP/LF invariants', async () => {
+test('PR21_04 app.mjs, analytics.mjs & styles.css wire /api/ai-trader-control, in-place zero-jump rerender, 44px touch targets, and strict CSP/LF invariants', async () => {
   const appSrc = await readFile(new URL('../../ui/src/app.mjs', import.meta.url), 'utf8');
   const overseerSrc = await readFile(new URL('../../ui/src/ai-overseer.mjs', import.meta.url), 'utf8');
+  const analyticsSrc = await readFile(new URL('../../ui/src/analytics.mjs', import.meta.url), 'utf8');
   const stylesSrc = await readFile(new URL('../../ui/styles.css', import.meta.url), 'utf8');
 
   assert.match(appSrc, /\/api\/ai-trader-control/);
@@ -381,9 +383,75 @@ test('PR21_04 app.mjs & styles.css wire /api/ai-trader-control, in-place zero-ju
 
   const innerHtmlRe = new RegExp('\\b(inner' + 'HTML|outer' + 'HTML)\\b');
   const inlineStyleRe = /\bstyle\s*=\s*["']/i;
-  for (const [name, src] of [['app.mjs', appSrc], ['ai-overseer.mjs', overseerSrc], ['styles.css', stylesSrc]]) {
+  for (const [name, src] of [
+    ['app.mjs', appSrc],
+    ['ai-overseer.mjs', overseerSrc],
+    ['analytics.mjs', analyticsSrc],
+    ['styles.css', stylesSrc],
+  ]) {
     assert.equal(innerHtmlRe.test(src), false, `Forbidden HTML setter in ${name}`);
     assert.equal(inlineStyleRe.test(src), false, `Forbidden inline style in ${name}`);
     assert.equal(src.includes('\r'), false, `CR byte prohibited in ${name}`);
   }
+});
+
+test('PR21_05 Pending or unconfirmed transfers ($5,000.00) with $0.00 settled never inflate surplus or settled payouts and keep RECOVERY MODE active', () => {
+  const pendingDoc = buildUnderwaterRecoveryDoc(true);
+  pendingDoc.daily_quota.starting_equity_usd = '296000';
+  pendingDoc.daily_quota.realized_net_pnl_usd = '2000';
+  pendingDoc.banked_session.current_total_equity_usd = '298000';
+  pendingDoc.banked_session.net_surplus_usd = '-2000';
+  pendingDoc.banked_session.net_surplus_pct = '-0.67';
+  pendingDoc.banked_session.deficit_to_principal_usd = '2000';
+  pendingDoc.banked_session.capital_status = 'RECOVERY_MODE';
+  pendingDoc.banked_session.vault_sweeps_paused_for_recovery = true;
+  pendingDoc.banked_session.confirmed_bank_payouts_usd = '0';
+  pendingDoc.banked_session.pending_unconfirmed_transfers_usd = '5000';
+
+  const normTrader = normalizeAiTrader(pendingDoc);
+  assert.equal(normTrader.capitalStatus, 'RECOVERY_MODE');
+  assert.equal(normTrader.confirmedBankPayoutsUsd, '0');
+  assert.equal(normTrader.pendingUnconfirmedTransfersUsd, '5000');
+
+  const normTreas = normalizeTreasury({
+    schema: 'cas-forex.profit-vault/1',
+    sweep_ratio: '0.5',
+    sweep_ratio_pct: '50',
+    auto_sweep_enabled: true,
+    preferred_rail: 'COINBASE_ACH',
+    total_realized_profit_usd: '5000',
+    retained_trading_usd: '0',
+    bank_sweep_reserved_usd: '5000',
+    disbursed_to_bank_usd: '5000',
+    confirmed_settled_disbursed_usd: '0',
+    pending_or_unconfirmed_transfers_usd: '5000',
+    pending_disbursement_usd: '0',
+    recent_sweeps: [],
+    recent_transfers: [
+      {
+        transfer_id: 'tx-pending-1',
+        rail: 'COINBASE_ACH',
+        destination_bank_id: 'bank-1',
+        amount_usd: '5000',
+        status: 'ACH_SUBMITTED',
+        created_at: '2026-11-20T05:00:00Z',
+      },
+    ],
+  });
+  assert.equal(normTreas.disbursedToBankUsd, '5000');
+  assert.equal(normTreas.confirmedSettledDisbursedUsd, '0');
+  assert.equal(normTreas.pendingUnconfirmedTransfersUsd, '5000');
+
+  const state = displayState(fixture(), 'operate');
+  state.liveStreamConnected = true;
+  state.aiModels = normalizeAiModels(buildModelsDoc());
+  state.aiTrader = normTrader;
+  state.treasury = normTreas;
+
+  const hero = renderBankedProfitsHeroBanner(state);
+  assert.ok(hero.includes('RECOVERY MODE: -$2,000.00 (-0.67%) BELOW $300,000.00 PRINCIPAL'));
+  assert.ok(hero.includes('Bank Vault Sweeps Paused ($0.00 until > $300,000.00)'));
+  assert.ok(hero.includes('Confirmed Settled Payouts: $0.00'), 'Must never conflate disbursed_to_bank_usd pending rows with settled payouts');
+  assert.ok(hero.includes('Pending / Unconfirmed Transfers: $5,000.00 (excluded from surplus)'));
+  assert.equal(hero.includes('Confirmed Settled Payouts: $5,000.00'), false);
 });

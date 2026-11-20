@@ -1546,6 +1546,8 @@ class LoopbackCockpitServer:
                                                 or "0"
                                             ),
                                             "disbursed_to_bank_usd": str(v_doc.get("disbursed_to_bank_usd", "0")),
+                                            "confirmed_settled_disbursed_usd": str(v_doc.get("confirmed_settled_disbursed_usd", "0")),
+                                            "pending_or_unconfirmed_transfers_usd": str(v_doc.get("pending_or_unconfirmed_transfers_usd", "0")),
                                         }
                                 except Exception as exc_ctx:
                                     outer._last_routing_error = type(exc_ctx).__name__
@@ -1973,11 +1975,6 @@ def run_cockpit_cli(
         if tmp_state_holder is not None:
             tmp_state_holder.cleanup()
         return 0
-    if args.autonomous_ai and runtime_state.profit_vault is not None:
-        try:
-            trader.sync_session_profit_to_vault()
-        except Exception as exc_boot_sync:
-            print(f"[treasury] Initial session vault sync skipped ({type(exc_boot_sync).__name__}).")
 
     fixture_path = root / "docs" / "contracts" / "initial-market-stream.json"
     latest_stream: list[dict[str, Any] | None] = [
@@ -2083,10 +2080,17 @@ def run_cockpit_cli(
 
     poller = threading.Thread(target=_poll_loop, name="cas-forex-feed-poll", daemon=True)
     fast_poller = threading.Thread(target=_fast_tick_loop, name="cas-forex-mt5-50ms", daemon=True)
-    if args.poll_seconds > 0 and feed_client is not None:
-        poller.start()
+    # SAFETY INVARIANT: Start 50ms stop-protection thread FIRST with zero ledger I/O ahead of it!
     if args.fast_tick_ms > 0 and args.autonomous_ai and router.venues:
         fast_poller.start()
+    if args.poll_seconds > 0 and feed_client is not None:
+        poller.start()
+    if args.autonomous_ai and runtime_state.profit_vault is not None:
+        threading.Thread(
+            target=lambda: trader._attempt_startup_vault_sync_post_protection(trader._now()),
+            name="cas-forex-boot-vault-sync",
+            daemon=True,
+        ).start()
 
     print(f"CAS Forex Cockpit Execution Mode : {router.execution_mode} (live_armed={routing_summary['live_trading_armed']})")
     for row in routing_summary["chain"]:

@@ -174,6 +174,7 @@ function normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operating
     : '0';
   const sessionDate = str(bs?.session_date, dailyQuota.sessionDate, 64);
   const confirmedBankPayoutsUsd = numStr(bs?.confirmed_bank_payouts_usd, '0');
+  const pendingUnconfirmedTransfersUsd = numStr(bs?.pending_unconfirmed_transfers_usd, '0');
   const initialCapitalUsd = numStr(bs?.initial_capital_usd ?? doc?.initial_capital_usd, '300000');
   const fallbackEquityUsd = compareDecimalStrings(dailyQuota.startingEquityUsd, '0') > 0
     ? centsBigIntToDecimal(toCentsBigInt(dailyQuota.startingEquityUsd) + toCentsBigInt(dailyQuota.realizedNetPnlUsd))
@@ -249,6 +250,7 @@ function normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operating
     sessionVaultReserved50PctUsd: numStr(bs?.session_vault_reserved_50pct_usd, vaultSwept50PctUsd),
     vaultRetained50PctUsd,
     confirmedBankPayoutsUsd,
+    pendingUnconfirmedTransfersUsd,
     profitsLockedForSession: typeof bs?.profits_locked_for_session === 'boolean' ? bs.profits_locked_for_session : lockedDefault,
     operatingMode: str(bs?.operating_mode, operatingMode, 40),
     sessionRolloverLabel: str(bs?.session_rollover_label, '17:00 America/New_York (14:00 Pacific)', 120),
@@ -384,6 +386,7 @@ export const STATIC_AI_TRADER = Object.freeze({
     sessionVaultReserved50PctUsd: '0',
     vaultRetained50PctUsd: '0',
     confirmedBankPayoutsUsd: '0',
+    pendingUnconfirmedTransfersUsd: '0',
     profitsLockedForSession: false,
     operatingMode: 'ACTIVE_TRADING',
     sessionRolloverLabel: '17:00 America/New_York (14:00 Pacific)',
@@ -391,6 +394,7 @@ export const STATIC_AI_TRADER = Object.freeze({
   }),
   accountingBasis: 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT',
   confirmedBankPayoutsUsd: '0',
+  pendingUnconfirmedTransfersUsd: '0',
   sessionVaultReserved50PctUsd: '0',
   initialCapitalUsd: '300000',
   currentTotalEquityUsd: '300000',
@@ -559,6 +563,7 @@ export function normalizeAiTrader(doc) {
     bankSweepReservedUsd,
     accountingBasis: bankedSession.accountingBasis,
     confirmedBankPayoutsUsd: bankedSession.confirmedBankPayoutsUsd,
+    pendingUnconfirmedTransfersUsd: bankedSession.pendingUnconfirmedTransfersUsd,
     sessionVaultReserved50PctUsd: bankedSession.sessionVaultReserved50PctUsd,
     initialCapitalUsd: bankedSession.initialCapitalUsd,
     currentTotalEquityUsd: bankedSession.currentTotalEquityUsd,
@@ -857,10 +862,18 @@ export function renderBankedProfitsHeroBanner(state) {
   const surplusCompoundingUsd = netSurplusCents > 0n && netSurplusCents >= totalVaultSweptCents
     ? centsBigIntToDecimal(netSurplusCents - totalVaultSweptCents)
     : (bs.vaultRetained50PctUsd ?? '0');
-  const rawTreasuryDisbursed = state?.treasury?.connected
-    ? state.treasury.disbursedToBankUsd
-    : (state?.treasury && state.treasury.connected === undefined ? state.treasury.disbursedToBankUsd : undefined);
-  const confirmedPayoutsUsd = rawTreasuryDisbursed ?? bs.confirmedBankPayoutsUsd ?? '0';
+  const rawTreasurySettled = state?.treasury?.connected
+    ? state.treasury.confirmedSettledDisbursedUsd
+    : (state?.treasury && state.treasury.connected === undefined ? state.treasury.confirmedSettledDisbursedUsd : undefined);
+  const confirmedSettledUsd = rawTreasurySettled ?? bs.confirmedBankPayoutsUsd ?? '0';
+
+  const rawTreasuryPending = state?.treasury?.connected
+    ? state.treasury.pendingUnconfirmedTransfersUsd
+    : (state?.treasury && state.treasury.connected === undefined ? state.treasury.pendingUnconfirmedTransfersUsd : undefined);
+  const pendingUnconfirmedUsd = (rawTreasuryPending !== undefined && toCentsBigInt(rawTreasuryPending) !== 0n)
+    ? rawTreasuryPending
+    : (bs.pendingUnconfirmedTransfersUsd ?? rawTreasuryPending ?? '0');
+  const hasPendingUnconfirmed = toCentsBigInt(pendingUnconfirmedUsd) !== 0n;
 
   const pctStr = String(bs.realizedPnlPct ?? '0');
   const signedPct = pctStr.startsWith('-') || pctStr === '0' || pctStr === '0.00' ? `${pctStr}%` : `+${pctStr}%`;
@@ -887,12 +900,17 @@ export function renderBankedProfitsHeroBanner(state) {
     ? `Rebuilding principal — NOT surplus profit · ${bs.closedTrades} closed trades (${bs.winCount}W / ${bs.lossCount}L) · 70% Session Floor: ${floorDisplay} · ${floorDetail}`
     : `${signedPct} · ${bs.closedTrades} closed trades (${bs.winCount}W / ${bs.lossCount}L) · Internal ledger figure · 70% Session Floor: ${floorDisplay} · ${floorDetail} · Session ${bs.sessionDate}`;
 
+  const pendingTransferHtml = hasPendingUnconfirmed
+    ? ` · <strong class="pending-transfer-inline">Pending / Unconfirmed Transfers: ${esc(formatExactUsd(pendingUnconfirmedUsd))} (excluded from surplus)</strong>`
+    : '';
+  const settledPayoutSummaryHtml = `<strong class="confirmed-payout-inline">Confirmed Settled Payouts: ${esc(formatExactUsd(confirmedSettledUsd))}</strong> <span class="quiet-note">(Confirmed Bank Payouts: ${esc(formatExactUsd(confirmedSettledUsd))})</span>${pendingTransferHtml}`;
+
   const card3ValueHtml = bs.vaultSweepsPausedForRecovery
     ? `Bank Vault Sweeps Paused ($0.00 until > ${esc(principalFormatted)})`
     : `${esc(formatExactUsd(reserveUsd))} Internal Vault Reserve`;
   const card3SubHtml = bs.vaultSweepsPausedForRecovery
-    ? `100% of recovery stays in trading capital · <strong class="confirmed-payout-inline">Confirmed Bank Payouts: ${esc(formatExactUsd(confirmedPayoutsUsd))}</strong>`
-    : `${esc(formatExactUsd(surplusCompoundingUsd))} Surplus Compounding · Internal Ledger Reserve — Not a Confirmed Bank Payout · <strong class="confirmed-payout-inline">Confirmed Bank Payouts: ${esc(formatExactUsd(confirmedPayoutsUsd))}</strong>`;
+    ? `100% of recovery stays in trading capital · ${settledPayoutSummaryHtml}`
+    : `${esc(formatExactUsd(surplusCompoundingUsd))} Surplus Compounding · Internal Ledger Reserve — Not a Confirmed Bank Payout · ${settledPayoutSummaryHtml}`;
 
   const legBadge = bs.activeSessionLeg > 1 ? ` (Leg #${esc(String(bs.activeSessionLeg))})` : '';
   const card4ModeHtml = isRespite

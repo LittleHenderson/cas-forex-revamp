@@ -232,6 +232,8 @@ class DailyQuotaGovernanceStore:
         self._active_period_base: str | None = None
         self._active_leg: int = 1
         self._leg_max_loss_cap_usd: Decimal | None = None
+        self._unlocked_day_key: str | None = None
+        self._unlocked_day_pnl_usd: Decimal = Decimal("0.00")
 
     @classmethod
     def from_environ(
@@ -350,15 +352,40 @@ class DailyQuotaGovernanceStore:
                     active_period_base TEXT,
                     active_leg INTEGER NOT NULL DEFAULT 1,
                     leg_max_loss_cap_usd TEXT,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    unlocked_day_key TEXT,
+                    unlocked_day_pnl_usd TEXT
                 )
                 """
             )
+            meta_cols = {
+                str(r[1])
+                for r in conn.execute("PRAGMA table_info(daily_quota_meta)").fetchall()
+            }
+            if "unlocked_day_key" not in meta_cols:
+                conn.execute("ALTER TABLE daily_quota_meta ADD COLUMN unlocked_day_key TEXT")
+            if "unlocked_day_pnl_usd" not in meta_cols:
+                conn.execute("ALTER TABLE daily_quota_meta ADD COLUMN unlocked_day_pnl_usd TEXT")
             self._initialized = True
         if not self._meta_loaded:
             self._load_meta_from_conn(conn)
             self._meta_loaded = True
         return conn
+
+    @staticmethod
+    def _select_meta_row_static(conn: sqlite3.Connection, scope_id: str, *, has_unlock_cols: bool) -> Any:
+        if has_unlock_cols:
+            return conn.execute(
+                "SELECT session_cadence, active_period_base, active_leg, leg_max_loss_cap_usd, "
+                "unlocked_day_key, unlocked_day_pnl_usd "
+                "FROM daily_quota_meta WHERE scope_id = ?",
+                (scope_id,),
+            ).fetchone()
+        return conn.execute(
+            "SELECT session_cadence, active_period_base, active_leg, leg_max_loss_cap_usd, NULL, NULL "
+            "FROM daily_quota_meta WHERE scope_id = ?",
+            (scope_id,),
+        ).fetchone()
 
     def _load_meta_from_conn(self, conn: sqlite3.Connection) -> None:
         tables = {
@@ -367,11 +394,9 @@ class DailyQuotaGovernanceStore:
         }
         if "daily_quota_meta" not in tables:
             return
-        mrow = conn.execute(
-            "SELECT session_cadence, active_period_base, active_leg, leg_max_loss_cap_usd "
-            "FROM daily_quota_meta WHERE scope_id = ?",
-            (self._scope_id,),
-        ).fetchone()
+        mcols = {str(c[1]) for c in conn.execute("PRAGMA table_info(daily_quota_meta)").fetchall()}
+        has_unl = "unlocked_day_key" in mcols and "unlocked_day_pnl_usd" in mcols
+        mrow = self._select_meta_row_static(conn, self._scope_id, has_unlock_cols=has_unl)
         if mrow is None:
             return
         saved_cad = str(mrow[0] or "").strip().upper()
@@ -382,19 +407,26 @@ class DailyQuotaGovernanceStore:
         self._leg_max_loss_cap_usd = (
             Decimal(str(mrow[3])) if mrow[3] not in (None, "") else None
         )
+        self._unlocked_day_key = str(mrow[4]) if mrow[4] not in (None, "") else None
+        self._unlocked_day_pnl_usd = (
+            Decimal(str(mrow[5])) if mrow[5] not in (None, "") else Decimal("0.00")
+        )
 
     def _persist_meta(self, conn: sqlite3.Connection, ts_str: str) -> None:
         conn.execute(
             """
             INSERT INTO daily_quota_meta (
-                scope_id, session_cadence, active_period_base, active_leg, leg_max_loss_cap_usd, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                scope_id, session_cadence, active_period_base, active_leg,
+                leg_max_loss_cap_usd, updated_at, unlocked_day_key, unlocked_day_pnl_usd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(scope_id) DO UPDATE SET
                 session_cadence = excluded.session_cadence,
                 active_period_base = excluded.active_period_base,
                 active_leg = excluded.active_leg,
                 leg_max_loss_cap_usd = excluded.leg_max_loss_cap_usd,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                unlocked_day_key = excluded.unlocked_day_key,
+                unlocked_day_pnl_usd = excluded.unlocked_day_pnl_usd
             """,
             (
                 self._scope_id,
@@ -403,6 +435,8 @@ class DailyQuotaGovernanceStore:
                 int(self._active_leg),
                 None if self._leg_max_loss_cap_usd is None else decimal_text(self._leg_max_loss_cap_usd),
                 ts_str,
+                self._unlocked_day_key,
+                decimal_text(self._unlocked_day_pnl_usd),
             ),
         )
 
@@ -634,6 +668,197 @@ class DailyQuotaGovernanceStore:
         if pnl >= soft:
             return QUOTA_STATUS_SOFT, f"Daily soft quota reached ({decimal_text(pnl)} >= {decimal_text(soft)} USD); risk halved"
         return QUOTA_STATUS_OPEN, None
+
+    @staticmethod
+    def _trading_day_roots(ts: datetime) -> tuple[str, str]:
+        ny_d = session_date_for(ts)
+        reg_p = regional_session_window_for(ts)["period_key"]
+        reg_d = reg_p.rsplit("-", 1)[0]
+        return ny_d, reg_d
+
+    @staticmethod
+    def _matches_trading_day(session_date: str, d1: str, d2: str) -> bool:
+        for d in (d1, d2):
+            if session_date == d or session_date.startswith(f"{d}-") or session_date.startswith(f"{d}#"):
+                return True
+        return False
+
+    @staticmethod
+    def _select_day_rows_static(
+        conn: sqlite3.Connection,
+        scope_id: str,
+        d1: str,
+        d2: str,
+        *,
+        has_peak: bool,
+        has_ov: bool,
+    ) -> list[Any]:
+        params = (scope_id, d1, f"{d1}-%", f"{d1}#%", d2, f"{d2}-%", f"{d2}#%")
+        if has_peak and has_ov:
+            return conn.execute(
+                "SELECT session_key, session_date, scope_id, starting_equity, realized_net_pnl_usd, "
+                "peak_realized_pnl_usd, closed_trades, win_count, loss_count, consecutive_losses, "
+                "status, lock_reason, updated_at, max_loss_override_usd "
+                "FROM daily_quota_sessions "
+                "WHERE scope_id = ? AND ("
+                "session_date = ? OR session_date LIKE ? OR session_date LIKE ? "
+                "OR session_date = ? OR session_date LIKE ? OR session_date LIKE ?"
+                ") ORDER BY updated_at ASC, session_key ASC",
+                params,
+            ).fetchall()
+        if has_peak:
+            return conn.execute(
+                "SELECT session_key, session_date, scope_id, starting_equity, realized_net_pnl_usd, "
+                "peak_realized_pnl_usd, closed_trades, win_count, loss_count, consecutive_losses, "
+                "status, lock_reason, updated_at, NULL "
+                "FROM daily_quota_sessions "
+                "WHERE scope_id = ? AND ("
+                "session_date = ? OR session_date LIKE ? OR session_date LIKE ? "
+                "OR session_date = ? OR session_date LIKE ? OR session_date LIKE ?"
+                ") ORDER BY updated_at ASC, session_key ASC",
+                params,
+            ).fetchall()
+        return conn.execute(
+            "SELECT session_key, session_date, scope_id, starting_equity, realized_net_pnl_usd, "
+            "'0', closed_trades, win_count, loss_count, consecutive_losses, "
+            "status, lock_reason, updated_at, NULL "
+            "FROM daily_quota_sessions "
+            "WHERE scope_id = ? AND ("
+            "session_date = ? OR session_date LIKE ? OR session_date LIKE ? "
+            "OR session_date = ? OR session_date LIKE ? OR session_date LIKE ?"
+            ") ORDER BY updated_at ASC, session_key ASC",
+            params,
+        ).fetchall()
+
+    def _collect_trading_day_rows(
+        self,
+        ts: datetime,
+        *,
+        conn: sqlite3.Connection | None,
+        has_peak: bool = True,
+        has_ov: bool = True,
+    ) -> list[dict[str, Any]]:
+        d1, d2 = self._trading_day_roots(ts)
+        if conn is None:
+            matched = [
+                dict(r)
+                for r in self._days.values()
+                if r.get("scope_id") == self._scope_id
+                and self._matches_trading_day(str(r.get("session_date", "")), d1, d2)
+            ]
+            matched.sort(key=lambda item: (str(item.get("updated_at", "")), str(item.get("session_key", ""))))
+            return matched
+        raw_rows = self._select_day_rows_static(
+            conn, self._scope_id, d1, d2, has_peak=has_peak, has_ov=has_ov
+        )
+        out: list[dict[str, Any]] = []
+        for db_row in raw_rows:
+            loaded_pnl = Decimal(str(db_row[4]))
+            loaded_peak = _q2(max(Decimal(str(db_row[5] or "0")), loaded_pnl, Decimal("0")))
+            out.append({
+                "session_key": str(db_row[0]),
+                "session_date": str(db_row[1]),
+                "scope_id": str(db_row[2]),
+                "starting_equity": str(db_row[3]),
+                "realized_net_pnl_usd": str(db_row[4]),
+                "peak_realized_pnl_usd": decimal_text(loaded_peak),
+                "closed_trades": int(db_row[6]),
+                "win_count": int(db_row[7]),
+                "loss_count": int(db_row[8]),
+                "consecutive_losses": int(db_row[9]),
+                "status": str(db_row[10]),
+                "lock_reason": db_row[11],
+                "updated_at": str(db_row[12]),
+                "max_loss_override_usd": None if db_row[13] in (None, "") else str(db_row[13]),
+            })
+        return out
+
+    def _apply_trading_day_loss_overlay(
+        self,
+        ts: datetime,
+        active_row: Mapping[str, Any],
+        *,
+        conn: sqlite3.Connection | None,
+        has_peak: bool = True,
+        has_ov: bool = True,
+        unlocked_day_override: str | None = None,
+        unlocked_pnl_override: Decimal | None = None,
+    ) -> dict[str, Any]:
+        """Enforce trading-day-wide loss-circuit carryover across $300k daily<->regional cadence switches."""
+        out = dict(active_row)
+        cur_status = str(out["status"])
+        if cur_status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
+            return out
+
+        d1, d2 = self._trading_day_roots(ts)
+        day_rows = self._collect_trading_day_rows(ts, conn=conn, has_peak=has_peak, has_ov=has_ov)
+        active_key = str(out["session_key"])
+        merged: list[dict[str, Any]] = []
+        replaced = False
+        for r in day_rows:
+            if str(r["session_key"]) == active_key:
+                merged.append(dict(out))
+                replaced = True
+            else:
+                merged.append(r)
+        if not replaced:
+            merged.append(dict(out))
+        merged.sort(key=lambda item: (str(item.get("updated_at", "")), str(item.get("session_key", ""))))
+
+        # 1. Any row on this trading day in DAILY_LOSS_CIRCUIT_TRIPPED locks the entire trading day
+        for r in merged:
+            if str(r["status"]) == QUOTA_STATUS_LOSS_TRIPPED:
+                out["status"] = QUOTA_STATUS_LOSS_TRIPPED
+                out["lock_reason"] = (
+                    r.get("lock_reason")
+                    or f"Trading-day loss circuit active from {r.get('session_date')}"
+                )
+                out["consecutive_losses"] = max(
+                    int(out["consecutive_losses"]), int(r["consecutive_losses"])
+                )
+                return out
+
+        # 2. Combined net realized P&L across the day's rows <= -day_max_loss
+        day_pnl = sum((Decimal(str(r["realized_net_pnl_usd"])) for r in merged), Decimal("0.00"))
+        unl_day = unlocked_day_override if unlocked_day_override is not None else self._unlocked_day_key
+        unl_pnl = unlocked_pnl_override if unlocked_pnl_override is not None else self._unlocked_day_pnl_usd
+        baseline_pnl = unl_pnl if (unl_day is not None and unl_day in (d1, d2)) else Decimal("0.00")
+        net_since_unlock = _q2(day_pnl - baseline_pnl)
+
+        start_candidates = [
+            Decimal(str(r["starting_equity"]))
+            for r in merged
+            if Decimal(str(r["starting_equity"])) > Decimal("0")
+        ]
+        day_start_eq = max(start_candidates) if start_candidates else None
+        _, _, day_max_loss = self._effective_targets(day_start_eq, max_loss_override=None)
+        if net_since_unlock <= -day_max_loss:
+            out["status"] = QUOTA_STATUS_LOSS_TRIPPED
+            out["lock_reason"] = (
+                f"Trading-day combined max loss reached ({decimal_text(net_since_unlock)} <= -{decimal_text(day_max_loss)} USD)"
+            )
+            return out
+
+        # 3. Trailing consecutive losses across non-profit-locked rows of the trading day
+        trailing_consec = 0
+        for r in merged:
+            r_st = str(r["status"])
+            if r_st in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
+                trailing_consec = 0
+            elif int(r["closed_trades"]) == 0:
+                continue
+            elif int(r["win_count"]) > 0:
+                trailing_consec = int(r["consecutive_losses"])
+            else:
+                trailing_consec += int(r["consecutive_losses"])
+
+        if trailing_consec >= self._max_consecutive_losses:
+            out["status"] = QUOTA_STATUS_LOSS_TRIPPED
+            out["consecutive_losses"] = trailing_consec
+            out["lock_reason"] = (
+                f"Trading-day consecutive losses reached limit ({trailing_consec} >= {self._max_consecutive_losses})"
+            )
+        return out
 
     @staticmethod
     def _select_session_row_static(
@@ -943,7 +1168,8 @@ class DailyQuotaGovernanceStore:
                 row = self._load_or_init_row(
                     sdate, starting_equity=starting_equity, ts_str=ts_str, max_loss_override=leg_cap
                 )
-                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
+                eff_row = self._apply_trading_day_loss_overlay(ts, row, conn=None)
+                return self._format_snapshot(eff_row, session_cadence=self._session_cadence, active_leg=act_leg)
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -953,14 +1179,17 @@ class DailyQuotaGovernanceStore:
                 row = self._load_or_init_row(
                     sdate, starting_equity=starting_equity, ts_str=ts_str, conn=conn, max_loss_override=leg_cap
                 )
+                eff_row = self._apply_trading_day_loss_overlay(ts, row, conn=conn)
                 conn.commit()
-                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
+                return self._format_snapshot(eff_row, session_cadence=self._session_cadence, active_leg=act_leg)
             except Exception:
                 if conn.in_transaction:
                     conn.rollback()
                 raise
             finally:
                 conn.close()
+
+    observe_equity = observe_day_start
 
     def record_realized_trade(
         self,
@@ -986,7 +1215,12 @@ class DailyQuotaGovernanceStore:
                     sdate, starting_equity=starting_equity, ts_str=ts_str, max_loss_override=leg_cap
                 )
                 self._apply_trade(row, pnl_dec, ts_str)
-                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
+                overlaid = self._apply_trading_day_loss_overlay(ts, row, conn=None)
+                if overlaid["status"] == QUOTA_STATUS_LOSS_TRIPPED and row["status"] != QUOTA_STATUS_LOSS_TRIPPED:
+                    row["status"] = QUOTA_STATUS_LOSS_TRIPPED
+                    row["lock_reason"] = overlaid["lock_reason"]
+                    row["consecutive_losses"] = overlaid["consecutive_losses"]
+                return self._format_snapshot(overlaid, session_cadence=self._session_cadence, active_leg=act_leg)
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -997,15 +1231,22 @@ class DailyQuotaGovernanceStore:
                     sdate, starting_equity=starting_equity, ts_str=ts_str, conn=conn, max_loss_override=leg_cap
                 )
                 self._apply_trade(row, pnl_dec, ts_str)
+                overlaid = self._apply_trading_day_loss_overlay(ts, row, conn=conn)
+                if overlaid["status"] == QUOTA_STATUS_LOSS_TRIPPED and row["status"] != QUOTA_STATUS_LOSS_TRIPPED:
+                    row["status"] = QUOTA_STATUS_LOSS_TRIPPED
+                    row["lock_reason"] = overlaid["lock_reason"]
+                    row["consecutive_losses"] = overlaid["consecutive_losses"]
                 self._save_row_and_event(row, event_kind="REALIZED_TRADE", delta_pnl_usd=decimal_text(_q2(pnl_dec)), conn=conn)
                 conn.commit()
-                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
+                return self._format_snapshot(overlaid, session_cadence=self._session_cadence, active_leg=act_leg)
             except Exception:
                 if conn.in_transaction:
                     conn.rollback()
                 raise
             finally:
                 conn.close()
+
+    record_closed_trade = record_realized_trade
 
     def _apply_trade(self, row: dict[str, Any], pnl_dec: Decimal, ts_str: str) -> None:
         new_pnl = _q2(Decimal(str(row["realized_net_pnl_usd"])) + pnl_dec)
@@ -1112,11 +1353,25 @@ class DailyQuotaGovernanceStore:
             now=ts,
         )
         ts_str = ts.isoformat().replace("+00:00", "Z")
+        d1, d2 = self._trading_day_roots(ts)
         with self._lock:
             if self._path is None:
                 sdate, _, act_leg, leg_cap = self._resolve_session_target(
                     ts, in_recovery_mode=in_recovery_mode
                 )
+                day_pnl = Decimal("0.00")
+                for d_row in self._days.values():
+                    if d_row.get("scope_id") == self._scope_id and self._matches_trading_day(
+                        str(d_row.get("session_date", "")), d1, d2
+                    ):
+                        day_pnl += Decimal(str(d_row["realized_net_pnl_usd"]))
+                        if str(d_row["status"]) == QUOTA_STATUS_LOSS_TRIPPED or int(d_row["consecutive_losses"]) > 0:
+                            d_row["status"] = QUOTA_STATUS_OPEN
+                            d_row["consecutive_losses"] = 0
+                            d_row["lock_reason"] = f"OWNER_UNLOCKED:{owner_request_id}"
+                            d_row["updated_at"] = ts_str
+                self._unlocked_day_key = d1
+                self._unlocked_day_pnl_usd = _q2(day_pnl)
                 row = self._load_or_init_row(
                     sdate, starting_equity=None, ts_str=ts_str, max_loss_override=leg_cap
                 )
@@ -1131,14 +1386,31 @@ class DailyQuotaGovernanceStore:
                 sdate, _, act_leg, leg_cap = self._resolve_session_target(
                     ts, in_recovery_mode=in_recovery_mode
                 )
+                day_rows = self._collect_trading_day_rows(ts, conn=conn)
+                day_pnl = sum((Decimal(str(r["realized_net_pnl_usd"])) for r in day_rows), Decimal("0.00"))
+                for r in day_rows:
+                    if str(r["status"]) == QUOTA_STATUS_LOSS_TRIPPED or int(r["consecutive_losses"]) > 0:
+                        r["status"] = QUOTA_STATUS_OPEN
+                        r["consecutive_losses"] = 0
+                        r["lock_reason"] = f"OWNER_UNLOCKED:{owner_request_id}"
+                        r["updated_at"] = ts_str
+                        self._save_row_and_event(
+                            r, event_kind=f"OWNER_UNLOCK:{owner_request_id}", delta_pnl_usd="0", conn=conn
+                        )
+                self._unlocked_day_key = d1
+                self._unlocked_day_pnl_usd = _q2(day_pnl)
+                self._persist_meta(conn, ts_str)
                 row = self._load_or_init_row(
                     sdate, starting_equity=None, ts_str=ts_str, conn=conn, max_loss_override=leg_cap
                 )
-                row["status"] = QUOTA_STATUS_OPEN
-                row["consecutive_losses"] = 0
-                row["lock_reason"] = f"OWNER_UNLOCKED:{owner_request_id}"
-                row["updated_at"] = ts_str
-                self._save_row_and_event(row, event_kind=f"OWNER_UNLOCK:{owner_request_id}", delta_pnl_usd="0", conn=conn)
+                if str(row["lock_reason"] or "") != f"OWNER_UNLOCKED:{owner_request_id}":
+                    row["status"] = QUOTA_STATUS_OPEN
+                    row["consecutive_losses"] = 0
+                    row["lock_reason"] = f"OWNER_UNLOCKED:{owner_request_id}"
+                    row["updated_at"] = ts_str
+                    self._save_row_and_event(
+                        row, event_kind=f"OWNER_UNLOCK:{owner_request_id}", delta_pnl_usd="0", conn=conn
+                    )
                 conn.commit()
                 return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
             except Exception:
@@ -1270,7 +1542,11 @@ class DailyQuotaGovernanceStore:
                 )
                 key = f"{self._scope_id}:{sdate}"
                 mem_row = self._days.get(key)
-                if mem_row is None:
+                if mem_row is not None:
+                    mem_row = dict(mem_row)
+                    if Decimal(str(mem_row["starting_equity"])) <= 0 and starting_equity is not None and starting_equity > 0:
+                        mem_row["starting_equity"] = decimal_text(_q2(starting_equity))
+                else:
                     mem_row = self._find_legacy_asia_seed(sdate, conn=None)
                 if mem_row is None:
                     start_val = decimal_text(_q2(starting_equity)) if starting_equity is not None else "0"
@@ -1290,7 +1566,8 @@ class DailyQuotaGovernanceStore:
                         "updated_at": ts_str,
                         "max_loss_override_usd": None if leg_cap is None else decimal_text(_q2(leg_cap)),
                     }
-                return self._format_snapshot(mem_row, session_cadence=eff_cad, active_leg=act_leg)
+                overlaid_mem = self._apply_trading_day_loss_overlay(ts, mem_row, conn=None)
+                return self._format_snapshot(overlaid_mem, session_cadence=eff_cad, active_leg=act_leg)
 
             if not self._path.is_file():
                 sdate, _, act_leg, leg_cap = self._resolve_session_target(
@@ -1320,18 +1597,19 @@ class DailyQuotaGovernanceStore:
                 }
                 return self._format_snapshot(ephemeral, session_cadence=eff_cad, active_leg=act_leg)
 
-            conn = sqlite3.connect(str(self._path), timeout=5.0, isolation_level=None)
+            ro_uri = f"{self._path.resolve().as_uri()}?mode=ro"
+            conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0, isolation_level=None)
             try:
                 tables = {
                     str(r[0])
                     for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
                 }
+                eff_unl_day = self._unlocked_day_key
+                eff_unl_pnl = self._unlocked_day_pnl_usd
                 if not self._meta_loaded and "daily_quota_meta" in tables:
-                    mrow = conn.execute(
-                        "SELECT session_cadence, active_period_base, active_leg, leg_max_loss_cap_usd "
-                        "FROM daily_quota_meta WHERE scope_id = ?",
-                        (self._scope_id,),
-                    ).fetchone()
+                    mcols = {str(c[1]) for c in conn.execute("PRAGMA table_info(daily_quota_meta)").fetchall()}
+                    has_unl = "unlocked_day_key" in mcols and "unlocked_day_pnl_usd" in mcols
+                    mrow = self._select_meta_row_static(conn, self._scope_id, has_unlock_cols=has_unl)
                     if mrow is not None:
                         saved_cad = str(mrow[0] or "").strip().upper()
                         if not self._explicit_cadence_arg and saved_cad in VALID_SESSION_CADENCES:
@@ -1339,6 +1617,8 @@ class DailyQuotaGovernanceStore:
                         eff_base = str(mrow[1]) if mrow[1] not in (None, "") else None
                         eff_leg = max(1, int(mrow[2] or 1))
                         eff_cap = Decimal(str(mrow[3])) if mrow[3] not in (None, "") else None
+                        eff_unl_day = str(mrow[4]) if mrow[4] not in (None, "") else None
+                        eff_unl_pnl = Decimal(str(mrow[5])) if mrow[5] not in (None, "") else Decimal("0.00")
 
                 sdate, _, act_leg, leg_cap = self._resolve_session_target(
                     ts,
@@ -1350,6 +1630,8 @@ class DailyQuotaGovernanceStore:
                 )
                 key = f"{self._scope_id}:{sdate}"
                 db_dict: dict[str, Any] | None = None
+                has_peak = True
+                has_ov = True
                 if "daily_quota_sessions" in tables:
                     cols = {
                         str(c[1])
@@ -1406,6 +1688,16 @@ class DailyQuotaGovernanceStore:
                         "updated_at": ts_str,
                         "max_loss_override_usd": None if leg_cap is None else decimal_text(_q2(leg_cap)),
                     }
+                if "daily_quota_sessions" in tables:
+                    db_dict = self._apply_trading_day_loss_overlay(
+                        ts,
+                        db_dict,
+                        conn=conn,
+                        has_peak=has_peak,
+                        has_ov=has_ov,
+                        unlocked_day_override=eff_unl_day,
+                        unlocked_pnl_override=eff_unl_pnl,
+                    )
                 return self._format_snapshot(db_dict, session_cadence=eff_cad, active_leg=act_leg)
             finally:
                 conn.close()
@@ -1417,31 +1709,9 @@ class DailyQuotaGovernanceStore:
         starting_equity: Decimal | None = None,
         in_recovery_mode: bool = False,
     ) -> dict[str, Any]:
-        ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
-        ts_str = ts.isoformat().replace("+00:00", "Z")
-        with self._lock:
-            if self._path is None:
-                sdate, _, act_leg, leg_cap = self._resolve_session_target(
-                    ts, in_recovery_mode=in_recovery_mode
-                )
-                row = self._load_or_init_row(
-                    sdate, starting_equity=starting_equity, ts_str=ts_str, max_loss_override=leg_cap
-                )
-                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
-            conn = self._connect()
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                sdate, _, act_leg, leg_cap = self._resolve_session_target(
-                    ts, in_recovery_mode=in_recovery_mode
-                )
-                row = self._load_or_init_row(
-                    sdate, starting_equity=starting_equity, ts_str=ts_str, conn=conn, max_loss_override=leg_cap
-                )
-                conn.commit()
-                return self._format_snapshot(row, session_cadence=self._session_cadence, active_leg=act_leg)
-            except Exception:
-                if conn.in_transaction:
-                    conn.rollback()
-                raise
-            finally:
-                conn.close()
+        """Strictly read-only session quota snapshot (PURE SELECT ONLY; 0 SQLite writes across rollovers)."""
+        return self.peek_snapshot(
+            now=now,
+            starting_equity=starting_equity,
+            in_recovery_mode=in_recovery_mode,
+        )
