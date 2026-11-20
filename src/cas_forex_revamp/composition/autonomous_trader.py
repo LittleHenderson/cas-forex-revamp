@@ -243,6 +243,22 @@ def _iso(dt: datetime) -> str:
     return utc_time(dt, "timestamp").isoformat().replace("+00:00", "Z")
 
 
+def _next_ny_session_rollover_utc(now_utc: datetime) -> str:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    ts = utc_time(now_utc, "now")
+    try:
+        ny_tz: Any = ZoneInfo("America/New_York")
+    except ZoneInfoNotFoundError:
+        ny_tz = timezone(timedelta(hours=-5))
+    local_ny = ts.astimezone(ny_tz)
+    cand_ny = datetime(local_ny.year, local_ny.month, local_ny.day, 17, 0, 0, tzinfo=ny_tz)
+    if local_ny >= cand_ny:
+        nxt_d = local_ny.date() + timedelta(days=1)
+        cand_ny = datetime(nxt_d.year, nxt_d.month, nxt_d.day, 17, 0, 0, tzinfo=ny_tz)
+    return cand_ny.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def _tick_size(symbol: str) -> Decimal:
     if symbol in INDEX_INSTRUMENTS:
         return Decimal("0.01")
@@ -882,6 +898,15 @@ class AutonomousAiTrader:
                                         realized_net_usd=pnl_dec,
                                         occurred_at=ts,
                                     )
+                                    sess_net = Decimal(str(q_closed.get("realized_net_pnl_usd", "0")))
+                                    if sess_net > Decimal("0") and hasattr(
+                                        self._profit_vault, "reconcile_session_realized_profit"
+                                    ):
+                                        self._profit_vault.reconcile_session_realized_profit(
+                                            session_date=str(q_closed.get("session_date", "")),
+                                            session_realized_net_usd=sess_net,
+                                            occurred_at=ts,
+                                        )
                                 if q_closed["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
                                     self._current_focus_status = (
                                         f"RESEARCH_RESPITE: Profits Banked ({q_closed['realized_net_pnl_usd']} USD · "
@@ -2190,6 +2215,50 @@ class AutonomousAiTrader:
             equities = self._router.equities()
             total_eq = self._router.barbell.total_equity(equities)
             quota_snap = self._quota.snapshot(now=ts, starting_equity=total_eq if total_eq > 0 else None)
+            v_snap: Mapping[str, Any] = {}
+            deployable_eq_val = total_eq
+            if self._profit_vault is not None:
+                try:
+                    sess_net_dec = Decimal(str(quota_snap.get("realized_net_pnl_usd", "0")))
+                    if sess_net_dec > Decimal("0") and hasattr(
+                        self._profit_vault, "reconcile_session_realized_profit"
+                    ):
+                        self._profit_vault.reconcile_session_realized_profit(
+                            session_date=str(quota_snap.get("session_date", "")),
+                            session_realized_net_usd=sess_net_dec,
+                            occurred_at=ts,
+                        )
+                    v_snap = self._profit_vault.snapshot()
+                    deployable_eq_val = self._profit_vault.deployable_equity(total_eq)
+                except Exception as exc_vsync:
+                    logger.warning("profit vault session sync/read skipped: %s", type(exc_vsync).__name__)
+                    v_snap = {}
+            operating_mode_val = (
+                FOCUS_MODE_RESEARCH_RESPITE
+                if quota_snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED)
+                else OPERATING_MODE_ACTIVE_TRADING
+            )
+            banked_session = {
+                "schema": "cas-forex.banked-session/1",
+                "session_date": str(quota_snap.get("session_date", "")),
+                "banked_net_pnl_usd": str(quota_snap.get("realized_net_pnl_usd", "0")),
+                "realized_pnl_pct": str(quota_snap.get("realized_pnl_pct", "0")),
+                "peak_realized_pnl_usd": str(quota_snap.get("peak_realized_pnl_usd", "0")),
+                "protected_profit_floor_usd": str(quota_snap.get("protected_profit_floor_usd", "0")),
+                "ratchet_armed": bool(quota_snap.get("ratchet_armed", False)),
+                "closed_trades": int(quota_snap.get("closed_trades", 0)),
+                "win_count": int(quota_snap.get("win_count", 0)),
+                "loss_count": int(quota_snap.get("loss_count", 0)),
+                "vault_total_realized_usd": str(v_snap.get("total_realized_profit_usd", "0")),
+                "vault_swept_50pct_usd": str(v_snap.get("bank_sweep_reserved_usd", "0")),
+                "vault_retained_50pct_usd": str(v_snap.get("retained_trading_usd", "0")),
+                "profits_locked_for_session": bool(
+                    quota_snap.get("status") in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED)
+                ),
+                "operating_mode": operating_mode_val,
+                "session_rollover_label": "17:00 America/New_York (14:00 Pacific)",
+                "next_session_opens_utc": _next_ny_session_rollover_utc(ts),
+            }
             cat_snap = self._registry.catalog_snapshot()
             payload = {
                 "schema": "cas-forex.ai-trader/1",
@@ -2202,11 +2271,8 @@ class AutonomousAiTrader:
                     else self._governance_mode
                 ),
                 "respite_mode": quota_snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED),
-                "operating_mode": (
-                    FOCUS_MODE_RESEARCH_RESPITE
-                    if quota_snap["status"] in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED)
-                    else OPERATING_MODE_ACTIVE_TRADING
-                ),
+                "operating_mode": operating_mode_val,
+                "banked_session": banked_session,
                 "fast_tick_ms": int(self._fast_tick_ms),
                 "cadence": self._last_cadence,
                 "markets_evaluated": len(EXPANDED_MARKETS),
@@ -2220,12 +2286,8 @@ class AutonomousAiTrader:
                 "last_latency_ms": cat_snap.get("last_latency_ms"),
                 "last_regime": self._last_regime,
                 "last_pyramid_leg": self._last_pyramid_leg,
-                "deployable_equity_usd": decimal_text(
-                    self._profit_vault.deployable_equity(total_eq) if self._profit_vault is not None else total_eq
-                ),
-                "bank_sweep_reserved_usd": (
-                    self._profit_vault.snapshot()["bank_sweep_reserved_usd"] if self._profit_vault is not None else "0"
-                ),
+                "deployable_equity_usd": decimal_text(deployable_eq_val),
+                "bank_sweep_reserved_usd": str(v_snap.get("bank_sweep_reserved_usd", "0")),
                 "fast_scout_enabled": cat_snap["fast_scout_enabled"],
                 "fast_scout_ready": cat_snap["fast_scout_ready"],
                 "cycle_count": int(self._cycle_seq),
