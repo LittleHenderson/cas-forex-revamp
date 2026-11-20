@@ -20,6 +20,8 @@ const GOVERNANCE_MODES = Object.freeze(['ACTIVE', 'PAUSED_NEW_RISK', 'PAUSED', '
 const QUOTA_STATUSES = Object.freeze(['OPEN', 'SOFT_QUOTA_REACHED', 'DAILY_QUOTA_LOCKED', 'PROFIT_FLOOR_LOCKED', 'DAILY_LOSS_CIRCUIT_TRIPPED']);
 const PROTECTION_STAGES = Object.freeze(['INITIAL_SL', 'BREAKEVEN_LOCKED', 'TRAILING_ACTIVE']);
 export const RISK_GEAR_MODES = Object.freeze(['CONSERVATIVE', 'AUTO_ADAPTIVE', 'AGGRESSIVE']);
+export const CONSTITUTIONAL_MAX_STOP_RISK_PCT = '1';
+export const CONSTITUTIONAL_MAX_DRAWDOWN_PCT = '0.1';
 export const CAPITAL_STATUSES = Object.freeze(['RECOVERY_MODE', 'AT_PRINCIPAL', 'IN_SURPLUS']);
 export const SESSION_CADENCE_MODES = Object.freeze(['AUTO', 'REGIONAL_RECOVERY', 'REGIONAL_8H', 'DAILY_NY']);
 export const LIVE_TRADING_STATE_CODES = Object.freeze([
@@ -534,6 +536,14 @@ export const STATIC_AI_MODELS = Object.freeze({
   }))),
 });
 
+function clampConstitutionalDecimal(rawValue, maxNum, fallbackStr, maxFormattedStr) {
+  const s = numStr(rawValue, fallbackStr);
+  const n = Number(s);
+  if (!Number.isFinite(n) || n <= 0) return fallbackStr;
+  if (n > maxNum) return maxFormattedStr;
+  return s;
+}
+
 export const STATIC_AI_TRADER = Object.freeze({
   connected: false,
   humanRole: 'OVERSEER_ONLY',
@@ -567,14 +577,14 @@ export const STATIC_AI_TRADER = Object.freeze({
   riskGear: Object.freeze({
     ownerMode: 'AUTO_ADAPTIVE',
     activeGear: 'CONSERVATIVE',
-    effectiveRiskPct: '1',
-    ownerMaxRiskPct: '5',
+    effectiveRiskPct: '0.5',
+    ownerMaxRiskPct: '1',
     effectiveSoftQuotaUsd: '500',
     effectiveHardQuotaUsd: '1000',
     ownerHardQuotaUsd: '3000',
-    softDrawdownDownshiftPct: '0.1',
-    ownerMaxDrawdownPct: '0.2',
-    reason: 'Auto-Adaptive Gear ready under owner Valve ceiling.',
+    softDrawdownDownshiftPct: '0.05',
+    ownerMaxDrawdownPct: '0.1',
+    reason: 'Auto-Adaptive Gear ready under immutable 1.00% stop-risk & 10.00% drawdown constitutional ceiling.',
   }),
   dailyQuota: Object.freeze({
     sessionDate: 'Unknown',
@@ -860,14 +870,14 @@ export function normalizeAiTrader(doc) {
       ownerMode: RISK_GEAR_MODES.includes(str(doc.risk_gear.owner_mode, 'AUTO_ADAPTIVE').toUpperCase())
         ? str(doc.risk_gear.owner_mode, 'AUTO_ADAPTIVE').toUpperCase() : 'AUTO_ADAPTIVE',
       activeGear: str(doc.risk_gear.active_gear, 'CONSERVATIVE', 40),
-      effectiveRiskPct: numStr(doc.risk_gear.effective_risk_pct, '1'),
-      ownerMaxRiskPct: numStr(doc.risk_gear.owner_max_risk_pct, '5'),
+      effectiveRiskPct: clampConstitutionalDecimal(doc.risk_gear.effective_risk_pct, 1, '0.5', CONSTITUTIONAL_MAX_STOP_RISK_PCT),
+      ownerMaxRiskPct: clampConstitutionalDecimal(doc.risk_gear.owner_max_risk_pct, 1, '1', CONSTITUTIONAL_MAX_STOP_RISK_PCT),
       effectiveSoftQuotaUsd: numStr(doc.risk_gear.effective_soft_quota_usd, '500'),
       effectiveHardQuotaUsd: numStr(doc.risk_gear.effective_hard_quota_usd, '1000'),
       ownerHardQuotaUsd: numStr(doc.risk_gear.owner_hard_quota_usd, '3000'),
-      softDrawdownDownshiftPct: numStr(doc.risk_gear.soft_drawdown_downshift_pct, '0.1'),
-      ownerMaxDrawdownPct: numStr(doc.risk_gear.owner_max_drawdown_pct, '0.2'),
-      reason: str(doc.risk_gear.reason, 'Owner-bounded adaptive risk gear.', 200),
+      softDrawdownDownshiftPct: clampConstitutionalDecimal(doc.risk_gear.soft_drawdown_downshift_pct, 0.1, '0.05', CONSTITUTIONAL_MAX_DRAWDOWN_PCT),
+      ownerMaxDrawdownPct: clampConstitutionalDecimal(doc.risk_gear.owner_max_drawdown_pct, 0.1, '0.1', CONSTITUTIONAL_MAX_DRAWDOWN_PCT),
+      reason: str(doc.risk_gear.reason, 'Owner-bounded adaptive risk gear under 1.00% stop-risk & 10.00% drawdown ceiling.', 200),
     }) : STATIC_AI_TRADER.riskGear,
     dailyQuota,
     bankedSession,
@@ -993,6 +1003,15 @@ export function renderAiOverseerPanel(state) {
     : '';
 
   const issueNote = state?.aiIssue ? `<p class="quiet-note warning-text" role="alert">${esc(state.aiIssue)}</p>` : '';
+  const ownerLocked = state?.sessionScope === 'DEVICE_READ_AND_EXPLAINER' || state?.ownerControlsAllowed === false;
+  const modelDisabled = !models.connected || busy || ownerLocked;
+  const traderDisabled = !trader.connected || busy || ownerLocked;
+  const pairedNotice = trader.connected && ownerLocked
+    ? '<p class="quiet-note paired-readonly-note" data-paired-readonly-notice="true">Paired Device Session (<code>DEVICE_READ_AND_EXPLAINER</code>): live observation &amp; Gemini 4 Neon Explainer are active; owner trading, risk-gear, and model controls require Primary Owner Key step-up.</p>'
+    : '';
+  const rg = trader.riskGear ?? STATIC_AI_TRADER.riskGear;
+  const maxRiskFmt = Number(rg.ownerMaxRiskPct || 1).toFixed(2);
+  const maxDdFmt = (Number(rg.ownerMaxDrawdownPct || 0.1) * 100).toFixed(2);
   const connectBtn = !trader.connected
     ? '<button type="button" class="button button-small button-primary" data-connect-loopback="true">Connect live server</button>'
     : '';
@@ -1000,7 +1019,7 @@ export function renderAiOverseerPanel(state) {
   const unlockDraftVal = esc(state?.unlockDraft ?? '');
   const unlockVisLabel = state?.unlockKeyVisible ? 'Hide' : 'Show';
   const unlockBar = !trader.connected
-    ? `<form class="mobile-unlock-bar prominent-unlock-bar" data-cockpit-unlock-form="true" autocomplete="on"><div class="unlock-bar-row"><label class="sr-only" for="overseer-access-key">Cockpit access key</label><input id="overseer-access-key" class="mobile-unlock-input" type="${unlockInputType}" name="cockpit_access_key" value="${unlockDraftVal}" autocomplete="current-password" spellcheck="false" autocapitalize="off" placeholder="Paste Cockpit access key here (or run D:\\MetaTrader5\\Launch_24x7_Cloud_Cockpit.cmd) to unlock live 24/7 cloud AI"><button type="button" class="button button-small button-secondary unlock-vis-btn" data-toggle-unlock-visibility="true" aria-pressed="${Boolean(state?.unlockKeyVisible)}">${unlockVisLabel}</button><button type="submit" class="button button-small button-primary">Unlock &amp; Connect Live Cloud</button></div><p class="unlock-helper-note">Paste your 43-character key from <code>D:\\MetaTrader5\\.cloud_cockpit.token</code> on your PC — or scan the 1-second Pairing QR from an unlocked PC</p>${state?.aiIssue ? `<p class="unlock-inline-error warning-text" role="alert">${esc(state.aiIssue)}</p>` : ''}</form>`
+    ? `<form class="mobile-unlock-bar prominent-unlock-bar" data-cockpit-unlock-form="true" autocomplete="on"><div class="unlock-bar-row"><label class="sr-only" for="overseer-access-key">Cockpit access key</label><input id="overseer-access-key" class="mobile-unlock-input" type="${unlockInputType}" name="cockpit_access_key" value="${unlockDraftVal}" autocomplete="current-password" spellcheck="false" autocapitalize="off" placeholder="Paste Cockpit access key here (or run D:\\MetaTrader5\\Launch_24x7_Cloud_Cockpit.cmd) to unlock live 24/7 cloud AI"><button type="button" class="button button-small button-secondary unlock-vis-btn" data-toggle-unlock-visibility="true" aria-pressed="${Boolean(state?.unlockKeyVisible)}">${unlockVisLabel}</button><button type="submit" class="button button-small button-primary">Unlock &amp; Connect Live Cloud</button></div><p class="unlock-helper-note">Paste your 43-character key from <code>D:\\MetaTrader5\\.cloud_cockpit.token</code> on your PC — or scan the single-use Pairing QR from an unlocked PC</p>${state?.aiIssue ? `<p class="unlock-inline-error warning-text" role="alert">${esc(state.aiIssue)}</p>` : ''}</form>`
     : '';
   const workingPill = `<span class="working-now-pill" data-working-now="true">WORKING NOW: ${esc(trader.currentFocusStatus ?? (`SCANNING ${trader.marketsEvaluated} MARKETS`))}</span>`;
 
@@ -1017,13 +1036,14 @@ export function renderAiOverseerPanel(state) {
     </div>
     <p class="panel-copy">${esc(trader.governanceReason)} Last signal: <strong>${esc(trader.lastAction)}</strong>${trader.lastSymbol !== 'None' ? ` on ${esc(trader.lastSymbol)}` : ''} · ${esc(trader.lastReason)}</p>
     ${issueNote}
+    ${pairedNotice}
     ${unlockBar}
     <div class="ai-overseer-grid">
       <div class="ai-control-block">
         <label class="control-label" for="ai-model-select">Active AI Brain (#1-#8 Frontier, #9 Qwen Offline Fallback Last)</label>
         <div class="ai-model-row">
-          <select id="ai-model-select" class="ai-model-select" data-select-ai-model="true" ${!models.connected || busy ? 'disabled' : ''}>${modelOptions}</select>
-          <button type="button" class="button button-small ${models.fastScoutEnabled ? 'selected' : 'button-secondary'}" data-ai-overseer-action="TOGGLE_FAST_SCOUT" aria-pressed="${models.fastScoutEnabled}" ${!models.connected || busy ? 'disabled' : ''}>${models.fastScoutEnabled ? 'Gemini Decision 1 Fast Scout: ON' : 'Gemini Decision 1 Fast Scout: OFF'}</button>
+          <select id="ai-model-select" class="ai-model-select" data-select-ai-model="true" ${modelDisabled ? 'disabled' : ''}>${modelOptions}</select>
+          <button type="button" class="button button-small ${models.fastScoutEnabled ? 'selected' : 'button-secondary'}" data-ai-overseer-action="TOGGLE_FAST_SCOUT" aria-pressed="${models.fastScoutEnabled}" ${modelDisabled ? 'disabled' : ''}>${models.fastScoutEnabled ? 'Gemini Decision 1 Fast Scout: ON' : 'Gemini Decision 1 Fast Scout: OFF'}</button>
         </div>
         <p class="quiet-note">Active: <strong>${esc(models.activeDisplayName)}</strong> (${esc(models.activeStatus)}) · Depth <strong>${esc(models.thinkingDepth)}</strong> (${esc(models.lastEffectiveEffort)}${models.lastLatencyMs !== null ? ` · ${esc(String(models.lastLatencyMs))}ms` : ''}) · Min prob ${esc(models.minDecisionProbability)} · Cycles ${esc(trader.cycleCount)} · Vetoes ${esc(trader.vetoCount)}</p>
       </div>
@@ -1041,21 +1061,21 @@ export function renderAiOverseerPanel(state) {
     <div class="risk-gear-block" role="group" aria-label="Owner risk gear and dynamic daily quota selector">
       <div class="quota-header">
         <strong>3-Gear Adaptive Risk &amp; Dynamic Daily Quota ($500 → $2,000 → $3,000)</strong>
-        <span class="tag" data-active-risk-gear="${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).activeGear)}"><span class="state-rule" aria-hidden="true"></span>${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).activeGear)} · ${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).effectiveRiskPct)}% risk · $${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).effectiveSoftQuotaUsd)}/$${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).effectiveHardQuotaUsd)}</span>
+        <span class="tag" data-active-risk-gear="${esc(rg.activeGear)}"><span class="state-rule" aria-hidden="true"></span>${esc(rg.activeGear)} · ${esc(rg.effectiveRiskPct)}% risk · $${esc(rg.effectiveSoftQuotaUsd)}/$${esc(rg.effectiveHardQuotaUsd)}</span>
       </div>
       <div class="risk-gear-buttons">
-        <button type="button" class="button button-small ${(trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMode === 'CONSERVATIVE' ? 'selected' : 'button-secondary'}" data-risk-gear="CONSERVATIVE" aria-pressed="${(trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMode === 'CONSERVATIVE'}" ${!trader.connected || busy ? 'disabled' : ''}>Conservative (1% · $500–$1k)</button>
-        <button type="button" class="button button-small ${(trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMode === 'AUTO_ADAPTIVE' ? 'selected' : 'button-secondary'}" data-risk-gear="AUTO_ADAPTIVE" aria-pressed="${(trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMode === 'AUTO_ADAPTIVE'}" ${!trader.connected || busy ? 'disabled' : ''}>Auto-Adaptive (1%→2.5%→5% · $500→$3k)</button>
-        <button type="button" class="button button-small ${(trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMode === 'AGGRESSIVE' ? 'selected' : 'button-secondary'}" data-risk-gear="AGGRESSIVE" aria-pressed="${(trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMode === 'AGGRESSIVE'}" ${!trader.connected || busy ? 'disabled' : ''}>Aggressive (5% · $2k–$3k)</button>
+        <button type="button" class="button button-small ${rg.ownerMode === 'CONSERVATIVE' ? 'selected' : 'button-secondary'}" data-risk-gear="CONSERVATIVE" aria-pressed="${rg.ownerMode === 'CONSERVATIVE'}" ${traderDisabled ? 'disabled' : ''}>Conservative (0.50% · $500–$1k)</button>
+        <button type="button" class="button button-small ${rg.ownerMode === 'AUTO_ADAPTIVE' ? 'selected' : 'button-secondary'}" data-risk-gear="AUTO_ADAPTIVE" aria-pressed="${rg.ownerMode === 'AUTO_ADAPTIVE'}" ${traderDisabled ? 'disabled' : ''}>Auto-Adaptive (0.50% → 0.75% → 1.00% · $500→$3k)</button>
+        <button type="button" class="button button-small ${rg.ownerMode === 'AGGRESSIVE' ? 'selected' : 'button-secondary'}" data-risk-gear="AGGRESSIVE" aria-pressed="${rg.ownerMode === 'AGGRESSIVE'}" ${traderDisabled ? 'disabled' : ''}>Aggressive (1.00% · $2k–$3k)</button>
       </div>
-      <p class="quiet-note">${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).reason)} Hard owner ceiling: ${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMaxRiskPct)}% max stop risk · ${esc(String(Math.round(Number((trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerMaxDrawdownPct) * 100)))}% max drawdown · $${esc((trader.riskGear ?? STATIC_AI_TRADER.riskGear).ownerHardQuotaUsd)} daily cap.</p>
+      <p class="quiet-note">${esc(rg.reason)} Hard constitutional ceiling: ${esc(maxRiskFmt)}% max stop risk · ${esc(maxDdFmt)}% max drawdown · $${esc(rg.ownerHardQuotaUsd)} daily cap.</p>
     </div>
     <div class="overseer-controls" role="group" aria-label="Human overseer emergency controls">
-      <button type="button" class="button button-small" data-ai-overseer-action="PAUSE_NEW_RISK" ${!trader.connected || busy ? 'disabled' : ''}>Pause AI new risk</button>
-      <button type="button" class="button button-small button-secondary" data-ai-overseer-action="RESUME_AUTONOMOUS" ${!trader.connected || busy ? 'disabled' : ''}>Resume AI loop</button>
-      <button type="button" class="button button-small button-secondary" data-ai-overseer-action="STOP_AUTOMATION" ${!trader.connected || busy ? 'disabled' : ''}>Stop AI trader</button>
-      <button type="button" class="button button-small button-warning" data-ai-overseer-action="EMERGENCY_CLOSE_ALL" ${!trader.connected || busy ? 'disabled' : ''}>Emergency close all</button>
-      <button type="button" class="button button-small button-secondary" data-ai-overseer-action="REARM_DRAWDOWN" ${!trader.connected || busy ? 'disabled' : ''}>Re-arm &amp; unlock</button>
+      <button type="button" class="button button-small" data-ai-overseer-action="PAUSE_NEW_RISK" ${traderDisabled ? 'disabled' : ''}>Pause AI new risk</button>
+      <button type="button" class="button button-small button-secondary" data-ai-overseer-action="RESUME_AUTONOMOUS" ${traderDisabled ? 'disabled' : ''}>Resume AI loop</button>
+      <button type="button" class="button button-small button-secondary" data-ai-overseer-action="STOP_AUTOMATION" ${traderDisabled ? 'disabled' : ''}>Stop AI trader</button>
+      <button type="button" class="button button-small button-warning" data-ai-overseer-action="EMERGENCY_CLOSE_ALL" ${traderDisabled ? 'disabled' : ''}>Emergency close all</button>
+      <button type="button" class="button button-small button-secondary" data-ai-overseer-action="REARM_DRAWDOWN" ${traderDisabled ? 'disabled' : ''}>Re-arm &amp; unlock</button>
     </div>
     ${positionRows}
     ${recentFeed}
@@ -1406,9 +1426,11 @@ export function renderBankedProfitsHeroBanner(state) {
   const card4ScheduleHtml = isRegionalActive
     ? `Window: ${esc(bs.activeRegionWindow)} · Next Auto-Wakeup: ${esc(nextWakeupLabel)}${bs.nextSessionOpensUtc ? ` · ${esc(bs.nextSessionOpensUtc)}` : ''} (17:00 America/New_York once in surplus)`
     : `Window: ${esc(bs.activeRegionWindow)} · Next Session Rollover: ${esc(bs.sessionRolloverLabel)}${bs.nextSessionOpensUtc ? ` · ${esc(bs.nextSessionOpensUtc)}` : ''}`;
+  const ownerLocked = state?.sessionScope === 'DEVICE_READ_AND_EXPLAINER' || state?.ownerControlsAllowed === false;
+  const cadenceDisabled = busy || ownerLocked;
   const isRegionalBtnSelected = bs.sessionCadence === 'REGIONAL_RECOVERY' || bs.sessionCadence === 'REGIONAL_8H';
   const advanceBtnHtml = bs.canAdvanceRecoverySession
-    ? `<button type="button" class="button button-small button-warning recovery-advance-btn" data-ai-overseer-action="ADVANCE_RECOVERY_SESSION" ${busy ? 'disabled' : ''}>Resume Next Region Session</button>`
+    ? `<button type="button" class="button button-small button-warning recovery-advance-btn" data-ai-overseer-action="ADVANCE_RECOVERY_SESSION" ${cadenceDisabled ? 'disabled' : ''}>Resume Next Region Session</button>`
     : '';
 
   return `<section class="panel banked-profits-hero is-connected ${isUnderwater ? 'is-recovery-mode' : 'is-in-surplus'}" data-banked-profits-hero="true" aria-label="Principal High-Water Mark and Session Vault Scoreboard">
@@ -1453,9 +1475,9 @@ export function renderBankedProfitsHeroBanner(state) {
         <div class="banked-hero-value banked-hero-mode">${card4ModeHtml}</div>
         <p class="banked-hero-sub">${card4ScheduleHtml}</p>
         <div class="cadence-toggle-group" role="group" aria-label="Session cadence mode">
-          <button type="button" class="button button-small cadence-toggle-btn ${bs.sessionCadence === 'AUTO' ? 'selected' : 'button-secondary'}" data-ai-session-cadence="AUTO" aria-pressed="${bs.sessionCadence === 'AUTO'}" ${busy ? 'disabled' : ''}>Auto (3-Region Recovery → 17:00 NY)</button>
-          <button type="button" class="button button-small cadence-toggle-btn ${isRegionalBtnSelected ? 'selected' : 'button-secondary'}" data-ai-session-cadence="REGIONAL_8H" aria-pressed="${isRegionalBtnSelected}" ${busy ? 'disabled' : ''}>3-Region 8h (Asia · London · NY)</button>
-          <button type="button" class="button button-small cadence-toggle-btn ${bs.sessionCadence === 'DAILY_NY' ? 'selected' : 'button-secondary'}" data-ai-session-cadence="DAILY_NY" aria-pressed="${bs.sessionCadence === 'DAILY_NY'}" ${busy ? 'disabled' : ''}>Daily 17:00 America/New_York</button>
+          <button type="button" class="button button-small cadence-toggle-btn ${bs.sessionCadence === 'AUTO' ? 'selected' : 'button-secondary'}" data-ai-session-cadence="AUTO" aria-pressed="${bs.sessionCadence === 'AUTO'}" ${cadenceDisabled ? 'disabled' : ''}>Auto (3-Region Recovery → 17:00 NY)</button>
+          <button type="button" class="button button-small cadence-toggle-btn ${isRegionalBtnSelected ? 'selected' : 'button-secondary'}" data-ai-session-cadence="REGIONAL_8H" aria-pressed="${isRegionalBtnSelected}" ${cadenceDisabled ? 'disabled' : ''}>3-Region 8h (Asia · London · NY)</button>
+          <button type="button" class="button button-small cadence-toggle-btn ${bs.sessionCadence === 'DAILY_NY' ? 'selected' : 'button-secondary'}" data-ai-session-cadence="DAILY_NY" aria-pressed="${bs.sessionCadence === 'DAILY_NY'}" ${cadenceDisabled ? 'disabled' : ''}>Daily 17:00 America/New_York</button>
         </div>
         <div class="banked-card-cta">${advanceBtnHtml}<button type="button" class="button button-small button-primary banked-voice-btn" data-open-voice-explainer="true">Ask / Speak to Gemini 4 Neon</button></div>
       </article>

@@ -246,7 +246,15 @@ class Tier3PairwiseE2ETests(unittest.TestCase):
                 clock=clk,
             )
             rec = OwnerRecoveryVerifier(db_path=root / "vault.sqlite3", clock=clk)
-            tok = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep_t3 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("150.00"),
+                owner_request_id="req-t3-05",
+                reason="Pairwise ACH test",
+                coinbase_client=cb,
+                idempotency_key="idem-t3-05",
+            )
+            tok = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep_t3["intent_sha256"], now=T0)
             vault.execute_offramp_ach_payout(
                 rail=RAIL_COINBASE_ACH,
                 amount_usd=D("150.00"),
@@ -256,6 +264,8 @@ class Tier3PairwiseE2ETests(unittest.TestCase):
                 recovery_token=tok,
                 coinbase_client=cb,
                 idempotency_key="idem-t3-05",
+                intent_id=prep_t3["intent_id"],
+                intent_sha256=prep_t3["intent_sha256"],
             )
             srv = LoopbackCockpitServer(repo_root=REPO_ROOT, host="127.0.0.1", port=0, profit_vault=vault)
             srv.start()

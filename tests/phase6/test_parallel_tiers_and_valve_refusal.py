@@ -462,7 +462,15 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
             rec = OwnerRecoveryVerifier(db_path=db_path, clock=lambda: T0)
 
             # 1. Transport error persists OUTCOME_UNKNOWN with error_detail and keeps $100 locked
-            tok1 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep1 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("100.00"),
+                owner_request_id="req-ach-1",
+                reason="ach sweep",
+                coinbase_client=cb,
+                idempotency_key="idem-ach-001",
+            )
+            tok1 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep1["intent_sha256"], now=T0)
             with self.assertRaises(OfframpTransportError):
                 vault.execute_offramp_ach_payout(
                     rail=RAIL_COINBASE_ACH,
@@ -473,6 +481,8 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                     recovery_token=tok1,
                     coinbase_client=cb,
                     idempotency_key="idem-ach-001",
+                    intent_id=prep1["intent_id"],
+                    intent_sha256=prep1["intent_sha256"],
                 )
             self.assertEqual(len(seen_bodies), 1)
             snap_unk = vault.snapshot()
@@ -494,7 +504,15 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
             self.assertEqual(err_row[2], "idem-ach-001")
 
             # 2. Duplicate idempotency_key is refused BEFORE any HTTP dispatch
-            tok2 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep2 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("25.00"),
+                owner_request_id="req-ach-dup",
+                reason="duplicate idem",
+                coinbase_client=cb,
+                idempotency_key="idem-ach-001",
+            )
+            tok2 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep2["intent_sha256"], now=T0)
             with self.assertRaises(OfframpSecurityError):
                 vault.execute_offramp_ach_payout(
                     rail=RAIL_COINBASE_ACH,
@@ -505,11 +523,21 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                     recovery_token=tok2,
                     coinbase_client=cb,
                     idempotency_key="idem-ach-001",
+                    intent_id=prep2["intent_id"],
+                    intent_sha256=prep2["intent_sha256"],
                 )
             self.assertEqual(len(seen_bodies), 1)
 
             # 3. Retry with mismatched rail or amount or unknown transfer_id is refused
-            tok3 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep3 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("50.00"),
+                owner_request_id="req-ach-bad-amt",
+                reason="bad amt",
+                coinbase_client=cb,
+                retry_transfer_id=transfer_id,
+            )
+            tok3 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep3["intent_sha256"], now=T0)
             with self.assertRaises(ContractError):
                 vault.execute_offramp_ach_payout(
                     rail=RAIL_COINBASE_ACH,
@@ -520,8 +548,18 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                     recovery_token=tok3,
                     coinbase_client=cb,
                     retry_transfer_id=transfer_id,
+                    intent_id=prep3["intent_id"],
+                    intent_sha256=prep3["intent_sha256"],
                 )
-            tok4 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep4 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("100.00"),
+                owner_request_id="req-ach-missing",
+                reason="missing id",
+                coinbase_client=cb,
+                retry_transfer_id="trach-nonexistent",
+            )
+            tok4 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep4["intent_sha256"], now=T0)
             with self.assertRaises(ContractError):
                 vault.execute_offramp_ach_payout(
                     rail=RAIL_COINBASE_ACH,
@@ -532,11 +570,21 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                     recovery_token=tok4,
                     coinbase_client=cb,
                     retry_transfer_id="trach-nonexistent",
+                    intent_id=prep4["intent_id"],
+                    intent_sha256=prep4["intent_sha256"],
                 )
 
             # 4. Retry recovery from OUTCOME_UNKNOWN reuses exact original idempotency_key and settles once
             fail_mode["fail"] = False
-            tok5 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep5 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("100.00"),
+                owner_request_id="req-ach-retry",
+                reason="retry unknown",
+                coinbase_client=cb,
+                retry_transfer_id=transfer_id,
+            )
+            tok5 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep5["intent_sha256"], now=T0)
             out = vault.execute_offramp_ach_payout(
                 rail=RAIL_COINBASE_ACH,
                 amount_usd=D("100.00"),
@@ -546,6 +594,8 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                 recovery_token=tok5,
                 coinbase_client=cb,
                 retry_transfer_id=transfer_id,
+                intent_id=prep5["intent_id"],
+                intent_sha256=prep5["intent_sha256"],
             )
             self.assertEqual(len(seen_bodies), 2)
             self.assertEqual(seen_bodies[0]["client_reference_id"], "idem-ach-001")
@@ -555,7 +605,15 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
             self.assertEqual(out["vault"]["pending_disbursement_usd"], "50")
 
             # 5. Re-retrying an already ACH_SUBMITTED transfer is refused
-            tok6 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep6 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("100.00"),
+                owner_request_id="req-ach-re-retry",
+                reason="cannot retry submitted",
+                coinbase_client=cb,
+                retry_transfer_id=transfer_id,
+            )
+            tok6 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep6["intent_sha256"], now=T0)
             with self.assertRaises(ContractError):
                 vault.execute_offramp_ach_payout(
                     rail=RAIL_COINBASE_ACH,
@@ -566,6 +624,8 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                     recovery_token=tok6,
                     coinbase_client=cb,
                     retry_transfer_id=transfer_id,
+                    intent_id=prep6["intent_id"],
+                    intent_sha256=prep6["intent_sha256"],
                 )
             self.assertEqual(RAIL_KRAKEN_ACH, "KRAKEN_ACH")
 

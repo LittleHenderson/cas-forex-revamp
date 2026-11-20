@@ -92,7 +92,10 @@ class SecurityAudit14FindingsTests(unittest.TestCase):
             srv.start()
             try:
                 tok = srv.auth_token
-                status_ui, hdrs_ui, _ = self._http(srv, "GET", f"/ui/index.html?token={tok}")
+                st_tok_url, _, _ = self._http(srv, "GET", f"/ui/index.html?token={tok}")
+                self.assertEqual(st_tok_url, 401)
+                pair_doc = srv.mint_pairing_code()
+                status_ui, hdrs_ui, _ = self._http(srv, "GET", f"/ui/index.html?pair_code={pair_doc['pair_code']}")
                 self.assertEqual(status_ui, 200)
                 self.assertNotIn("set-cookie", hdrs_ui)  # Finding [1]: zero cookies emitted
 
@@ -253,19 +256,28 @@ class SecurityAudit14FindingsTests(unittest.TestCase):
                 "CAS_FOREX_HUGOSWAY_MT5_SERVER": "Hugosway-Demo",
             })
             tr.connect(creds)
+            import cas_forex_revamp.venue.mt5_broker_bridge as _mbb
             req = Mt5OrderRequest(
                 request_id="req-hmac-1", action="OPEN", symbol="EURUSD", side=Side.BUY, volume_lots=Decimal("0.10"),
                 price=Decimal("1.10010"), stop_loss=Decimal("1.09500"), position_ticket=None,
                 deviation_points=20, magic=20261116, comment="cas-hmac", created_at=T0,
+                valve_decision_sha256="a" * 64,
             )
             bound = tr.prepare_request(req)
+            if callable(getattr(_mbb, "sign_spool_valve_admission", None)):
+                bound = _mbb.sign_spool_valve_admission(bound, spool_dir=spool, expires_at=T0 + timedelta(seconds=30))
             doc = bound.to_spool_dict()
             self.assertEqual(doc["protocol"], "cas-forex-mt5-spool/2")
-            hkey = _load_or_create_spool_hmac_key(spool)
+            raw_hkey = _load_or_create_spool_hmac_key(spool)
+            hkey = (
+                _mbb.derive_spool_channel_key(raw_hkey, "hugosway_mt5")
+                if callable(getattr(_mbb, "derive_spool_channel_key", None))
+                else raw_hkey
+            )
             sig = _spool_hmac_hex(hkey, _canonical_spool_request_hmac_input(doc))
             self.assertEqual(len(sig), 64)
             # Valid order succeeds with verified receipt HMAC; duplicate request_id blocked
-            rcpt = tr.send_order(req)
+            rcpt = tr.send_order(bound)
             self.assertTrue(bool(rcpt.position_ticket))
 
             # Tampered request HMAC fails closed inside emulator/spool handler

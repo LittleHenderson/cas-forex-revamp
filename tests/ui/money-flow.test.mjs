@@ -22,9 +22,9 @@ import { normalizeAiTrader, renderAiOverseerPanel, STATIC_AI_TRADER } from '../.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 
-test('Money Flow catalog exposes all 9 capital presets, 4 risk %, 11 lot presets, and 7 markets', () => {
+test('Money Flow catalog exposes all 9 capital presets, 4 constitutional risk %, 11 lot presets, and 7 markets', () => {
   assert.deepEqual(MONEY_FLOW_CAPITAL_PRESETS, [300, 1000, 3000, 6000, 10000, 25000, 50000, 100000, 300000]);
-  assert.deepEqual(MONEY_FLOW_RISK_PRESETS, [1, 2, 3, 5]);
+  assert.deepEqual(MONEY_FLOW_RISK_PRESETS, [0.25, 0.5, 0.75, 1]);
   assert.equal(MONEY_FLOW_LOT_PRESETS.length, 11);
   assert.deepEqual(MONEY_FLOW_MARKET_ORDER, ['EURUSD', 'GBPUSD', 'USDJPY', 'NAS100', 'US30', 'SPX500', 'XAUUSD']);
   for (const id of MONEY_FLOW_MARKET_ORDER) {
@@ -68,7 +68,7 @@ test('XAUUSD (100 oz/lot) and NAS100 index math + simulation steps (+1 Win, +1 L
     marketId: 'XAUUSD',
     lotMode: 'risk',
     riskPct: 1,
-    ownerMaxRiskPct: 5,
+    ownerMaxRiskPct: 1,
   });
   assert.equal(gold.allowed, true);
   assert.equal(gold.leverage, 200);
@@ -82,29 +82,31 @@ test('XAUUSD (100 oz/lot) and NAS100 index math + simulation steps (+1 Win, +1 L
     ownerMaxRiskPct: 5,
   });
   assert.equal(nas.allowed, true);
+  assert.equal(nas.ownerMaxRiskPct, 1, 'Constitutional risk ceiling clamps ownerMaxRiskPct to 1.00%');
+  assert.ok(nas.riskPctActual <= 1.005, 'Risk mode clamps per-trade stop risk <= 1.00%');
   assert.ok(nas.lotHundredths <= 5000);
 
   let s = createDefaultMoneyFlowState();
-  s = stepMoneyFlowSimulation(s, 'win', 5);
+  s = stepMoneyFlowSimulation(s, 'win', 1);
   assert.equal(s.simWins, 1);
   assert.ok(s.simCapitalCents > 100000);
   assert.ok(s.simBankCents > 0);
 
-  s = stepMoneyFlowSimulation(s, 'win5', 5);
+  s = stepMoneyFlowSimulation(s, 'win5', 1);
   assert.equal(s.simWins, 6);
 
   const beforeLoss = s.simCapitalCents;
-  s = stepMoneyFlowSimulation(s, 'loss', 5);
+  s = stepMoneyFlowSimulation(s, 'loss', 1);
   assert.equal(s.simLosses, 1);
   assert.ok(s.simCapitalCents < beforeLoss);
 
   // 100% Compound mode routes $0 to bank vault
   let comp = { ...createDefaultMoneyFlowState(), splitMode: '100_COMPOUND' };
-  comp = stepMoneyFlowSimulation(comp, 'win', 5);
+  comp = stepMoneyFlowSimulation(comp, 'win', 1);
   assert.equal(comp.simBankCents, 0);
   assert.equal(comp.simCapitalCents, 100000 + 2172);
 
-  const reset = stepMoneyFlowSimulation(s, 'reset', 5);
+  const reset = stepMoneyFlowSimulation(s, 'reset', 1);
   assert.equal(reset.simWins, 0);
   assert.equal(reset.simLosses, 0);
   assert.equal(reset.simCapitalCents, 100000);
@@ -167,13 +169,16 @@ test('Lot Comparison cards, strict CSP (no inline styles or CDN URLs), and 3-Gea
   });
   assert.equal(normalized.riskGear.ownerMode, 'AUTO_ADAPTIVE');
   assert.equal(normalized.riskGear.activeGear, 'STRONG_TREND_RUNNER');
-  assert.equal(normalized.riskGear.effectiveRiskPct, '5');
+  assert.equal(normalized.riskGear.effectiveRiskPct, '1');
+  assert.equal(normalized.riskGear.ownerMaxRiskPct, '1');
+  assert.equal(normalized.riskGear.ownerMaxDrawdownPct, '0.1');
   assert.equal(normalized.riskGear.effectiveHardQuotaUsd, '3000');
 
   const panelHtml = renderAiOverseerPanel({ aiTrader: normalized });
   assert.match(panelHtml, /data-risk-gear="CONSERVATIVE"/);
   assert.match(panelHtml, /data-risk-gear="AUTO_ADAPTIVE"/);
   assert.match(panelHtml, /data-risk-gear="AGGRESSIVE"/);
+  assert.match(panelHtml, /Hard constitutional ceiling: 1\.00% max stop risk · 10\.00% max drawdown/);
   assert.match(panelHtml, /STRONG_TREND_RUNNER/);
   assert.equal(formatCentsUsd(123456), '$1,234.56');
   assert.ok(STATIC_AI_TRADER.riskGear);

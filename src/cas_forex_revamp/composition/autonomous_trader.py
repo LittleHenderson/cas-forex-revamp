@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal, localcontext
+from decimal import InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal, localcontext
 from hashlib import sha256
 import json
 import logging
@@ -51,7 +51,7 @@ from cas_forex_revamp.operator.frontier_backends import (
     FrontierTransportError,
     assert_safe_ai_catalog_payload,
 )
-from cas_forex_revamp.operator.model import ActualModelDecisionAdapter, ModelInvocation
+from cas_forex_revamp.operator.model import ActualModelDecisionAdapter, DurableModelExecutionGate, ModelInvocation
 from cas_forex_revamp.treasury.profit_sweep import ENV_INITIAL_CAPITAL_USD
 from cas_forex_revamp.valve.daily_quota import (
     DailyQuotaGovernanceStore,
@@ -133,7 +133,9 @@ ACTIVE_GEAR_CONSERVATIVE = "CONSERVATIVE"
 ACTIVE_GEAR_GROWTH = "GROWTH"
 ACTIVE_GEAR_STRONG_TREND_RUNNER = "STRONG_TREND_RUNNER"
 
-SOFT_DRAWDOWN_DOWNSHIFT_PCT = Decimal("0.10")
+MAX_CONSTITUTIONAL_STOP_RISK_PCT = Decimal("1.00")
+MAX_CONSTITUTIONAL_DRAWDOWN_PCT = Decimal("0.10")
+SOFT_DRAWDOWN_DOWNSHIFT_PCT = Decimal("0.05")
 
 
 def resolve_adaptive_risk_and_quota(
@@ -147,21 +149,30 @@ def resolve_adaptive_risk_and_quota(
     owner_soft_quota_usd: Decimal,
     owner_hard_quota_usd: Decimal,
 ) -> dict[str, Any]:
-    """Resolve active Risk Gear & Dynamic Daily Profit Quota strictly inside owner ceilings.
+    """Resolve active Risk Gear & Dynamic Daily Profit Quota strictly inside constitutional ceilings.
 
-    Safety invariants:
-    - The AI can NEVER raise its own safety ceiling above owner_max_risk_pct,
-      owner_max_drawdown_pct, or owner_hard_quota_usd.
-    - AUTO_ADAPTIVE scales across three owner-bounded gears:
-      1. Conservative (CHOP_RANGE / loss streak / drawdown >= 10%): 1.00% risk, $500 soft / $1,000 hard.
-      2. Growth (TREND_IGNITION, 0 losses, drawdown < 10%): 2.50% risk, $2,000 soft / $2,500 hard.
-      3. Strong-Trend Runner (STRONG_TREND, 0 losses, drawdown < 10%): 5.00% risk, $2,000 soft / $3,000 hard.
+    Constitutional safety invariants (immutable upper bounds):
+    - Per-trade stop-loss risk can NEVER exceed 1.00% of equity (`MAX_CONSTITUTIONAL_STOP_RISK_PCT`).
+    - Maximum drawdown cutoff can NEVER exceed 10.00% (`MAX_CONSTITUTIONAL_DRAWDOWN_PCT = 0.10`).
+    - Configuration may only tighten (lower) these bounds, never weaken them.
+    - Higher gears adjust selectivity, allocation, and daily profit quota strictly within [0.50%, 1.00%]:
+      1. Conservative (CHOP_RANGE / loss streak / drawdown >= 5%): 0.50% risk, $500 soft / $1,000 hard.
+      2. Growth (TREND_IGNITION, 0 losses, drawdown < 5%): 0.75% risk, $2,000 soft / $2,500 hard.
+      3. Strong-Trend Runner / Aggressive (STRONG_TREND, 0 losses, drawdown < 5%): 1.00% risk, $2,000 soft / $3,000 hard.
     """
     mode = str(owner_gear_mode or RISK_GEAR_AUTO_ADAPTIVE).strip().upper()
     if mode not in VALID_RISK_GEAR_MODES:
         raise ContractError(f"owner_gear_mode must be one of {VALID_RISK_GEAR_MODES}")
     max_risk = decimal_value(owner_max_risk_pct, "owner_max_risk_pct", positive=True)
+    if max_risk > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
+        raise ContractError(
+            f"owner_max_risk_pct {decimal_text(max_risk)}% exceeds immutable constitutional 1.00% stop-risk ceiling"
+        )
     max_dd = decimal_value(owner_max_drawdown_pct, "owner_max_drawdown_pct", positive=True)
+    if max_dd > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+        raise ContractError(
+            f"owner_max_drawdown_pct {decimal_text(max_dd)} exceeds immutable constitutional 0.10 (10.00%) drawdown ceiling"
+        )
     if isinstance(drawdown_pct, bool) or not isinstance(drawdown_pct, Decimal) or not drawdown_pct.is_finite():
         raise ContractError("drawdown_pct must be a finite Decimal")
     if drawdown_pct < Decimal("0"):
@@ -171,55 +182,57 @@ def resolve_adaptive_risk_and_quota(
     soft_cap = decimal_value(owner_soft_quota_usd, "owner_soft_quota_usd", positive=True)
     consec = max(0, int(consecutive_losses))
     reg = str(regime or REGIME_CHOP_RANGE).strip().upper()
+    eff_soft_dd = min(SOFT_DRAWDOWN_DOWNSHIFT_PCT, max_dd)
 
     if mode == RISK_GEAR_CONSERVATIVE:
         active_gear = ACTIVE_GEAR_CONSERVATIVE
-        target_risk = Decimal("1.00")
+        target_risk = Decimal("0.50")
         target_soft = Decimal("500")
         target_hard = Decimal("1000")
-        reason = "Owner selected Conservative Gear (1.00% risk · $500/$1,000 daily quota)."
+        reason = "Owner selected Conservative Gear (0.50% risk · $500/$1,000 quota · 1.00%/10.00% cap)."
     elif mode == RISK_GEAR_AGGRESSIVE:
         active_gear = ACTIVE_GEAR_STRONG_TREND_RUNNER
-        target_risk = Decimal("5.00")
+        target_risk = Decimal("1.00")
         target_soft = Decimal("2000")
         target_hard = Decimal("3000")
-        reason = "Owner selected Aggressive Gear (up to 5.00% risk · $2,000/$3,000 daily quota under Valve ceiling)."
+        reason = "Owner selected Aggressive Gear (1.00% constitutional stop cap · $2,000/$3,000 quota)."
     else:
-        if dd >= SOFT_DRAWDOWN_DOWNSHIFT_PCT:
+        if dd >= eff_soft_dd:
             active_gear = ACTIVE_GEAR_CONSERVATIVE
-            target_risk = Decimal("1.00")
+            target_risk = Decimal("0.50")
             target_soft = Decimal("500")
             target_hard = Decimal("1000")
             dd_pct_disp = (dd * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+            soft_pct_disp = (eff_soft_dd * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
             reason = (
-                f"Auto-downshifted to Conservative Gear (drawdown {decimal_text(dd_pct_disp)}% >= 10% soft floor)."
+                f"Auto-downshifted to Conservative Gear (drawdown {decimal_text(dd_pct_disp)}% >= {decimal_text(soft_pct_disp)}% soft floor)."
             )
         elif consec >= 1:
             active_gear = ACTIVE_GEAR_CONSERVATIVE
-            target_risk = Decimal("1.00")
+            target_risk = Decimal("0.50")
             target_soft = Decimal("500")
             target_hard = Decimal("1000")
-            reason = f"Auto-downshifted to Conservative Gear (loss streak {consec} >= 1)."
+            reason = f"Auto-downshifted to Conservative Gear (loss streak {consec} >= 1 · 0.50% risk)."
         elif reg == REGIME_STRONG_TREND:
             active_gear = ACTIVE_GEAR_STRONG_TREND_RUNNER
-            target_risk = Decimal("5.00")
+            target_risk = Decimal("1.00")
             target_soft = Decimal("2000")
             target_hard = Decimal("3000")
-            reason = "Strong-Trend Runner Gear active (0 loss streak, <10% drawdown: up to 5.00% risk · $2,000/$3,000 quota)."
+            reason = "Strong-Trend Runner Gear active (0 loss streak: 1.00% constitutional cap · $2,000/$3,000 quota)."
         elif reg == REGIME_TREND_IGNITION:
             active_gear = ACTIVE_GEAR_GROWTH
-            target_risk = Decimal("2.50")
+            target_risk = Decimal("0.75")
             target_soft = Decimal("2000")
             target_hard = Decimal("2500")
-            reason = "Growth Gear active on Trend Ignition (0 loss streak, <10% drawdown: 2.50% risk · $2,000/$2,500 quota)."
+            reason = "Growth Gear active on Trend Ignition (0 loss streak: 0.75% risk · $2,000/$2,500 quota)."
         else:
             active_gear = ACTIVE_GEAR_CONSERVATIVE
-            target_risk = Decimal("1.00")
+            target_risk = Decimal("0.50")
             target_soft = Decimal("500")
             target_hard = Decimal("1000")
-            reason = f"Conservative Gear active in {reg} regime (1.00% risk · $500/$1,000 quota)."
+            reason = f"Conservative Gear active in {reg} regime (0.50% risk · $500/$1,000 quota)."
 
-    eff_risk = min(target_risk, max_risk)
+    eff_risk = min(target_risk, max_risk, MAX_CONSTITUTIONAL_STOP_RISK_PCT)
     eff_hard = min(target_hard, hard_cap)
     eff_soft = min(target_soft, eff_hard)
     # Also respect owner_soft_quota_usd ceiling when owner configured a tighter soft target in Conservative mode
@@ -242,9 +255,9 @@ def resolve_adaptive_risk_and_quota(
         "effective_soft_quota_usd": decimal_text(eff_soft),
         "effective_hard_quota_usd": decimal_text(eff_hard),
         "owner_hard_quota_usd": decimal_text(hard_cap),
-        "soft_drawdown_downshift_pct": decimal_text(SOFT_DRAWDOWN_DOWNSHIFT_PCT),
+        "soft_drawdown_downshift_pct": decimal_text(eff_soft_dd),
         "owner_max_drawdown_pct": decimal_text(max_dd),
-        "reason": reason,
+        "reason": reason[:240],
     }
 
 
@@ -406,11 +419,23 @@ class AutonomousAiTrader:
         self._owner_verifier = owner_verifier
         self._fast_tick_ms = fast_tick_ms
         self._clock = clock or _utc_now
+        if router.barbell.max_stop_loss_equity_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
+            raise ContractError(
+                f"router max_stop_loss_equity_risk_pct {decimal_text(router.barbell.max_stop_loss_equity_risk_pct)}% "
+                "exceeds immutable constitutional 1.00% ceiling"
+            )
+        if router.barbell.max_drawdown_pct > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+            raise ContractError(
+                f"router max_drawdown_pct {decimal_text(router.barbell.max_drawdown_pct)} "
+                "exceeds immutable constitutional 0.10 (10.00%) ceiling"
+            )
         if execution_gate is None or not callable(execution_gate):
             raise ContractError(
                 "AutonomousAiTrader requires an explicit execution_gate (DurableModelExecutionGate); no-op fallback is forbidden"
             )
         self._execution_gate = execution_gate
+        if isinstance(execution_gate, DurableModelExecutionGate) and hasattr(model_registry, "bind_execution_gate"):
+            model_registry.bind_execution_gate(execution_gate)
         self._journal_path = Path(journal_path) if journal_path is not None else None
         self._scope = scope or RunScope(
             account_id="dual-shield-barbell",
@@ -747,8 +772,23 @@ class AutonomousAiTrader:
                 has_venue_acct = True
                 bal_sum += venue.nav or Decimal("0")
                 free_sum += venue.margin_available or Decimal("0")
+                if venue.summary is not None and callable(getattr(venue, "positions", None)):
+                    for pos in venue.positions(refresh=False):
+                        inventory.append({
+                            "broker_id": broker_id,
+                            "ticket": pos.ticket,
+                            "symbol": pos.symbol,
+                            "side": pos.side.value,
+                            "volume_lots": decimal_text(pos.volume_lots),
+                        })
         balance_val = bal_sum if has_venue_acct and bal_sum > Decimal("0") else total_eq
         margin_val = free_sum if has_venue_acct else total_eq
+        router_dd = self._router.barbell.max_drawdown_pct
+        if router_dd > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+            raise ContractError(
+                f"router max_drawdown_pct {decimal_text(router_dd)} exceeds immutable constitutional 0.10 ceiling"
+            )
+        eff_dd_cap = min(router_dd, MAX_CONSTITUTIONAL_DRAWDOWN_PCT)
         return {
             "balance": decimal_text(balance_val),
             "equity": decimal_text(total_eq),
@@ -760,7 +800,7 @@ class AutonomousAiTrader:
                 "new_risk_permission": new_risk_permission,
                 "management_permission": management_permission,
                 "max_entry_quantity": "10000000",
-                "max_drawdown_pct": decimal_text(self._router.barbell.max_drawdown_pct),
+                "max_drawdown_pct": decimal_text(eff_dd_cap),
             },
         }
 
@@ -1219,7 +1259,11 @@ class AutonomousAiTrader:
             else total_equity
         )
         sizing_equity = min(total_equity, eff_eq) if eff_eq > Decimal("0") else total_equity
-        budget = self._router.barbell.max_stop_risk_amount(sizing_equity) * risk_multiplier
+        constitutional_max_budget = (sizing_equity * MAX_CONSTITUTIONAL_STOP_RISK_PCT) / Decimal("100")
+        budget = min(
+            self._router.barbell.max_stop_risk_amount(sizing_equity) * risk_multiplier,
+            constitutional_max_budget,
+        )
         active_mt5: tuple[str, Mt5PaperBrokerVenue] | None = None
         first_mt5: Mt5PaperBrokerVenue | None = None
         for bid_id in self._router.priority_order:
@@ -2097,23 +2141,30 @@ class AutonomousAiTrader:
                     "choices": ["WAIT", action_ref],
                 }]
                 try:
-                    if hasattr(self._execution_gate, "admit_scout_call"):
-                        self._execution_gate.admit_scout_call(model_id="gemini-decision-1", request_id=cycle_id, now=ts)
-                    else:
-                        scout_spec, _, _ = self._registry.build_backend("gemini-decision-1")
-                        scout_inv = ModelInvocation(
-                            request_sha256=content_digest(scout_q),
-                            model=scout_spec,
-                            session_id=f"scout-{cycle_id}",
-                            system_policy=SYSTEM_POLICY,
-                            packet_json=canonical_bytes({"scout": scout_q}).decode("utf-8"),
-                            budget=InferenceBudget(
-                                max_calls=1, max_input_tokens_per_call=4096, max_generated_tokens_per_call=64,
-                                max_seconds_per_call=10, max_total_seconds=10,
-                            ),
+                    if isinstance(self._execution_gate, DurableModelExecutionGate):
+                        scout = self._registry.scout_opportunities(
+                            scout_q,
+                            execution_gate=self._execution_gate,
+                            request_id=cycle_id,
                         )
-                        self._execution_gate(scout_inv)
-                    scout = self._registry.scout_opportunities(scout_q)
+                    else:
+                        if hasattr(self._execution_gate, "admit_scout_call"):
+                            self._execution_gate.admit_scout_call(model_id="gemini-decision-1", request_id=cycle_id, now=ts)
+                        else:
+                            scout_spec, _, _ = self._registry.build_backend("gemini-decision-1")
+                            scout_inv = ModelInvocation(
+                                request_sha256=content_digest(scout_q),
+                                model=scout_spec,
+                                session_id=f"scout-{cycle_id}",
+                                system_policy=SYSTEM_POLICY,
+                                packet_json=canonical_bytes({"scout": scout_q}).decode("utf-8"),
+                                budget=InferenceBudget(
+                                    max_calls=1, max_input_tokens_per_call=4096, max_generated_tokens_per_call=64,
+                                    max_seconds_per_call=10, max_total_seconds=10,
+                                ),
+                            )
+                            self._execution_gate(scout_inv)
+                        scout = self._registry.scout_opportunities(scout_q)
                 except FrontierTransportError as scout_exc:
                     self._registry.record_call(
                         "gemini-decision-1",
@@ -2186,7 +2237,11 @@ class AutonomousAiTrader:
                 evidence=(EvidenceReference(ev_id, EvidenceKind.OBSERVATION, "autonomous-ai-trader", content_digest(fact_obj), ts),),
             )
             max_gen = 12288 if eff_depth == "high" else (6144 if eff_depth == "medium" else 2048)
-            spec, backend, verifier = self._registry.build_backend(active_id, reasoning_effort=eff_depth)
+            spec, backend, verifier = self._registry.build_backend(
+                active_id,
+                reasoning_effort=eff_depth,
+                execution_gate=self._execution_gate if isinstance(self._execution_gate, DurableModelExecutionGate) else None,
+            )
             adapter = ActualModelDecisionAdapter(
                 adapter_id=f"adapter-{active_id.replace(':', '-')}",
                 model=spec,
@@ -2428,6 +2483,7 @@ class AutonomousAiTrader:
     def emergency_close_all(self, *, reason: str = "Overseer reviewed emergency close all", now: datetime | None = None) -> dict[str, Any]:
         ts = self._now(now)
         closed_tickets: list[str] = []
+        close_errors: list[Exception] = []
         deferred_em_vault: list[tuple[str, str, str, Decimal, str, Decimal, Decimal | None]] = []
         v_snap_em = self._read_vault_snapshot_outside_lock()
         with self._lock:
@@ -2437,71 +2493,177 @@ class AutonomousAiTrader:
             total_eq = self._router.barbell.total_equity(equities)
             peak_eq = self._router.peak_equity() or total_eq
             for broker_id, venue in list(self._router.venues.items()):
-                if not isinstance(venue, Mt5PaperBrokerVenue) or venue.account is None:
-                    continue
-                venue.probe()
-                for pos in venue.positions:
-                    self._cycle_seq += 1
-                    st_ref = self._build_state_ref(ts)
-                    tick = venue._transport.symbol_tick(pos.symbol)
-                    units = venue._calc.lots_to_units(pos.volume_lots, symbol=pos.symbol)
-                    action_ref = f"overseer-close-{pos.ticket}-{self._cycle_seq}"
-                    intent = ActionIntent(
-                        intent_id=f"intent-{action_ref}",
-                        scope=self._scope,
-                        decision_id=f"dec-{action_ref}",
-                        opportunity_id=f"opp-{action_ref}",
-                        action_ref=action_ref,
-                        source_state=st_ref,
-                        kind=ActionKind.CLOSE,
-                        instrument_id=pos.symbol,
-                        origin=DecisionOrigin.OWNER_REVIEWED,
-                        created_at=ts,
-                        expires_at=st_ref.valid_until,
-                        quantity=units,
-                        side=Side.SELL if pos.side is Side.BUY else Side.BUY,
-                        target_id=pos.ticket,
-                        target_version=1,
-                    )
-                    dec = self._make_valve_request_and_clear(
-                        intent=intent,
-                        strategy_id="overseer-emergency-close",
-                        timeframe="M1",
-                        label=f"Close {pos.ticket}",
-                        reason=reason,
-                        bid=tick.bid,
-                        ask=tick.ask,
-                        total_eq=total_eq,
-                        peak_eq=peak_eq,
-                        position_side=pos.side,
-                        now=ts,
-                    )
-                    order = OrderIntent.from_action_intent(intent, symbol=pos.symbol, position_ticket=pos.ticket)
-                    self._router.execute_management(broker_id, order, valve_decision=dec)
-                    eq_em_after = self._router.barbell.total_equity(self._router.equities())
-                    ps_em = self._principal_surplus_metrics(eq_em_after, v_snap=v_snap_em)
-                    q_em = self._quota.record_realized_trade(
-                        pos.profit,
-                        symbol=pos.symbol,
-                        ticket=pos.ticket,
-                        trade_id=pos.ticket,
-                        broker_id=broker_id,
-                        starting_equity=eq_em_after,
-                        now=ts,
-                        in_recovery_mode=bool(ps_em["in_recovery_mode"]),
-                    )
-                    if pos.profit > Decimal("0"):
-                        deferred_em_vault.append((
-                            pos.ticket,
-                            pos.symbol,
-                            broker_id,
-                            pos.profit,
-                            str(q_em.get("session_date", "")),
-                            eq_em_after,
-                            ps_em["configured_initial_capital_usd"],
-                        ))
-                    self._open_position_meta.pop(pos.ticket, None)
-                    closed_tickets.append(pos.ticket)
+                if isinstance(venue, Mt5PaperBrokerVenue):
+                    if venue.account is None:
+                        continue
+                    try:
+                        venue.probe()
+                        open_positions = tuple(venue.positions)
+                    except Exception as exc_probe:
+                        close_errors.append(exc_probe)
+                        continue
+                    for pos in open_positions:
+                        try:
+                            self._cycle_seq += 1
+                            st_ref = self._build_state_ref(ts)
+                            tick = venue._transport.symbol_tick(pos.symbol)
+                            units = venue._calc.lots_to_units(pos.volume_lots, symbol=pos.symbol)
+                            action_ref = f"overseer-close-{pos.ticket}-{self._cycle_seq}"
+                            intent = ActionIntent(
+                                intent_id=f"intent-{action_ref}",
+                                scope=self._scope,
+                                decision_id=f"dec-{action_ref}",
+                                opportunity_id=f"opp-{action_ref}",
+                                action_ref=action_ref,
+                                source_state=st_ref,
+                                kind=ActionKind.CLOSE,
+                                instrument_id=pos.symbol,
+                                origin=DecisionOrigin.OWNER_REVIEWED,
+                                created_at=ts,
+                                expires_at=st_ref.valid_until,
+                                quantity=units,
+                                side=Side.SELL if pos.side is Side.BUY else Side.BUY,
+                                target_id=pos.ticket,
+                                target_version=1,
+                            )
+                            dec = self._make_valve_request_and_clear(
+                                intent=intent,
+                                strategy_id="overseer-emergency-close",
+                                timeframe="M1",
+                                label=f"Close {pos.ticket}",
+                                reason=reason,
+                                bid=tick.bid,
+                                ask=tick.ask,
+                                total_eq=total_eq,
+                                peak_eq=peak_eq,
+                                position_side=pos.side,
+                                now=ts,
+                            )
+                            order = OrderIntent.from_action_intent(intent, symbol=pos.symbol, position_ticket=pos.ticket)
+                            self._router.execute_management(broker_id, order, valve_decision=dec)
+                            eq_em_after = self._router.barbell.total_equity(self._router.equities())
+                            ps_em = self._principal_surplus_metrics(eq_em_after, v_snap=v_snap_em)
+                            q_em = self._quota.record_realized_trade(
+                                pos.profit,
+                                symbol=pos.symbol,
+                                ticket=pos.ticket,
+                                trade_id=pos.ticket,
+                                broker_id=broker_id,
+                                starting_equity=eq_em_after,
+                                now=ts,
+                                in_recovery_mode=bool(ps_em["in_recovery_mode"]),
+                            )
+                            if pos.profit > Decimal("0"):
+                                deferred_em_vault.append((
+                                    pos.ticket,
+                                    pos.symbol,
+                                    broker_id,
+                                    pos.profit,
+                                    str(q_em.get("session_date", "")),
+                                    eq_em_after,
+                                    ps_em["configured_initial_capital_usd"],
+                                ))
+                            self._open_position_meta.pop(pos.ticket, None)
+                            closed_tickets.append(pos.ticket)
+                        except Exception as exc_close:
+                            close_errors.append(exc_close)
+                elif isinstance(venue, OandaPracticeFallbackVenue):
+                    if venue.summary is None:
+                        continue
+                    try:
+                        oanda_positions = tuple(venue.positions(now=ts, refresh=True))
+                    except Exception as exc_oprobe:
+                        close_errors.append(exc_oprobe)
+                        continue
+                    for pos in oanda_positions:
+                        try:
+                            self._cycle_seq += 1
+                            st_ref = self._build_state_ref(ts)
+                            exact_units = venue.position_units(pos.ticket) if callable(getattr(venue, "position_units", None)) else None
+                            if exact_units is None or exact_units <= Decimal("0"):
+                                csize = (
+                                    MT5_GOLD_CONTRACT_SIZE
+                                    if pos.symbol == "XAUUSD"
+                                    else (MT5_INDEX_CONTRACT_SIZE if pos.symbol in INDEX_INSTRUMENTS else MT5_CONTRACT_SIZE)
+                                )
+                                exact_units = (pos.volume_lots * csize).normalize()
+                            try:
+                                o_bid, o_ask = venue.symbol_quote(pos.symbol, now=ts)
+                            except Exception:
+                                fallback_px = pos.price_open if pos.price_open > Decimal("0") else Decimal("1")
+                                o_bid, o_ask = fallback_px, fallback_px
+                            action_ref = f"overseer-close-oanda-{pos.ticket}-{self._cycle_seq}"
+                            intent = ActionIntent(
+                                intent_id=f"intent-{action_ref}",
+                                scope=self._scope,
+                                decision_id=f"dec-{action_ref}",
+                                opportunity_id=f"opp-{action_ref}",
+                                action_ref=action_ref,
+                                source_state=st_ref,
+                                kind=ActionKind.CLOSE,
+                                instrument_id=pos.symbol,
+                                origin=DecisionOrigin.OWNER_REVIEWED,
+                                created_at=ts,
+                                expires_at=st_ref.valid_until,
+                                quantity=exact_units,
+                                side=Side.SELL if pos.side is Side.BUY else Side.BUY,
+                                target_id=pos.ticket,
+                                target_version=1,
+                            )
+                            dec = self._make_valve_request_and_clear(
+                                intent=intent,
+                                strategy_id="overseer-emergency-close",
+                                timeframe="M1",
+                                label=f"Close OANDA {pos.ticket}",
+                                reason=reason,
+                                bid=o_bid,
+                                ask=o_ask,
+                                total_eq=total_eq,
+                                peak_eq=peak_eq,
+                                position_side=pos.side,
+                                now=ts,
+                            )
+                            order = OrderIntent.from_action_intent(intent, symbol=pos.symbol, position_ticket=pos.ticket)
+                            exec_res = self._router.execute_management(broker_id, order, valve_decision=dec)
+                            realized_pnl = pos.profit
+                            o_rcpt = exec_res.oanda_receipt if isinstance(exec_res.oanda_receipt, Mapping) else None
+                            if o_rcpt is not None:
+                                for pnl_key in ("realized_pnl", "pl"):
+                                    raw_pl = o_rcpt.get(pnl_key)
+                                    if raw_pl is not None and str(raw_pl).strip():
+                                        try:
+                                            parsed_pl = Decimal(str(raw_pl))
+                                            if parsed_pl.is_finite():
+                                                realized_pnl = parsed_pl
+                                                break
+                                        except (InvalidOperation, ValueError, TypeError):
+                                            logger.debug("Ignored non-decimal OANDA realized_pnl field %r", pnl_key)
+                            eq_em_after = self._router.barbell.total_equity(self._router.equities())
+                            ps_em = self._principal_surplus_metrics(eq_em_after, v_snap=v_snap_em)
+                            q_em = self._quota.record_realized_trade(
+                                realized_pnl,
+                                symbol=pos.symbol,
+                                ticket=pos.ticket,
+                                trade_id=pos.ticket,
+                                broker_id=broker_id,
+                                starting_equity=eq_em_after,
+                                now=ts,
+                                in_recovery_mode=bool(ps_em["in_recovery_mode"]),
+                            )
+                            if realized_pnl > Decimal("0"):
+                                deferred_em_vault.append((
+                                    pos.ticket,
+                                    pos.symbol,
+                                    broker_id,
+                                    realized_pnl,
+                                    str(q_em.get("session_date", "")),
+                                    eq_em_after,
+                                    ps_em["configured_initial_capital_usd"],
+                                ))
+                            self._open_position_meta.pop(pos.ticket, None)
+                            closed_tickets.append(pos.ticket)
+                        except Exception as exc_oclose:
+                            close_errors.append(exc_oclose)
         if closed_tickets and self._profit_vault is not None:
             try:
                 for t_id, sym_e, brk_e, pnl_e, sdate_e, eq_e, cap_e in deferred_em_vault:
@@ -2520,6 +2682,8 @@ class AutonomousAiTrader:
                 with self._lock:
                     self._last_vault_sync_error = type(exc_vsync).__name__
                 logger.warning("emergency_close_all post-lock vault sync deferred: %s", type(exc_vsync).__name__)
+        if close_errors:
+            raise close_errors[0]
         snap = self.status_snapshot(now=ts)
         snap["closed_tickets"] = closed_tickets
         return assert_safe_ai_catalog_payload(snap)

@@ -182,8 +182,8 @@ class Pr19ProfitRatchetAndRespiteTests(unittest.TestCase):
             router = DualShieldBrokerRouter(
                 environ={
                     ENV_EXECUTION_MODE: EXECUTION_MODE_DEMO,
-                    "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "5.00",
-                    "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.20",
+                    "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "1.00",
+                    "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.10",
                 },
                 valve_gate=GATE,
                 oracle=oracle,

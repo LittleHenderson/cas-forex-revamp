@@ -24,11 +24,17 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from enum import StrEnum
 from hashlib import sha256
+import hmac
+import http.client
 import ipaddress
 import json
+import os
+from pathlib import Path
 import re
 import socket
 import ssl
+import stat
+import struct
 from threading import Lock
 import time
 from typing import Any, Callable, Mapping, TypeVar
@@ -37,11 +43,13 @@ import urllib.parse
 import urllib.request
 
 from cas_forex_revamp.contracts import ContractError, canonical_bytes, content_digest, decimal_text
-from cas_forex_revamp.contracts.primitives import decimal_value, integer, utc_time
+from cas_forex_revamp.contracts.primitives import decimal_value, digest, integer, utc_time
 
 from .decisions import OperatorUnavailable
 from .model import (
+    DurableModelExecutionGate,
     InferenceReply,
+    LOCAL_ZERO_COST_MODELS,
     ModelBackend,
     ModelInvocation,
     ModelSpecification,
@@ -611,21 +619,512 @@ def default_frontier_https_post(
     return status, raw
 
 
+OLLAMA_SUPERVISOR_AUTH_HEADER = "X-CAS-Ollama-Supervisor-Token"
+OLLAMA_RECEIPT_DOMAIN = b"cas-forex-supervised-ollama-receipt-v1\x00"
+OLLAMA_RECEIPT_ALGORITHMS = frozenset({"Ed25519", "HMAC-SHA256"})
+
+
+def _is_ollama_model_id(model_id: str | None) -> bool:
+    if not isinstance(model_id, str):
+        return False
+    low = model_id.strip().lower().removeprefix("models/")
+    return low in LOCAL_ZERO_COST_MODELS or low in ("qwen3:0.6b", "qwen3-0.6b", "cas-qwen3-0.6b")
+
+
+def reject_preexisting_ollama_listener(
+    host: str = "127.0.0.1",
+    port: int = 11434,
+    *,
+    timeout_seconds: float = 0.25,
+) -> None:
+    """Fail closed if a pre-existing foreign listener is already bound on (host, port)."""
+    clean_port = integer(port, "port", minimum=1)
+    if clean_port > 65535:
+        raise FrontierConfigurationError("port must be in 1..65535")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(max(0.05, float(timeout_seconds)))
+        rc = sock.connect_ex((host, clean_port))
+    if rc == 0:
+        raise FrontierConfigurationError(
+            f"OLLAMA_PREEXISTING_FOREIGN_LISTENER: refused pre-existing listener at {host}:{clean_port}"
+        )
+
+
+def _hash_artifact_file(path: Path, label: str) -> str:
+    if not isinstance(path, Path):
+        raise FrontierTransportError(f"OLLAMA_ARTIFACT_INVALID_PATH: {label}")
+    if path.is_symlink() or not path.is_file():
+        raise FrontierTransportError(f"OLLAMA_ARTIFACT_MISSING_OR_SYMLINK: {label}")
+    h = sha256()
+    try:
+        with path.open("rb") as fh:
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except OSError as exc:
+        raise FrontierTransportError(f"OLLAMA_ARTIFACT_READ_FAILED: {label} ({type(exc).__name__})") from None
+    return h.hexdigest()
+
+
+def _verify_pid_alive(pid: int, start_time: str) -> bool:
+    if type(pid) is not int or pid <= 0:
+        return False
+    if os.name == "posix":
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        if start_time.startswith("bootticks:"):
+            expected_ticks = start_time[len("bootticks:"):].strip()
+            try:
+                raw = Path(f"/proc/{pid}/stat").read_bytes()
+                end = raw.rfind(b")")
+                if end <= 0:
+                    return False
+                fields = raw[end + 2:].split()
+                actual_ticks = fields[19].decode("ascii")
+                return hmac.compare_digest(actual_ticks, expected_ticks)
+            except (OSError, IndexError, UnicodeDecodeError):
+                return False
+        return True
+    # On Windows, confirm current process or query process liveness via kernel32.
+    if pid == os.getpid():
+        return True
+    try:
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong(0)
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            return bool(ok and exit_code.value == 259)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
+def _receipt_signing_payload(
+    *,
+    receipt_id: str,
+    invocation_sha256: str,
+    model_id: str,
+    artifact_sha256: str,
+    response_sha256: str,
+    pid: int,
+    start_time: str,
+) -> bytes:
+    body = {
+        "artifact_sha256": artifact_sha256,
+        "invocation_sha256": invocation_sha256,
+        "model_id": model_id,
+        "pid": pid,
+        "receipt_id": receipt_id,
+        "response_sha256": response_sha256,
+        "start_time": start_time,
+    }
+    return OLLAMA_RECEIPT_DOMAIN + canonical_bytes(body)
+
+
+class SupervisedOllamaReceiptSigner:
+    """Independent supervisor-held receipt signer (NEVER passed to FrontierChatBackend)."""
+
+    def __init__(
+        self,
+        *,
+        algorithm: str = "Ed25519",
+        signing_key: bytes,
+        pid: int,
+        start_time: str,
+    ) -> None:
+        if algorithm not in OLLAMA_RECEIPT_ALGORITHMS:
+            raise FrontierConfigurationError(f"receipt algorithm must be one of {sorted(OLLAMA_RECEIPT_ALGORITHMS)}")
+        if not isinstance(signing_key, (bytes, bytearray)):
+            raise FrontierConfigurationError("signing_key must be bytes")
+        raw_key = bytes(signing_key)
+        if len(raw_key) < 32:
+            raise FrontierConfigurationError("signing_key must be at least 32 bytes")
+        if algorithm == "Ed25519" and len(raw_key) != 32:
+            raise FrontierConfigurationError("Ed25519 private signing_key must be 32 raw seed bytes")
+        self._algorithm = algorithm
+        self._signing_key = raw_key
+        self._pid = integer(pid, "pid", minimum=1)
+        if not isinstance(start_time, str) or not start_time.strip():
+            raise FrontierConfigurationError("start_time must be a non-empty string")
+        self._start_time = start_time.strip()
+
+    def __repr__(self) -> str:
+        return f"SupervisedOllamaReceiptSigner(algorithm={self._algorithm!r}, pid={self._pid}, redacted=True)"
+
+    def public_verify_key(self) -> bytes:
+        if self._algorithm == "Ed25519":
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+            priv = Ed25519PrivateKey.from_private_bytes(self._signing_key)
+            return priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        return self._signing_key
+
+    def sign_receipt(
+        self,
+        *,
+        receipt_id: str,
+        invocation_sha256: str,
+        model_id: str,
+        artifact_sha256: str,
+        response_sha256: str,
+    ) -> dict[str, Any]:
+        digest(invocation_sha256, "invocation_sha256")
+        digest(artifact_sha256, "artifact_sha256")
+        digest(response_sha256, "response_sha256")
+        msg = _receipt_signing_payload(
+            receipt_id=receipt_id,
+            invocation_sha256=invocation_sha256,
+            model_id=model_id,
+            artifact_sha256=artifact_sha256,
+            response_sha256=response_sha256,
+            pid=self._pid,
+            start_time=self._start_time,
+        )
+        if self._algorithm == "Ed25519":
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+            sig = Ed25519PrivateKey.from_private_bytes(self._signing_key).sign(msg)
+        else:
+            sig = hmac.new(self._signing_key, msg, sha256).digest()
+        return {
+            "algorithm": self._algorithm,
+            "receipt_id": receipt_id,
+            "invocation_sha256": invocation_sha256,
+            "model_id": model_id,
+            "artifact_sha256": artifact_sha256,
+            "response_sha256": response_sha256,
+            "pid": self._pid,
+            "start_time": self._start_time,
+            "signature_hex": sig.hex(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SupervisedOllamaBinding:
+    """Explicit supervised local Ollama handle binding process, artifacts, auth secret, and receipt key."""
+
+    pid: int
+    start_time: str
+    executable_sha256: str
+    model_manifest_sha256: str
+    weights_sha256: str
+    template_sha256: str
+    tokenizer_sha256: str
+    endpoint_url: str
+    auth_secret: _RedactedSecret | str
+    receipt_verify_key: bytes
+    receipt_algorithm: str = "Ed25519"
+    model_id: str = "qwen3:0.6b"
+    executable_path: Path | None = None
+    manifest_path: Path | None = None
+    weights_path: Path | None = None
+    template_path: Path | None = None
+    tokenizer_path: Path | None = None
+    process_verifier: Callable[["SupervisedOllamaBinding"], bool] | None = None
+    artifact_verifier: Callable[["SupervisedOllamaBinding"], bool] | None = None
+    listener_ownership_verifier: Callable[["SupervisedOllamaBinding"], bool] | None = None
+
+    def __post_init__(self) -> None:
+        integer(self.pid, "pid", minimum=1)
+        if not isinstance(self.start_time, str) or not self.start_time.strip():
+            raise FrontierConfigurationError("SupervisedOllamaBinding requires non-empty start_time")
+        for field_name in (
+            "executable_sha256",
+            "model_manifest_sha256",
+            "weights_sha256",
+            "template_sha256",
+            "tokenizer_sha256",
+        ):
+            digest(getattr(self, field_name), field_name)
+        _validate_slug(self.model_id, "SupervisedOllamaBinding.model_id")
+        if self.receipt_algorithm not in OLLAMA_RECEIPT_ALGORITHMS:
+            raise FrontierConfigurationError(
+                f"receipt_algorithm must be one of {sorted(OLLAMA_RECEIPT_ALGORITHMS)}"
+            )
+        if not isinstance(self.receipt_verify_key, (bytes, bytearray)):
+            raise FrontierConfigurationError("receipt_verify_key must be bytes")
+        vkey = bytes(self.receipt_verify_key)
+        if self.receipt_algorithm == "Ed25519" and len(vkey) != 32:
+            raise FrontierConfigurationError("Ed25519 receipt_verify_key must be 32 raw public key bytes")
+        if self.receipt_algorithm == "HMAC-SHA256" and len(vkey) < 32:
+            raise FrontierConfigurationError("HMAC-SHA256 receipt_verify_key must be at least 32 bytes")
+        object.__setattr__(self, "receipt_verify_key", vkey)
+
+        if isinstance(self.auth_secret, _RedactedSecret):
+            raw_secret = self.auth_secret.reveal_for_header()
+            sec_obj = self.auth_secret
+        elif isinstance(self.auth_secret, str):
+            raw_secret = self.auth_secret.strip()
+            sec_obj = _RedactedSecret(raw_secret)
+        else:
+            raise FrontierConfigurationError("auth_secret must be a non-empty string or _RedactedSecret")
+        if len(raw_secret) < 32:
+            raise FrontierConfigurationError(
+                "SupervisedOllamaBinding auth_secret must be at least 32 high-entropy characters"
+            )
+        object.__setattr__(self, "auth_secret", sec_obj)
+
+        # Validate per-launch supervised endpoint; strictly forbid shared default 127.0.0.1:11434!
+        if not isinstance(self.endpoint_url, str) or not self.endpoint_url.strip():
+            raise FrontierConfigurationError("SupervisedOllamaBinding requires endpoint_url")
+        ep = self.endpoint_url.strip()
+        if ep.startswith("unix://"):
+            sock_path_str = ep[len("unix://"):]
+            if not sock_path_str or ".." in Path(sock_path_str).parts or not Path(sock_path_str).is_absolute():
+                raise FrontierConfigurationError("unix:// Ollama endpoint must be an absolute normalized socket path")
+        else:
+            parsed = urllib.parse.urlsplit(ep)
+            if (
+                parsed.scheme != "http"
+                or parsed.hostname != "127.0.0.1"
+                or parsed.port is None
+                or parsed.path != "/api/chat"
+                or parsed.query
+                or parsed.fragment
+                or parsed.username is not None
+                or parsed.password is not None
+            ):
+                raise FrontierConfigurationError(
+                    "SupervisedOllamaBinding endpoint_url must be http://127.0.0.1:<dedicated_port>/api/chat or unix://<abs_path>"
+                )
+            if int(parsed.port) == 11434 or not (1024 <= int(parsed.port) <= 65535):
+                raise FrontierConfigurationError(
+                    "OLLAMA_SHARED_DEFAULT_PORT_FORBIDDEN: 127.0.0.1:11434 is forbidden; bind a dedicated supervised port"
+                )
+
+    def __repr__(self) -> str:
+        return (
+            f"SupervisedOllamaBinding(pid={self.pid}, model_id={self.model_id!r}, "
+            f"endpoint_url={self.endpoint_url!r}, redacted=True)"
+        )
+
+    def auth_headers(self) -> dict[str, str]:
+        sec = self.auth_secret
+        raw = sec.reveal_for_header() if isinstance(sec, _RedactedSecret) else str(sec)
+        return {OLLAMA_SUPERVISOR_AUTH_HEADER: raw}
+
+    def artifact_digest(self) -> str:
+        return content_digest({
+            "endpoint_url": self.endpoint_url,
+            "executable_sha256": self.executable_sha256,
+            "model_id": self.model_id,
+            "model_manifest_sha256": self.model_manifest_sha256,
+            "pid": self.pid,
+            "start_time": self.start_time,
+            "template_sha256": self.template_sha256,
+            "tokenizer_sha256": self.tokenizer_sha256,
+            "weights_sha256": self.weights_sha256,
+        })
+
+    def verify_artifacts(self) -> None:
+        if self.artifact_verifier is not None:
+            if self.artifact_verifier(self) is not True:
+                raise FrontierTransportError("OLLAMA_ARTIFACT_VERIFICATION_FAILED: supervised model artifacts rejected")
+        path_checks = (
+            ("executable", self.executable_path, self.executable_sha256),
+            ("manifest", self.manifest_path, self.model_manifest_sha256),
+            ("weights", self.weights_path, self.weights_sha256),
+            ("template", self.template_path, self.template_sha256),
+            ("tokenizer", self.tokenizer_path, self.tokenizer_sha256),
+        )
+        for label, fpath, expected_sha in path_checks:
+            if fpath is not None:
+                actual_sha = _hash_artifact_file(Path(fpath), label)
+                if not hmac.compare_digest(actual_sha, expected_sha):
+                    raise FrontierTransportError(
+                        f"OLLAMA_ARTIFACT_HASH_MISMATCH: {label} digest mismatch"
+                    )
+
+    def verify_process_and_listener(self) -> None:
+        if self.process_verifier is not None:
+            if self.process_verifier(self) is not True:
+                raise FrontierTransportError("OLLAMA_PROCESS_IDENTITY_MISMATCH: supervised process verification failed")
+        elif not _verify_pid_alive(self.pid, self.start_time):
+            raise FrontierTransportError(
+                f"OLLAMA_PROCESS_IDENTITY_MISMATCH: bound pid {self.pid} is not active or start_time mismatched"
+            )
+        if self.listener_ownership_verifier is not None:
+            if self.listener_ownership_verifier(self) is not True:
+                raise FrontierTransportError(
+                    "OLLAMA_FOREIGN_LISTENER_DETECTED: endpoint listener does not match supervised process"
+                )
+        if self.endpoint_url.startswith("unix://") and os.name == "posix":
+            sock_path = Path(self.endpoint_url[len("unix://"):])
+            try:
+                st = sock_path.lstat()
+            except OSError:
+                raise FrontierTransportError("OLLAMA_UNIX_SOCKET_MISSING: bound socket unavailable") from None
+            if (
+                not stat.S_ISSOCK(st.st_mode)
+                or st.st_uid != os.getuid()
+                or (st.st_mode & 0o077) != 0
+            ):
+                raise FrontierTransportError(
+                    "OLLAMA_UNIX_SOCKET_CUSTODY_FAILED: socket must be owner-only 0600"
+                )
+
+    def verify_binding(self) -> None:
+        self.verify_process_and_listener()
+        self.verify_artifacts()
+
+    def is_bound_and_verified(self) -> bool:
+        try:
+            self.verify_binding()
+            return True
+        except Exception:
+            return False
+
+
+def verify_supervised_ollama_receipt(
+    receipt: Mapping[str, Any] | None,
+    *,
+    binding: SupervisedOllamaBinding,
+    reply: InferenceReply,
+    invocation: ModelInvocation,
+) -> bool:
+    """Cryptographically verify an independently signed supervisor invocation receipt."""
+    if not isinstance(receipt, Mapping):
+        return False
+    expected_inv_sha = content_digest(invocation)
+    expected_resp_sha = sha256(reply.raw_selection_json.encode("utf-8")).hexdigest()
+    if receipt.get("algorithm") != binding.receipt_algorithm:
+        return False
+    if receipt.get("receipt_id") != reply.receipt_id:
+        return False
+    if receipt.get("invocation_sha256") != expected_inv_sha or reply.invocation_sha256 != expected_inv_sha:
+        return False
+    if receipt.get("model_id") != invocation.model.model_id or reply.model.model_id != invocation.model.model_id:
+        return False
+    if (
+        receipt.get("artifact_sha256") != invocation.model.artifact_sha256
+        or reply.model.artifact_sha256 != invocation.model.artifact_sha256
+    ):
+        return False
+    if receipt.get("response_sha256") != expected_resp_sha:
+        return False
+    if receipt.get("pid") != binding.pid or receipt.get("start_time") != binding.start_time:
+        return False
+    sig_hex = receipt.get("signature_hex")
+    if not isinstance(sig_hex, str) or not sig_hex.strip():
+        return False
+    try:
+        sig_bytes = bytes.fromhex(sig_hex)
+    except ValueError:
+        return False
+
+    msg = _receipt_signing_payload(
+        receipt_id=reply.receipt_id,
+        invocation_sha256=expected_inv_sha,
+        model_id=invocation.model.model_id,
+        artifact_sha256=invocation.model.artifact_sha256,
+        response_sha256=expected_resp_sha,
+        pid=binding.pid,
+        start_time=binding.start_time,
+    )
+    if binding.receipt_algorithm == "Ed25519":
+        if len(sig_bytes) != 64:
+            return False
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+            Ed25519PublicKey.from_public_bytes(binding.receipt_verify_key).verify(sig_bytes, msg)
+            return True
+        except Exception:
+            return False
+    expected_mac = hmac.new(binding.receipt_verify_key, msg, sha256).digest()
+    return len(sig_bytes) == 32 and hmac.compare_digest(expected_mac, sig_bytes)
+
+
+class _UnixSupervisedHttpConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path: str, *, expected_pid: int, timeout: float) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self._socket_path = socket_path
+        self._expected_pid = expected_pid
+
+    def connect(self) -> None:
+        if os.name != "posix" or not hasattr(socket, "AF_UNIX"):
+            raise FrontierTransportError("Unix domain socket transport requires POSIX")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect(self._socket_path)
+            if hasattr(socket, "SO_PEERCRED"):
+                creds = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+                if creds[0] != self._expected_pid or creds[1] != os.getuid():
+                    raise FrontierTransportError(
+                        "OLLAMA_FOREIGN_LISTENER_DETECTED: Unix socket peer PID/UID mismatch"
+                    )
+        except Exception:
+            sock.close()
+            raise
+        self.sock = sock
+
+
 def default_ollama_loopback_post(
     url: str,
     headers: dict[str, str],
     body: bytes,
     timeout_seconds: float,
     max_wire_bytes: int,
+    *,
+    supervised_binding: SupervisedOllamaBinding | None = None,
 ) -> tuple[int, bytes]:
-    """Execute one loopback-only Ollama v0.40.2 fallback POST without redirects."""
+    """Execute one authenticated POST strictly to a verified SupervisedOllamaBinding endpoint."""
+    if supervised_binding is None:
+        raise FrontierConfigurationError(
+            "OLLAMA_UNSUPERVISED_ENDPOINT_FORBIDDEN: unauthenticated 127.0.0.1:11434 fallback is forbidden; SupervisedOllamaBinding required"
+        )
+    supervised_binding.verify_binding()
+    if url != supervised_binding.endpoint_url:
+        raise FrontierConfigurationError(
+            "Ollama fallback URL must exactly match SupervisedOllamaBinding.endpoint_url"
+        )
+
+    req_headers = dict(headers)
+    req_headers.update(supervised_binding.auth_headers())
+
+    if url.startswith("unix://"):
+        sock_path = url[len("unix://"):]
+        conn = _UnixSupervisedHttpConnection(sock_path, expected_pid=supervised_binding.pid, timeout=timeout_seconds)
+        try:
+            conn.request("POST", "/api/chat", body=body, headers=req_headers)
+            resp = conn.getresponse()
+            status = int(resp.status)
+            raw = resp.read(max_wire_bytes + 1)
+        except FrontierTransportError:
+            raise
+        except (TimeoutError, OSError, http.client.HTTPException) as exc:
+            raise FrontierTransportError(
+                f"Ollama supervised socket unavailable: {type(exc).__name__}",
+                retryable=True,
+            ) from None
+        finally:
+            req_headers.clear()
+            conn.close()
+        if len(raw) > max_wire_bytes:
+            raise FrontierTransportError("Ollama fallback response exceeded byte limit")
+        return status, raw
+
     parsed = urllib.parse.urlsplit(url)
-    if url != OLLAMA_LOOPBACK_ENDPOINT or parsed.hostname != "127.0.0.1" or parsed.port != 11434:
-        raise FrontierConfigurationError("Ollama fallback is restricted to 127.0.0.1:11434/api/chat")
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None or int(parsed.port) == 11434 or parsed.path != "/api/chat":
+        raise FrontierConfigurationError(
+            "Ollama fallback requires a dedicated supervised loopback endpoint (port 11434 forbidden)"
+        )
     opener = urllib.request.build_opener(_NoRedirectHandler())
-    req = urllib.request.Request(url, data=body, headers=dict(headers), method="POST")
+    req = urllib.request.Request(url, data=body, headers=req_headers, method="POST")
     try:
-        with opener.open(req, timeout=timeout_seconds) as resp:  # nosec B310: pinned loopback http://127.0.0.1:11434/api/chat endpoint
+        with opener.open(req, timeout=timeout_seconds) as resp:  # nosec B310: verified dedicated supervised 127.0.0.1 endpoint with per-launch auth secret
             status = int(getattr(resp, "status", 200))
             raw = resp.read(max_wire_bytes + 1)
     except urllib.error.HTTPError as exc:
@@ -643,6 +1142,7 @@ def default_ollama_loopback_post(
             retryable=True,
         ) from None
     finally:
+        req_headers.clear()
         req.headers.clear()
         req.unredirected_hdrs.clear()
     if len(raw) > max_wire_bytes:
@@ -848,6 +1348,87 @@ def _extract_provider_input_units(
         if prompt_cnt is not None:
             return prompt_cnt
     return max(0, int(fallback_input_units))
+
+
+def _extract_confirmed_provider_usage(
+    provider: str,
+    doc: Mapping[str, Any],
+) -> tuple[int, int] | None:
+    """Return provider-reported (input_tokens, output_tokens) ONLY when explicitly attested."""
+    if provider == "anthropic":
+        usage = doc.get("usage")
+        if isinstance(usage, Mapping):
+            in_tok = _safe_non_neg_int(usage.get("input_tokens"))
+            out_tok = _safe_non_neg_int(usage.get("output_tokens"))
+            if in_tok is not None and out_tok is not None:
+                cache_create = _safe_non_neg_int(usage.get("cache_creation_input_tokens")) or 0
+                cache_read = _safe_non_neg_int(usage.get("cache_read_input_tokens")) or 0
+                return in_tok + cache_create + cache_read, out_tok
+        return None
+    if provider == "gemini":
+        meta = doc.get("usageMetadata")
+        if isinstance(meta, Mapping):
+            in_tok = _safe_non_neg_int(meta.get("promptTokenCount"))
+            cand_tok = _safe_non_neg_int(meta.get("candidatesTokenCount"))
+            if in_tok is not None and cand_tok is not None:
+                thought_tok = _safe_non_neg_int(meta.get("thoughtsTokenCount")) or 0
+                return in_tok, cand_tok + thought_tok
+        return None
+    if provider == "gemini_decision":
+        meta = doc.get("usageMetadata")
+        if isinstance(meta, Mapping):
+            in_tok = _safe_non_neg_int(meta.get("promptTokenCount"))
+            if in_tok is not None:
+                return in_tok, 0
+        usage = doc.get("usage")
+        if isinstance(usage, Mapping):
+            for key in ("input_tokens", "prompt_tokens"):
+                in_tok = _safe_non_neg_int(usage.get(key))
+                if in_tok is not None:
+                    return in_tok, 0
+        return None
+    if provider in ("openai", "deepseek"):
+        usage = doc.get("usage")
+        if isinstance(usage, Mapping):
+            in_tok = _safe_non_neg_int(usage.get("prompt_tokens"))
+            out_tok = _safe_non_neg_int(usage.get("completion_tokens"))
+            if in_tok is not None and out_tok is not None:
+                return in_tok, out_tok
+        return None
+    if provider == "ollama":
+        in_tok = _safe_non_neg_int(doc.get("prompt_eval_count"))
+        out_tok = _safe_non_neg_int(doc.get("eval_count"))
+        if in_tok is not None and out_tok is not None:
+            return in_tok, out_tok
+        return None
+    return None
+
+
+def _effective_max_output_tokens(
+    entry: FrontierModelCatalogEntry,
+    api_slug: str,
+    invocation: ModelInvocation,
+) -> int:
+    """Return the exact worst-case billable output tokens implied by the wire request."""
+    max_tokens = int(invocation.budget.max_generated_tokens_per_call)
+    effort = str(getattr(invocation.model, "reasoning_effort", "low") or "low").strip().lower()
+    if entry.provider == "anthropic":
+        low_slug = api_slug.lower()
+        is_legacy_claude = "-4-" in low_slug or low_slug.endswith("-4") or low_slug.startswith("claude-3")
+        if is_legacy_claude:
+            if effort in ("medium", "high"):
+                think_budget = 2048 if effort == "medium" else 6144
+                return max(max_tokens, think_budget + 1024)
+            return max_tokens
+        ant_effort = effort if effort in ("low", "medium", "high") else "low"
+        min_tok = 1024 if ant_effort == "low" else (4096 if ant_effort == "medium" else 8192)
+        return max(max_tokens, min_tok)
+    if entry.provider == "gemini_decision":
+        return 0
+    if entry.provider == "gemini":
+        think_budget = 2048 if effort == "medium" else (6144 if effort == "high" else 256)
+        return max_tokens + think_budget
+    return max_tokens
 
 
 def _is_retryable_http_status(status_code: int) -> bool:
@@ -1155,6 +1736,8 @@ def _build_provider_payload(
     api_slug: str,
     invocation: ModelInvocation,
     secret: _RedactedSecret | None,
+    *,
+    supervised_ollama: SupervisedOllamaBinding | None = None,
 ) -> tuple[str, dict[str, str], bytes]:
     max_tokens = invocation.budget.max_generated_tokens_per_call
     user_content = invocation.packet_json
@@ -1276,6 +1859,11 @@ def _build_provider_payload(
         return url, headers, canonical_bytes(body_obj)
 
     if entry.provider == "ollama":
+        if supervised_ollama is None:
+            raise FrontierConfigurationError(
+                "OLLAMA_UNSUPERVISED_ENDPOINT_FORBIDDEN: SupervisedOllamaBinding required for local Ollama inference"
+            )
+        headers.update(supervised_ollama.auth_headers())
         body_obj = {
             "model": api_slug,
             "stream": False,
@@ -1287,7 +1875,7 @@ def _build_provider_payload(
                 {"role": "user", "content": user_content},
             ],
         }
-        return OLLAMA_LOOPBACK_ENDPOINT, headers, canonical_bytes(body_obj)
+        return supervised_ollama.endpoint_url, headers, canonical_bytes(body_obj)
 
     raise FrontierConfigurationError(f"unknown provider {entry.provider!r}")
 
@@ -1344,19 +1932,61 @@ def _extract_gemini_cand_text(raw_doc: dict[str, Any]) -> str:
 
 
 class FrontierReceiptVerifier:
-    """Independently verifies that each FrontierChatBackend reply matches its recorded invocation."""
+    """Verifies frontier replies and requires independent supervisor signatures for local Ollama fallback."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, supervised_ollama: SupervisedOllamaBinding | None = None) -> None:
         self._records: dict[str, tuple[str, str, str]] = {}
+        self._supervised_receipts: dict[str, dict[str, Any]] = {}
+        self._supervised_ollama: SupervisedOllamaBinding | None = supervised_ollama
         self._lock = Lock()
 
+    def bind_supervised_ollama(self, binding: SupervisedOllamaBinding | None) -> None:
+        if binding is not None and not isinstance(binding, SupervisedOllamaBinding):
+            raise FrontierConfigurationError("binding must be SupervisedOllamaBinding or None")
+        with self._lock:
+            self._supervised_ollama = binding
+
+    def submit_supervised_receipt(self, receipt: Mapping[str, Any]) -> None:
+        """Register an untrusted supervisor-signed receipt candidate for independent cryptographic verification."""
+        if not isinstance(receipt, Mapping):
+            raise ContractError("supervised Ollama receipt must be a JSON object")
+        rid = receipt.get("receipt_id")
+        if not isinstance(rid, str) or not rid.strip():
+            raise ContractError("supervised Ollama receipt missing receipt_id")
+        with self._lock:
+            self._supervised_receipts[rid.strip()] = dict(receipt)
+
     def record(self, reply: InferenceReply, invocation: ModelInvocation) -> None:
+        if (
+            _is_ollama_model_id(reply.model.model_id)
+            or _is_ollama_model_id(invocation.model.model_id)
+            or reply.receipt_id.startswith("rcpt-ollama")
+        ):
+            raise ContractError(
+                "OLLAMA_SELF_RECORDED_RECEIPT_FORBIDDEN: local Ollama receipts must be signed by the independent supervisor"
+            )
         inv_sha = content_digest(invocation)
         raw_sha = sha256(reply.raw_selection_json.encode("utf-8")).hexdigest()
         with self._lock:
             self._records[reply.receipt_id] = (inv_sha, reply.model.model_id, raw_sha)
 
     def verify(self, reply: InferenceReply, invocation: ModelInvocation) -> bool:
+        if (
+            _is_ollama_model_id(reply.model.model_id)
+            or _is_ollama_model_id(invocation.model.model_id)
+            or reply.receipt_id.startswith("rcpt-ollama")
+        ):
+            with self._lock:
+                binding = self._supervised_ollama
+                sup_receipt = self._supervised_receipts.get(reply.receipt_id)
+            if binding is None or sup_receipt is None:
+                return False
+            return verify_supervised_ollama_receipt(
+                sup_receipt,
+                binding=binding,
+                reply=reply,
+                invocation=invocation,
+            )
         expected_inv_sha = content_digest(invocation)
         expected_raw_sha = sha256(reply.raw_selection_json.encode("utf-8")).hexdigest()
         with self._lock:
@@ -1365,7 +1995,7 @@ class FrontierReceiptVerifier:
 
 
 class FrontierChatBackend(ModelBackend):
-    """Concrete :class:`ModelBackend` targeting one catalog model with no silent fallback."""
+    """Concrete :class:`ModelBackend` targeting one catalog model with per-attempt spend gating."""
 
     def __init__(
         self,
@@ -1385,6 +2015,8 @@ class FrontierChatBackend(ModelBackend):
         circuit_breaker: ProviderCircuitBreaker | None = None,
         retry_policy: RetryPolicy | None = None,
         usage_recorder: Callable[[str, int, int], None] | None = None,
+        execution_gate: DurableModelExecutionGate | None = None,
+        supervised_ollama: SupervisedOllamaBinding | None = None,
     ) -> None:
         self._entry = entry
         self._api_slug = api_slug
@@ -1401,10 +2033,16 @@ class FrontierChatBackend(ModelBackend):
         self._circuit_breaker = circuit_breaker if circuit_breaker is not None else ProviderCircuitBreaker(clock=self._clock)
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._usage_recorder = usage_recorder
+        self._execution_gate = execution_gate if isinstance(execution_gate, DurableModelExecutionGate) else None
+        self._supervised_ollama = supervised_ollama
         self._seq = 0
         self._lock = Lock()
         self._decide_404: bool = False
         self.last_decision_probability: Decimal | None = None
+
+    @property
+    def manages_per_attempt_gate(self) -> bool:
+        return self._execution_gate is not None
 
     def __repr__(self) -> str:
         return (
@@ -1417,10 +2055,28 @@ class FrontierChatBackend(ModelBackend):
 
     def _dispatch_http(self, url: str, headers: dict[str, str], body: bytes, timeout: float) -> tuple[int, bytes]:
         try:
+            if self._entry.provider == "ollama":
+                if self._supervised_ollama is None:
+                    raise FrontierConfigurationError(
+                        "OLLAMA_UNSUPERVISED_ENDPOINT_FORBIDDEN: SupervisedOllamaBinding required"
+                    )
+                self._supervised_ollama.verify_binding()
+                if url != self._supervised_ollama.endpoint_url:
+                    raise FrontierConfigurationError(
+                        "Ollama dispatch URL must match SupervisedOllamaBinding.endpoint_url"
+                    )
+                if self._http_post is not None:
+                    return self._http_post(url, dict(headers), body, timeout, self._max_wire_bytes)
+                return default_ollama_loopback_post(
+                    url,
+                    dict(headers),
+                    body,
+                    timeout,
+                    self._max_wire_bytes,
+                    supervised_binding=self._supervised_ollama,
+                )
             if self._http_post is not None:
                 return self._http_post(url, dict(headers), body, timeout, self._max_wire_bytes)
-            if self._entry.provider == "ollama":
-                return default_ollama_loopback_post(url, dict(headers), body, timeout, self._max_wire_bytes)
             return default_frontier_https_post(
                 url,
                 dict(headers),
@@ -1447,6 +2103,46 @@ class FrontierChatBackend(ModelBackend):
             )
         return status, raw
 
+    def _reserve_and_dispatch(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+        body: bytes,
+        timeout: float,
+        gate_model_id: str,
+        request_id: str,
+        inv_sha: str,
+        input_bytes: int,
+        max_output_tokens: int,
+        attempt_counter: list[int],
+        last_reservation: list[str | None],
+    ) -> tuple[int, bytes]:
+        attempt_counter[0] += 1
+        res_id: str | None = None
+        if self._execution_gate is not None:
+            res = self._execution_gate.reserve_attempt(
+                model_id=gate_model_id,
+                request_id=request_id,
+                route_kind="decision",
+                attempt_number=attempt_counter[0],
+                input_chars_or_tokens=input_bytes,
+                max_output_tokens=max_output_tokens,
+                input_is_tokens=False,
+                invocation_sha256=inv_sha,
+                now=self._clock(),
+            )
+            res_id = str(res["reservation_id"])
+            last_reservation[0] = res_id
+        try:
+            return self._dispatch_checked(url, headers, body, timeout)
+        except Exception as exc:
+            if res_id is not None and self._execution_gate is not None:
+                outcome = "TIMEOUT" if isinstance(exc, TimeoutError) or "Timeout" in str(exc) else "TRANSPORT_ERROR"
+                self._execution_gate.settle_attempt(res_id, outcome=outcome, now=self._clock())
+                last_reservation[0] = None
+            raise
+
     def infer(self, invocation: ModelInvocation) -> InferenceReply:
         if invocation.system_policy != SYSTEM_POLICY or invocation.output_schema_id != OUTPUT_SCHEMA_ID:
             raise ContractError("frontier backend requires canonical SYSTEM_POLICY and OUTPUT_SCHEMA_ID")
@@ -1456,6 +2152,7 @@ class FrontierChatBackend(ModelBackend):
         started_at = utc_time(self._clock(), "started_at")
         input_tokens = self.count_input_tokens(invocation)
         inv_sha = content_digest(invocation)
+        in_bytes_total = len(invocation.system_policy.encode("utf-8")) + len(invocation.packet_json.encode("utf-8"))
         timeout_dec = min(
             Decimal(str(self._timeout)),
             Decimal(str(invocation.budget.max_seconds_per_call)),
@@ -1463,7 +2160,13 @@ class FrontierChatBackend(ModelBackend):
         if timeout_dec <= 0:
             timeout_dec = Decimal("0.001")
 
-        # Validate credential presence before opening/tripping circuit breaker.
+        # Validate credential / supervised local binding before opening/tripping circuit breaker.
+        if self._entry.provider == "ollama":
+            if self._supervised_ollama is None:
+                raise FrontierConfigurationError(
+                    "OLLAMA_UNSUPERVISED_ENDPOINT_FORBIDDEN: SupervisedOllamaBinding required before local fallback inference"
+                )
+            self._supervised_ollama.verify_binding()
         if self._entry.provider == "gemini_decision" and self._secret is None:
             raise FrontierTransportError(f"{self._entry.display_name} requires {self._entry.credential_env}")
         if self._entry.provider in ("anthropic", "gemini", "openai", "deepseek") and self._secret is None:
@@ -1472,6 +2175,8 @@ class FrontierChatBackend(ModelBackend):
         extract_provider = self._entry.provider
         is_probe = self._circuit_breaker.before_call(self._entry.provider)
         breaker_settled = False
+        attempt_counter = [0]
+        last_reservation: list[str | None] = [None]
 
         try:
             if self._entry.provider == "gemini_decision":
@@ -1484,7 +2189,19 @@ class FrontierChatBackend(ModelBackend):
                     def _attempt_decide(t_out: float) -> tuple[int, bytes]:
                         u, hdrs, b = _build_provider_payload(self._entry, self._api_slug, invocation, self._secret)
                         try:
-                            return self._dispatch_checked(u, hdrs, b, min(t_out, 4.0))
+                            return self._reserve_and_dispatch(
+                                url=u,
+                                headers=hdrs,
+                                body=b,
+                                timeout=min(t_out, 4.0),
+                                gate_model_id=self._entry.model_id,
+                                request_id=invocation.session_id,
+                                inv_sha=inv_sha,
+                                input_bytes=in_bytes_total,
+                                max_output_tokens=0,
+                                attempt_counter=attempt_counter,
+                                last_reservation=last_reservation,
+                            )
                         finally:
                             hdrs.clear()
 
@@ -1535,7 +2252,19 @@ class FrontierChatBackend(ModelBackend):
                                 allowed_host=self._entry.allowed_host,
                             )
                             try:
-                                return self._dispatch_checked(fb_url, fb_hdrs, fb_body, t_out)
+                                return self._reserve_and_dispatch(
+                                    url=fb_url,
+                                    headers=fb_hdrs,
+                                    body=fb_body,
+                                    timeout=t_out,
+                                    gate_model_id=slug_choice,
+                                    request_id=invocation.session_id,
+                                    inv_sha=inv_sha,
+                                    input_bytes=in_bytes_total,
+                                    max_output_tokens=max(128, int(invocation.budget.max_generated_tokens_per_call)),
+                                    attempt_counter=attempt_counter,
+                                    last_reservation=last_reservation,
+                                )
                             finally:
                                 fb_hdrs.clear()
 
@@ -1569,10 +2298,30 @@ class FrontierChatBackend(ModelBackend):
                             break
                     extract_provider = "gemini"
             else:
+                eff_max_out = _effective_max_output_tokens(self._entry, self._api_slug, invocation)
+
                 def _attempt_primary(t_out: float) -> tuple[int, bytes]:
-                    u, hdrs, b = _build_provider_payload(self._entry, self._api_slug, invocation, self._secret)
+                    u, hdrs, b = _build_provider_payload(
+                        self._entry,
+                        self._api_slug,
+                        invocation,
+                        self._secret,
+                        supervised_ollama=self._supervised_ollama,
+                    )
                     try:
-                        return self._dispatch_checked(u, hdrs, b, t_out)
+                        return self._reserve_and_dispatch(
+                            url=u,
+                            headers=hdrs,
+                            body=b,
+                            timeout=t_out,
+                            gate_model_id=self._entry.model_id,
+                            request_id=invocation.session_id,
+                            inv_sha=inv_sha,
+                            input_bytes=in_bytes_total,
+                            max_output_tokens=eff_max_out,
+                            attempt_counter=attempt_counter,
+                            last_reservation=last_reservation,
+                        )
                     finally:
                         hdrs.clear()
 
@@ -1606,6 +2355,13 @@ class FrontierChatBackend(ModelBackend):
                     extract_provider, doc, invocation, min_probability=self._min_probability
                 )
             except FrontierTransportError as exc:
+                if last_reservation[0] is not None and self._execution_gate is not None:
+                    self._execution_gate.settle_attempt(
+                        last_reservation[0],
+                        outcome="PARSE_ERROR",
+                        now=self._clock(),
+                    )
+                    last_reservation[0] = None
                 self._circuit_breaker.record_failure(
                     self._entry.provider,
                     reason=str(exc),
@@ -1614,9 +2370,34 @@ class FrontierChatBackend(ModelBackend):
                 breaker_settled = True
                 raise
 
+            if last_reservation[0] is not None and self._execution_gate is not None:
+                confirmed = _extract_confirmed_provider_usage(extract_provider, doc)
+                if confirmed is not None:
+                    self._execution_gate.settle_attempt(
+                        last_reservation[0],
+                        input_tokens=confirmed[0],
+                        output_tokens=confirmed[1],
+                        outcome="CONFIRMED_USAGE",
+                        now=self._clock(),
+                    )
+                else:
+                    self._execution_gate.settle_attempt(
+                        last_reservation[0],
+                        outcome="UNKNOWN",
+                        now=self._clock(),
+                    )
+                last_reservation[0] = None
+
             self._circuit_breaker.record_success(self._entry.provider)
             breaker_settled = True
         finally:
+            if last_reservation[0] is not None and self._execution_gate is not None:
+                self._execution_gate.settle_attempt(
+                    last_reservation[0],
+                    outcome="UNKNOWN",
+                    now=self._clock(),
+                )
+                last_reservation[0] = None
             if is_probe and not breaker_settled:
                 self._circuit_breaker.release_probe_on_abort(self._entry.provider)
 
@@ -1630,6 +2411,27 @@ class FrontierChatBackend(ModelBackend):
         completed_at = utc_time(self._clock(), "completed_at")
         if completed_at < started_at:
             completed_at = started_at
+
+        if self._entry.provider == "ollama":
+            sup_receipt = doc.get("cas_supervisor_receipt")
+            if not isinstance(sup_receipt, Mapping) or not isinstance(sup_receipt.get("receipt_id"), str) or not sup_receipt["receipt_id"].strip():
+                raise FrontierTransportError(
+                    "OLLAMA_SUPERVISOR_RECEIPT_MISSING: local Ollama response lacks independently signed supervisor receipt"
+                )
+            receipt_id = str(sup_receipt["receipt_id"]).strip()
+            reply = InferenceReply(
+                raw_selection_json=selection_text,
+                receipt_id=receipt_id,
+                invocation_sha256=inv_sha,
+                model=self._model_spec,
+                started_at=started_at,
+                completed_at=completed_at,
+                input_tokens=input_tokens,
+                generated_tokens=generated_tokens,
+            )
+            # Submit untrusted supervisor receipt for independent cryptographic verification; NEVER self-record!
+            self._verifier.submit_supervised_receipt(sup_receipt)
+            return reply
 
         with self._lock:
             self._seq += 1
@@ -1664,6 +2466,8 @@ class FrontierModelRegistry:
         circuit_breaker_config: CircuitBreakerConfig | None = None,
         retry_policy: RetryPolicy | None = None,
         pricing_micro_usd_per_1m: Mapping[str, tuple[int, int]] | None = None,
+        supervised_ollama: SupervisedOllamaBinding | None = None,
+        execution_gate: DurableModelExecutionGate | None = None,
     ) -> None:
         if not isinstance(environ, Mapping):
             raise FrontierConfigurationError("environ must be a key-value Mapping")
@@ -1693,7 +2497,13 @@ class FrontierModelRegistry:
                 integer(pair[0], "input_micro_usd_per_1m", minimum=0),
                 integer(pair[1], "output_micro_usd_per_1m", minimum=0),
             )
-        self._verifier = FrontierReceiptVerifier()
+        if supervised_ollama is not None and not isinstance(supervised_ollama, SupervisedOllamaBinding):
+            raise FrontierConfigurationError("supervised_ollama must be SupervisedOllamaBinding or None")
+        self._supervised_ollama: SupervisedOllamaBinding | None = supervised_ollama
+        self._execution_gate: DurableModelExecutionGate | None = (
+            execution_gate if isinstance(execution_gate, DurableModelExecutionGate) else None
+        )
+        self._verifier = FrontierReceiptVerifier(supervised_ollama=self._supervised_ollama)
         self._lock = Lock()
         self._secrets: dict[str, _RedactedSecret] = {}
         self._slugs: dict[str, str] = {}
@@ -1765,9 +2575,26 @@ class FrontierModelRegistry:
             active = self._active_model_id
         return f"FrontierModelRegistry(active_model={active!r}, secrets='[REDACTED]')"
 
+    def bind_execution_gate(self, gate: DurableModelExecutionGate | None) -> None:
+        if gate is not None and not isinstance(gate, DurableModelExecutionGate):
+            raise FrontierConfigurationError("gate must be DurableModelExecutionGate or None")
+        with self._lock:
+            self._execution_gate = gate
+
+    def bind_supervised_ollama(self, binding: SupervisedOllamaBinding | None) -> None:
+        if binding is not None and not isinstance(binding, SupervisedOllamaBinding):
+            raise FrontierConfigurationError("binding must be SupervisedOllamaBinding or None")
+        with self._lock:
+            self._supervised_ollama = binding
+        self._verifier.bind_supervised_ollama(binding)
+
     def _is_entry_ready(self, entry: FrontierModelCatalogEntry) -> bool:
         if entry.is_fallback:
-            return self._ollama_fallback_enabled or (self._ollama_http_post is not None)
+            return (
+                self._ollama_fallback_enabled
+                and self._supervised_ollama is not None
+                and self._supervised_ollama.is_bound_and_verified()
+            )
         return entry.credential_env in self._secrets
 
     def _pick_default_model_id(self) -> str:
@@ -1875,14 +2702,26 @@ class FrontierModelRegistry:
             eff = str(reasoning_effort).strip().lower()
         else:
             eff = self.resolve_reasoning_effort(model_id=target_id)
-        artifact_sha = content_digest({
+        artifact_payload: dict[str, Any] = {
             "model_id": entry.model_id,
             "provider": entry.provider,
             "api_slug": slug,
             "rank": entry.rank,
             "tier": entry.tier,
             "system_policy_sha256": sha256(SYSTEM_POLICY.encode("utf-8")).hexdigest(),
-        })
+        }
+        if entry.is_fallback and self._supervised_ollama is not None:
+            artifact_payload.update({
+                "supervised_binding_sha256": self._supervised_ollama.artifact_digest(),
+                "executable_sha256": self._supervised_ollama.executable_sha256,
+                "model_manifest_sha256": self._supervised_ollama.model_manifest_sha256,
+                "weights_sha256": self._supervised_ollama.weights_sha256,
+                "template_sha256": self._supervised_ollama.template_sha256,
+                "tokenizer_sha256": self._supervised_ollama.tokenizer_sha256,
+                "pid": self._supervised_ollama.pid,
+                "start_time": self._supervised_ollama.start_time,
+            })
+        artifact_sha = content_digest(artifact_payload)
         spec_id = f"cas-{entry.model_id.replace(':', '-')}"
         return ModelSpecification(
             model_id=spec_id,
@@ -1896,6 +2735,7 @@ class FrontierModelRegistry:
         model_id: str | None = None,
         *,
         reasoning_effort: str | None = None,
+        execution_gate: DurableModelExecutionGate | None = None,
     ) -> tuple[ModelSpecification, FrontierChatBackend, FrontierReceiptVerifier]:
         target_id = self.active_model_id if model_id is None else model_id
         if target_id not in _CATALOG_BY_ID:
@@ -1904,6 +2744,7 @@ class FrontierModelRegistry:
         spec = self.model_spec(target_id, reasoning_effort=reasoning_effort)
         secret = self._secrets.get(entry.credential_env) if entry.credential_env else None
         transport = self._ollama_http_post if entry.provider == "ollama" else self._http_post
+        eff_gate = execution_gate if isinstance(execution_gate, DurableModelExecutionGate) else self._execution_gate
         backend = FrontierChatBackend(
             entry=entry,
             api_slug=self._slugs[target_id],
@@ -1918,6 +2759,8 @@ class FrontierModelRegistry:
             circuit_breaker=self._breakers,
             retry_policy=self._retry_policy,
             usage_recorder=self._record_usage,
+            execution_gate=eff_gate,
+            supervised_ollama=self._supervised_ollama if entry.provider == "ollama" else None,
         )
         return spec, backend, self._verifier
 
@@ -1926,8 +2769,10 @@ class FrontierModelRegistry:
         questions: list[dict[str, Any]],
         *,
         min_probability: Decimal | None = None,
+        execution_gate: DurableModelExecutionGate | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
-        """Batch-screen candidate markets in 150-250ms using Gemini Decision 1."""
+        """Batch-screen candidate markets in 150-250ms using Gemini Decision 1 with per-attempt spend gating."""
         gate_prob = min_probability if min_probability is not None else self._min_probability
         entry = _CATALOG_BY_ID["gemini-decision-1"]
         secret = self._secrets.get(entry.credential_env)
@@ -1944,30 +2789,9 @@ class FrontierModelRegistry:
                 self._last_scout = summary
             return summary
 
-        def _post(u: str, h: dict[str, str], b: bytes, timeout_s: float = 8.0) -> tuple[int, bytes]:
-            try:
-                try:
-                    if self._http_post is not None:
-                        st, resp_raw = self._http_post(u, dict(h), b, timeout_s, MAX_PROVIDER_WIRE_BYTES)
-                    else:
-                        st, resp_raw = default_frontier_https_post(
-                            u, dict(h), b, timeout_s, MAX_PROVIDER_WIRE_BYTES,
-                            expected_host=entry.allowed_host, resolve_dns=self._resolve_dns,
-                        )
-                except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
-                    raise FrontierTransportError(
-                        f"frontier AI connection error: {type(exc).__name__}",
-                        retryable=True,
-                    ) from None
-                if st < 200 or st >= 300:
-                    raise FrontierTransportError(
-                        f"Gemini Decision 1 returned HTTP status {st}",
-                        status_code=int(st),
-                        retryable=_is_retryable_http_status(int(st)),
-                    )
-                return st, resp_raw
-            finally:
-                h.clear()
+        eff_gate = execution_gate if isinstance(execution_gate, DurableModelExecutionGate) else self._execution_gate
+        scout_attempt = [0]
+        last_scout_res: list[str | None] = [None]
 
         clean_slug = self._slugs["gemini-decision-1"].removeprefix("models/")
         t0 = utc_time(self._clock(), "scout_start")
@@ -1977,6 +2801,71 @@ class FrontierModelRegistry:
         is_probe = self._breakers.before_call(entry.provider)
         breaker_settled = False
         scout_idem = content_digest({"questions": questions[:1000], "slug": clean_slug})
+        scout_req_id = request_id.strip() if isinstance(request_id, str) and request_id.strip() else f"scout-{scout_idem[:16]}"
+
+        def _post(
+            u: str,
+            h: dict[str, str],
+            b: bytes,
+            timeout_s: float = 8.0,
+            *,
+            gate_model_id: str = "gemini-decision-1",
+            max_output_tokens: int = 0,
+        ) -> tuple[int, bytes]:
+            scout_attempt[0] += 1
+            res_id: str | None = None
+            try:
+                if eff_gate is not None:
+                    res = eff_gate.reserve_attempt(
+                        model_id=gate_model_id,
+                        request_id=scout_req_id,
+                        route_kind="scout",
+                        attempt_number=scout_attempt[0],
+                        input_chars_or_tokens=len(b),
+                        max_output_tokens=max_output_tokens,
+                        input_is_tokens=False,
+                        invocation_sha256=scout_idem,
+                        now=self._clock(),
+                    )
+                    res_id = str(res["reservation_id"])
+                    last_scout_res[0] = res_id
+                try:
+                    if self._http_post is not None:
+                        st, resp_raw = self._http_post(u, dict(h), b, timeout_s, MAX_PROVIDER_WIRE_BYTES)
+                    else:
+                        st, resp_raw = default_frontier_https_post(
+                            u, dict(h), b, timeout_s, MAX_PROVIDER_WIRE_BYTES,
+                            expected_host=entry.allowed_host, resolve_dns=self._resolve_dns,
+                        )
+                except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+                    if res_id is not None and eff_gate is not None:
+                        eff_gate.settle_attempt(
+                            res_id,
+                            outcome="TIMEOUT" if isinstance(exc, TimeoutError) else "TRANSPORT_ERROR",
+                            now=self._clock(),
+                        )
+                        last_scout_res[0] = None
+                    raise FrontierTransportError(
+                        f"frontier AI connection error: {type(exc).__name__}",
+                        retryable=True,
+                    ) from None
+                if st < 200 or st >= 300:
+                    if res_id is not None and eff_gate is not None:
+                        eff_gate.settle_attempt(res_id, outcome="HTTP_ERROR", now=self._clock())
+                        last_scout_res[0] = None
+                    raise FrontierTransportError(
+                        f"Gemini Decision 1 returned HTTP status {st}",
+                        status_code=int(st),
+                        retryable=_is_retryable_http_status(int(st)),
+                    )
+                return st, resp_raw
+            except FrontierTransportError:
+                if res_id is not None and last_scout_res[0] == res_id and eff_gate is not None:
+                    eff_gate.settle_attempt(res_id, outcome="TRANSPORT_ERROR", now=self._clock())
+                    last_scout_res[0] = None
+                raise
+            finally:
+                h.clear()
 
         try:
             with self._lock:
@@ -1995,7 +2884,7 @@ class FrontierModelRegistry:
                         "Content-Type": "application/json",
                         "x-goog-api-key": secret.reveal_for_header(),
                     }
-                    return _post(url, headers, body, min(t_out, 4.0))
+                    return _post(url, headers, body, min(t_out, 4.0), gate_model_id="gemini-decision-1", max_output_tokens=0)
 
                 try:
                     status, raw = execute_resilient_frontier_call(
@@ -2048,7 +2937,7 @@ class FrontierModelRegistry:
                             secret=secret,
                             allowed_host=entry.allowed_host,
                         )
-                        return _post(fb_url, fb_hdrs, fb_body, t_out)
+                        return _post(fb_url, fb_hdrs, fb_body, t_out, gate_model_id=slug_choice, max_output_tokens=512)
 
                     try:
                         status, raw = execute_resilient_frontier_call(
@@ -2119,6 +3008,9 @@ class FrontierModelRegistry:
                         best_prob = prob
                         best_market = mkt
             except FrontierTransportError as exc:
+                if last_scout_res[0] is not None and eff_gate is not None:
+                    eff_gate.settle_attempt(last_scout_res[0], outcome="PARSE_ERROR", now=self._clock())
+                    last_scout_res[0] = None
                 self._breakers.record_failure(
                     entry.provider,
                     reason=str(exc),
@@ -2127,9 +3019,29 @@ class FrontierModelRegistry:
                 breaker_settled = True
                 raise
 
+            if last_scout_res[0] is not None and eff_gate is not None:
+                confirmed = _extract_confirmed_provider_usage(
+                    "gemini" if used_generate else "gemini_decision",
+                    outer_doc,
+                )
+                if confirmed is not None:
+                    eff_gate.settle_attempt(
+                        last_scout_res[0],
+                        input_tokens=confirmed[0],
+                        output_tokens=confirmed[1],
+                        outcome="CONFIRMED_USAGE",
+                        now=self._clock(),
+                    )
+                else:
+                    eff_gate.settle_attempt(last_scout_res[0], outcome="UNKNOWN", now=self._clock())
+                last_scout_res[0] = None
+
             self._breakers.record_success(entry.provider)
             breaker_settled = True
         finally:
+            if last_scout_res[0] is not None and eff_gate is not None:
+                eff_gate.settle_attempt(last_scout_res[0], outcome="UNKNOWN", now=self._clock())
+                last_scout_res[0] = None
             if is_probe and not breaker_settled:
                 self._breakers.release_probe_on_abort(entry.provider)
 
@@ -2227,14 +3139,17 @@ class FrontierModelRegistry:
         context_summary: Mapping[str, Any] | None = None,
         audio_base64: str | None = None,
         audio_mime_type: str | None = None,
+        execution_gate: DurableModelExecutionGate | None = None,
+        preauthorized_reservation_id: str | None = None,
     ) -> dict[str, Any]:
-        """Read-only Explainer helper routed to Gemini 4 Neon with zero trading execution authority."""
+        """Read-only Explainer helper routed through DurableModelExecutionGate with zero trading authority."""
         if not isinstance(question, str):
             raise FrontierConfigurationError("question must be a string")
         clean_q = " ".join(question.replace("\r", " ").replace("\n", " ").strip().split())
 
         clean_audio_b64: str | None = None
         clean_audio_mime: str | None = None
+        decoded_audio_bytes = 0
         if audio_base64 is not None and str(audio_base64).strip() != "":
             if not isinstance(audio_base64, str):
                 raise FrontierConfigurationError("audio_base64 must be a string")
@@ -2259,12 +3174,49 @@ class FrontierModelRegistry:
                 )
             clean_audio_b64 = norm_b64
             clean_audio_mime = base_mime
+            decoded_audio_bytes = len(decoded_audio)
 
         if clean_audio_b64 is None:
             if not clean_q or len(clean_q) > 500:
                 raise FrontierConfigurationError("question must be 1..500 characters")
         elif len(clean_q) > 500:
             raise FrontierConfigurationError("question must be 0..500 characters when audio_base64 is attached")
+
+        eff_gate = execution_gate if isinstance(execution_gate, DurableModelExecutionGate) else self._execution_gate
+        aux_route = "transcription" if clean_audio_b64 is not None else "explainer"
+        preauth_slot: list[str | None] = [
+            preauthorized_reservation_id.strip()
+            if isinstance(preauthorized_reservation_id, str) and preauthorized_reservation_id.strip()
+            else None
+        ]
+        aux_attempt = [0]
+
+        def _reserve_aux(
+            *,
+            model_id: str,
+            max_output_tokens: int,
+            input_bytes: int,
+            audio_bytes: int,
+            request_id: str,
+        ) -> str | None:
+            if eff_gate is None:
+                return None
+            aux_attempt[0] += 1
+            if preauth_slot[0] is not None:
+                rid = preauth_slot[0]
+                preauth_slot[0] = None
+                return rid
+            res = eff_gate.authorize_auxiliary_call(
+                route_kind=aux_route,
+                model_id=model_id,
+                max_output_tokens=max_output_tokens,
+                input_bytes=input_bytes,
+                audio_bytes=audio_bytes,
+                request_id=request_id,
+                attempt_number=aux_attempt[0],
+                now=self._clock(),
+            )
+            return str(res["reservation_id"])
 
         summary_obj = dict(context_summary) if isinstance(context_summary, Mapping) else {}
         gemini_secret = self._secrets.get(ENV_GEMINI_API_KEY)
@@ -2298,6 +3250,7 @@ class FrontierModelRegistry:
                     "thinkingConfig": {"thinkingLevel": "LOW"},
                 },
             })
+            neon_in_bytes = len(EXPLAINER_SYSTEM_PROMPT.encode("utf-8")) + len(pkt_str.encode("utf-8"))
             timeout_s = Decimal("25")
             neon_idem = content_digest({
                 "model_id": neon_slug,
@@ -2305,9 +3258,18 @@ class FrontierModelRegistry:
                 "pkt": pkt_str,
                 "has_audio": clean_audio_b64 is not None,
             })
+            last_neon_res: list[str | None] = [None]
 
             def _attempt_neon(t_out: float) -> tuple[int, bytes]:
                 req_hdrs = dict(headers)
+                res_id = _reserve_aux(
+                    model_id=neon_slug,
+                    max_output_tokens=1536 + 256,
+                    input_bytes=neon_in_bytes,
+                    audio_bytes=decoded_audio_bytes,
+                    request_id=f"exp-{neon_idem[:16]}",
+                )
+                last_neon_res[0] = res_id
                 try:
                     try:
                         if self._http_post is not None:
@@ -2323,17 +3285,32 @@ class FrontierModelRegistry:
                                 resolve_dns=self._resolve_dns,
                             )
                     except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+                        if res_id is not None and eff_gate is not None:
+                            eff_gate.settle_attempt(
+                                res_id,
+                                outcome="TIMEOUT" if isinstance(exc, TimeoutError) else "TRANSPORT_ERROR",
+                                now=self._clock(),
+                            )
+                            last_neon_res[0] = None
                         raise FrontierTransportError(
                             f"frontier AI connection error: {type(exc).__name__}",
                             retryable=True,
                         ) from None
                     if st < 200 or st >= 300:
+                        if res_id is not None and eff_gate is not None:
+                            eff_gate.settle_attempt(res_id, outcome="HTTP_ERROR", now=self._clock())
+                            last_neon_res[0] = None
                         raise FrontierTransportError(
                             f"{neon_display} returned HTTP status {st}",
                             status_code=int(st),
                             retryable=_is_retryable_http_status(int(st)),
                         )
                     return st, resp_raw
+                except FrontierTransportError:
+                    if res_id is not None and last_neon_res[0] == res_id and eff_gate is not None:
+                        eff_gate.settle_attempt(res_id, outcome="TRANSPORT_ERROR", now=self._clock())
+                        last_neon_res[0] = None
+                    raise
                 finally:
                     req_hdrs.clear()
 
@@ -2352,6 +3329,20 @@ class FrontierModelRegistry:
                 )
                 if 200 <= status < 300:
                     doc = _decode_json_dict(raw, max_bytes=MAX_EXPLAINER_RESPONSE_BYTES)
+                    if last_neon_res[0] is not None and eff_gate is not None:
+                        confirmed = _extract_confirmed_provider_usage("gemini", doc)
+                        if confirmed is not None:
+                            eff_gate.settle_attempt(
+                                last_neon_res[0],
+                                input_tokens=confirmed[0],
+                                output_tokens=confirmed[1],
+                                audio_bytes=0,
+                                outcome="CONFIRMED_USAGE",
+                                now=self._clock(),
+                            )
+                        else:
+                            eff_gate.settle_attempt(last_neon_res[0], outcome="UNKNOWN", now=self._clock())
+                        last_neon_res[0] = None
                     txt = _extract_gemini_cand_text(doc)
                     ans_text = txt
                     spoken_q = ""
@@ -2387,9 +3378,14 @@ class FrontierModelRegistry:
                     fallback_reason = f"HTTP_{exc_neon.status_code}"
                 else:
                     fallback_reason = type(exc_neon).__name__
+            except OperatorUnavailable:
+                raise
             except Exception as exc_neon:
                 fallback_reason = type(exc_neon).__name__
             finally:
+                if last_neon_res[0] is not None and eff_gate is not None:
+                    eff_gate.settle_attempt(last_neon_res[0], outcome="UNKNOWN", now=self._clock())
+                    last_neon_res[0] = None
                 headers.clear()
 
         # 2. Secondary fallback to configured active/alternate read-only model when Gemini 4 Neon is unconfigured or unavailable
@@ -2435,9 +3431,32 @@ class FrontierModelRegistry:
             )
             fallback_reason = "LOCAL_READ_ONLY_FALLBACK"
             explainer_idem = content_digest({"model_id": chosen_entry.model_id, "question": clean_q, "pkt": pkt})
+            sec_in_bytes = len(EXPLAINER_SYSTEM_PROMPT.encode("utf-8")) + len(pkt.encode("utf-8"))
+            sec_max_out = _effective_max_output_tokens(chosen_entry, api_slug, inv)  # type: ignore[arg-type]
+            last_exp_res: list[str | None] = [None]
 
             def _attempt_explainer(t_out: float) -> tuple[int, bytes]:
-                u, hdrs, b = _build_provider_payload(chosen_entry, api_slug, inv, secret)
+                if chosen_entry.provider == "ollama":
+                    if self._supervised_ollama is None:
+                        raise FrontierConfigurationError(
+                            "OLLAMA_UNSUPERVISED_ENDPOINT_FORBIDDEN: SupervisedOllamaBinding required"
+                        )
+                    self._supervised_ollama.verify_binding()
+                res_id = _reserve_aux(
+                    model_id=chosen_entry.model_id,
+                    max_output_tokens=sec_max_out,
+                    input_bytes=sec_in_bytes,
+                    audio_bytes=0,
+                    request_id=f"exp-{explainer_idem[:16]}",
+                )
+                last_exp_res[0] = res_id
+                u, hdrs, b = _build_provider_payload(
+                    chosen_entry,
+                    api_slug,
+                    inv,  # type: ignore[arg-type]
+                    secret,
+                    supervised_ollama=self._supervised_ollama if chosen_entry.provider == "ollama" else None,
+                )
                 try:
                     try:
                         if self._http_post is not None and chosen_entry.provider != "ollama":
@@ -2448,7 +3467,14 @@ class FrontierModelRegistry:
                             elif self._http_post is not None:
                                 st, resp_raw = self._http_post(u, dict(hdrs), b, t_out, MAX_PROVIDER_WIRE_BYTES)
                             else:
-                                st, resp_raw = default_ollama_loopback_post(u, dict(hdrs), b, t_out, MAX_PROVIDER_WIRE_BYTES)
+                                st, resp_raw = default_ollama_loopback_post(
+                                    u,
+                                    dict(hdrs),
+                                    b,
+                                    t_out,
+                                    MAX_PROVIDER_WIRE_BYTES,
+                                    supervised_binding=self._supervised_ollama,
+                                )
                         else:
                             st, resp_raw = default_frontier_https_post(
                                 u,
@@ -2460,17 +3486,32 @@ class FrontierModelRegistry:
                                 resolve_dns=self._resolve_dns,
                             )
                     except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+                        if res_id is not None and eff_gate is not None:
+                            eff_gate.settle_attempt(
+                                res_id,
+                                outcome="TIMEOUT" if isinstance(exc, TimeoutError) else "TRANSPORT_ERROR",
+                                now=self._clock(),
+                            )
+                            last_exp_res[0] = None
                         raise FrontierTransportError(
                             f"frontier AI connection error: {type(exc).__name__}",
                             retryable=True,
                         ) from None
                     if st < 200 or st >= 300:
+                        if res_id is not None and eff_gate is not None:
+                            eff_gate.settle_attempt(res_id, outcome="HTTP_ERROR", now=self._clock())
+                            last_exp_res[0] = None
                         raise FrontierTransportError(
                             f"{chosen_entry.display_name} returned HTTP status {st}",
                             status_code=int(st),
                             retryable=_is_retryable_http_status(int(st)),
                         )
                     return st, resp_raw
+                except FrontierTransportError:
+                    if res_id is not None and last_exp_res[0] == res_id and eff_gate is not None:
+                        eff_gate.settle_attempt(res_id, outcome="TRANSPORT_ERROR", now=self._clock())
+                        last_exp_res[0] = None
+                    raise
                 finally:
                     hdrs.clear()
 
@@ -2489,8 +3530,21 @@ class FrontierModelRegistry:
                 )
                 if 200 <= status < 300:
                     doc = _decode_json_dict(raw, max_bytes=MAX_PROVIDER_WIRE_BYTES)
+                    if last_exp_res[0] is not None and eff_gate is not None:
+                        confirmed = _extract_confirmed_provider_usage(chosen_entry.provider, doc)
+                        if confirmed is not None:
+                            eff_gate.settle_attempt(
+                                last_exp_res[0],
+                                input_tokens=confirmed[0],
+                                output_tokens=confirmed[1],
+                                outcome="CONFIRMED_USAGE",
+                                now=self._clock(),
+                            )
+                        else:
+                            eff_gate.settle_attempt(last_exp_res[0], outcome="UNKNOWN", now=self._clock())
+                        last_exp_res[0] = None
                     txt, out_units, _ = _extract_provider_text_and_usage(
-                        chosen_entry.provider, doc, inv, min_probability=self._min_probability
+                        chosen_entry.provider, doc, inv, min_probability=self._min_probability  # type: ignore[arg-type]
                     )
                     in_fallback = max(1, (len(EXPLAINER_SYSTEM_PROMPT.encode("utf-8")) + len(pkt.encode("utf-8")) + 3) // 4)
                     in_units = _extract_provider_input_units(
@@ -2517,8 +3571,16 @@ class FrontierModelRegistry:
                             "advisory_only": True,
                             "voice_ready": has_gemini_key,
                         })
+            except FrontierTransportError as exc_exp:
+                fallback_reason = type(exc_exp).__name__
+            except OperatorUnavailable:
+                raise
             except Exception as exc_exp:
                 fallback_reason = type(exc_exp).__name__
+            finally:
+                if last_exp_res[0] is not None and eff_gate is not None:
+                    eff_gate.settle_attempt(last_exp_res[0], outcome="UNKNOWN", now=self._clock())
+                    last_exp_res[0] = None
 
         focus_txt = str(summary_obj.get("current_focus_status") or "Scanning all 20 markets under ForexMetaValveGate.")
         mode_txt = str(summary_obj.get("execution_mode") or "DEMO")
@@ -2544,8 +3606,10 @@ class FrontierModelRegistry:
         text: str,
         *,
         voice_name: str = "Kore",
+        execution_gate: DurableModelExecutionGate | None = None,
+        preauthorized_reservation_id: str | None = None,
     ) -> dict[str, Any]:
-        """Synthesize natural spoken Explainer audio via Gemini 3.8 Flash TTS with graceful WEB_SPEECH fallback."""
+        """Synthesize spoken Explainer audio via Gemini TTS through DurableModelExecutionGate."""
         if not isinstance(text, str):
             raise FrontierConfigurationError("text must be a string")
         cleaned_text = " ".join(
@@ -2565,6 +3629,16 @@ class FrontierModelRegistry:
                 "fallback": "WEB_SPEECH",
                 "reason": "GEMINI_API_KEY_UNCONFIGURED",
             })
+
+        eff_gate = execution_gate if isinstance(execution_gate, DurableModelExecutionGate) else self._execution_gate
+        preauth_slot: list[str | None] = [
+            preauthorized_reservation_id.strip()
+            if isinstance(preauthorized_reservation_id, str) and preauthorized_reservation_id.strip()
+            else None
+        ]
+        tts_attempt = [0]
+        tts_in_bytes = len(cleaned_text.encode("utf-8"))
+        tts_max_out = max(1024, len(cleaned_text) * 4)
 
         candidates = [self._explainer_tts_model_slug]
         if FALLBACK_EXPLAINER_TTS_MODEL_ID not in candidates:
@@ -2597,9 +3671,29 @@ class FrontierModelRegistry:
                 "voice": clean_voice,
                 "text": cleaned_text,
             })
+            last_tts_res: list[str | None] = [None]
 
             def _attempt_tts(t_out: float) -> tuple[int, bytes]:
                 req_hdrs = dict(headers)
+                res_id: str | None = None
+                if eff_gate is not None:
+                    tts_attempt[0] += 1
+                    if preauth_slot[0] is not None:
+                        res_id = preauth_slot[0]
+                        preauth_slot[0] = None
+                    else:
+                        res = eff_gate.authorize_auxiliary_call(
+                            route_kind="tts",
+                            model_id=tts_slug,
+                            max_output_tokens=tts_max_out,
+                            input_bytes=tts_in_bytes,
+                            audio_bytes=0,
+                            request_id=f"tts-{tts_idem[:16]}",
+                            attempt_number=tts_attempt[0],
+                            now=self._clock(),
+                        )
+                        res_id = str(res["reservation_id"])
+                    last_tts_res[0] = res_id
                 try:
                     try:
                         if self._http_post is not None:
@@ -2615,17 +3709,32 @@ class FrontierModelRegistry:
                                 resolve_dns=self._resolve_dns,
                             )
                     except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+                        if res_id is not None and eff_gate is not None:
+                            eff_gate.settle_attempt(
+                                res_id,
+                                outcome="TIMEOUT" if isinstance(exc, TimeoutError) else "TRANSPORT_ERROR",
+                                now=self._clock(),
+                            )
+                            last_tts_res[0] = None
                         raise FrontierTransportError(
                             f"frontier AI connection error: {type(exc).__name__}",
                             retryable=True,
                         ) from None
                     if st < 200 or st >= 300:
+                        if res_id is not None and eff_gate is not None:
+                            eff_gate.settle_attempt(res_id, outcome="HTTP_ERROR", now=self._clock())
+                            last_tts_res[0] = None
                         raise FrontierTransportError(
                             f"Gemini TTS ({tts_slug}) returned HTTP status {st}",
                             status_code=int(st),
                             retryable=_is_retryable_http_status(int(st)),
                         )
                     return st, resp_raw
+                except FrontierTransportError:
+                    if res_id is not None and last_tts_res[0] == res_id and eff_gate is not None:
+                        eff_gate.settle_attempt(res_id, outcome="TRANSPORT_ERROR", now=self._clock())
+                        last_tts_res[0] = None
+                    raise
                 finally:
                     req_hdrs.clear()
 
@@ -2644,6 +3753,19 @@ class FrontierModelRegistry:
                 )
                 if 200 <= status < 300:
                     doc = _decode_json_dict(raw, max_bytes=MAX_TTS_WIRE_BYTES)
+                    if last_tts_res[0] is not None and eff_gate is not None:
+                        confirmed = _extract_confirmed_provider_usage("gemini", doc)
+                        if confirmed is not None:
+                            eff_gate.settle_attempt(
+                                last_tts_res[0],
+                                input_tokens=confirmed[0],
+                                output_tokens=confirmed[1],
+                                outcome="CONFIRMED_USAGE",
+                                now=self._clock(),
+                            )
+                        else:
+                            eff_gate.settle_attempt(last_tts_res[0], outcome="UNKNOWN", now=self._clock())
+                        last_tts_res[0] = None
                     cands = doc.get("candidates")
                     if isinstance(cands, list) and cands and isinstance(cands[0], Mapping):
                         content = cands[0].get("content")
@@ -2687,9 +3809,14 @@ class FrontierModelRegistry:
                     safe_reason = f"HTTP_{exc_tts.status_code}"
                 else:
                     safe_reason = type(exc_tts).__name__
+            except OperatorUnavailable:
+                raise
             except Exception as exc_tts:
                 safe_reason = type(exc_tts).__name__
             finally:
+                if last_tts_res[0] is not None and eff_gate is not None:
+                    eff_gate.settle_attempt(last_tts_res[0], outcome="UNKNOWN", now=self._clock())
+                    last_tts_res[0] = None
                 headers.clear()
 
         return assert_safe_ai_catalog_payload({
@@ -2799,7 +3926,7 @@ class FrontierModelRegistry:
             "selection_mode": "USER_SELECTED" if explicit else "PRIORITY_AUTO",
             "frontier_ahead_of_qwen": True,
             "frontier_configured_count": frontier_ready_count,
-            "offline_fallback_enabled": self._ollama_fallback_enabled,
+            "offline_fallback_enabled": self._is_entry_ready(_CATALOG_BY_ID["qwen3:0.6b"]),
             "thinking_depth": self.thinking_depth,
             "valid_thinking_depths": list(VALID_THINKING_DEPTHS),
             "last_effective_effort": self._last_effective_effort,

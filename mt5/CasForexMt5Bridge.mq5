@@ -43,8 +43,13 @@ datetime g_last_publish = 0;
 datetime g_last_candles = 0;
 string   g_active_nonce = "0";
 ulong    g_last_monotonic_nonce = 0;
+uchar    g_master_hmac_key[];
 uchar    g_hmac_key[];
+string   g_channel_key_id = "";
 bool     g_hmac_key_loaded = false;
+uchar    g_valve_key[];
+bool     g_valve_key_loaded = false;
+string   g_global_seen_ids[];
 
 //+------------------------------------------------------------------+
 //| Helpers                                                          |
@@ -215,11 +220,43 @@ string Sha256Hex(const string text)
    return(BytesToHex(digest));
   }
 
-string HmacSha256Hex(const uchar &key_bytes[], const string message)
+string NormalizeLowerTrim(string value)
+  {
+   StringToLower(value);
+   StringTrimLeft(value);
+   StringTrimRight(value);
+   return(value);
+  }
+
+bool IsHex64(string text)
+  {
+   if(StringLen(text) != 64)
+      return(false);
+   for(int i = 0; i < 64; i++)
+     {
+      if(HexNibble(StringGetCharacter(text, i)) < 0)
+         return(false);
+     }
+   return(true);
+  }
+
+bool BytesEqualConstTime(const uchar &a[], const uchar &b[])
+  {
+   int la = ArraySize(a);
+   int lb = ArraySize(b);
+   if(la != lb || la == 0)
+      return(false);
+   int diff = 0;
+   for(int i = 0; i < la; i++)
+      diff |= (a[i] ^ b[i]);
+   return(diff == 0);
+  }
+
+bool HmacSha256Raw(const uchar &key_bytes[], const string message, uchar &out_hash[])
   {
    int klen = ArraySize(key_bytes);
    if(klen < 32)
-      return("");
+      return(false);
    uchar k_pad[64];
    ArrayInitialize(k_pad, 0);
    if(klen > 64)
@@ -227,7 +264,7 @@ string HmacSha256Hex(const uchar &key_bytes[], const string message)
       uchar khash[];
       uchar empty_k[];
       if(CryptEncode(CRYPT_HASH_SHA256, key_bytes, empty_k, khash) <= 0)
-         return("");
+         return(false);
       for(int i = 0; i < ArraySize(khash) && i < 64; i++)
          k_pad[i] = khash[i];
      }
@@ -253,7 +290,7 @@ string HmacSha256Hex(const uchar &key_bytes[], const string message)
    uchar empty_key[];
    uchar inner_hash[];
    if(CryptEncode(CRYPT_HASH_SHA256, inner_in, empty_key, inner_hash) <= 0)
-      return("");
+      return(false);
 
    uchar outer_in[];
    ArrayResize(outer_in, 64 + ArraySize(inner_hash));
@@ -262,10 +299,43 @@ string HmacSha256Hex(const uchar &key_bytes[], const string message)
    for(int i = 0; i < ArraySize(inner_hash); i++)
       outer_in[64 + i] = inner_hash[i];
 
-   uchar outer_hash[];
-   if(CryptEncode(CRYPT_HASH_SHA256, outer_in, empty_key, outer_hash) <= 0)
+   if(CryptEncode(CRYPT_HASH_SHA256, outer_in, empty_key, out_hash) <= 0)
+      return(false);
+   return(ArraySize(out_hash) == 32);
+  }
+
+string HmacSha256Hex(const uchar &key_bytes[], const string message)
+  {
+   uchar digest[];
+   if(!HmacSha256Raw(key_bytes, message, digest))
       return("");
-   return(BytesToHex(outer_hash));
+   return(BytesToHex(digest));
+  }
+
+bool DeriveChannelKey(const uchar &master_key[], const string broker_channel, uchar &out_channel_key[])
+  {
+   return(HmacSha256Raw(master_key, "channel:" + NormalizeLowerTrim(broker_channel), out_channel_key));
+  }
+
+string ComputeChannelKeyId(const string broker_channel, const uchar &channel_key[])
+  {
+   string prefix = "key-id:" + NormalizeLowerTrim(broker_channel) + ":";
+   uchar pbytes[];
+   int plen = StringToCharArray(prefix, pbytes, 0, StringLen(prefix), CP_UTF8);
+   if(plen <= 0)
+      return("");
+   int klen = ArraySize(channel_key);
+   uchar buf[];
+   ArrayResize(buf, plen + klen);
+   for(int i = 0; i < plen; i++)
+      buf[i] = pbytes[i];
+   for(int i = 0; i < klen; i++)
+      buf[plen + i] = channel_key[i];
+   uchar empty_key[];
+   uchar digest[];
+   if(CryptEncode(CRYPT_HASH_SHA256, buf, empty_key, digest) <= 0)
+      return("");
+   return(StringSubstr(BytesToHex(digest), 0, 16));
   }
 
 string ReadText(const string path)
@@ -287,7 +357,111 @@ bool LoadSpoolHmacKey()
       raw = ReadText(SpoolPath(".spool_hmac.key"));
    if(StringLen(raw) == 0)
       return(false);
-   return(DecodeHexKey(raw, g_hmac_key));
+   if(!DecodeHexKey(raw, g_master_hmac_key))
+      return(false);
+   if(!DeriveChannelKey(g_master_hmac_key, InpBrokerChannel, g_hmac_key))
+      return(false);
+   g_channel_key_id = ComputeChannelKeyId(InpBrokerChannel, g_hmac_key);
+   return(StringLen(g_channel_key_id) == 16);
+  }
+
+bool LoadValveAdmissionKey()
+  {
+   string raw = ReadText(RootSpoolPath(".valve_admission.key"));
+   if(StringLen(raw) == 0)
+      raw = ReadText(SpoolPath(".valve_admission.key"));
+   if(StringLen(raw) == 0)
+      return(false);
+   if(!DecodeHexKey(raw, g_valve_key))
+      return(false);
+   if(g_hmac_key_loaded && (BytesEqualConstTime(g_valve_key, g_master_hmac_key) || BytesEqualConstTime(g_valve_key, g_hmac_key)))
+     {
+      ArrayResize(g_valve_key, 0);
+      return(false);
+     }
+   return(true);
+  }
+
+bool VerifyValveAdmission(const string text)
+  {
+   if(!g_valve_key_loaded)
+      g_valve_key_loaded = LoadValveAdmissionKey();
+   if(!g_valve_key_loaded)
+      return(false);
+   if(g_hmac_key_loaded && (BytesEqualConstTime(g_valve_key, g_master_hmac_key) || BytesEqualConstTime(g_valve_key, g_hmac_key)))
+      return(false);
+   string dec_sha = JsonGet(text, "valve_decision_sha256");
+   string adm_exp = JsonGet(text, "valve_admission_expires_at");
+   string adm_sig = JsonGet(text, "valve_admission_sig");
+   if(!IsHex64(dec_sha) || !IsHex64(adm_sig))
+      return(false);
+   datetime exp_dt = ParseIsoUtc(adm_exp);
+   datetime iss_dt = ParseIsoUtc(JsonGet(text, "issued_at"));
+   if(exp_dt == 0 || iss_dt == 0 || TimeGMT() > exp_dt)
+      return(false);
+   long ttl_sec = (long)(exp_dt - iss_dt);
+   if(ttl_sec <= 0 || ttl_sec > 60)
+      return(false);
+   string valve_msg = "cas-forex-valve-admission/1|" +
+                      JsonGet(text, "broker_channel") + "|" + JsonGet(text, "account_login") + "|" +
+                      JsonGet(text, "server") + "|" + JsonGet(text, "execution_mode") + "|" +
+                      JsonGet(text, "action") + "|" + JsonGet(text, "symbol") + "|" +
+                      JsonGet(text, "side") + "|" + JsonGet(text, "volume") + "|" +
+                      JsonGet(text, "sl") + "|" + JsonGet(text, "tp") + "|" +
+                      JsonGet(text, "position_ticket") + "|" + dec_sha + "|" + adm_exp;
+   string expected_sig = HmacSha256Hex(g_valve_key, valve_msg);
+   return(ConstTimeHexEquals(expected_sig, adm_sig));
+  }
+
+void LoadGlobalReplayDomain()
+  {
+   ArrayResize(g_global_seen_ids, 0);
+   string fname = RootSpoolPath(".global_ea_seen.txt");
+   int h = FileOpen(fname, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(h == INVALID_HANDLE)
+      return;
+   while(!FileIsEnding(h))
+     {
+      string line = FileReadString(h);
+      StringTrimLeft(line);
+      StringTrimRight(line);
+      if(StringLen(line) > 0)
+        {
+         int n = ArraySize(g_global_seen_ids);
+         ArrayResize(g_global_seen_ids, n + 1);
+         g_global_seen_ids[n] = line;
+        }
+     }
+   FileClose(h);
+  }
+
+bool IsGlobalReplayIdSeen(const string req_id)
+  {
+   LoadGlobalReplayDomain();
+   int n = ArraySize(g_global_seen_ids);
+   for(int i = 0; i < n; i++)
+     {
+      if(g_global_seen_ids[i] == req_id)
+         return(true);
+     }
+   return(false);
+  }
+
+void RecordGlobalReplayId(const string req_id)
+  {
+   int n = ArraySize(g_global_seen_ids);
+   ArrayResize(g_global_seen_ids, n + 1);
+   g_global_seen_ids[n] = req_id;
+   int start = (ArraySize(g_global_seen_ids) > 2048) ? (ArraySize(g_global_seen_ids) - 2048) : 0;
+   string fname = RootSpoolPath(".global_ea_seen.txt");
+   int h = FileOpen(fname, FILE_WRITE | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(h != INVALID_HANDLE)
+     {
+      for(int i = start; i < ArraySize(g_global_seen_ids); i++)
+         FileWriteString(h, g_global_seen_ids[i] + "\n");
+      FileFlush(h);
+      FileClose(h);
+     }
   }
 
 void LoadReplayNonceLedger()
@@ -484,6 +658,13 @@ void ExecuteRequest(const string request_id, const string text)
    string nonce_s = JsonGet(text, "monotonic_nonce");
    g_active_nonce = (StringLen(nonce_s) > 0) ? nonce_s : "0";
 
+   string json_req_id = JsonGet(text, "request_id");
+   if(StringLen(request_id) == 0 || json_req_id != request_id)
+     {
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "request_id filename mismatch"));
+      return;
+     }
+
    string core = text;
    StringReplace(core, ",\"request_sha256\":\"" + request_sha + "\"", "");
    StringReplace(core, ",\"request_hmac_sha256\":\"" + request_mac + "\"", "");
@@ -497,15 +678,21 @@ void ExecuteRequest(const string request_id, const string text)
 
    if(!g_hmac_key_loaded)
       g_hmac_key_loaded = LoadSpoolHmacKey();
+   if(!g_hmac_key_loaded || JsonGet(text, "channel_key_id") != g_channel_key_id)
+     {
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10017, "0", "0", "0", "0", "0", "0", "channel_key_id mismatch"));
+      return;
+     }
    string hmac_msg = JsonGet(text, "protocol") + "|" + JsonGet(text, "request_id") + "|" + nonce_s + "|" +
                      JsonGet(text, "issued_at") + "|" + JsonGet(text, "expires_at") + "|" +
-                     JsonGet(text, "broker_channel") + "|" + JsonGet(text, "account_login") + "|" +
-                     JsonGet(text, "server") + "|" + JsonGet(text, "execution_mode") + "|" +
-                     JsonGet(text, "valve_decision_sha256") + "|" + JsonGet(text, "action") + "|" +
-                     JsonGet(text, "symbol") + "|" + JsonGet(text, "side") + "|" + JsonGet(text, "volume") + "|" +
-                     JsonGet(text, "price") + "|" + JsonGet(text, "sl") + "|" + JsonGet(text, "tp") + "|" +
-                     JsonGet(text, "position_ticket") + "|" + JsonGet(text, "deviation_points") + "|" +
-                     JsonGet(text, "magic") + "|" + JsonGet(text, "comment");
+                     JsonGet(text, "broker_channel") + "|" + JsonGet(text, "channel_key_id") + "|" +
+                     JsonGet(text, "account_login") + "|" + JsonGet(text, "server") + "|" +
+                     JsonGet(text, "execution_mode") + "|" + JsonGet(text, "valve_decision_sha256") + "|" +
+                     JsonGet(text, "valve_admission_expires_at") + "|" + JsonGet(text, "valve_admission_sig") + "|" +
+                     JsonGet(text, "action") + "|" + JsonGet(text, "symbol") + "|" + JsonGet(text, "side") + "|" +
+                     JsonGet(text, "volume") + "|" + JsonGet(text, "price") + "|" + JsonGet(text, "sl") + "|" +
+                     JsonGet(text, "tp") + "|" + JsonGet(text, "position_ticket") + "|" +
+                     JsonGet(text, "deviation_points") + "|" + JsonGet(text, "magic") + "|" + JsonGet(text, "comment");
    string expected_mac = g_hmac_key_loaded ? HmacSha256Hex(g_hmac_key, hmac_msg) : "";
    if(!g_hmac_key_loaded || !ConstTimeHexEquals(expected_mac, request_mac))
      {
@@ -513,21 +700,39 @@ void ExecuteRequest(const string request_id, const string text)
       return;
      }
 
-   ulong req_nonce = (ulong)StringToInteger(nonce_s);
-   datetime exp_dt = ParseIsoUtc(JsonGet(text, "expires_at"));
-   if(req_nonce == 0 || req_nonce <= g_last_monotonic_nonce || exp_dt == 0 || TimeGMT() > exp_dt)
+   string expected_mode = InpLiveExecutionMode ? "LIVE" : "DEMO";
+   if(!ModeGuard() ||
+      NormalizeLowerTrim(JsonGet(text, "broker_channel")) != NormalizeLowerTrim(InpBrokerChannel) ||
+      JsonGet(text, "account_login") != IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) ||
+      NormalizeLowerTrim(JsonGet(text, "server")) != NormalizeLowerTrim(AccountInfoString(ACCOUNT_SERVER)) ||
+      JsonGet(text, "execution_mode") != expected_mode)
      {
-      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "expired or replayed nonce"));
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10017, "0", "0", "0", "0", "0", "0", "mode guard or sink context binding failed"));
+      return;
+     }
+
+   datetime exp_dt = ParseIsoUtc(JsonGet(text, "expires_at"));
+   if(exp_dt == 0 || TimeGMT() > exp_dt)
+     {
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "request expired"));
+      return;
+     }
+
+   if(!VerifyValveAdmission(text))
+     {
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10017, "0", "0", "0", "0", "0", "0", "valve admission verification failed"));
+      return;
+     }
+
+   ulong req_nonce = (ulong)StringToInteger(nonce_s);
+   if(req_nonce == 0 || req_nonce <= g_last_monotonic_nonce || IsGlobalReplayIdSeen(request_id))
+     {
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "replayed nonce or request_id"));
       return;
      }
    g_last_monotonic_nonce = req_nonce;
    SaveReplayNonceLedger(req_nonce);
-
-   if(!ModeGuard() || JsonGet(text, "account_login") != IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)))
-     {
-      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10017, "0", "0", "0", "0", "0", "0", "mode guard or account binding failed"));
-      return;
-     }
+   RecordGlobalReplayId(request_id);
 
    string action  = JsonGet(text, "action");
    string symbol  = BrokerSymbol(JsonGet(text, "symbol"));
@@ -794,7 +999,9 @@ int OnInit()
    FolderCreate(InpSpoolFolder, CommonFlag());
    FolderCreate(SpoolDir(), CommonFlag());
    g_hmac_key_loaded = LoadSpoolHmacKey();
+   g_valve_key_loaded = LoadValveAdmissionKey();
    LoadReplayNonceLedger();
+   LoadGlobalReplayDomain();
    g_mode_ok = true;
    ReportInterruptedRequests();
    PublishMarket();

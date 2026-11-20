@@ -626,14 +626,18 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
                 stalled_sockets.append(s)
             time.sleep(0.1)
 
-            # 2. While ordinary slots are saturated, emergency POST route STILL succeeds on reserved emergency slots!
-            conn = http.client.HTTPConnection("127.0.0.1", srv.bound_port, timeout=2.0)
+            # 2. While ordinary slots are saturated, emergency POST route STILL succeeds on dedicated owner emergency port!
+            conn = http.client.HTTPConnection("127.0.0.1", srv.emergency_port, timeout=2.0)
             try:
                 conn.request(
                     "POST",
                     "/api/ai-overseer-action",
                     body=b"{}",
-                    headers={**srv.auth_headers(), "Content-Type": "application/json"},
+                    headers={
+                        "Host": srv.emergency_expected_host_header,
+                        **srv.auth_headers(),
+                        "Content-Type": "application/json",
+                    },
                 )
                 resp = conn.getresponse()
                 resp.read()
@@ -720,13 +724,29 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
                 resolve_dns=lambda _h: ["104.18.0.1"],
                 clock=lambda: T0,
             )
-            tok1 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
-            tok2 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep_r1 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=Decimal("100.00"),
+                owner_request_id="req-race-1",
+                reason="race test",
+                coinbase_client=cb,
+            )
+            prep_r2 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=Decimal("100.00"),
+                owner_request_id="req-race-2",
+                reason="race test",
+                coinbase_client=cb,
+            )
+            tok1 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep_r1["intent_sha256"], now=T0)
+            tok2 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep_r2["intent_sha256"], now=T0)
+            preps = {1: prep_r1, 2: prep_r2}
             results: list[tuple[str, object]] = []
 
             def worker(idx: int, tok: str) -> None:
                 barrier.wait()
                 try:
+                    pr = preps[idx]
                     out = vault.execute_offramp_ach_payout(
                         rail=RAIL_COINBASE_ACH,
                         amount_usd=Decimal("100.00"),
@@ -735,6 +755,8 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
                         verifier=rec,
                         recovery_token=tok,
                         coinbase_client=cb,
+                        intent_id=pr["intent_id"],
+                        intent_sha256=pr["intent_sha256"],
                     )
                     results.append(("OK", out))
                 except Exception as exc:
@@ -763,7 +785,14 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
                 resolve_dns=lambda _h: ["104.18.0.1"],
                 clock=lambda: T0,
             )
-            tok3 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep_r3 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=Decimal("50.00"),
+                owner_request_id="req-missing-tx",
+                reason="missing tx id test",
+                coinbase_client=cb_missing_id,
+            )
+            tok3 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep_r3["intent_sha256"], now=T0)
             with self.assertRaises(OfframpSecurityError):
                 vault.execute_offramp_ach_payout(
                     rail=RAIL_COINBASE_ACH,
@@ -773,6 +802,8 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
                     verifier=rec,
                     recovery_token=tok3,
                     coinbase_client=cb_missing_id,
+                    intent_id=prep_r3["intent_id"],
+                    intent_sha256=prep_r3["intent_sha256"],
                 )
             # Reserve stays locked ($0 pending) after OUTCOME_UNKNOWN!
             self.assertEqual(vault.snapshot()["pending_disbursement_usd"], "0")
@@ -802,8 +833,8 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
                 paused = threading.Event()
                 resume = threading.Event()
 
-                def pausing_verify(tok, ep):
-                    ok = orig_verify(tok, ep)
+                def pausing_verify(tok, ep, **kw):
+                    ok = orig_verify(tok, ep, **kw)
                     if ok and ep == old_epoch:
                         paused.set()
                         resume.wait(timeout=5.0)
@@ -856,7 +887,13 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
                 realized_net_usd=Decimal("400.00"), occurred_at=T0,
             )  # $200 pending sweep reserve
 
-            tok_req = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep_req = vault.prepare_broker_2fa_withdrawal(
+                broker_id="HUGOSWAY_MT5",
+                amount_usd=Decimal("200.00"),
+                owner_request_id="req-2fa-create",
+                reason="manual withdrawal",
+            )
+            tok_req = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep_req["intent_sha256"], now=T0)
             req_out = vault.request_broker_2fa_withdrawal(
                 broker_id="HUGOSWAY_MT5",
                 amount_usd=Decimal("200.00"),
@@ -864,19 +901,23 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
                 reason="manual withdrawal",
                 verifier=rec,
                 recovery_token=tok_req,
+                intent_id=prep_req["intent_id"],
+                intent_sha256=prep_req["intent_sha256"],
             )
             tid = req_out["transfer_id"]
             self.assertEqual(vault.snapshot()["pending_disbursement_usd"], "200")
 
-            # 1. Wildcard recovery token (target_ref="*") MUST be rejected!
-            tok_wild = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref="*", now=T0)
+            # 1. Wildcard recovery token (target_ref="*") is rejected at mint AND wrong-target token rejected at confirm!
+            with self.assertRaises(ContractError):
+                rec.mint_token(action_scope="TREASURY_SWEEP", target_ref="*", now=T0)
+            tok_wrong_target = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref="tr2fa-different-target", now=T0)
             with self.assertRaises(ContractError):
                 vault.confirm_broker_2fa_withdrawal(
                     transfer_id=tid,
                     provider_tx_id="tx-real-1",
                     owner_request_id="req-2fa-c1",
                     verifier=rec,
-                    recovery_token=tok_wild,
+                    recovery_token=tok_wrong_target,
                     provider_verifier=lambda b, tx: {
                         "status": "SETTLED", "broker_id": b, "provider_tx_id": tx,
                         "amount_usd": "200.00", "destination_bank_id": "OWNER_LINKED_BANK",

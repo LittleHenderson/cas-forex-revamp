@@ -58,8 +58,12 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
     _SpoolReplayLedger,
     _canonical_spool_receipt_hmac_input,
     _canonical_spool_request_hmac_input,
+    _canonical_valve_admission_input,
     _spool_hmac_hex,
     _status_for_retcode,
+    derive_spool_channel_key,
+    sign_spool_valve_admission,
+    spool_channel_key_id,
     normalize_market_symbol,
     validate_demo_server,
     validate_mt5_server_name,
@@ -163,13 +167,13 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
             normalize_market_symbol("UNKNOWNPAIR")
 
     def test_21_field_request_and_16_field_receipt_hmac_canonical_order_and_core_sha256(self) -> None:
-        # 1. Verify MQL5 ExecuteRequest 21-field hmac_msg (41 '+'-tokens interleaved with "|")
+        # 1. Verify MQL5 ExecuteRequest 24-field hmac_msg (47 '+'-tokens interleaved with "|")
         exec_fn = _extract_mql5_function(self.mq5, "void ExecuteRequest(")
         self.assertIn('string nonce_s = JsonGet(text, "monotonic_nonce");', exec_fn)
         m_hmac = re.search(r"string\s+hmac_msg\s*=\s*(.*?);", exec_fn, flags=re.DOTALL)
         self.assertIsNotNone(m_hmac)
         raw_req_tokens = [tok.strip() for tok in m_hmac.group(1).split("+")]
-        self.assertEqual(len(raw_req_tokens), 41)
+        self.assertEqual(len(raw_req_tokens), 47)
         self.assertTrue(all(tok == '"|"' for tok in raw_req_tokens[1::2]))
         mq5_req_fields = []
         for tok in raw_req_tokens[0::2]:
@@ -181,11 +185,12 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                 mq5_req_fields.append(m_get.group(1))
         expected_req_fields = [
             "protocol", "request_id", "monotonic_nonce", "issued_at", "expires_at",
-            "broker_channel", "account_login", "server", "execution_mode", "valve_decision_sha256",
+            "broker_channel", "channel_key_id", "account_login", "server", "execution_mode",
+            "valve_decision_sha256", "valve_admission_expires_at", "valve_admission_sig",
             "action", "symbol", "side", "volume", "price", "sl", "tp",
             "position_ticket", "deviation_points", "magic", "comment",
         ]
-        self.assertEqual(len(mq5_req_fields), 21)
+        self.assertEqual(len(mq5_req_fields), 24)
         self.assertEqual(mq5_req_fields, expected_req_fields)
 
         req_probe = {field: f"v_{idx}" for idx, field in enumerate(expected_req_fields)}
@@ -296,9 +301,9 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
         )
         key_bytes = secrets.token_bytes(32)
         spool_doc = order_req.to_spool_dict()
-        self.assertEqual(len(spool_doc), 23)  # 22 core fields + request_sha256
+        self.assertEqual(len(spool_doc), 26)  # 25 core fields + request_sha256
         spool_doc["request_hmac_sha256"] = _spool_hmac_hex(key_bytes, _canonical_spool_request_hmac_input(spool_doc))
-        self.assertEqual(len(spool_doc), 24)  # + request_hmac_sha256
+        self.assertEqual(len(spool_doc), 27)  # + request_hmac_sha256
         wire_text = canonical_bytes(spool_doc).decode("utf-8")
         # Mirror MQL5 ExecuteRequest lines 487-490 exactly
         stripped = wire_text.replace(f',"request_sha256":"{spool_doc["request_sha256"]}"', "")
@@ -316,7 +321,8 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                 spool_dir, sleep=emu.sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=2.0
             )
             transport.connect(Mt5Credentials(BROKER_HUGOSWAY_MT5, 7001234, "Hugosway-Demo"))
-            receipt = transport.send_order(order_req)
+            signed_order_req = sign_spool_valve_admission(transport.prepare_request(order_req), spool_dir=spool_dir)
+            receipt = transport.send_order(signed_order_req)
             self.assertTrue(receipt.accepted)
             self.assertEqual(receipt.status, "FILLED")
 
@@ -429,7 +435,8 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
     def test_replay_nonce_ledger_monotonicity_and_ttl_parity(self) -> None:
         # Static MQL5 replay/TTL/interrupted-request assertions
         self.assertIn('.ea_nonce.txt', self.mq5)
-        self.assertIn("req_nonce == 0 || req_nonce <= g_last_monotonic_nonce || exp_dt == 0 || TimeGMT() > exp_dt", self.mq5)
+        self.assertIn("exp_dt == 0 || TimeGMT() > exp_dt", self.mq5)
+        self.assertIn("req_nonce == 0 || req_nonce <= g_last_monotonic_nonce || IsGlobalReplayIdSeen(request_id)", self.mq5)
         interrupted_fn = _extract_mql5_function(self.mq5, "void ReportInterruptedRequests()")
         self.assertIn('"UNKNOWN"', interrupted_fn)
         self.assertIn("(uint)0", interrupted_fn)
@@ -487,7 +494,12 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                 execution_mode=EXECUTION_MODE_DEMO,
                 valve_decision_sha256="b" * 64,
             )
-            rcpt_exp = transport.send_order(expired_req)
+            signed_exp = sign_spool_valve_admission(
+                transport.prepare_request(expired_req),
+                spool_dir=spool_dir,
+                expires_at=expired_req.issued_at + timedelta(seconds=30),
+            )
+            rcpt_exp = transport.send_order(signed_exp)
             self.assertFalse(rcpt_exp.accepted)
             self.assertEqual(rcpt_exp.retcode, 10013)
             self.assertEqual(rcpt_exp.status, "REJECTED")
@@ -520,8 +532,11 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                 execution_mode=EXECUTION_MODE_DEMO,
                 valve_decision_sha256="c" * 64,
             )
+            signed_timeout = sign_spool_valve_admission(
+                no_reply_transport.prepare_request(timeout_req), spool_dir=spool_dir
+            )
             with self.assertRaises(Mt5OutcomeUnknownError):
-                no_reply_transport.send_order(timeout_req)
+                no_reply_transport.send_order(signed_timeout)
 
     def test_execute_request_rejection_codes_and_python_interpretation(self) -> None:
         m_max_vol = re.search(r"input\s+double\s+InpMaxVolumeLots\s*=\s*([0-9.]+);", self.mq5)
@@ -599,17 +614,22 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                 ("req-rej-10016", 10016, {"stop_loss": D("1.10500")}),
                 ("req-rej-10013", 10013, {"symbol": "NAS100"}),
             ):
-                rcpt = t_h.send_order(_mk_req(req_id, **overrides))
+                raw_req = _mk_req(req_id, **overrides)
+                signed_req = sign_spool_valve_admission(t_h.prepare_request(raw_req), spool_dir=t_h.spool_dir)
+                rcpt = t_h.send_order(signed_req)
                 self.assertFalse(rcpt.accepted)
                 self.assertEqual(rcpt.retcode, expected_code)
                 self.assertEqual(rcpt.status, "REJECTED")
                 self.assertIsNone(rcpt.position_ticket)
 
             # 10014 invalid volume (open 0.10 then REDUCE 99.00 lots)
-            rcpt_open = t_h.send_order(_mk_req("req-open-for-14"))
+            rcpt_open = t_h.send_order(sign_spool_valve_admission(t_h.prepare_request(_mk_req("req-open-for-14")), spool_dir=t_h.spool_dir))
             self.assertTrue(rcpt_open.accepted)
             rcpt_14 = t_h.send_order(
-                _mk_req("req-rej-10014", action="REDUCE", position_ticket=rcpt_open.position_ticket, volume_lots=D("99.00"))
+                sign_spool_valve_admission(
+                    t_h.prepare_request(_mk_req("req-rej-10014", action="REDUCE", position_ticket=rcpt_open.position_ticket, volume_lots=D("99.00"))),
+                    spool_dir=t_h.spool_dir,
+                )
             )
             self.assertFalse(rcpt_14.accepted)
             self.assertEqual(rcpt_14.retcode, 10014)
@@ -617,7 +637,9 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
             self.assertIsNone(rcpt_14.position_ticket)
 
             # 10014 oversized OPEN volume (> 50.00 lots) parity with CasForexMt5Bridge.mq5 InpMaxVolumeLots
-            rcpt_open_over = t_h.send_order(_mk_req("req-rej-open-10014", action="OPEN", volume_lots=D("50.01")))
+            rcpt_open_over = t_h.send_order(
+                sign_spool_valve_admission(t_h.prepare_request(_mk_req("req-rej-open-10014", action="OPEN", volume_lots=D("50.01"))), spool_dir=t_h.spool_dir)
+            )
             self.assertFalse(rcpt_open_over.accepted)
             self.assertEqual(rcpt_open_over.retcode, 10014)
             self.assertEqual(rcpt_open_over.status, "REJECTED")
@@ -625,15 +647,20 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
 
             # 10017 account binding mismatch (keep issued_at/expires_at/server so prepare_request keeps account_login)
             rcpt_17 = t_h.send_order(
-                _mk_req(
-                    "req-rej-10017",
-                    monotonic_nonce=99,
-                    issued_at=T0,
-                    expires_at=T0 + timedelta(seconds=30),
-                    broker_channel="hugosway_mt5",
-                    account_login="9999999",
-                    server="Hugosway-Demo",
-                    execution_mode=EXECUTION_MODE_DEMO,
+                sign_spool_valve_admission(
+                    t_h.prepare_request(
+                        _mk_req(
+                            "req-rej-10017",
+                            monotonic_nonce=99,
+                            issued_at=T0,
+                            expires_at=T0 + timedelta(seconds=30),
+                            broker_channel="hugosway_mt5",
+                            account_login="9999999",
+                            server="Hugosway-Demo",
+                            execution_mode=EXECUTION_MODE_DEMO,
+                        )
+                    ),
+                    spool_dir=t_h.spool_dir,
                 )
             )
             self.assertFalse(rcpt_17.accepted)
@@ -824,7 +851,7 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                 )
 
             req1 = _prebound("req-prebound-1")
-            bound1 = tr.prepare_request(req1)
+            bound1 = sign_spool_valve_admission(tr.prepare_request(req1), spool_dir=tr.spool_dir)
             self.assertEqual(bound1.monotonic_nonce, 1)
             # Idempotent re-preparation of the already-prepared object must not burn nonce 2
             self.assertEqual(tr.prepare_request(bound1).monotonic_nonce, 1)
@@ -832,7 +859,7 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
             self.assertTrue(rcpt1.accepted)
             self.assertEqual(rcpt1.status, "FILLED")
 
-            req2 = _prebound("req-prebound-2")
+            req2 = sign_spool_valve_admission(tr.prepare_request(_prebound("req-prebound-2")), spool_dir=tr.spool_dir)
             rcpt2 = tr.send_order(req2)
             self.assertTrue(rcpt2.accepted)
             self.assertEqual(rcpt2.status, "FILLED")

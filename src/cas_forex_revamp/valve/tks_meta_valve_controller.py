@@ -36,7 +36,29 @@ from typing import Any
 from cas_forex_revamp.contracts import ActionKind, ContractError, ControlKind, canonical_bytes, decimal_text
 
 
-DEFAULT_MAX_DRAWDOWN_PCT = Decimal("0.10")
+MAX_CONSTITUTIONAL_DRAWDOWN_PCT = Decimal("0.10")
+DEFAULT_MAX_DRAWDOWN_PCT = MAX_CONSTITUTIONAL_DRAWDOWN_PCT
+
+
+def validate_constitutional_drawdown_pct(
+    value: Any,
+    *,
+    field: str = "max_drawdown_pct",
+    allow_none: bool = False,
+) -> Decimal | None:
+    """Validate that max_drawdown_pct is strictly in (0, 0.10] (immutable 10.00% constitutional ceiling)."""
+    if value is None:
+        if allow_none:
+            return None
+        raise ContractError(f"{field} must be a finite Decimal in (0, 0.10]")
+    parsed = _safe_decimal(value)
+    if parsed is None or parsed <= Decimal("0") or parsed >= Decimal("1"):
+        raise ContractError(f"{field} must be a finite Decimal in (0, 0.10]")
+    if parsed > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+        raise ContractError(
+            f"CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: {field}={parsed} exceeds immutable 0.10 (10.00%) ceiling"
+        )
+    return parsed
 _GENESIS_SHA256 = "0" * 64
 
 FOREX_FEATURE_NAMES: tuple[str, ...] = (
@@ -837,25 +859,43 @@ def extract_forex_valve_features(
     # 1b. Peak-equity / maximum drawdown hard-floor gate on new-risk entries (OPEN / ADD).
     # WAIT (intent is None) and risk-reducing/protective management (REDUCE, CLOSE, AMEND_STOP, CANCEL_ORDER)
     # remain available during drawdown.
+    # Constitutional invariant (Finding [5]): max_drawdown_pct can NEVER exceed 0.10 (10.00%);
+    # policy overrides may ONLY tighten below the immutable 10.00% ceiling.
     if intent is not None and intent.kind in (ActionKind.OPEN, ActionKind.ADD):
         pol_dict = policy if isinstance(policy, Mapping) else {}
-        dd_threshold: Decimal | None
+        dd_threshold: Decimal | None = None
         dd_invalid = False
+        dd_ceiling_exceeded = False
+        gate_dd: Decimal | None = None
+        if max_drawdown_pct is not None:
+            gate_dd = _safe_decimal(max_drawdown_pct)
+            if gate_dd is None or gate_dd <= Decimal("0") or gate_dd >= Decimal("1"):
+                dd_invalid = True
+            elif gate_dd > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+                dd_ceiling_exceeded = True
+                gate_dd = MAX_CONSTITUTIONAL_DRAWDOWN_PCT
         if "max_drawdown_pct" in pol_dict:
-            dd_threshold = _safe_decimal(pol_dict.get("max_drawdown_pct"))
-            if dd_threshold is None or dd_threshold <= Decimal("0") or dd_threshold >= Decimal("1"):
+            pol_dd = _safe_decimal(pol_dict.get("max_drawdown_pct"))
+            if pol_dd is None or pol_dd <= Decimal("0") or pol_dd >= Decimal("1"):
                 dd_invalid = True
-        elif max_drawdown_pct is not None:
-            dd_threshold = _safe_decimal(max_drawdown_pct)
-            if dd_threshold is None or dd_threshold <= Decimal("0") or dd_threshold >= Decimal("1"):
-                dd_invalid = True
-        else:
-            dd_threshold = None
+            elif pol_dd > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+                dd_ceiling_exceeded = True
+                dd_threshold = (
+                    min(gate_dd, MAX_CONSTITUTIONAL_DRAWDOWN_PCT)
+                    if gate_dd is not None
+                    else MAX_CONSTITUTIONAL_DRAWDOWN_PCT
+                )
+            else:
+                dd_threshold = min(pol_dd, gate_dd) if gate_dd is not None else pol_dd
+        elif gate_dd is not None:
+            dd_threshold = min(gate_dd, MAX_CONSTITUTIONAL_DRAWDOWN_PCT)
 
+        if dd_ceiling_exceeded:
+            vetoes.append("CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED")
         if dd_invalid:
             missing_ratio = max(missing_ratio, 0.25)
             vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
-        elif dd_threshold is not None:
+        if not dd_invalid and dd_threshold is not None:
             require_explicit_peak = bool(pol_dict.get("require_peak_equity", False))
             if current_view is not None:
                 cur_eq = _extract_money_decimal(current_view.get("equity"))
@@ -1389,14 +1429,21 @@ class ForexMetaValveGate:
         if not isinstance(controller, TKSMetaValveController):
             raise ContractError("ForexMetaValveGate requires a typed TKSMetaValveController")
         self.controller = controller
+        if default_policy is not None:
+            if not isinstance(default_policy, Mapping):
+                raise ContractError("default_policy must be a mapping")
+            if "max_drawdown_pct" in default_policy:
+                validate_constitutional_drawdown_pct(
+                    default_policy.get("max_drawdown_pct"),
+                    field="default_policy['max_drawdown_pct']",
+                    allow_none=False,
+                )
         self.default_policy = deepcopy(default_policy) if default_policy is not None else None
-        if max_drawdown_pct is None:
-            self.max_drawdown_pct: Decimal | None = None
-        else:
-            parsed_dd = _safe_decimal(max_drawdown_pct)
-            if parsed_dd is None or parsed_dd <= Decimal("0") or parsed_dd >= Decimal("1"):
-                raise ContractError("max_drawdown_pct must be a finite Decimal in (0, 1)")
-            self.max_drawdown_pct = parsed_dd
+        self.max_drawdown_pct: Decimal | None = validate_constitutional_drawdown_pct(
+            max_drawdown_pct,
+            field="max_drawdown_pct",
+            allow_none=True,
+        )
         self.peak_equity_store = peak_equity_store if peak_equity_store is not None else PeakEquityStore()
         self._weights_sha256 = controller.weights_sha256()
 

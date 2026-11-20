@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import base64
 import ctypes
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -511,6 +512,20 @@ def _load_or_create_recovery_key(key_path: Path, *, dir_fd: int | None = None) -
             os.close(opened_dir_fd)
 
 
+_RECOVERY_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS owner_recovery_tokens (
+    token_id TEXT PRIMARY KEY,
+    action_scope TEXT NOT NULL,
+    target_ref TEXT NOT NULL,
+    issued_at_utc TEXT NOT NULL,
+    expires_at_utc TEXT NOT NULL,
+    hmac_sha256 TEXT NOT NULL,
+    consumed_at_utc TEXT,
+    consumed_by TEXT
+)
+"""
+
+
 class OwnerRecoveryVerifier:
     """Single-use, expiring, scope-bound HMAC recovery verifier stored transactionally in SQLite."""
 
@@ -527,26 +542,24 @@ class OwnerRecoveryVerifier:
         self._lock = RLock()
         self._initialized = False
 
+    @property
+    def db_path(self) -> Path:
+        return self._db_path
+
+    def ensure_initialized(self) -> None:
+        with self._lock:
+            if self._initialized and self._db_path.exists():
+                return
+            conn = self._connect()
+            conn.close()
+
     def _connect(self) -> sqlite3.Connection:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self._db_path), timeout=10.0, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         if not self._initialized:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS owner_recovery_tokens (
-                    token_id TEXT PRIMARY KEY,
-                    action_scope TEXT NOT NULL,
-                    target_ref TEXT NOT NULL,
-                    issued_at_utc TEXT NOT NULL,
-                    expires_at_utc TEXT NOT NULL,
-                    hmac_sha256 TEXT NOT NULL,
-                    consumed_at_utc TEXT,
-                    consumed_by TEXT
-                )
-                """
-            )
+            conn.execute(_RECOVERY_TABLE_SQL)
             self._initialized = True
         return conn
 
@@ -563,7 +576,15 @@ class OwnerRecoveryVerifier:
             raise ContractError(f"action_scope must be one of {sorted(VALID_RECOVERY_SCOPES)}")
         if type(ttl_seconds) is not int or not (30 <= ttl_seconds <= MAX_RECOVERY_TTL_SECONDS):
             raise ContractError(f"recovery ttl_seconds must be in 30..{MAX_RECOVERY_TTL_SECONDS}")
-        ref_clean = target_ref.strip() or "*"
+        raw_ref = target_ref.strip() if isinstance(target_ref, str) else ""
+        if scope == "TREASURY_SWEEP":
+            if not raw_ref or raw_ref == "*":
+                raise ContractError(
+                    "OWNER_RECOVERY_TARGET_REQUIRED: TREASURY_SWEEP tokens must bind an exact non-wildcard transaction digest or transfer_id"
+                )
+            ref_clean = raw_ref
+        else:
+            ref_clean = raw_ref or "*"
         ts = utc_time(self._clock(), "clock") if now is None else utc_time(now, "now")
         exp = ts + timedelta(seconds=ttl_seconds)
         issued_str = ts.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -623,7 +644,7 @@ class OwnerRecoveryVerifier:
             raise ContractError("OWNER_RECOVERY_TOKEN_PROTOCOL_INVALID")
         return {str(k): str(v) for k, v in obj.items()}
 
-    def verify_and_consume(
+    def _validate_token_for_consume(
         self,
         raw_token: str,
         *,
@@ -632,7 +653,7 @@ class OwnerRecoveryVerifier:
         require_exact_target: bool = False,
         owner_request_id: str,
         now: datetime | None = None,
-    ) -> dict[str, str]:
+    ) -> tuple[str, str, str, str]:
         identifier(owner_request_id, "owner_request_id")
         scope = expected_scope.strip().upper()
         if scope not in VALID_RECOVERY_SCOPES:
@@ -641,8 +662,9 @@ class OwnerRecoveryVerifier:
         if fields.get("action_scope") != scope:
             raise ContractError("OWNER_RECOVERY_SCOPE_MISMATCH: token scope does not match action")
         tok_target = fields.get("target_ref", "*")
-        if require_exact_target:
-            if not target_ref or not target_ref.strip():
+        must_match_exact = bool(require_exact_target or scope == "TREASURY_SWEEP")
+        if must_match_exact:
+            if not target_ref or not target_ref.strip() or target_ref.strip() == "*":
                 raise ContractError("OWNER_RECOVERY_TARGET_REQUIRED: exact target_ref required")
             if tok_target == "*" or tok_target != target_ref.strip():
                 raise ContractError("OWNER_RECOVERY_TARGET_MISMATCH: token must be explicitly bound to this exact target")
@@ -657,13 +679,76 @@ class OwnerRecoveryVerifier:
         ts = utc_time(self._clock(), "clock") if now is None else utc_time(now, "now")
         if ts < iss_dt - timedelta(seconds=30) or ts > exp_dt:
             raise ContractError("OWNER_RECOVERY_TOKEN_EXPIRED")
+        key = _load_or_create_recovery_key(self._key_path)
+        msg = f"cas-forex-owner-recovery/1|{token_id}|{scope}|{tok_target}|{issued_str}|{expires_str}"
+        expected_sig = hmac.new(key, msg.encode("utf-8"), sha256).hexdigest()
+        if len(actual_sig) != 64 or not hmac.compare_digest(expected_sig, actual_sig):
+            raise ContractError("OWNER_RECOVERY_SIGNATURE_INVALID")
+        ts_str = ts.isoformat().replace("+00:00", "Z")
+        return token_id, scope, expected_sig, ts_str
+
+    def consume_on_connection(
+        self,
+        conn: sqlite3.Connection,
+        raw_token: str,
+        *,
+        expected_scope: str,
+        target_ref: str | None = None,
+        require_exact_target: bool = False,
+        owner_request_id: str,
+        now: datetime | None = None,
+    ) -> dict[str, str]:
+        """Mark a verified recovery token consumed inside caller's active SQLite transaction (same-DB atomic commit)."""
         with self._lock:
-            key = _load_or_create_recovery_key(self._key_path)
-            msg = f"cas-forex-owner-recovery/1|{token_id}|{scope}|{tok_target}|{issued_str}|{expires_str}"
-            expected_sig = hmac.new(key, msg.encode("utf-8"), sha256).hexdigest()
-            if len(actual_sig) != 64 or not hmac.compare_digest(expected_sig, actual_sig):
-                raise ContractError("OWNER_RECOVERY_SIGNATURE_INVALID")
-            ts_str = ts.isoformat().replace("+00:00", "Z")
+            token_id, scope, expected_sig, ts_str = self._validate_token_for_consume(
+                raw_token,
+                expected_scope=expected_scope,
+                target_ref=target_ref,
+                require_exact_target=require_exact_target,
+                owner_request_id=owner_request_id,
+                now=now,
+            )
+            cur = conn.execute(
+                """
+                UPDATE owner_recovery_tokens
+                   SET consumed_at_utc = ?, consumed_by = ?
+                 WHERE token_id = ?
+                   AND action_scope = ?
+                   AND hmac_sha256 = ?
+                   AND consumed_at_utc IS NULL
+                """,
+                (ts_str, owner_request_id, token_id, scope, expected_sig),
+            )
+            if cur.rowcount != 1:
+                raise ContractError("OWNER_RECOVERY_TOKEN_UNKNOWN_OR_REPLAYED")
+            return {
+                "token_id": token_id,
+                "action_scope": scope,
+                "consumed_by": owner_request_id,
+                "consumed_at_utc": ts_str,
+            }
+
+    @contextmanager
+    def atomic_consume(
+        self,
+        raw_token: str,
+        *,
+        expected_scope: str,
+        target_ref: str | None = None,
+        require_exact_target: bool = False,
+        owner_request_id: str,
+        now: datetime | None = None,
+    ) -> Iterator[dict[str, str]]:
+        """Hold an uncommitted BEGIN IMMEDIATE token consumption across a dependent reservation, rolling back on failure."""
+        with self._lock:
+            token_id, scope, expected_sig, ts_str = self._validate_token_for_consume(
+                raw_token,
+                expected_scope=expected_scope,
+                target_ref=target_ref,
+                require_exact_target=require_exact_target,
+                owner_request_id=owner_request_id,
+                now=now,
+            )
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -681,6 +766,13 @@ class OwnerRecoveryVerifier:
                 if cur.rowcount != 1:
                     conn.rollback()
                     raise ContractError("OWNER_RECOVERY_TOKEN_UNKNOWN_OR_REPLAYED")
+                receipt = {
+                    "token_id": token_id,
+                    "action_scope": scope,
+                    "consumed_by": owner_request_id,
+                    "consumed_at_utc": ts_str,
+                }
+                yield receipt
                 conn.commit()
             except Exception:
                 if conn.in_transaction:
@@ -688,7 +780,26 @@ class OwnerRecoveryVerifier:
                 raise
             finally:
                 conn.close()
-        return {"token_id": token_id, "action_scope": scope, "consumed_by": owner_request_id, "consumed_at_utc": ts_str}
+
+    def verify_and_consume(
+        self,
+        raw_token: str,
+        *,
+        expected_scope: str,
+        target_ref: str | None = None,
+        require_exact_target: bool = False,
+        owner_request_id: str,
+        now: datetime | None = None,
+    ) -> dict[str, str]:
+        with self.atomic_consume(
+            raw_token,
+            expected_scope=expected_scope,
+            target_ref=target_ref,
+            require_exact_target=require_exact_target,
+            owner_request_id=owner_request_id,
+            now=now,
+        ) as receipt:
+            return receipt
 
 
 @dataclass(slots=True)

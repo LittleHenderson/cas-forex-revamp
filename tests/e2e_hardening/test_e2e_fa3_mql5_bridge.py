@@ -30,6 +30,9 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
     _canonical_spool_receipt_hmac_input,
     _canonical_spool_request_hmac_input,
     _spool_hmac_hex,
+    derive_spool_channel_key,
+    sign_spool_valve_admission,
+    spool_channel_key_id,
 )
 
 try:
@@ -98,15 +101,16 @@ class Mql5BridgeE2ETests(unittest.TestCase):
         )
         doc = req.to_spool_dict()
         py_canonical = _canonical_spool_request_hmac_input(doc)
-        self.assertEqual(len(py_canonical.split("|")), 21)
+        self.assertEqual(len(py_canonical.split("|")), 24)
 
         m = re.search(r'string\s+hmac_msg\s*=\s*JsonGet\(text,\s*\"protocol\"\)(.*?);', mq5, re.S)
         self.assertIsNotNone(m)
         mq5_block = m.group(1)
         expected_tokens = (
             "request_id", "nonce_s", "issued_at", "expires_at",
-            "broker_channel", "account_login", "server", "execution_mode",
-            "valve_decision_sha256", "action", "symbol", "side", "volume",
+            "broker_channel", "channel_key_id", "account_login", "server", "execution_mode",
+            "valve_decision_sha256", "valve_admission_expires_at", "valve_admission_sig",
+            "action", "symbol", "side", "volume",
             "price", "sl", "tp", "position_ticket", "deviation_points",
             "magic", "comment",
         )
@@ -214,7 +218,8 @@ class Mql5BridgeE2ETests(unittest.TestCase):
                 created_at=T0,
                 valve_decision_sha256="c" * 64,
             )
-            rcpt = transport.send_order(req)
+            signed_req = sign_spool_valve_admission(transport.prepare_request(req), spool_dir=spool_dir)
+            rcpt = transport.send_order(signed_req)
             self.assertTrue(rcpt.accepted)
             self.assertEqual(rcpt.status, "FILLED")
             self.assertEqual(rcpt.retcode, 10009)
@@ -314,11 +319,12 @@ class Mql5BridgeE2ETests(unittest.TestCase):
                 created_at=T0,
                 valve_decision_sha256="d" * 64,
             )
-            rcpt1 = transport.send_order(req1)
+            signed_req1 = sign_spool_valve_admission(transport.prepare_request(req1), spool_dir=spool_dir)
+            rcpt1 = transport.send_order(signed_req1)
             self.assertTrue(rcpt1.accepted)
 
             key_hex = (Path(td) / ".spool_hmac.key").read_text(encoding="ascii").strip()
-            key_bytes = bytes.fromhex(key_hex)
+            key_bytes = derive_spool_channel_key(bytes.fromhex(key_hex), "hugosway_mt5")
             replay_req = Mt5OrderRequest(
                 request_id="req-nonce-02",
                 action="OPEN",
@@ -340,6 +346,10 @@ class Mql5BridgeE2ETests(unittest.TestCase):
                 server="Hugosway-Demo",
                 execution_mode="DEMO",
                 valve_decision_sha256="d" * 64,
+            )
+            replay_req = sign_spool_valve_admission(
+                dataclasses.replace(replay_req, channel_key_id=spool_channel_key_id(key_bytes, "hugosway_mt5")),
+                spool_dir=spool_dir,
             )
             doc = replay_req.to_spool_dict()
             doc["request_hmac_sha256"] = _spool_hmac_hex(key_bytes, _canonical_spool_request_hmac_input(doc))

@@ -207,7 +207,7 @@ class _FakeMt5Sdk:
 _SHARED_LIVE_FIXTURE_DIR: str | None = None
 
 
-def _ensure_live_ticket_files(root_dir: str) -> tuple[str, str]:
+def _ensure_live_ticket_files(root_dir: str, *, issued_at: datetime | None = None) -> tuple[str, str]:
     r = Path(root_dir)
     key_path = r / ".test_live_auth.key"
     ticket_path = r / "live_auth_bundle.json"
@@ -220,12 +220,18 @@ def _ensure_live_ticket_files(root_dir: str) -> tuple[str, str]:
             (BROKER_OANDA_LIVE, "001-001-live-01", "api-fxtrade.oanda.com"),
         ],
         ttl_seconds=86400,
+        issued_at=issued_at,
     )
     ticket_path.write_text(json.dumps(bundle), encoding="utf-8")
     return str(key_path), str(ticket_path)
 
 
-def _live_env(tmp_dir: str | None = None, *, primary: str = BROKER_HUGOSWAY_MT5) -> dict[str, str]:
+def _live_env(
+    tmp_dir: str | None = None,
+    *,
+    primary: str = BROKER_HUGOSWAY_MT5,
+    issued_at: datetime | None = None,
+) -> dict[str, str]:
     global _SHARED_LIVE_FIXTURE_DIR
     if tmp_dir is None:
         if _SHARED_LIVE_FIXTURE_DIR is None:
@@ -233,7 +239,7 @@ def _live_env(tmp_dir: str | None = None, *, primary: str = BROKER_HUGOSWAY_MT5)
         auth_dir = _SHARED_LIVE_FIXTURE_DIR
     else:
         auth_dir = tmp_dir
-    key_file, ticket_file = _ensure_live_ticket_files(auth_dir)
+    key_file, ticket_file = _ensure_live_ticket_files(auth_dir, issued_at=issued_at)
     o_tok_key = "CAS_FOREX_OANDA_LIVE_TOK" + "EN"
     h_pwd_key = "CAS_FOREX_HUGOSWAY_MT5_PASS" + "WORD"
     l_pwd_key = "CAS_FOREX_LHFX_MT5_PASS" + "WORD"
@@ -367,15 +373,18 @@ class DualModeBrokerTests(unittest.TestCase):
 
             oanda_stub = _OandaTransportStub()
             router = DualShieldBrokerRouter(
-                environ=_live_env(str(spool)),
+                environ=_live_env(str(spool), issued_at=_T0),
                 valve_gate=GATE,
                 transport_factory=lambda bid, mode, root: Mt5SpoolBridgeTransport(
                     Path(root) / bid.lower(),
                     sleep=emus[bid].sleep_hook,
                     poll_interval_seconds=0.01,
                     receipt_timeout_seconds=5,
+                    clock=clock,
                 ),
-                oanda_client_factory=lambda env: OandaPracticePaperClient.from_runtime_env(env, transport=oanda_stub),
+                oanda_client_factory=lambda env: OandaPracticePaperClient.from_runtime_env(
+                    env, transport=oanda_stub, clock=clock
+                ),
                 clock=clock,
             )
             statuses = router.activate_all()

@@ -187,7 +187,15 @@ class ValveQuotaVaultE2ETests(unittest.TestCase):
                 clock=lambda: T0,
             )
             rec = OwnerRecoveryVerifier(db_path=Path(td) / "vault.sqlite3", clock=lambda: T0)
-            tok = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep_e2e = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("125.00"),
+                owner_request_id="req-ach-e2e-1",
+                reason="E2E ACH settlement",
+                coinbase_client=cb,
+                idempotency_key="idem-e2e-t1-10",
+            )
+            tok = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep_e2e["intent_sha256"], now=T0)
             res = vault.execute_offramp_ach_payout(
                 rail=RAIL_COINBASE_ACH,
                 amount_usd=D("125.00"),
@@ -197,6 +205,8 @@ class ValveQuotaVaultE2ETests(unittest.TestCase):
                 recovery_token=tok,
                 coinbase_client=cb,
                 idempotency_key="idem-e2e-t1-10",
+                intent_id=prep_e2e["intent_id"],
+                intent_sha256=prep_e2e["intent_sha256"],
             )
             self.assertEqual(res["provider_tx_id"], "cb-ach-e2e-001")
             self.assertEqual(Decimal(res["vault"]["pending_disbursement_usd"]), D("75.00"))
@@ -337,7 +347,15 @@ class ValveQuotaVaultE2ETests(unittest.TestCase):
                 clock=lambda: T0,
             )
             rec = OwnerRecoveryVerifier(db_path=Path(td) / "vault.sqlite3", clock=lambda: T0)
-            tok1 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep1 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("40.00"),
+                owner_request_id="req-dup-1",
+                reason="first payout",
+                coinbase_client=cb,
+                idempotency_key="same-idem-key",
+            )
+            tok1 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep1["intent_sha256"], now=T0)
             vault.execute_offramp_ach_payout(
                 rail=RAIL_COINBASE_ACH,
                 amount_usd=D("40.00"),
@@ -347,8 +365,18 @@ class ValveQuotaVaultE2ETests(unittest.TestCase):
                 recovery_token=tok1,
                 coinbase_client=cb,
                 idempotency_key="same-idem-key",
+                intent_id=prep1["intent_id"],
+                intent_sha256=prep1["intent_sha256"],
             )
-            tok2 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep2 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("40.00"),
+                owner_request_id="req-dup-2",
+                reason="duplicate key payout",
+                coinbase_client=cb,
+                idempotency_key="same-idem-key",
+            )
+            tok2 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep2["intent_sha256"], now=T0)
             with self.assertRaises(OfframpSecurityError):
                 vault.execute_offramp_ach_payout(
                     rail=RAIL_COINBASE_ACH,
@@ -359,10 +387,20 @@ class ValveQuotaVaultE2ETests(unittest.TestCase):
                     recovery_token=tok2,
                     coinbase_client=cb,
                     idempotency_key="same-idem-key",
+                    intent_id=prep2["intent_id"],
+                    intent_sha256=prep2["intent_sha256"],
                 )
             self.assertEqual(len(cb_calls), 1)
 
-            tok3 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep3 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("999.00"),
+                owner_request_id="req-overdraw",
+                reason="overdraw payout",
+                coinbase_client=cb,
+                idempotency_key="overdraw-idem-key",
+            )
+            tok3 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep3["intent_sha256"], now=T0)
             with self.assertRaises(ContractError):
                 vault.execute_offramp_ach_payout(
                     rail=RAIL_COINBASE_ACH,
@@ -373,6 +411,8 @@ class ValveQuotaVaultE2ETests(unittest.TestCase):
                     recovery_token=tok3,
                     coinbase_client=cb,
                     idempotency_key="overdraw-idem-key",
+                    intent_id=prep3["intent_id"],
+                    intent_sha256=prep3["intent_sha256"],
                 )
 
 
