@@ -116,9 +116,9 @@ bool IsPinnedLiveServer(string server)
    if(StringFind(server, "demo") >= 0 || StringFind(server, "practice") >= 0 || StringFind(server, "trial") >= 0)
       return(false);
    if(InpBrokerChannel == "hugosway_mt5")
-      return(server == "hugo pro5" || server == "hugosway-real" || server == "hugosway-live");
+      return(server == "hugo pro5" || server == "hugopro5" || server == "hugo-real" || server == "hugosway-real" || server == "hugosway-live" || server == "hugosway live");
    if(InpBrokerChannel == "lhfx_mt5")
-      return(server == "lhfxsa-trade" || server == "lhfxsa-live" || server == "lhfxsa live");
+      return(server == "lhfxsa-trade" || server == "lhfxsa trade" || server == "lhfxsa-live" || server == "lhfx-live" || server == "lhfxsa-real" || server == "lhfxsa live");
    return(false);
   }
 

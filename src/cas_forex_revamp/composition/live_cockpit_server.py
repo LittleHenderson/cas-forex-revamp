@@ -142,6 +142,8 @@ class _ExclusiveThreadingHTTPServer(HTTPServer):
             max_workers=self._ordinary_slots + self._emergency_slots,
             thread_name_prefix="cas-cockpit-worker",
         )
+        if ":" in str(server_address[0]):
+            self.address_family = socket.AF_INET6
         super().__init__(server_address, RequestHandlerClass)
 
     def server_bind(self) -> None:
@@ -355,6 +357,42 @@ STRICT_CSP = (
     "connect-src 'self'; img-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
 )
 
+_KNOWN_METRICS_ROUTES: frozenset[str] = frozenset({
+    "/",
+    "/ui",
+    "/ui/",
+    "/ui/index.html",
+    "/api/health",
+    "/api/market-stream",
+    "/api/broker-routing",
+    "/api/ai-models",
+    "/api/ai-trader",
+    "/api/treasury",
+    "/api/audit-verify",
+    "/api/metrics",
+    "/api/parallel-tiers",
+    "/api/index-stream",
+    "/api/market-events",
+    "/api/boot",
+    "/api/cockpit",
+    "/api/decision-read",
+    "/api/select-ai-model",
+    "/api/thinking-depth",
+    "/api/treasury-config",
+    "/api/treasury-action",
+    "/api/ai-overseer-action",
+    "/api/ai-trader-control",
+    "/api/resolve-evidence",
+    "/api/prepare-control",
+    "/api/request-control",
+    "/api/read-control",
+    "/api/prepare-close",
+    "/api/request-reviewed-close",
+    "/api/read-command",
+    "/api/explainer-ask",
+    "/api/explainer-tts",
+})
+
 _CONTENT_TYPES: dict[str, str] = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -503,6 +541,14 @@ class LoopbackCockpitServer:
         self._sse_sem = threading.BoundedSemaphore(4)
         self._sockets_lock = threading.Lock()
         self._active_sockets: set[socket.socket] = set()
+        self._metrics_lock = threading.Lock()
+        self._started_mono: float | None = None
+        self._requests_total = 0
+        self._auth_failures_total = 0
+        self._sse_active_clients = 0
+        self._sse_events_sent_total = 0
+        self._sse_heartbeats_sent_total = 0
+        self._route_counts: dict[str, int] = {}
         # Finding [2]: preserve un-resolved Path so symlink/parent custody checks run BEFORE any open!
         if token_file is not None and str(token_file).strip():
             tf_raw = str(token_file).strip()
@@ -726,6 +772,91 @@ class LoopbackCockpitServer:
             self._sse_version += 1
             self._sse_cond.notify_all()
 
+    def _record_request(self, route: str) -> None:
+        bucket = route if route in _KNOWN_METRICS_ROUTES else "__other__"
+        with self._metrics_lock:
+            self._requests_total += 1
+            self._route_counts[bucket] = self._route_counts.get(bucket, 0) + 1
+
+    def _record_auth_failure(self) -> None:
+        with self._metrics_lock:
+            self._auth_failures_total += 1
+
+    def _record_sse_client(self, delta: int) -> None:
+        with self._metrics_lock:
+            self._sse_active_clients = max(0, self._sse_active_clients + int(delta))
+
+    def _record_sse_emit(self, *, events: int = 0, heartbeats: int = 0) -> None:
+        with self._metrics_lock:
+            if events > 0:
+                self._sse_events_sent_total += int(events)
+            if heartbeats > 0:
+                self._sse_heartbeats_sent_total += int(heartbeats)
+
+    def _snapshot_metrics(self) -> dict[str, Any]:
+        with self._metrics_lock:
+            started = self._started_mono
+            requests_total = int(self._requests_total)
+            auth_failures_total = int(self._auth_failures_total)
+            sse_active_clients = int(self._sse_active_clients)
+            sse_events_sent_total = int(self._sse_events_sent_total)
+            sse_heartbeats_sent_total = int(self._sse_heartbeats_sent_total)
+            route_counts = {str(k): int(v) for k, v in sorted(self._route_counts.items())}
+        with self._sse_cond:
+            sse_version = int(self._sse_version)
+        uptime_seconds = int(max(0, int(time.monotonic() - started))) if started is not None else 0
+        payload: dict[str, Any] = {
+            "schema": "cas-forex.cockpit-metrics/1",
+            "uptime_seconds": uptime_seconds,
+            "requests_total": requests_total,
+            "auth_failures_total": auth_failures_total,
+            "sse_version": sse_version,
+            "sse_active_clients": sse_active_clients,
+            "sse_events_sent_total": sse_events_sent_total,
+            "sse_heartbeats_sent_total": sse_heartbeats_sent_total,
+            "route_counts": route_counts,
+            "components": {
+                "ui_service": self._ui_service is not None,
+                "market_stream": self._market_stream_reader is not None or (
+                    self._ui_service is not None and hasattr(self._ui_service, "readMarketStream")
+                ),
+                "broker_routing": self._broker_router_reader is not None,
+                "ai_model_registry": self._ai_model_registry is not None,
+                "autonomous_trader": self._autonomous_trader is not None,
+                "profit_vault": self._profit_vault is not None,
+                "parallel_tiers": self._parallel_tiers is not None,
+            },
+        }
+        if self._autonomous_trader is not None:
+            try:
+                tsnap = self._autonomous_trader.status_snapshot()
+                payload["trader_summary"] = {
+                    "governance_mode": str(tsnap.get("governance_mode", "")),
+                    "effective_status": str(tsnap.get("effective_status", "")),
+                    "cycle_count": int(tsnap.get("cycle_count", 0)),
+                    "veto_count": int(tsnap.get("veto_count", 0)),
+                }
+            except Exception as exc:
+                self._last_routing_error = type(exc).__name__
+        if self._parallel_tiers is not None:
+            try:
+                ptsnap = self._parallel_tiers.snapshot()
+                payload["parallel_tiers_summary"] = {
+                    "tier_count": int(ptsnap.get("tier_count", 0)),
+                }
+            except Exception as exc:
+                self._last_routing_error = type(exc).__name__
+        if self._profit_vault is not None:
+            try:
+                vsnap = self._profit_vault.snapshot()
+                payload["vault_summary"] = {
+                    "auto_sweep_enabled": bool(vsnap.get("auto_sweep_enabled", False)),
+                    "preferred_rail": str(vsnap.get("preferred_rail", "")),
+                }
+            except Exception as exc:
+                self._last_routing_error = type(exc).__name__
+        return assert_safe_ai_catalog_payload(payload)
+
     def _read_stream_payload(self) -> dict[str, Any] | None:
         if self._market_stream_reader is not None:
             return self._market_stream_reader()
@@ -838,8 +969,11 @@ class LoopbackCockpitServer:
                     self._write_json(HTTPStatus.FORBIDDEN, {"error": "Cross-origin loopback request forbidden"})
                     return False
 
-                sec_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
-                if sec_site and sec_site not in ("same-origin", "none"):
+                sec_sites = [s.strip().lower() for s in (self.headers.get_all("Sec-Fetch-Site") or [])]
+                if len(sec_sites) > 1:
+                    self._write_json(HTTPStatus.FORBIDDEN, {"error": "Multiple Sec-Fetch-Site headers forbidden"})
+                    return False
+                if len(sec_sites) == 1 and sec_sites[0] not in ("same-origin", "none"):
                     self._write_json(HTTPStatus.FORBIDDEN, {"error": "Cross-site browser request forbidden"})
                     return False
                 return True
@@ -937,6 +1071,7 @@ class LoopbackCockpitServer:
                 return False, bool(self.headers.get_all("Cookie")), epoch, "" 
 
             def _reject_unauthorized(self) -> None:
+                outer._record_auth_failure()
                 self._write_json(
                     HTTPStatus.UNAUTHORIZED,
                     {"error": "Authentication required"},
@@ -953,7 +1088,10 @@ class LoopbackCockpitServer:
                 data = self.rfile.read(length)
                 if len(data) != length:
                     raise ContractError("incomplete HTTP request body")
-                return json.loads(data.decode("utf-8"))
+                def _reject_non_finite(token: str) -> Any:
+                    raise ContractError(f"non-finite JSON constant {token!r} forbidden")
+
+                return json.loads(data.decode("utf-8"), parse_constant=_reject_non_finite)
 
             def do_GET(self) -> None:
                 if not outer._worker_sem.acquire(blocking=False):
@@ -969,6 +1107,7 @@ class LoopbackCockpitServer:
                     return
                 parsed = urllib.parse.urlsplit(self.path)
                 route = parsed.path
+                outer._record_request(route)
 
                 if route == "/api/health":
                     authed, supplied, epoch, _ = self._check_auth(is_post=False)
@@ -994,7 +1133,12 @@ class LoopbackCockpitServer:
                         self._reject_unauthorized()
                         return
                     if route == "/api/market-stream":
-                        stream = outer._read_stream_payload()
+                        try:
+                            stream = outer._read_stream_payload()
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Market stream unavailable"})
+                            return
                         if stream is None:
                             self._write_json(HTTPStatus.NOT_FOUND, {"error": "Market stream not configured"})
                         else:
@@ -1037,37 +1181,70 @@ class LoopbackCockpitServer:
                     if route == "/api/treasury":
                         if outer._profit_vault is None:
                             self._write_json(HTTPStatus.NOT_FOUND, {"error": "Profit Sweep Vault not configured"})
-                        else:
-                            self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(outer._profit_vault.snapshot()))
+                            return
+                        try:
+                            vsnap = assert_safe_ai_catalog_payload(outer._profit_vault.snapshot())
+                            self._write_json(HTTPStatus.OK, vsnap)
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Treasury snapshot unavailable"})
+                        return
+                    if route == "/api/audit-verify":
+                        if outer._profit_vault is None:
+                            self._write_json(HTTPStatus.NOT_FOUND, {"error": "Profit Sweep Vault not configured"})
+                            return
+                        try:
+                            audit_report = assert_safe_ai_catalog_payload(outer._profit_vault.verify_audit_chain())
+                            self._write_json(HTTPStatus.OK, audit_report)
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Vault audit verification unavailable"})
+                        return
+                    if route == "/api/metrics":
+                        try:
+                            metrics = outer._snapshot_metrics()
+                            self._write_json(HTTPStatus.OK, metrics)
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Cockpit metrics unavailable"})
                         return
                     if route == "/api/parallel-tiers":
                         if outer._parallel_tiers is None:
                             self._write_json(HTTPStatus.NOT_FOUND, {"error": "Parallel Tier Engine not configured"})
-                        else:
-                            self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(outer._parallel_tiers.snapshot()))
+                            return
+                        try:
+                            ptsnap = assert_safe_ai_catalog_payload(outer._parallel_tiers.snapshot())
+                            self._write_json(HTTPStatus.OK, ptsnap)
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Parallel tiers unavailable"})
                         return
                     if route == "/api/index-stream":
-                        idx_snap = outer._index_stream_reader() if outer._index_stream_reader is not None else None
-                        if idx_snap is None:
-                            stream_fallback = outer._read_stream_payload()
-                            if isinstance(stream_fallback, dict):
-                                from cas_forex_revamp.venue.live_market_stream import INDEX_INSTRUMENTS as _IDX_SYMS
-                                idx_rows = [
-                                    m for m in (stream_fallback.get("markets") or [])
-                                    if isinstance(m, dict) and m.get("pair") in _IDX_SYMS
-                                ]
-                                if idx_rows:
-                                    idx_snap = {
-                                        "schema": "cas-forex.index-stream/1",
-                                        "sequence": int(stream_fallback.get("sequence") or 1),
-                                        "observed_at": stream_fallback.get("observed_at"),
-                                        "feed_mode": "SYNTHESIZED_FROM_MARKET_STREAM",
-                                        "markets": idx_rows,
-                                    }
-                        if idx_snap is None:
-                            self._write_json(HTTPStatus.NOT_FOUND, {"error": "Index stream not configured"})
-                        else:
-                            self._write_json(HTTPStatus.OK, idx_snap)
+                        try:
+                            idx_snap = outer._index_stream_reader() if outer._index_stream_reader is not None else None
+                            if idx_snap is None:
+                                stream_fallback = outer._read_stream_payload()
+                                if isinstance(stream_fallback, dict):
+                                    from cas_forex_revamp.venue.live_market_stream import INDEX_INSTRUMENTS as _IDX_SYMS
+                                    idx_rows = [
+                                        m for m in (stream_fallback.get("markets") or [])
+                                        if isinstance(m, dict) and m.get("pair") in _IDX_SYMS
+                                    ]
+                                    if idx_rows:
+                                        idx_snap = {
+                                            "schema": "cas-forex.index-stream/1",
+                                            "sequence": int(stream_fallback.get("sequence") or 1),
+                                            "observed_at": stream_fallback.get("observed_at"),
+                                            "feed_mode": "SYNTHESIZED_FROM_MARKET_STREAM",
+                                            "markets": idx_rows,
+                                        }
+                            if idx_snap is None:
+                                self._write_json(HTTPStatus.NOT_FOUND, {"error": "Index stream not configured"})
+                            else:
+                                self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(idx_snap))
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Index stream unavailable"})
                         return
                     if route == "/api/market-events":
                         if not outer._sse_sem.acquire(blocking=False):
@@ -1075,6 +1252,7 @@ class LoopbackCockpitServer:
                             return
                         outer._worker_sem.release()
                         reacquire_worker = True
+                        sse_client_recorded = False
                         try:
                             self.send_response(int(HTTPStatus.OK))
                             self._send_security_headers("text/event-stream; charset=utf-8")
@@ -1086,6 +1264,10 @@ class LoopbackCockpitServer:
                             last_models_mono = 0.0
                             last_treasury_json = ""
                             last_treasury_mono = 0.0
+                            last_parallel_tiers_json = ""
+                            last_parallel_tiers_mono = 0.0
+                            outer._record_sse_client(1)
+                            sse_client_recorded = True
                             try:
                                 while not outer._stop_event.is_set():
                                     if not outer._verify_commit_epoch(supplied_tok, initial_epoch):
@@ -1105,49 +1287,101 @@ class LoopbackCockpitServer:
                                     if cur_ver != seen_ver:
                                         seen_ver = cur_ver
                                         now_mono = time.monotonic()
-                                        snap = outer._read_stream_payload()
-                                        if snap is not None:
-                                            frame = f"event: market\ndata: {json.dumps(snap, sort_keys=False)}\n\n".encode("utf-8")
-                                            self.wfile.write(frame)
+                                        emitted_events = 0
+                                        try:
+                                            snap = outer._read_stream_payload()
+                                            if snap is not None:
+                                                frame = f"event: market\ndata: {json.dumps(snap, sort_keys=False)}\n\n".encode("utf-8")
+                                                self.wfile.write(frame)
+                                                emitted_events += 1
+                                        except Exception as exc:
+                                            outer._last_routing_error = type(exc).__name__
+                                            eframe = f"event: error\ndata: {json.dumps({'source': 'market', 'error': 'Market stream unavailable'})}\n\n".encode("utf-8")
+                                            self.wfile.write(eframe)
+                                            emitted_events += 1
                                         if outer._index_stream_reader is not None:
-                                            isnap = outer._index_stream_reader()
-                                            if isnap is not None:
-                                                safe_isnap = assert_safe_ai_catalog_payload(isnap)
-                                                iframe = f"event: index_stream\ndata: {json.dumps(safe_isnap, sort_keys=False)}\n\n".encode("utf-8")
-                                                self.wfile.write(iframe)
+                                            try:
+                                                isnap = outer._index_stream_reader()
+                                                if isnap is not None:
+                                                    safe_isnap = assert_safe_ai_catalog_payload(isnap)
+                                                    iframe = f"event: index_stream\ndata: {json.dumps(safe_isnap, sort_keys=False)}\n\n".encode("utf-8")
+                                                    self.wfile.write(iframe)
+                                                    emitted_events += 1
+                                            except Exception as exc:
+                                                outer._last_routing_error = type(exc).__name__
+                                                eframe = f"event: error\ndata: {json.dumps({'source': 'index_stream', 'error': 'Index stream unavailable'})}\n\n".encode("utf-8")
+                                                self.wfile.write(eframe)
+                                                emitted_events += 1
                                         if outer._autonomous_trader is not None:
-                                            tsnap = assert_safe_ai_catalog_payload(outer._autonomous_trader.status_snapshot())
-                                            tframe = f"event: ai_trader\ndata: {json.dumps(tsnap, sort_keys=False)}\n\n".encode("utf-8")
-                                            self.wfile.write(tframe)
+                                            try:
+                                                tsnap = assert_safe_ai_catalog_payload(outer._autonomous_trader.status_snapshot())
+                                                tframe = f"event: ai_trader\ndata: {json.dumps(tsnap, sort_keys=False)}\n\n".encode("utf-8")
+                                                self.wfile.write(tframe)
+                                                emitted_events += 1
+                                            except Exception as exc:
+                                                outer._last_routing_error = type(exc).__name__
+                                                eframe = f"event: error\ndata: {json.dumps({'source': 'ai_trader', 'error': 'Autonomous AI snapshot unavailable'})}\n\n".encode("utf-8")
+                                                self.wfile.write(eframe)
+                                                emitted_events += 1
                                         if outer._ai_model_registry is not None:
-                                            csnap = assert_safe_ai_catalog_payload(outer._ai_model_registry.catalog_snapshot())
-                                            cjson = json.dumps(csnap, sort_keys=False)
-                                            if not last_models_json or cjson != last_models_json or (now_mono - last_models_mono) >= 1.0:
-                                                last_models_json = cjson
-                                                last_models_mono = now_mono
-                                                cframe = f"event: ai_models\ndata: {cjson}\n\n".encode("utf-8")
-                                                self.wfile.write(cframe)
+                                            try:
+                                                csnap = assert_safe_ai_catalog_payload(outer._ai_model_registry.catalog_snapshot())
+                                                cjson = json.dumps(csnap, sort_keys=False)
+                                                if not last_models_json or cjson != last_models_json or (now_mono - last_models_mono) >= 1.0:
+                                                    last_models_json = cjson
+                                                    last_models_mono = now_mono
+                                                    cframe = f"event: ai_models\ndata: {cjson}\n\n".encode("utf-8")
+                                                    self.wfile.write(cframe)
+                                                    emitted_events += 1
+                                            except Exception as exc:
+                                                outer._last_routing_error = type(exc).__name__
+                                                eframe = f"event: error\ndata: {json.dumps({'source': 'ai_models', 'error': 'AI catalog unavailable'})}\n\n".encode("utf-8")
+                                                self.wfile.write(eframe)
+                                                emitted_events += 1
                                         if outer._profit_vault is not None:
-                                            vsnap = assert_safe_ai_catalog_payload(outer._profit_vault.snapshot())
-                                            vjson = json.dumps(vsnap, sort_keys=False)
-                                            if not last_treasury_json or vjson != last_treasury_json or (now_mono - last_treasury_mono) >= 1.0:
-                                                last_treasury_json = vjson
-                                                last_treasury_mono = now_mono
-                                                vframe = f"event: treasury\ndata: {vjson}\n\n".encode("utf-8")
-                                                self.wfile.write(vframe)
+                                            try:
+                                                vsnap = assert_safe_ai_catalog_payload(outer._profit_vault.snapshot())
+                                                vjson = json.dumps(vsnap, sort_keys=False)
+                                                if not last_treasury_json or vjson != last_treasury_json or (now_mono - last_treasury_mono) >= 1.0:
+                                                    last_treasury_json = vjson
+                                                    last_treasury_mono = now_mono
+                                                    vframe = f"event: treasury\ndata: {vjson}\n\n".encode("utf-8")
+                                                    self.wfile.write(vframe)
+                                                    emitted_events += 1
+                                            except Exception as exc:
+                                                outer._last_routing_error = type(exc).__name__
+                                                eframe = f"event: error\ndata: {json.dumps({'source': 'treasury', 'error': 'Treasury snapshot unavailable'})}\n\n".encode("utf-8")
+                                                self.wfile.write(eframe)
+                                                emitted_events += 1
                                         if outer._parallel_tiers is not None:
-                                            ptsnap = assert_safe_ai_catalog_payload(outer._parallel_tiers.snapshot())
-                                            ptframe = f"event: parallel_tiers\ndata: {json.dumps(ptsnap, sort_keys=False)}\n\n".encode("utf-8")
-                                            self.wfile.write(ptframe)
+                                            try:
+                                                ptsnap = assert_safe_ai_catalog_payload(outer._parallel_tiers.snapshot())
+                                                ptjson = json.dumps(ptsnap, sort_keys=False)
+                                                if not last_parallel_tiers_json or ptjson != last_parallel_tiers_json or (now_mono - last_parallel_tiers_mono) >= 1.0:
+                                                    last_parallel_tiers_json = ptjson
+                                                    last_parallel_tiers_mono = now_mono
+                                                    ptframe = f"event: parallel_tiers\ndata: {ptjson}\n\n".encode("utf-8")
+                                                    self.wfile.write(ptframe)
+                                                    emitted_events += 1
+                                            except Exception as exc:
+                                                outer._last_routing_error = type(exc).__name__
+                                                eframe = f"event: error\ndata: {json.dumps({'source': 'parallel_tiers', 'error': 'Parallel tiers unavailable'})}\n\n".encode("utf-8")
+                                                self.wfile.write(eframe)
+                                                emitted_events += 1
+                                        if emitted_events > 0:
+                                            outer._record_sse_emit(events=emitted_events)
                                         last_emit_mono = now_mono
                                         self.wfile.flush()
                                     else:
                                         self.wfile.write(b": heartbeat\n\n")
                                         self.wfile.flush()
+                                        outer._record_sse_emit(heartbeats=1)
                             except (BrokenPipeError, ConnectionResetError, OSError):
                                 pass
                             self.close_connection = True
                         finally:
+                            if sse_client_recorded:
+                                outer._record_sse_client(-1)
                             outer._sse_sem.release()
                             if reacquire_worker:
                                 outer._worker_sem.acquire(blocking=True)
@@ -1212,6 +1446,7 @@ class LoopbackCockpitServer:
             def _handle_post(self, route: str) -> None:
                 if not self._enforce_loopback_envelope():
                     return
+                outer._record_request(route)
                 authed, _, auth_epoch, supplied_tok = self._check_auth(is_post=True)
                 if not authed:
                     self._reject_unauthorized()
@@ -1746,6 +1981,7 @@ class LoopbackCockpitServer:
                     self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
         self._stop_event.clear()
+        self._started_mono = time.monotonic()
         self._load_or_init_auth_token()
         self._httpd = _ExclusiveThreadingHTTPServer(
             (self._host, self._port),

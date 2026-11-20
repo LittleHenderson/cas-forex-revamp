@@ -66,7 +66,9 @@ import stat
 import hmac
 import secrets
 import sqlite3
+import threading
 import time
+import uuid
 from typing import Any, Protocol
 
 from cas_forex_revamp.contracts import ActionKind, ContractError, Side, canonical_bytes, decimal_text, parse_decimal
@@ -274,8 +276,8 @@ _DEFAULT_LIVE_MT5_SERVERS: dict[str, str] = {
     BROKER_LHFX_MT5: "LHFXSA-Trade",
 }
 _PINNED_LIVE_MT5_SERVERS: dict[str, frozenset[str]] = {
-    BROKER_HUGOSWAY_MT5: frozenset({"hugo pro5", "hugopro5", "hugo-real", "hugosway-live", "hugosway live"}),
-    BROKER_LHFX_MT5: frozenset({"lhfxsa-live", "lhfx-live", "lhfxsa-real", "lhfxsa-trade", "lhfxsa trade"}),
+    BROKER_HUGOSWAY_MT5: frozenset({"hugo pro5", "hugopro5", "hugo-real", "hugosway-real", "hugosway-live", "hugosway live"}),
+    BROKER_LHFX_MT5: frozenset({"lhfxsa-live", "lhfx-live", "lhfxsa-real", "lhfxsa-trade", "lhfxsa trade", "lhfxsa live"}),
 }
 
 TRANSPORT_AUTO = "AUTO"
@@ -501,35 +503,39 @@ class _SpoolReplayLedger:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._lock = threading.RLock()
 
     def load(self) -> tuple[int, list[str]]:
-        if not os.path.lexists(self.path):
-            return 0, []
-        data = _read_spool_json(self.path, max_bytes=262_144)
-        if type(data) is not dict:
-            raise Mt5TransportError("corrupted MT5 spool replay ledger")
-        last_nonce = int(str(data.get("last_monotonic_nonce", "0")))
-        seen = [str(x) for x in (data.get("seen_request_ids") or ()) if isinstance(x, str)]
-        return last_nonce, seen[-512:]
+        with self._lock:
+            if not os.path.lexists(self.path):
+                return 0, []
+            data = _read_spool_json(self.path, max_bytes=262_144)
+            if type(data) is not dict:
+                raise Mt5TransportError("corrupted MT5 spool replay ledger")
+            last_nonce = int(str(data.get("last_monotonic_nonce", "0")))
+            seen = [str(x) for x in (data.get("seen_request_ids") or ()) if isinstance(x, str)]
+            return last_nonce, seen[-512:]
 
     def next_nonce(self) -> int:
-        last_nonce, seen = self.load()
-        nxt = last_nonce + 1
-        _atomic_write_json(
-            self.path,
-            {"last_monotonic_nonce": str(nxt), "seen_request_ids": seen[-512:]},
-        )
-        return nxt
+        with self._lock:
+            last_nonce, seen = self.load()
+            nxt = last_nonce + 1
+            _atomic_write_json(
+                self.path,
+                {"last_monotonic_nonce": str(nxt), "seen_request_ids": seen[-512:]},
+            )
+            return nxt
 
     def verify_and_record(self, *, request_id: str, nonce: int) -> None:
-        last_nonce, seen = self.load()
-        if nonce <= last_nonce or request_id in seen:
-            raise Mt5TransportError(f"MT5 spool replay detected (request_id={request_id}, nonce={nonce} <= {last_nonce})")
-        seen.append(request_id)
-        _atomic_write_json(
-            self.path,
-            {"last_monotonic_nonce": str(nonce), "seen_request_ids": seen[-512:]},
-        )
+        with self._lock:
+            last_nonce, seen = self.load()
+            if nonce <= last_nonce or request_id in seen:
+                raise Mt5TransportError(f"MT5 spool replay detected (request_id={request_id}, nonce={nonce} <= {last_nonce})")
+            seen.append(request_id)
+            _atomic_write_json(
+                self.path,
+                {"last_monotonic_nonce": str(nonce), "seen_request_ids": seen[-512:]},
+            )
 
 
 def apply_verified_directory_mode(path: str | Path, dir_mode: int = 0o700) -> Path:
@@ -546,7 +552,7 @@ def apply_verified_directory_mode(path: str | Path, dir_mode: int = 0o700) -> Pa
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp")
     try:
         with open(tmp, "wb") as handle:
             handle.write(data)
@@ -1791,6 +1797,7 @@ class Mt5SpoolBridgeTransport:
         self._credentials: Mt5Credentials | None = None
         self._hmac_key: bytes | None = None
         self._nonce_ledger = _SpoolReplayLedger(_spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.outbound_nonce.json")
+        self._prepared_nonces: dict[str, int] = {}
 
     def __repr__(self) -> str:
         return f"Mt5SpoolBridgeTransport(spool_dir={self.spool_dir.name!r}, connected={self._credentials is not None})"
@@ -1962,15 +1969,23 @@ class Mt5SpoolBridgeTransport:
 
     def prepare_request(self, request: Mt5OrderRequest) -> Mt5OrderRequest:
         creds = self._require_connected()
-        if request.issued_at is not None and request.expires_at is not None and request.server == creds.server:
-            return request
+        import dataclasses as _dc
+        prebound = request.issued_at is not None and request.expires_at is not None and request.server == creds.server
+        with self._nonce_ledger._lock:
+            if prebound and self._prepared_nonces.get(request.request_id) == request.monotonic_nonce:
+                return request
+            nonce_val = self._nonce_ledger.next_nonce()
+            self._prepared_nonces[request.request_id] = nonce_val
+            if len(self._prepared_nonces) > 1024:
+                oldest = next(iter(self._prepared_nonces))
+                self._prepared_nonces.pop(oldest, None)
+        if prebound:
+            return _dc.replace(request, monotonic_nonce=nonce_val)
         mkt_doc = self._market_doc()
         obs_raw = mkt_doc.get("observed_at")
         term_now = _parse_iso(obs_raw, "observed_at") if isinstance(obs_raw, str) and obs_raw.strip() else _utc_now()
-        nonce_val = self._nonce_ledger.next_nonce()
         eff_issued = request.issued_at if request.issued_at is not None else term_now
         eff_expires = request.expires_at if request.expires_at is not None else (eff_issued + timedelta(seconds=30))
-        import dataclasses as _dc
         return _dc.replace(
             request,
             monotonic_nonce=nonce_val,
@@ -2091,6 +2106,7 @@ class Mt5SpoolPaperTerminalEmulator:
         currency: str = "USD",
         leverage: int = MAX_DEMO_LEVERAGE,
         trade_mode: str = "DEMO",
+        max_volume_lots: Decimal = MT5_MAX_VOLUME_DEFAULT,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.spool_dir = Path(spool_dir)
@@ -2101,6 +2117,7 @@ class Mt5SpoolPaperTerminalEmulator:
         self.currency = currency
         self.leverage = leverage
         self.trade_mode = trade_mode
+        self._max_lots = decimal_value(max_volume_lots, "max_volume_lots", positive=True)
         self._clock = clock or _utc_now
         self._calc = Mt5MarginCalculator(leverage=min(leverage, MAX_DEMO_LEVERAGE), account_currency=currency)
         self._positions: dict[str, dict[str, Any]] = {}
@@ -2243,6 +2260,8 @@ class Mt5SpoolPaperTerminalEmulator:
         if action == "OPEN":
             side = Side(req["side"])
             lots = Decimal(req["volume"])
+            if lots <= Decimal("0") or lots > self._max_lots:
+                return self._receipt(req, "REJECTED", 10014, message="invalid or oversized open volume")
             price = ask if side is Side.BUY else bid
             if sl is None or (side is Side.BUY and sl >= bid) or (side is Side.SELL and sl <= ask):
                 return self._receipt(req, "REJECTED", 10016, message="invalid stops")

@@ -1,0 +1,1174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:ai-trader:1.0",
+  "title": "AutonomousAiTraderSnapshot",
+  "description": "Valve-gated autonomous AI trader status snapshot for GET /api/ai-trader.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "human_role",
+    "governance_mode",
+    "governance_reason",
+    "effective_status",
+    "fast_tick_ms",
+    "cadence",
+    "markets_evaluated",
+    "watchlist_markets",
+    "active_model_id",
+    "active_display_name",
+    "active_model_status",
+    "fast_scout_enabled",
+    "fast_scout_ready",
+    "cycle_count",
+    "last_cycle_ms",
+    "last_action",
+    "last_symbol",
+    "last_reason",
+    "last_valve_score",
+    "veto_count",
+    "valve_controller",
+    "valve_parameters",
+    "valve_threshold",
+    "daily_quota",
+    "open_positions",
+    "recent_actions"
+  ],
+  "properties": {
+    "schema": {
+      "const": "cas-forex.ai-trader/1"
+    },
+    "human_role": {
+      "const": "OVERSEER_ONLY"
+    },
+    "governance_mode": {
+      "enum": [
+        "ACTIVE",
+        "PAUSED_NEW_RISK",
+        "PAUSED",
+        "STOPPED",
+        "STANDBY"
+      ]
+    },
+    "governance_reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "effective_status": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "respite_mode": {
+      "type": "boolean"
+    },
+    "operating_mode": {
+      "enum": [
+        "ACTIVE_TRADING",
+        "RESEARCH_RESPITE"
+      ]
+    },
+    "fast_tick_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 5000
+    },
+    "cadence": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "markets_evaluated": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64
+    },
+    "watchlist_markets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/symbol"
+      }
+    },
+    "active_model_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "active_display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "active_model_status": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "thinking_depth": {
+      "enum": [
+        "AUTO",
+        "LOW",
+        "MEDIUM",
+        "HIGH"
+      ]
+    },
+    "valid_thinking_depths": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 32
+      }
+    },
+    "last_effective_effort": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "last_latency_ms": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/nonNegativeInt"
+        }
+      ]
+    },
+    "last_regime": {
+      "enum": [
+        "TREND_IGNITION",
+        "STRONG_TREND",
+        "CHOP_RANGE",
+        "SPREAD_SPIKE"
+      ]
+    },
+    "last_pyramid_leg": {
+      "type": "boolean"
+    },
+    "deployable_equity_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "bank_sweep_reserved_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "fast_scout_enabled": {
+      "type": "boolean"
+    },
+    "fast_scout_ready": {
+      "type": "boolean"
+    },
+    "cycle_count": {
+      "$ref": "#/$defs/nonNegativeInt"
+    },
+    "last_cycle_ms": {
+      "$ref": "#/$defs/nonNegativeInt"
+    },
+    "last_action": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "last_symbol": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/symbol"
+        }
+      ]
+    },
+    "last_reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "last_valve_score": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/decimal"
+        }
+      ]
+    },
+    "veto_count": {
+      "$ref": "#/$defs/nonNegativeInt"
+    },
+    "valve_controller": {
+      "const": "tks_meta_valve_controller"
+    },
+    "valve_parameters": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000000
+    },
+    "valve_threshold": {
+      "$ref": "#/$defs/decimal"
+    },
+    "daily_quota": {
+      "$ref": "#/$defs/dailyQuota"
+    },
+    "risk_gear": {
+      "$ref": "#/$defs/riskGear"
+    },
+    "open_positions": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "$ref": "#/$defs/openPosition"
+      }
+    },
+    "active_working_markets": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/symbol"
+      }
+    },
+    "recent_actions": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/recentAction"
+      }
+    },
+    "observed_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "current_focus_symbol": {
+      "$ref": "#/$defs/symbol"
+    },
+    "current_focus_status": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240
+    },
+    "market_sessions": {
+      "$ref": "#/$defs/marketSessions"
+    },
+    "banked_session": {
+      "$ref": "#/$defs/bankedSession"
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+    },
+    "decimal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 31,
+      "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+    },
+    "nonNegativeInt": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 32,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$"
+    },
+    "symbol": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 16,
+      "pattern": "^[A-Z0-9._-]{3,16}$"
+    },
+    "dailyQuota": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_date",
+        "status",
+        "new_risk_allowed",
+        "lock_reason",
+        "quota_mode",
+        "starting_equity_usd",
+        "realized_net_pnl_usd",
+        "realized_pnl_pct",
+        "soft_quota_usd",
+        "hard_quota_usd",
+        "daily_quota_pct",
+        "quota_progress_pct",
+        "risk_multiplier",
+        "max_daily_loss_usd",
+        "closed_trades",
+        "win_count",
+        "loss_count",
+        "consecutive_losses",
+        "max_consecutive_losses"
+      ],
+      "properties": {
+        "schema": {
+          "const": "cas-forex.daily-quota/1"
+        },
+        "session_date": {
+          "$ref": "#/$defs/sessionIdentifier"
+        },
+        "scope_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "status": {
+          "enum": [
+            "OPEN",
+            "SOFT_QUOTA_REACHED",
+            "DAILY_QUOTA_LOCKED",
+            "PROFIT_FLOOR_LOCKED",
+            "DAILY_LOSS_CIRCUIT_TRIPPED"
+          ]
+        },
+        "new_risk_allowed": {
+          "type": "boolean"
+        },
+        "lock_reason": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 240
+            }
+          ]
+        },
+        "quota_mode": {
+          "enum": [
+            "USD",
+            "PCT",
+            "COMPOUND_CAPPED"
+          ]
+        },
+        "starting_equity_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "realized_net_pnl_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "peak_realized_pnl_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "ratchet_armed": {
+          "type": "boolean"
+        },
+        "ratchet_activation_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "protected_profit_floor_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "realized_pnl_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "soft_quota_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "hard_quota_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "daily_quota_pct": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/decimal"
+            }
+          ]
+        },
+        "quota_progress_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "risk_multiplier": {
+          "$ref": "#/$defs/decimal"
+        },
+        "max_daily_loss_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "closed_trades": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "win_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "loss_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "consecutive_losses": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "max_consecutive_losses": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "session_cadence": {
+          "enum": [
+            "AUTO",
+            "DAILY_NY",
+            "REGIONAL_RECOVERY",
+            "REGIONAL_8H"
+          ]
+        },
+        "active_session_leg": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        }
+      }
+    },
+    "riskGear": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owner_mode",
+        "active_gear",
+        "effective_risk_pct",
+        "owner_max_risk_pct",
+        "risk_scale_factor",
+        "effective_soft_quota_usd",
+        "effective_hard_quota_usd",
+        "owner_hard_quota_usd",
+        "soft_drawdown_downshift_pct",
+        "owner_max_drawdown_pct",
+        "reason"
+      ],
+      "properties": {
+        "owner_mode": {
+          "enum": [
+            "CONSERVATIVE",
+            "AUTO_ADAPTIVE",
+            "AGGRESSIVE"
+          ]
+        },
+        "active_gear": {
+          "enum": [
+            "CONSERVATIVE",
+            "GROWTH",
+            "STRONG_TREND_RUNNER"
+          ]
+        },
+        "effective_risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "owner_max_risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "risk_scale_factor": {
+          "$ref": "#/$defs/decimal"
+        },
+        "effective_soft_quota_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "effective_hard_quota_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "owner_hard_quota_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "soft_drawdown_downshift_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "owner_max_drawdown_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        }
+      }
+    },
+    "openPosition": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ticket",
+            "broker_id",
+            "symbol",
+            "side",
+            "volume_lots",
+            "entry_price",
+            "stop_loss",
+            "take_profit",
+            "profit",
+            "protection_stage"
+          ],
+          "properties": {
+            "ticket": {
+              "$ref": "#/$defs/identifier"
+            },
+            "broker_id": {
+              "enum": [
+                "HUGOSWAY_MT5",
+                "LHFX_MT5",
+                "OANDA_PRACTICE",
+                "OANDA_LIVE"
+              ]
+            },
+            "symbol": {
+              "$ref": "#/$defs/symbol"
+            },
+            "side": {
+              "enum": [
+                "BUY",
+                "SELL"
+              ]
+            },
+            "volume_lots": {
+              "$ref": "#/$defs/decimal"
+            },
+            "entry_price": {
+              "$ref": "#/$defs/decimal"
+            },
+            "stop_loss": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/decimal"
+                }
+              ]
+            },
+            "take_profit": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/decimal"
+                }
+              ]
+            },
+            "profit": {
+              "$ref": "#/$defs/decimal"
+            },
+            "protection_stage": {
+              "enum": [
+                "INITIAL_SL",
+                "BREAKEVEN_LOCKED",
+                "TRAILING_PROFIT",
+                "TRAILING_ACTIVE"
+              ]
+            },
+            "leg_index": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16
+            },
+            "pyramid_parent_ticket": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/identifier"
+                }
+              ]
+            },
+            "regime": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "thinking_depth": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "broker_id",
+            "ticket",
+            "symbol",
+            "side",
+            "volume_lots",
+            "price_open",
+            "sl",
+            "tp",
+            "profit",
+            "protection_stage"
+          ],
+          "properties": {
+            "broker_id": {
+              "enum": [
+                "HUGOSWAY_MT5",
+                "LHFX_MT5",
+                "OANDA_PRACTICE",
+                "OANDA_LIVE"
+              ]
+            },
+            "ticket": {
+              "$ref": "#/$defs/identifier"
+            },
+            "symbol": {
+              "$ref": "#/$defs/symbol"
+            },
+            "side": {
+              "enum": [
+                "BUY",
+                "SELL"
+              ]
+            },
+            "volume_lots": {
+              "$ref": "#/$defs/decimal"
+            },
+            "price_open": {
+              "$ref": "#/$defs/decimal"
+            },
+            "sl": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/decimal"
+                }
+              ]
+            },
+            "tp": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/decimal"
+                }
+              ]
+            },
+            "profit": {
+              "$ref": "#/$defs/decimal"
+            },
+            "protection_stage": {
+              "enum": [
+                "INITIAL_SL",
+                "BREAKEVEN_LOCKED",
+                "TRAILING_PROFIT",
+                "TRAILING_ACTIVE"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "recentAction": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cycle_id",
+            "observed_at",
+            "model_id",
+            "action",
+            "symbol",
+            "executed_on",
+            "ticket",
+            "stop_loss",
+            "take_profit",
+            "leg_index",
+            "pyramid_parent_ticket",
+            "regime",
+            "thinking_depth",
+            "valve_score",
+            "reason"
+          ],
+          "properties": {
+            "cycle_id": {
+              "$ref": "#/$defs/identifier"
+            },
+            "observed_at": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "model_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 120
+            },
+            "action": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80
+            },
+            "symbol": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/symbol"
+                }
+              ]
+            },
+            "executed_on": {
+              "enum": [
+                "HUGOSWAY_MT5",
+                "LHFX_MT5",
+                "OANDA_PRACTICE",
+                "OANDA_LIVE"
+              ]
+            },
+            "ticket": {
+              "$ref": "#/$defs/identifier"
+            },
+            "stop_loss": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/decimal"
+                }
+              ]
+            },
+            "take_profit": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/decimal"
+                }
+              ]
+            },
+            "leg_index": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16
+            },
+            "pyramid_parent_ticket": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/identifier"
+                }
+              ]
+            },
+            "regime": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "thinking_depth": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "valve_score": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/decimal"
+                }
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "observed_at",
+            "kind",
+            "symbol",
+            "detail"
+          ],
+          "properties": {
+            "observed_at": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "kind": {
+              "const": "SET_RISK_GEAR"
+            },
+            "symbol": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/symbol"
+                }
+              ]
+            },
+            "detail": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cycle_id",
+            "observed_at",
+            "kind",
+            "action",
+            "symbol",
+            "regime",
+            "reason",
+            "detail"
+          ],
+          "properties": {
+            "cycle_id": {
+              "$ref": "#/$defs/identifier"
+            },
+            "observed_at": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "kind": {
+              "const": "RESEARCH_RESPITE"
+            },
+            "action": {
+              "const": "RESEARCH_RESPITE"
+            },
+            "symbol": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/symbol"
+                }
+              ]
+            },
+            "regime": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64
+                }
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "detail": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "symbol",
+            "detail"
+          ],
+          "properties": {
+            "observed_at": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "kind": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "symbol": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/symbol"
+                }
+              ]
+            },
+            "detail": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          }
+        }
+      ]
+    },
+    "marketSessionEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "window_utc",
+        "open"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "window_utc": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "open": {
+          "type": "boolean"
+        }
+      }
+    },
+    "marketSessions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "utc_time",
+        "forex_24_5_open",
+        "forex_label",
+        "us_indices_status",
+        "us_indices_label",
+        "mt5_tick_fresh",
+        "sessions"
+      ],
+      "properties": {
+        "utc_time": {
+          "type": "string",
+          "minLength": 9,
+          "maxLength": 16,
+          "pattern": "^\\d{2}:\\d{2} UTC$"
+        },
+        "forex_24_5_open": {
+          "type": "boolean"
+        },
+        "forex_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "us_indices_status": {
+          "enum": [
+            "WEEKEND_CLOSED",
+            "DAILY_BREAK",
+            "CASH_OPEN",
+            "EXTENDED_OPEN"
+          ]
+        },
+        "us_indices_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "mt5_tick_fresh": {
+          "type": "boolean"
+        },
+        "sessions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/marketSessionEntry"
+          }
+        }
+      }
+    },
+    "sessionIdentifier": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 48,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}(?:-[A-Z_]+)?(?:#leg[0-9]+)?$"
+    },
+    "bankedSession": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "accounting_basis",
+        "session_date",
+        "initial_capital_usd",
+        "current_total_equity_usd",
+        "net_surplus_usd",
+        "net_surplus_pct",
+        "deficit_to_principal_usd",
+        "capital_status",
+        "vault_sweeps_paused_for_recovery",
+        "session_cadence",
+        "active_region_window",
+        "active_session_leg",
+        "can_advance_recovery_session",
+        "banked_net_pnl_usd",
+        "realized_pnl_pct",
+        "peak_realized_pnl_usd",
+        "protected_profit_floor_usd",
+        "ratchet_armed",
+        "closed_trades",
+        "win_count",
+        "loss_count",
+        "vault_total_realized_usd",
+        "vault_swept_50pct_usd",
+        "session_vault_reserved_50pct_usd",
+        "vault_retained_50pct_usd",
+        "confirmed_bank_payouts_usd",
+        "pending_unconfirmed_transfers_usd",
+        "profits_locked_for_session",
+        "operating_mode",
+        "session_rollover_label",
+        "next_session_opens_utc"
+      ],
+      "properties": {
+        "schema": {
+          "const": "cas-forex.banked-session/1"
+        },
+        "accounting_basis": {
+          "const": "INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT"
+        },
+        "session_date": {
+          "$ref": "#/$defs/sessionIdentifier"
+        },
+        "initial_capital_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "current_total_equity_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "net_surplus_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "net_surplus_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "deficit_to_principal_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "capital_status": {
+          "enum": [
+            "RECOVERY_MODE",
+            "AT_PRINCIPAL",
+            "IN_SURPLUS"
+          ]
+        },
+        "vault_sweeps_paused_for_recovery": {
+          "type": "boolean"
+        },
+        "session_cadence": {
+          "enum": [
+            "AUTO",
+            "DAILY_NY",
+            "REGIONAL_RECOVERY",
+            "REGIONAL_8H"
+          ]
+        },
+        "active_region_window": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "active_session_leg": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "can_advance_recovery_session": {
+          "type": "boolean"
+        },
+        "banked_net_pnl_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "realized_pnl_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "peak_realized_pnl_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "protected_profit_floor_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "ratchet_armed": {
+          "type": "boolean"
+        },
+        "closed_trades": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "win_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "loss_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "vault_total_realized_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "vault_swept_50pct_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "session_vault_reserved_50pct_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "vault_retained_50pct_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "confirmed_bank_payouts_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "pending_unconfirmed_transfers_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "profits_locked_for_session": {
+          "type": "boolean"
+        },
+        "operating_mode": {
+          "enum": [
+            "ACTIVE_TRADING",
+            "RESEARCH_RESPITE"
+          ]
+        },
+        "session_rollover_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "next_session_opens_utc": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    }
+  }
+}

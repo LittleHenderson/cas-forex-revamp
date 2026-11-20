@@ -2,19 +2,39 @@ stages:
   - test
   - security
 
-unit_and_contract_tests:
+python_unit_and_contract_tests:
   stage: test
   image: python:3.12-slim
   script:
     - python -m pip install --no-cache-dir -r requirements.txt pytest
-    - pytest -q
-    - node --test tests/ui/*.test.mjs
+    # ActualLinuxSentinelTests requires non-root /usr/bin/python3 + Landlock ABI >= 4 (covered on ubuntu-24.04 / AWS EC2).
+    - pytest -q -k "not ActualLinuxSentinelTests"
+
+node_ui_tests:
+  stage: test
+  image: node:22-slim
+  script:
+    - npm --prefix ui test
+    - node --test tests/ui/*.test.mjs tests/e2e_hardening/e2e_explainer_csp.test.mjs tests/integration/node/discovery.test.mjs
 
 static_and_supply_chain_scan:
   stage: security
   image: python:3.12-slim
   script:
     - python -m pip install --no-cache-dir -r requirements.txt bandit pip-audit
+    - |
+      python - <<'PY'
+      from pathlib import Path
+      from scripts.agent_pr_merger import verify_worktree_lightweight
+      ok, notes = verify_worktree_lightweight(Path("."))
+      print("verify_worktree_lightweight:", ok, notes)
+      raise SystemExit(0 if ok else 1)
+      PY
     - bandit -r src
     - pip-audit -r requirements.txt
-    - lantern analyze . --quiet || true
+    - |
+      if [ -n "${LANTERN_PIP_SPEC:-}" ]; then
+        python -m pip install --no-cache-dir "${LANTERN_PIP_SPEC}"
+      fi
+      command -v lantern >/dev/null 2>&1 || { echo "ERROR: lantern binary not installed (fail-closed)" >&2; exit 1; }
+      lantern analyze . --quiet

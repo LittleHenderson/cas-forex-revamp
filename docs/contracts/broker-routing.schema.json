@@ -1,0 +1,602 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:broker-routing:1.0",
+  "title": "BrokerRoutingSnapshot",
+  "description": "Dual-Shield Barbell and MT5 broker hierarchy routing snapshot for GET /api/broker-routing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "platform",
+    "platform_code",
+    "demo_only",
+    "live_trading_locked",
+    "primary_broker",
+    "active_broker",
+    "transport_mode",
+    "timeframes",
+    "valve",
+    "chain"
+  ],
+  "properties": {
+    "schema": {
+      "enum": [
+        "cas-forex.broker-routing/1",
+        "cas-forex.broker-routing/2"
+      ]
+    },
+    "architecture": {
+      "const": "DUAL_SHIELD_BARBELL"
+    },
+    "platform": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "platform_code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32
+    },
+    "execution_mode": {
+      "enum": [
+        "DEMO",
+        "LIVE"
+      ]
+    },
+    "demo_only": {
+      "type": "boolean"
+    },
+    "live_trading_locked": {
+      "type": "boolean"
+    },
+    "live_trading_armed": {
+      "type": "boolean"
+    },
+    "primary_broker": {
+      "enum": [
+        "HUGOSWAY_MT5",
+        "LHFX_MT5",
+        "OANDA_PRACTICE",
+        "OANDA_LIVE"
+      ]
+    },
+    "active_broker": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "enum": [
+            "HUGOSWAY_MT5",
+            "LHFX_MT5",
+            "OANDA_PRACTICE",
+            "OANDA_LIVE"
+          ]
+        }
+      ]
+    },
+    "transport_mode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "timeframes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+    },
+    "valve": {
+      "$ref": "#/$defs/valveInfo"
+    },
+    "margin": {
+      "$ref": "#/$defs/marginInfo"
+    },
+    "chain": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/chainEntry"
+      }
+    },
+    "dual_shield": {
+      "$ref": "#/$defs/dualShield"
+    },
+    "live_readiness": {
+      "$ref": "#/$defs/liveReadiness"
+    }
+  },
+  "$defs": {
+    "decimal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 31,
+      "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+    },
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "leverage": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 8,
+      "pattern": "^1:[0-9]{1,4}$"
+    },
+    "valveInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "controller",
+        "parameters",
+        "threshold",
+        "weights_sha256",
+        "required"
+      ],
+      "properties": {
+        "controller": {
+          "const": "tks_meta_valve_controller"
+        },
+        "parameters": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "threshold": {
+          "$ref": "#/$defs/decimal"
+        },
+        "weights_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "required": {
+          "const": true
+        }
+      }
+    },
+    "marginInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_leverage",
+        "min_post_trade_margin_level_pct"
+      ],
+      "properties": {
+        "max_leverage": {
+          "$ref": "#/$defs/leverage"
+        },
+        "min_post_trade_margin_level_pct": {
+          "$ref": "#/$defs/decimal"
+        }
+      }
+    },
+    "chainEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "broker_id",
+        "priority",
+        "role",
+        "label",
+        "platform",
+        "server",
+        "account_type",
+        "max_leverage",
+        "configured",
+        "status",
+        "failure"
+      ],
+      "properties": {
+        "broker_id": {
+          "enum": [
+            "HUGOSWAY_MT5",
+            "LHFX_MT5",
+            "OANDA_PRACTICE",
+            "OANDA_LIVE"
+          ]
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "server": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "account_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "max_leverage": {
+          "$ref": "#/$defs/leverage"
+        },
+        "configured": {
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "ACTIVE",
+            "STANDBY",
+            "NOT_CONFIGURED",
+            "FAILED",
+            "DISCONNECTED",
+            "FROZEN",
+            "LIVE_FORBIDDEN",
+            "NOT_CONNECTED"
+          ]
+        },
+        "failure": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          ]
+        }
+      }
+    },
+    "quoteTruthOracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reference_source",
+        "max_divergence_bps_major",
+        "max_divergence_bps_cross",
+        "max_spread_bps",
+        "max_oanda_spread_multiple"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "reference_source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "max_divergence_bps_major": {
+          "$ref": "#/$defs/decimal"
+        },
+        "max_divergence_bps_cross": {
+          "$ref": "#/$defs/decimal"
+        },
+        "max_spread_bps": {
+          "$ref": "#/$defs/decimal"
+        },
+        "max_oanda_spread_multiple": {
+          "$ref": "#/$defs/decimal"
+        }
+      }
+    },
+    "barbellPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "oanda_reserve_share",
+        "hugosway_share",
+        "lhfx_share",
+        "max_stop_loss_equity_risk_pct"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "oanda_reserve_share": {
+          "$ref": "#/$defs/decimal"
+        },
+        "hugosway_share": {
+          "$ref": "#/$defs/decimal"
+        },
+        "lhfx_share": {
+          "$ref": "#/$defs/decimal"
+        },
+        "max_stop_loss_equity_risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "max_drawdown_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "allocation_tolerance_share": {
+          "$ref": "#/$defs/decimal"
+        },
+        "demo_virtual_sleeve": {
+          "type": "boolean"
+        }
+      }
+    },
+    "allocationVenue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "broker_id",
+        "target_share",
+        "actual_share",
+        "equity"
+      ],
+      "properties": {
+        "broker_id": {
+          "enum": [
+            "HUGOSWAY_MT5",
+            "LHFX_MT5",
+            "OANDA_PRACTICE",
+            "OANDA_LIVE"
+          ]
+        },
+        "target_share": {
+          "$ref": "#/$defs/decimal"
+        },
+        "actual_share": {
+          "$ref": "#/$defs/decimal"
+        },
+        "equity": {
+          "$ref": "#/$defs/decimal"
+        }
+      }
+    },
+    "allocationReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_equity",
+        "venues"
+      ],
+      "properties": {
+        "total_equity": {
+          "$ref": "#/$defs/decimal"
+        },
+        "venues": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/allocationVenue"
+          }
+        },
+        "peak_equity": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/decimal"
+            }
+          ]
+        },
+        "drawdown_pct": {
+          "$ref": "#/$defs/decimal"
+        }
+      }
+    },
+    "degradationEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "broker_id",
+        "outcome",
+        "reason"
+      ],
+      "properties": {
+        "broker_id": {
+          "enum": [
+            "HUGOSWAY_MT5",
+            "LHFX_MT5",
+            "OANDA_PRACTICE",
+            "OANDA_LIVE"
+          ]
+        },
+        "outcome": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 240
+            }
+          ]
+        }
+      }
+    },
+    "safeHarbor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "broker_id",
+        "leverage",
+        "conservative_mode",
+        "recent_degradations"
+      ],
+      "properties": {
+        "broker_id": {
+          "enum": [
+            "HUGOSWAY_MT5",
+            "LHFX_MT5",
+            "OANDA_PRACTICE",
+            "OANDA_LIVE"
+          ]
+        },
+        "leverage": {
+          "$ref": "#/$defs/leverage"
+        },
+        "conservative_mode": {
+          "type": "boolean"
+        },
+        "recent_degradations": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/degradationEvent"
+          }
+        }
+      }
+    },
+    "offsetPlanner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "venue",
+        "leverage"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "venue": {
+          "enum": [
+            "HUGOSWAY_MT5",
+            "LHFX_MT5",
+            "OANDA_PRACTICE",
+            "OANDA_LIVE"
+          ]
+        },
+        "leverage": {
+          "$ref": "#/$defs/leverage"
+        },
+        "default_catastrophe_stop_bps": {
+          "$ref": "#/$defs/decimal"
+        },
+        "requires_valve_clearance": {
+          "type": "boolean"
+        }
+      }
+    },
+    "dualShield": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "quote_truth_oracle",
+        "barbell",
+        "safe_harbor",
+        "offset_planner"
+      ],
+      "properties": {
+        "quote_truth_oracle": {
+          "$ref": "#/$defs/quoteTruthOracle"
+        },
+        "barbell": {
+          "$ref": "#/$defs/barbellPolicy"
+        },
+        "allocation": {
+          "$ref": "#/$defs/allocationReport"
+        },
+        "safe_harbor": {
+          "$ref": "#/$defs/safeHarbor"
+        },
+        "offset_planner": {
+          "$ref": "#/$defs/offsetPlanner"
+        }
+      }
+    },
+    "liveReadinessGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "step",
+        "title",
+        "passed",
+        "detail"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "step": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    },
+    "liveReadiness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution_mode",
+        "live_armed",
+        "required_arm_phrase",
+        "gates",
+        "all_gates_ready"
+      ],
+      "properties": {
+        "execution_mode": {
+          "enum": [
+            "DEMO",
+            "LIVE"
+          ]
+        },
+        "live_armed": {
+          "type": "boolean"
+        },
+        "required_arm_phrase": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "gates": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/liveReadinessGate"
+          }
+        },
+        "all_gates_ready": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

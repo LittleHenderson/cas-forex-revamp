@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:health:1.0",
+  "title": "LoopbackCockpitServerHealth",
+  "description": "Read-only health probe payload for GET /api/health (unauthenticated and authenticated).",
+  "anyOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "auth_required",
+        "authenticated"
+      ],
+      "properties": {
+        "status": {
+          "const": "OK"
+        },
+        "auth_required": {
+          "const": true
+        },
+        "authenticated": {
+          "const": false
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "auth_required",
+        "authenticated",
+        "session_epoch",
+        "bridge_attached",
+        "stream_available"
+      ],
+      "properties": {
+        "status": {
+          "const": "OK"
+        },
+        "auth_required": {
+          "const": true
+        },
+        "authenticated": {
+          "const": true
+        },
+        "session_epoch": {
+          "type": "string",
+          "minLength": 38,
+          "maxLength": 38,
+          "pattern": "^epoch-[0-9a-f]{32}$"
+        },
+        "bridge_attached": {
+          "type": "boolean"
+        },
+        "stream_available": {
+          "type": "boolean"
+        }
+      }
+    }
+  ]
+}
