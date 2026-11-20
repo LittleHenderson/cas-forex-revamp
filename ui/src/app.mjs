@@ -24,6 +24,7 @@ import {
   evaluateLiveArmingPreflight,
   renderLiveFundingPanel,
 } from './live-funding.mjs';
+import { buildPairingUrl, renderQrSvg } from './qr-pairing.mjs';
 
 // Fixed same-origin assets. Only explicit trusted bootstrap may inject a scoped bridge.
 const schemaURL = new URL('../docs/contracts/cockpit.schema.json', document.baseURI);
@@ -70,16 +71,36 @@ try {
   }
 } catch { /* Static preview has no token query. */ }
 
+let qrAutoCloseTimer = null;
+
+function closeQrPairingDrawer(shouldRender = false) {
+  if (qrAutoCloseTimer !== null) {
+    window.clearTimeout(qrAutoCloseTimer);
+    qrAutoCloseTimer = null;
+  }
+  if (state.qrPairingOpen || state.qrPairingSvg || state.qrPairingCopiedNotice) {
+    state = { ...state, qrPairingOpen: false, qrPairingSvg: null, qrPairingCopiedNotice: null };
+    if (shouldRender) render();
+  }
+}
+
 /** Explicitly set or clear the origin-scoped loopback bearer token (sessionStorage + memory, zero cookies). */
 export function setLoopbackAuthToken(token) {
   if (token === null) {
     loopbackAuthToken = null;
     try { window.sessionStorage?.removeItem?.(SESSION_TOKEN_KEY); } catch { /* Ignore */ }
+    if (typeof state === 'object' && state) {
+      state.canPairDevice = false;
+      closeQrPairingDrawer(false);
+    }
     return;
   }
   if (typeof token !== 'string' || token.trim().length < 16 || /[\r\n\0]/.test(token)) throw new Error('Invalid loopback auth token.');
   loopbackAuthToken = token.trim();
   try { window.sessionStorage?.setItem?.(SESSION_TOKEN_KEY, loopbackAuthToken); } catch { /* Ignore */ }
+  if (typeof state === 'object' && state) {
+    state.canPairDevice = true;
+  }
 }
 let state = {
   projection: null, source: 'none', loadedAt: null, schemaReady: false,
@@ -92,6 +113,12 @@ let state = {
   treasury: null, parallelTiers: null, chartZoomBars: 60, inspectedTradeIdx: 0,
   moneyFlow: createDefaultMoneyFlowState(),
   liveFunding: createDefaultLiveFundingState(),
+  unlockDraft: '',
+  unlockKeyVisible: false,
+  canPairDevice: Boolean(loopbackAuthToken),
+  qrPairingOpen: false,
+  qrPairingSvg: null,
+  qrPairingCopiedNotice: null,
 };
 
 function routeFromHash() {
@@ -176,6 +203,17 @@ function render(focusMain = false) {
   const prevScrollX = window.scrollX || 0;
   const prevScrollY = window.scrollY || 0;
   const active = document.activeElement;
+  const activeUnlock = root.contains(active) && active?.tagName === 'INPUT' && active?.name === 'cockpit_access_key'
+    ? {
+        id: active.id,
+        value: String(active.value ?? ''),
+        selStart: typeof active.selectionStart === 'number' ? active.selectionStart : null,
+        selEnd: typeof active.selectionEnd === 'number' ? active.selectionEnd : null,
+      }
+    : null;
+  if (activeUnlock && !state.liveStreamConnected) {
+    state.unlockDraft = activeUnlock.value;
+  }
   const identity = root.contains(active) && active?.tagName === 'BUTTON' ? JSON.stringify(active.dataset) : null;
   document.documentElement.dataset.theme = state.theme;
   try { releaseDetachedCanvases(root); } catch { /* Best-effort buffer release. */ }
@@ -185,7 +223,20 @@ function render(focusMain = false) {
   try { explainer?.sync(); } catch { disableExplainer(); }
   document.title = `${state.route[0].toUpperCase() + state.route.slice(1)} / CAS Forex`;
   if (focusMain) document.querySelector('#main')?.focus({ preventScroll: true });
-  else if (identity) {
+  else if (activeUnlock && !state.liveStreamConnected) {
+    const restoredInput = activeUnlock.id
+      ? root.querySelector(`#${activeUnlock.id}`)
+      : root.querySelector('input[name="cockpit_access_key"]');
+    if (restoredInput) {
+      restoredInput.value = state.unlockDraft ?? activeUnlock.value;
+      restoredInput.focus({ preventScroll: true });
+      try {
+        if (activeUnlock.selStart !== null) {
+          restoredInput.setSelectionRange(activeUnlock.selStart, activeUnlock.selEnd ?? activeUnlock.selStart);
+        }
+      } catch { /* Optional selection restore */ }
+    }
+  } else if (identity) {
     const replacement = [...root.querySelectorAll('button')].find((item) => !item.disabled && JSON.stringify(item.dataset) === identity);
     (replacement ?? document.querySelector('#main'))?.focus({ preventScroll: true });
   }
@@ -314,6 +365,7 @@ function recordMicroTick(envelope) {
 function stopLoopbackStream() {
   if (liveSseAbort) { liveSseAbort.abort(); liveSseAbort = null; }
   state.liveStreamConnected = false;
+  closeQrPairingDrawer(false);
 }
 
 function handleSseEvent(eventName, dataText) {
@@ -410,6 +462,10 @@ async function connectLoopbackLiveFeed() {
     });
   }
   state.liveStreamConnected = true;
+  state.canPairDevice = Boolean(loopbackAuthToken);
+  state.aiIssue = null;
+  state.unlockDraft = '';
+  state.unlockKeyVisible = false;
   if (!controller?.attached) {
     try {
       const health = parseUniqueJSON(await readStatic(new URL('/api/health', window.location.origin)));
@@ -703,6 +759,67 @@ root.addEventListener('click', (event) => {
   if (transportClick(target)) return;
   if (target.dataset.connectLoopback) { report(connectLoopbackLiveFeed()); return; }
   if (target.dataset.disconnectLoopback) { stopLoopbackStream(); render(); announce('Live market stream paused.'); return; }
+  if (target.dataset.openVoiceExplainer) {
+    explainer?.open?.({ focusPrompt: true });
+    return;
+  }
+  if (target.dataset.toggleUnlockVisibility) {
+    const nextVis = !state.unlockKeyVisible;
+    state.unlockKeyVisible = nextVis;
+    for (const inp of root.querySelectorAll('input[name="cockpit_access_key"]')) {
+      inp.type = nextVis ? 'text' : 'password';
+    }
+    for (const btn of root.querySelectorAll('[data-toggle-unlock-visibility="true"]')) {
+      btn.textContent = nextVis ? 'Hide' : 'Show';
+      btn.setAttribute('aria-pressed', String(nextVis));
+    }
+    target.focus({ preventScroll: true });
+    return;
+  }
+  if (target.dataset.toggleQrPairing) {
+    if (state.qrPairingOpen) {
+      closeQrPairingDrawer(true);
+      announce('Pairing QR hidden.');
+      return;
+    }
+    if (!state.liveStreamConnected || !loopbackAuthToken) return;
+    try {
+      const pairUrl = buildPairingUrl(window.location.origin, loopbackAuthToken);
+      const svg = renderQrSvg(pairUrl, { ariaLabel: 'Scan with tablet or phone camera to unlock live CAS Forex cockpit' });
+      if (qrAutoCloseTimer !== null) window.clearTimeout(qrAutoCloseTimer);
+      state = { ...state, qrPairingOpen: true, qrPairingSvg: svg, qrPairingCopiedNotice: null };
+      qrAutoCloseTimer = window.setTimeout(() => {
+        qrAutoCloseTimer = null;
+        closeQrPairingDrawer(true);
+        announce('Pairing QR auto-closed after 120 seconds.');
+      }, 120000);
+      render();
+      announce('Device pairing QR code opened for 120 seconds.');
+    } catch (error) {
+      state.aiIssue = error instanceof Error ? error.message : 'Unable to generate pairing QR.';
+      render();
+    }
+    return;
+  }
+  if (target.dataset.copyUnlockLink) {
+    if (!loopbackAuthToken) return;
+    void (async () => {
+      try {
+        const pairUrl = buildPairingUrl(window.location.origin, loopbackAuthToken);
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(pairUrl);
+          state.qrPairingCopiedNotice = 'Private unlock link copied to clipboard.';
+        } else {
+          state.qrPairingCopiedNotice = 'Clipboard unavailable in this browser — scan the QR square above.';
+        }
+      } catch {
+        state.qrPairingCopiedNotice = 'Could not copy automatically — scan the QR square above.';
+      }
+      render();
+      announce(state.qrPairingCopiedNotice);
+    })();
+    return;
+  }
   if (target.dataset.aiOverseerAction) { void sendOverseerAction(target.dataset.aiOverseerAction); return; }
   if (target.dataset.riskGear) { void setRiskGearMode(target.dataset.riskGear); return; }
   if (target.dataset.lfCap) {
@@ -864,19 +981,27 @@ root.addEventListener('submit', async (event) => {
   if (!form) return;
   event.preventDefault();
   const input = form.querySelector('input[name="cockpit_access_key"]');
-  const val = String(input?.value ?? '').trim();
-  if (!val) { state.aiIssue = 'Enter your Cockpit access key to unlock live feeds.'; render(); return; }
+  const val = String(input?.value || state.unlockDraft || '').trim();
+  if (!val) { state.aiIssue = 'Enter your 43-character Cockpit access key to unlock live feeds.'; render(); return; }
   try {
     setLoopbackAuthToken(val);
+    state.unlockDraft = '';
+    state.unlockKeyVisible = false;
+    state.aiIssue = null;
     if (input) input.value = '';
     await connectLoopbackLiveFeed();
   } catch (error) {
+    state.unlockDraft = val;
     state.aiIssue = error instanceof Error ? error.message : 'Cockpit unlock failed.';
     render();
   }
 });
 
 root.addEventListener('input', (event) => {
+  if (event.target?.name === 'cockpit_access_key') {
+    state.unlockDraft = String(event.target.value ?? '');
+    return;
+  }
   if (event.target?.dataset?.lfPhraseInput) {
     state.liveFunding = { ...state.liveFunding, armPhraseInput: String(event.target.value ?? '') };
   }
@@ -970,6 +1095,7 @@ dialog.addEventListener('close', () => {
 });
 window.addEventListener('hashchange', () => {
   if (dialog.open) dialog.close();
+  closeQrPairingDrawer(false);
   state.route = routeFromHash();
   render(true);
 });

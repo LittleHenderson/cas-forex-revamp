@@ -73,6 +73,75 @@ const numStr = (value, fallback = '0') => {
   return fallback;
 };
 
+function compareDecimalStrings(aRaw, bRaw) {
+  const parseDec = (raw) => {
+    const clean = typeof raw === 'string' && /^-?[0-9]+(\.[0-9]+)?$/.test(raw.trim()) ? raw.trim() : '0';
+    const neg = clean.startsWith('-');
+    const unsigned = neg ? clean.slice(1) : clean;
+    const [intPart, fracPart = ''] = unsigned.split('.');
+    return { neg, intPart, fracPart };
+  };
+  const a = parseDec(aRaw);
+  const b = parseDec(bRaw);
+  const scale = Math.max(a.fracPart.length, b.fracPart.length);
+  const aVal = BigInt(a.intPart + a.fracPart.padEnd(scale, '0')) * (a.neg ? -1n : 1n);
+  const bVal = BigInt(b.intPart + b.fracPart.padEnd(scale, '0')) * (b.neg ? -1n : 1n);
+  if (aVal === bVal) return 0;
+  return aVal > bVal ? 1 : -1;
+}
+
+export function formatExactUsd(raw) {
+  const s = typeof raw === 'string' && /^-?[0-9]+(\.[0-9]+)?$/.test(raw.trim()) ? raw.trim() : '0';
+  const neg = s.startsWith('-');
+  const unsigned = neg ? s.slice(1) : s;
+  const [rawInt, rawFrac = ''] = unsigned.split('.');
+  const cleanInt = rawInt.replace(/^0+(?=\d)/, '') || '0';
+  const withCommas = cleanInt.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const frac = rawFrac.length >= 2 ? rawFrac : rawFrac.padEnd(2, '0');
+  const isZero = cleanInt === '0' && /^0+$/.test(frac);
+  return `${neg && !isZero ? '-' : ''}$${withCommas}.${frac}`;
+}
+
+export function formatSignedUsd(raw) {
+  const formatted = formatExactUsd(raw);
+  if (formatted === '$0.00' || formatted.startsWith('-')) return formatted;
+  return `+${formatted}`;
+}
+
+function normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operatingMode) {
+  const bs = doc?.banked_session && typeof doc.banked_session === 'object' && !Array.isArray(doc.banked_session)
+    ? doc.banked_session
+    : null;
+  const lockedDefault = dailyQuota.status === 'DAILY_QUOTA_LOCKED' || dailyQuota.status === 'PROFIT_FLOOR_LOCKED';
+  const defaultTotalRealized = compareDecimalStrings(dailyQuota.realizedNetPnlUsd, '0') > 0
+    ? dailyQuota.realizedNetPnlUsd
+    : '0';
+  const vaultSwept50PctUsd = numStr(bs?.vault_swept_50pct_usd, bankSweepReservedUsd);
+  const vaultRetained50PctUsd = numStr(bs?.vault_retained_50pct_usd, bankSweepReservedUsd);
+  return Object.freeze({
+    schema: 'cas-forex.banked-session/1',
+    accountingBasis: str(bs?.accounting_basis, 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT', 80),
+    sessionDate: str(bs?.session_date, dailyQuota.sessionDate, 40),
+    bankedNetPnlUsd: numStr(bs?.banked_net_pnl_usd, dailyQuota.realizedNetPnlUsd),
+    realizedPnlPct: numStr(bs?.realized_pnl_pct, dailyQuota.realizedPnlPct),
+    peakRealizedPnlUsd: numStr(bs?.peak_realized_pnl_usd, dailyQuota.peakRealizedPnlUsd),
+    protectedProfitFloorUsd: numStr(bs?.protected_profit_floor_usd, dailyQuota.protectedProfitFloorUsd),
+    ratchetArmed: typeof bs?.ratchet_armed === 'boolean' ? bs.ratchet_armed : Boolean(dailyQuota.ratchetArmed),
+    closedTrades: numStr(bs?.closed_trades, dailyQuota.closedTrades),
+    winCount: numStr(bs?.win_count, dailyQuota.winCount),
+    lossCount: numStr(bs?.loss_count, dailyQuota.lossCount),
+    vaultTotalRealizedUsd: numStr(bs?.vault_total_realized_usd, defaultTotalRealized),
+    vaultSwept50PctUsd,
+    sessionVaultReserved50PctUsd: numStr(bs?.session_vault_reserved_50pct_usd, vaultSwept50PctUsd),
+    vaultRetained50PctUsd,
+    confirmedBankPayoutsUsd: numStr(bs?.confirmed_bank_payouts_usd, '0'),
+    profitsLockedForSession: typeof bs?.profits_locked_for_session === 'boolean' ? bs.profits_locked_for_session : lockedDefault,
+    operatingMode: str(bs?.operating_mode, operatingMode, 40),
+    sessionRolloverLabel: str(bs?.session_rollover_label, '17:00 America/New_York (14:00 Pacific)', 80),
+    nextSessionOpensUtc: bs?.next_session_opens_utc ? str(bs.next_session_opens_utc, '', 64) : null,
+  });
+}
+
 export const STATIC_AI_MODELS = Object.freeze({
   connected: false,
   activeModelId: 'claude-fable-5.2',
@@ -173,6 +242,31 @@ export const STATIC_AI_TRADER = Object.freeze({
     ratchetActivationUsd: '0',
     protectedProfitFloorUsd: '0',
   }),
+  bankedSession: Object.freeze({
+    schema: 'cas-forex.banked-session/1',
+    accountingBasis: 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT',
+    sessionDate: 'Unknown',
+    bankedNetPnlUsd: '0',
+    realizedPnlPct: '0',
+    peakRealizedPnlUsd: '0',
+    protectedProfitFloorUsd: '0',
+    ratchetArmed: false,
+    closedTrades: '0',
+    winCount: '0',
+    lossCount: '0',
+    vaultTotalRealizedUsd: '0',
+    vaultSwept50PctUsd: '0',
+    sessionVaultReserved50PctUsd: '0',
+    vaultRetained50PctUsd: '0',
+    confirmedBankPayoutsUsd: '0',
+    profitsLockedForSession: false,
+    operatingMode: 'ACTIVE_TRADING',
+    sessionRolloverLabel: '17:00 America/New_York (14:00 Pacific)',
+    nextSessionOpensUtc: null,
+  }),
+  accountingBasis: 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT',
+  confirmedBankPayoutsUsd: '0',
+  sessionVaultReserved50PctUsd: '0',
   openPositions: Object.freeze([]),
   recentActions: Object.freeze([]),
 });
@@ -254,6 +348,34 @@ export function normalizeAiTrader(doc) {
     symbol: str(a.symbol ?? '', ''),
     detail: str(a.detail ?? a.reason ?? a.outcome ?? '', 'Recorded', 240),
   }));
+  const operatingMode = str(doc.operating_mode, 'ACTIVE_TRADING', 40);
+  const bankSweepReservedUsd = numStr(doc.bank_sweep_reserved_usd, '0');
+  const dailyQuota = Object.freeze({
+    sessionDate: str(q.session_date, 'Unknown'),
+    status: quotaStatus,
+    newRiskAllowed: Boolean(q.new_risk_allowed),
+    lockReason: q.lock_reason ? str(q.lock_reason) : null,
+    quotaMode: str(q.quota_mode, 'USD'),
+    startingEquityUsd: numStr(q.starting_equity_usd, '0'),
+    realizedNetPnlUsd: numStr(q.realized_net_pnl_usd, '0'),
+    realizedPnlPct: numStr(q.realized_pnl_pct, '0'),
+    softQuotaUsd: numStr(q.soft_quota_usd, '500'),
+    hardQuotaUsd: numStr(q.hard_quota_usd, '1000'),
+    dailyQuotaPct: q.daily_quota_pct ? numStr(q.daily_quota_pct) : null,
+    quotaProgressPct: numStr(q.quota_progress_pct, '0'),
+    riskMultiplier: numStr(q.risk_multiplier, '1'),
+    maxDailyLossUsd: numStr(q.max_daily_loss_usd, '500'),
+    closedTrades: numStr(q.closed_trades, '0'),
+    winCount: numStr(q.win_count, '0'),
+    lossCount: numStr(q.loss_count, '0'),
+    consecutiveLosses: numStr(q.consecutive_losses, '0'),
+    maxConsecutiveLosses: numStr(q.max_consecutive_losses, '3'),
+    peakRealizedPnlUsd: numStr(q.peak_realized_pnl_usd, '0'),
+    ratchetArmed: Boolean(q.ratchet_armed),
+    ratchetActivationUsd: numStr(q.ratchet_activation_usd, '0'),
+    protectedProfitFloorUsd: numStr(q.protected_profit_floor_usd, '0'),
+  });
+  const bankedSession = normalizeBankedSession(doc, dailyQuota, bankSweepReservedUsd, operatingMode);
   return Object.freeze({
     connected: true,
     humanRole: str(doc.human_role, 'OVERSEER_ONLY'),
@@ -261,7 +383,7 @@ export function normalizeAiTrader(doc) {
     governanceReason: str(doc.governance_reason, 'Autonomous loop active.'),
     effectiveStatus: str(doc.effective_status, govMode),
     respiteMode: Boolean(doc.respite_mode),
-    operatingMode: str(doc.operating_mode, 'ACTIVE_TRADING', 40),
+    operatingMode,
     fastTickMs: numStr(doc.fast_tick_ms, '50'),
     cadence: str(doc.cadence, '50ms_FAST_TICK'),
     marketsEvaluated: numStr(doc.markets_evaluated, '20'),
@@ -298,7 +420,10 @@ export function normalizeAiTrader(doc) {
     lastLatencyMs: Number.isSafeInteger(doc.last_latency_ms) ? doc.last_latency_ms : null,
     lastRegime: str(doc.last_regime, 'TREND_IGNITION'),
     deployableEquityUsd: numStr(doc.deployable_equity_usd, '0'),
-    bankSweepReservedUsd: numStr(doc.bank_sweep_reserved_usd, '0'),
+    bankSweepReservedUsd,
+    accountingBasis: bankedSession.accountingBasis,
+    confirmedBankPayoutsUsd: bankedSession.confirmedBankPayoutsUsd,
+    sessionVaultReserved50PctUsd: bankedSession.sessionVaultReserved50PctUsd,
     lastAction: str(doc.last_action, 'WAIT'),
     lastSymbol: doc.last_symbol ? str(doc.last_symbol) : 'None',
     lastReason: str(doc.last_reason, 'None'),
@@ -320,31 +445,8 @@ export function normalizeAiTrader(doc) {
       ownerMaxDrawdownPct: numStr(doc.risk_gear.owner_max_drawdown_pct, '0.2'),
       reason: str(doc.risk_gear.reason, 'Owner-bounded adaptive risk gear.', 200),
     }) : STATIC_AI_TRADER.riskGear,
-    dailyQuota: Object.freeze({
-      sessionDate: str(q.session_date, 'Unknown'),
-      status: quotaStatus,
-      newRiskAllowed: Boolean(q.new_risk_allowed),
-      lockReason: q.lock_reason ? str(q.lock_reason) : null,
-      quotaMode: str(q.quota_mode, 'USD'),
-      startingEquityUsd: numStr(q.starting_equity_usd, '0'),
-      realizedNetPnlUsd: numStr(q.realized_net_pnl_usd, '0'),
-      realizedPnlPct: numStr(q.realized_pnl_pct, '0'),
-      softQuotaUsd: numStr(q.soft_quota_usd, '500'),
-      hardQuotaUsd: numStr(q.hard_quota_usd, '1000'),
-      dailyQuotaPct: q.daily_quota_pct ? numStr(q.daily_quota_pct) : null,
-      quotaProgressPct: numStr(q.quota_progress_pct, '0'),
-      riskMultiplier: numStr(q.risk_multiplier, '1'),
-      maxDailyLossUsd: numStr(q.max_daily_loss_usd, '500'),
-      closedTrades: numStr(q.closed_trades, '0'),
-      winCount: numStr(q.win_count, '0'),
-      lossCount: numStr(q.loss_count, '0'),
-      consecutiveLosses: numStr(q.consecutive_losses, '0'),
-      maxConsecutiveLosses: numStr(q.max_consecutive_losses, '3'),
-      peakRealizedPnlUsd: numStr(q.peak_realized_pnl_usd, '0'),
-      ratchetArmed: Boolean(q.ratchet_armed),
-      ratchetActivationUsd: numStr(q.ratchet_activation_usd, '0'),
-      protectedProfitFloorUsd: numStr(q.protected_profit_floor_usd, '0'),
-    }),
+    dailyQuota,
+    bankedSession,
     openPositions: Object.freeze(openPositions),
     recentActions: Object.freeze(recentActions),
   });
@@ -467,8 +569,11 @@ export function renderAiOverseerPanel(state) {
   const connectBtn = !trader.connected
     ? '<button type="button" class="button button-small button-primary" data-connect-loopback="true">Connect live server</button>'
     : '';
+  const unlockInputType = state?.unlockKeyVisible ? 'text' : 'password';
+  const unlockDraftVal = esc(state?.unlockDraft ?? '');
+  const unlockVisLabel = state?.unlockKeyVisible ? 'Hide' : 'Show';
   const unlockBar = !trader.connected
-    ? '<form class="mobile-unlock-bar prominent-unlock-bar" data-cockpit-unlock-form="true" autocomplete="on"><label class="sr-only" for="overseer-access-key">Cockpit access key</label><input id="overseer-access-key" class="mobile-unlock-input" type="password" name="cockpit_access_key" autocomplete="current-password" placeholder="Paste Cockpit access key here (or run D:\\MetaTrader5\\Launch_24x7_Cloud_Cockpit.cmd) to unlock live 24/7 cloud AI"><button type="submit" class="button button-small button-primary">Unlock &amp; Connect Live Cloud</button></form>'
+    ? `<form class="mobile-unlock-bar prominent-unlock-bar" data-cockpit-unlock-form="true" autocomplete="on"><div class="unlock-bar-row"><label class="sr-only" for="overseer-access-key">Cockpit access key</label><input id="overseer-access-key" class="mobile-unlock-input" type="${unlockInputType}" name="cockpit_access_key" value="${unlockDraftVal}" autocomplete="current-password" spellcheck="false" autocapitalize="off" placeholder="Paste Cockpit access key here (or run D:\\MetaTrader5\\Launch_24x7_Cloud_Cockpit.cmd) to unlock live 24/7 cloud AI"><button type="button" class="button button-small button-secondary unlock-vis-btn" data-toggle-unlock-visibility="true" aria-pressed="${Boolean(state?.unlockKeyVisible)}">${unlockVisLabel}</button><button type="submit" class="button button-small button-primary">Unlock &amp; Connect Live Cloud</button></div><p class="unlock-helper-note">Paste your 43-character key from <code>D:\\MetaTrader5\\.cloud_cockpit.token</code> on your PC — or scan the 1-second Pairing QR from an unlocked PC</p>${state?.aiIssue ? `<p class="unlock-inline-error warning-text" role="alert">${esc(state.aiIssue)}</p>` : ''}</form>`
     : '';
   const workingPill = `<span class="working-now-pill" data-working-now="true">WORKING NOW: ${esc(trader.currentFocusStatus ?? (`SCANNING ${trader.marketsEvaluated} MARKETS`))}</span>`;
 
@@ -540,5 +645,87 @@ export function renderAiModelCatalogPanel(aiModels) {
     <div class="broker-chain">${m.models.map((entry) => (
       `<div class="stage-row"><div><span class="stage-letter">#${esc(entry.rank)}</span><h3>${esc(entry.displayName)}${entry.isFallback ? ' · Offline fallback only' : ''}</h3><p>${esc(entry.providerLabel)} · <code>${esc(entry.modelId)}</code> · tier ${esc(entry.tier)}</p></div><span class="tag${entry.providerReady ? '' : ' tag-warning'}"><span class="state-rule" aria-hidden="true"></span>${esc(entry.availability)}${entry.active ? ' · SELECTED' : ''}</span></div>`
     )).join('')}</div>
+  </section>`;
+}
+
+export function renderBankedProfitsHeroBanner(state) {
+  if (!state?.liveStreamConnected) {
+    return `<section class="panel banked-profits-hero is-locked" data-banked-profits-locked="true" aria-label="Locked Cockpit Cloud Status">
+      <div class="banked-locked-inner">
+        <span class="eyebrow">24/7 CLOUD SERVER RUNNING · THIS TAB IS LOCKED</span>
+        <h2>Cockpit Locked — Unlock Above or Scan Pairing QR to View Session Realized P&amp;L &amp; Internal Vault Reserve</h2>
+        <p>Cockpit Locked — Your 24/7 Cloud Server is running in the background, but this browser tab is not unlocked yet. Enter your 43-character Cockpit Access Key in the Unlock bar above (or click &#39;Pair Phone / Tablet (QR)&#39; on your unlocked PC and scan with your camera) to view Session Realized P&amp;L &amp; Internal Vault Reserve, 3-Broker Equity, and Gemini 4 Neon Voice Explainer.</p>
+      </div>
+    </section>`;
+  }
+
+  const trader = state?.aiTrader ?? STATIC_AI_TRADER;
+  const q = trader.dailyQuota ?? STATIC_AI_TRADER.dailyQuota;
+  const bs = trader.bankedSession ?? normalizeBankedSession(null, q, trader.bankSweepReservedUsd ?? '0', trader.operatingMode ?? 'ACTIVE_TRADING');
+  const isLiveArmed = state?.brokerRouting?.executionMode === 'LIVE' && state?.brokerRouting?.liveArmed === true;
+  const isRespite = Boolean(bs.profitsLockedForSession || trader.respiteMode || bs.operatingMode === 'RESEARCH_RESPITE');
+
+  const sessReserveRaw = bs.sessionVaultReserved50PctUsd ?? bs.vaultSwept50PctUsd ?? '0';
+  const reserveUsd = compareDecimalStrings(sessReserveRaw, '0') === 0
+    && compareDecimalStrings(bs.bankedNetPnlUsd, '0') > 0
+    && state?.treasury?.connected
+    ? state.treasury.bankSweepReservedUsd
+    : sessReserveRaw;
+  const retainedRaw = bs.vaultRetained50PctUsd ?? '0';
+  const retainedUsd = compareDecimalStrings(retainedRaw, '0') === 0
+    && compareDecimalStrings(bs.bankedNetPnlUsd, '0') > 0
+    && state?.treasury?.connected
+    ? state.treasury.retainedTradingUsd
+    : retainedRaw;
+  const rawTreasuryDisbursed = state?.treasury?.connected
+    ? state.treasury.disbursedToBankUsd
+    : (state?.treasury && state.treasury.connected === undefined ? state.treasury.disbursedToBankUsd : undefined);
+  const confirmedPayoutsUsd = rawTreasuryDisbursed ?? bs.confirmedBankPayoutsUsd ?? '0';
+
+  const pctStr = String(bs.realizedPnlPct ?? '0');
+  const signedPct = pctStr.startsWith('-') || pctStr === '0' || pctStr === '0.00' ? `${pctStr}%` : `+${pctStr}%`;
+  const floorDisplay = compareDecimalStrings(bs.protectedProfitFloorUsd, '0') > 0
+    ? formatSignedUsd(bs.protectedProfitFloorUsd)
+    : '$0.00';
+  const floorDetail = bs.ratchetArmed
+    ? `Peak Today: ${formatSignedUsd(bs.peakRealizedPnlUsd)} · RATCHET ARMED`
+    : `Peak Today: ${formatSignedUsd(bs.peakRealizedPnlUsd)} · Arms at ${formatExactUsd(q.ratchetActivationUsd)}`;
+  const pnlNegative = compareDecimalStrings(bs.bankedNetPnlUsd, '0') < 0;
+
+  return `<section class="panel banked-profits-hero is-connected" data-banked-profits-hero="true" aria-label="Session Realized P&amp;L and Internal Vault Reserve Scoreboard">
+    <div class="banked-hero-head">
+      <div>
+        <p class="eyebrow">SESSION REALIZED P&amp;L &amp; INTERNAL VAULT LEDGER · ZERO-SCROLL SCOREBOARD</p>
+        <h2>Today&#39;s Session Realized Net P&amp;L, 70% Protected Floor &amp; 50% Internal Vault Reserve</h2>
+        <p class="banked-accounting-disclaimer" data-accounting-disclaimer="true"><strong>Internal Accounting Figure — Not a Confirmed Bank Payout</strong> · Basis: <code>${esc(bs.accountingBasis ?? 'INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT')}</code> · Settled bank transfers appear separately under Confirmed Bank Payouts.</p>
+      </div>
+      <div class="banked-hero-actions">
+        <span class="exec-mode-badge ${isLiveArmed ? 'is-live-armed' : 'is-demo-mode'}" data-session-funding-mode="${isLiveArmed ? 'LIVE' : 'DEMO_PRACTICE'}">${isLiveArmed ? 'LIVE REAL-MONEY ACCOUNT' : 'DEMO PRACTICE ACCOUNT (SIMULATED FUNDS)'}</span>
+        <span class="banked-status-pill ${isRespite ? 'is-respite' : 'is-active'}">${isRespite ? 'RESEARCH RESPITE · QUOTA LOCK ACTIVE' : 'ACTIVE SESSION P&amp;L TRACKER'}</span>
+      </div>
+    </div>
+    <div class="banked-hero-grid">
+      <article class="banked-hero-card">
+        <span class="eyebrow">1 · Session Realized Net P&amp;L (Today · Internal Ledger)</span>
+        <div class="banked-hero-value numeric ${pnlNegative ? 'is-neg' : 'is-pos'}">${esc(formatSignedUsd(bs.bankedNetPnlUsd))}</div>
+        <p class="banked-hero-sub numeric">${esc(signedPct)} · ${esc(bs.closedTrades)} closed trades (${esc(bs.winCount)}W / ${esc(bs.lossCount)}L) · Internal ledger figure · Session ${esc(bs.sessionDate)}</p>
+      </article>
+      <article class="banked-hero-card">
+        <span class="eyebrow">2 · 70% Protected Profit Floor (Session Rule)</span>
+        <div class="banked-hero-value numeric is-pos">${esc(floorDisplay)}</div>
+        <p class="banked-hero-sub numeric">${esc(floorDetail)}</p>
+      </article>
+      <article class="banked-hero-card">
+        <span class="eyebrow">3 · 50% Internal Vault Reserve &amp; Confirmed Payouts</span>
+        <div class="banked-hero-value numeric">${esc(formatExactUsd(reserveUsd))} Internal Vault Reserve</div>
+        <p class="banked-hero-sub numeric">${esc(formatExactUsd(retainedUsd))} Retained Compounding · <strong class="confirmed-payout-inline">Confirmed Bank Payouts: ${esc(formatExactUsd(confirmedPayoutsUsd))}</strong></p>
+      </article>
+      <article class="banked-hero-card">
+        <span class="eyebrow">4 · Session Mode &amp; 17:00 Rollover</span>
+        <div class="banked-hero-value banked-hero-mode">${isRespite ? 'RESEARCH RESPITE · Quota Lock Active (0 New Risk · Observing 20 Markets)' : 'ACTIVE TRADING'}</div>
+        <p class="banked-hero-sub">Next Session Rollover: ${esc(bs.sessionRolloverLabel)}${bs.nextSessionOpensUtc ? ` · ${esc(bs.nextSessionOpensUtc)}` : ''}</p>
+        <div class="banked-card-cta"><button type="button" class="button button-small button-primary banked-voice-btn" data-open-voice-explainer="true">Ask / Speak to Gemini 4 Neon</button></div>
+      </article>
+    </div>
   </section>`;
 }

@@ -802,3 +802,190 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
   color: var(--mf-green);
   border-color: var(--mf-green);
 }
+
+/* --- PR #20: Top Banked Profits Hero Scoreboard, Android Tablet Unlock Fix & Offline SVG QR Pairing --- */
+.mobile-unlock-bar.prominent-unlock-bar {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+.unlock-bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.mobile-unlock-bar .mobile-unlock-input {
+  flex: 1 1 240px;
+  font-size: 16px;
+  min-height: 44px;
+  user-select: text;
+  -webkit-user-select: text;
+  pointer-events: auto;
+  touch-action: manipulation;
+  position: relative;
+  z-index: 2;
+}
+.unlock-vis-btn,
+.qr-pair-btn,
+.banked-voice-btn {
+  min-height: 44px;
+}
+.unlock-helper-note {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.unlock-inline-error {
+  margin: 2px 0 0;
+  font-size: 12px;
+}
+.account-locked-hint {
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--orange);
+  border-left-width: 4px;
+  background: var(--warning-surface);
+  font-size: 12px;
+  color: var(--ink);
+}
+.banked-profits-hero {
+  margin-bottom: 22px;
+}
+.banked-profits-hero.is-connected {
+  border-color: var(--mf-green);
+}
+.banked-profits-hero.is-locked {
+  border-color: var(--orange);
+  background: var(--warning-surface);
+}
+.banked-locked-inner h2 {
+  margin: 4px 0 8px;
+}
+.banked-locked-inner p {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink);
+}
+.banked-hero-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.banked-accounting-disclaimer {
+  margin: 8px 0 0;
+  padding: 6px 10px;
+  border: 1px solid var(--orange);
+  border-left-width: 4px;
+  background: var(--warning-surface);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--ink);
+}
+.banked-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.banked-status-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 2px solid var(--mf-blue);
+  color: var(--mf-blue);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.banked-status-pill.is-respite {
+  border-color: var(--mf-green);
+  color: var(--mf-green);
+  background: rgba(22, 163, 74, 0.12);
+}
+.banked-hero-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(235px, 1fr));
+  gap: 12px;
+}
+.banked-hero-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-top: 4px solid var(--mf-green);
+  background: var(--panel);
+}
+.banked-hero-value {
+  font-size: clamp(18px, 1.8vw, 24px);
+  font-weight: 800;
+  line-height: 1.25;
+  color: var(--ink);
+}
+.banked-hero-value.is-pos {
+  color: var(--mf-green);
+}
+.banked-hero-value.is-neg {
+  color: var(--mf-red);
+}
+.banked-hero-value.banked-hero-mode {
+  font-size: 13.5px;
+  line-height: 1.4;
+}
+.banked-hero-sub {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+.confirmed-payout-inline {
+  color: var(--ink);
+}
+.banked-card-cta {
+  margin-top: auto;
+  padding-top: 6px;
+}
+.qr-pairing-drawer {
+  margin-bottom: 22px;
+  border-color: var(--orange);
+}
+.qr-pairing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.qr-pairing-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 20px;
+}
+.qr-pairing-frame {
+  flex: 0 0 auto;
+  padding: 10px;
+  border: 2px solid var(--ink);
+  background: #ffffff;
+}
+.qr-pairing-svg {
+  display: block;
+  width: 220px;
+  height: 220px;
+}
+.qr-pairing-instructions {
+  flex: 1 1 280px;
+  min-width: 0;
+}
+.qr-pairing-steps {
+  margin: 8px 0 0;
+  padding-left: 20px;
+  font-size: 12.5px;
+  line-height: 1.65;
+}

@@ -200,6 +200,10 @@ export function createExplainer({ getContext, askModel = null, synthesizeSpeech 
       <div class="forex-explainer-quick-chips" role="group" aria-label="Quick live voice briefings" hidden>
         ${quickChipButtons}
       </div>
+      <div class="forex-explainer-locked-banner" data-explainer-locked-banner>
+        <p>Cockpit locked — unlock with your Cockpit access key at the top of the page (or scan the Pairing QR from your PC) to talk to Gemini 4 Neon</p>
+        <button type="button" class="forex-explainer-goto-unlock" data-explainer-goto-unlock="true">Go to Unlock Bar</button>
+      </div>
       <div class="forex-explainer-content">
         <h3 class="forex-explainer-question">What am I looking at?</h3>
         <p class="forex-explainer-answer"></p>
@@ -296,6 +300,7 @@ export function createExplainer({ getContext, askModel = null, synthesizeSpeech 
   const autoSpeakButton = host.querySelector('[data-explainer-autospeak]');
   const speakButton = host.querySelector('[data-explainer-speak]');
   const quickChipsWrap = host.querySelector('.forex-explainer-quick-chips');
+  const lockedBanner = host.querySelector('[data-explainer-locked-banner]');
   const footerNote = host.querySelector('#forex-explainer-unavailable');
   const modelField = host.querySelector('[data-guide-model]');
   const subtitleField = host.querySelector('[data-guide-subtitle]');
@@ -360,6 +365,7 @@ export function createExplainer({ getContext, askModel = null, synthesizeSpeech 
           chip.disabled = askBusy;
         }
       }
+      if (lockedBanner) lockedBanner.hidden = true;
       footerNote.textContent = voiceStatusNote
         ?? (askBusy
           ? `Asking ${voiceModel}…`
@@ -373,6 +379,7 @@ export function createExplainer({ getContext, askModel = null, synthesizeSpeech 
       askButton.hidden = true;
       askButton.disabled = true;
       if (quickChipsWrap) quickChipsWrap.hidden = true;
+      if (lockedBanner) lockedBanner.hidden = false;
       footerNote.textContent = voiceStatusNote
         ?? 'AI explanations are unavailable. The local guide and all source records remain readable.';
     }
@@ -846,6 +853,16 @@ export function createExplainer({ getContext, askModel = null, synthesizeSpeech 
       void submitQuestion({ overrideQuestion: quickQ });
       return;
     }
+    if (button.hasAttribute('data-explainer-goto-unlock')) {
+      if (!wide.matches) setOpen(false);
+      const topUnlock = document.querySelector('#top-cockpit-access-key') ?? document.querySelector('input[name="cockpit_access_key"]');
+      if (topUnlock) {
+        try { topUnlock.scrollIntoView?.({ block: 'center', behavior: 'auto' }); } catch { /* Optional */ }
+        topUnlock.focus({ preventScroll: true });
+      }
+      say('Moved focus to the Cockpit access key unlock bar.');
+      return;
+    }
     if (button.hasAttribute('data-explainer-ask-submit')) {
       unlockWebAudioSync();
       void submitQuestion();
@@ -924,6 +941,14 @@ export function createExplainer({ getContext, askModel = null, synthesizeSpeech 
   }
   return Object.freeze({
     sync() { if (!destroyed) { if (open) updateContent();position(); } },
+    open({ focusPrompt = false } = {}) {
+      if (destroyed) return;
+      unlockWebAudioSync();
+      setOpen(true, { focus: !focusPrompt });
+      if (focusPrompt && !promptInput.disabled) {
+        promptInput.focus({ preventScroll: true });
+      }
+    },
     destroy,
   });
 }

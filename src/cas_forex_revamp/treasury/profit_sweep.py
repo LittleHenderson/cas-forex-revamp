@@ -552,6 +552,7 @@ class ProfitSweepVault:
                     retained_trading_usd_text TEXT NOT NULL,
                     bank_sweep_usd_text TEXT NOT NULL,
                     occurred_at TEXT NOT NULL,
+                    session_date TEXT,
                     PRIMARY KEY (scope_id, trade_id)
                 );
                 CREATE TABLE IF NOT EXISTS bank_transfers (
@@ -581,6 +582,32 @@ class ProfitSweepVault:
                 );
                 """
             )
+            se_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(sweep_events)").fetchall()}
+            if "session_date" not in se_cols:
+                conn.execute("ALTER TABLE sweep_events ADD COLUMN session_date TEXT")
+            null_se = conn.execute(
+                "SELECT scope_id, trade_id, occurred_at FROM sweep_events WHERE session_date IS NULL OR session_date = ''"
+            ).fetchall()
+            if null_se:
+                from cas_forex_revamp.valve.daily_quota import session_date_for
+
+                for nr in null_se:
+                    tid = str(nr["trade_id"])
+                    inferred_sdate: str | None = None
+                    if tid.startswith("SESSION_SYNC_"):
+                        parts = tid.split("_")
+                        if len(parts) >= 4 and len(parts[2]) == 10:
+                            inferred_sdate = parts[2]
+                    if not inferred_sdate:
+                        try:
+                            r_dt = datetime.fromisoformat(str(nr["occurred_at"]).replace("Z", "+00:00"))
+                            inferred_sdate = session_date_for(r_dt)
+                        except ValueError:
+                            inferred_sdate = str(nr["occurred_at"])[:10] or "1970-01-01"
+                    conn.execute(
+                        "UPDATE sweep_events SET session_date = ? WHERE scope_id = ? AND trade_id = ?",
+                        (inferred_sdate, str(nr["scope_id"]), tid),
+                    )
             bt_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(bank_transfers)").fetchall()}
             if "idempotency_key" not in bt_cols:
                 conn.execute("ALTER TABLE bank_transfers ADD COLUMN idempotency_key TEXT")
@@ -665,11 +692,19 @@ class ProfitSweepVault:
         broker_id: str,
         realized_net_usd: Decimal,
         occurred_at: datetime | None = None,
+        session_date: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(trade_id, str) or not trade_id.strip():
             raise ContractError("trade_id must be a non-empty string")
         decimal_value(realized_net_usd, "realized_net_usd")
-        ts = _iso(occurred_at or self._clock())
+        occ_dt = occurred_at or self._clock()
+        ts = _iso(occ_dt)
+        if session_date is not None and str(session_date).strip():
+            eff_sdate = str(session_date).strip()
+        else:
+            from cas_forex_revamp.valve.daily_quota import session_date_for
+
+            eff_sdate = session_date_for(occ_dt)
         with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
@@ -697,8 +732,8 @@ class ProfitSweepVault:
                 """
                 INSERT INTO sweep_events(
                     trade_id, scope_id, symbol, broker_id, realized_net_usd_text,
-                    retained_trading_usd_text, bank_sweep_usd_text, occurred_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    retained_trading_usd_text, bank_sweep_usd_text, occurred_at, session_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade_id.strip(),
@@ -709,6 +744,7 @@ class ProfitSweepVault:
                     decimal_text(retained_part),
                     decimal_text(bank_part),
                     ts,
+                    eff_sdate,
                 ),
             )
             self._append_audit(
@@ -716,11 +752,156 @@ class ProfitSweepVault:
                 "REALIZED_CLOSE_SWEPT",
                 {
                     "trade_id": trade_id.strip(),
+                    "session_date": eff_sdate,
                     "symbol": str(symbol),
                     "broker_id": str(broker_id),
                     "realized_net_usd": decimal_text(realized_net_usd),
                     "retained_trading_usd": decimal_text(retained_part),
                     "bank_sweep_usd": decimal_text(bank_part),
+                },
+                ts,
+            )
+            conn.execute("COMMIT")
+        return self.snapshot()
+
+    def session_totals(self, session_date: str) -> dict[str, str]:
+        """Read-only per-session realized, retained, and internal vault reserve totals."""
+        if not isinstance(session_date, str) or not session_date.strip():
+            raise ContractError("session_date must be a non-empty YYYY-MM-DD string")
+        sdate = session_date.strip()
+        with self._lock, closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT realized_net_usd_text, retained_trading_usd_text, bank_sweep_usd_text "
+                "FROM sweep_events WHERE scope_id = ? AND session_date = ?",
+                (self.scope_id, sdate),
+            ).fetchall()
+            s_realized = Decimal("0")
+            s_retained = Decimal("0")
+            s_bank = Decimal("0")
+            for r in rows:
+                s_realized += Decimal(str(r["realized_net_usd_text"]))
+                s_retained += Decimal(str(r["retained_trading_usd_text"]))
+                s_bank += Decimal(str(r["bank_sweep_usd_text"]))
+        return {
+            "session_date": sdate,
+            "realized_net_usd": decimal_text(s_realized),
+            "retained_trading_usd": decimal_text(s_retained),
+            "bank_sweep_usd": decimal_text(max(Decimal("0.00"), s_bank)),
+        }
+
+    def reconcile_session_realized_profit(
+        self,
+        *,
+        session_date: str,
+        session_realized_net_usd: Decimal,
+        occurred_at: datetime | str | None = None,
+    ) -> dict[str, Any] | None:
+        """Idempotently reconcile session realized net P&L (upward, downward, or oscillating) into append-only sweep_events."""
+        if not isinstance(session_date, str) or not session_date.strip():
+            raise ContractError("session_date must be a non-empty YYYY-MM-DD string")
+        sdate = session_date.strip()
+        target_net = decimal_value(Decimal(session_realized_net_usd), "session_realized_net_usd").quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+
+        if occurred_at is None:
+            occ_dt = self._clock()
+        elif isinstance(occurred_at, datetime):
+            occ_dt = occurred_at
+        elif isinstance(occurred_at, str) and occurred_at.strip():
+            try:
+                occ_dt = datetime.fromisoformat(occurred_at.strip().replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ContractError("occurred_at must be a valid ISO-8601 UTC timestamp") from exc
+        else:
+            raise ContractError("occurred_at must be a datetime, ISO-8601 string, or None")
+        ts = _iso(occ_dt)
+
+        cents_int = int((target_net * Decimal("100")).to_integral_value())
+        cents_tag = f"M{abs(cents_int)}" if cents_int < 0 else str(cents_int)
+
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            sess_rows = conn.execute(
+                "SELECT realized_net_usd_text, bank_sweep_usd_text FROM sweep_events "
+                "WHERE scope_id = ? AND session_date = ?",
+                (self.scope_id, sdate),
+            ).fetchall()
+            session_realized = Decimal("0.00")
+            session_bank = Decimal("0.00")
+            for r in sess_rows:
+                session_realized += Decimal(str(r["realized_net_usd_text"]))
+                session_bank += Decimal(str(r["bank_sweep_usd_text"]))
+
+            overall_bank = Decimal("0.00")
+            for r_all in conn.execute(
+                "SELECT bank_sweep_usd_text FROM sweep_events WHERE scope_id = ?",
+                (self.scope_id,),
+            ):
+                overall_bank += Decimal(str(r_all["bank_sweep_usd_text"]))
+
+            gap = (target_net - session_realized).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+            cfg = conn.execute("SELECT * FROM vault_config WHERE scope_id = ?", (self.scope_id,)).fetchone()
+            ratio = Decimal(str(cfg["sweep_ratio_text"])) if cfg else DEFAULT_SWEEP_RATIO
+            auto_on = bool(int(cfg["auto_sweep_enabled"])) if cfg else True
+
+            if target_net > Decimal("0") and auto_on and ratio > Decimal("0"):
+                with localcontext() as ctx:
+                    ctx.prec = 40
+                    target_session_bank = (target_net * ratio).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+            else:
+                target_session_bank = Decimal("0.00")
+
+            bank_delta = (target_session_bank - session_bank).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if overall_bank + bank_delta < Decimal("0.00"):
+                bank_delta = -overall_bank
+            retained_delta = gap - bank_delta
+
+            if gap == Decimal("0.00") and bank_delta == Decimal("0.00"):
+                conn.execute("ROLLBACK")
+                return None
+
+            sync_prefix = f"SESSION_SYNC_{sdate}_"
+            seq_row = conn.execute(
+                "SELECT COUNT(*) FROM sweep_events WHERE scope_id = ? AND trade_id LIKE ?",
+                (self.scope_id, f"{sync_prefix}%"),
+            ).fetchone()
+            seq_n = (int(seq_row[0]) if seq_row is not None else 0) + 1
+            sync_trade_id = f"SESSION_SYNC_{sdate}_{seq_n:04d}_{cents_tag}"
+
+            conn.execute(
+                """
+                INSERT INTO sweep_events(
+                    trade_id, scope_id, symbol, broker_id, realized_net_usd_text,
+                    retained_trading_usd_text, bank_sweep_usd_text, occurred_at, session_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sync_trade_id,
+                    self.scope_id,
+                    "SESSION_BASKET",
+                    "DUAL_SHIELD_BARBELL",
+                    decimal_text(gap),
+                    decimal_text(retained_delta),
+                    decimal_text(bank_delta),
+                    ts,
+                    sdate,
+                ),
+            )
+            self._append_audit(
+                conn,
+                "SESSION_PROFIT_RECONCILED",
+                {
+                    "trade_id": sync_trade_id,
+                    "session_date": sdate,
+                    "symbol": "SESSION_BASKET",
+                    "broker_id": "DUAL_SHIELD_BARBELL",
+                    "realized_net_usd": decimal_text(gap),
+                    "retained_trading_usd": decimal_text(retained_delta),
+                    "bank_sweep_usd": decimal_text(bank_delta),
                 },
                 ts,
             )
@@ -1196,6 +1377,7 @@ class ProfitSweepVault:
                         "settled_at": r["settled_at"],
                     })
 
+            bank_reserved_total = max(Decimal("0.00"), bank_reserved_total)
             pending_rem = max(Decimal("0.00"), bank_reserved_total - disbursed)
             ratio = Decimal(str(cfg["sweep_ratio_text"])) if cfg else DEFAULT_SWEEP_RATIO
             return {

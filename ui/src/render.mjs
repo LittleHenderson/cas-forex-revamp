@@ -3,9 +3,10 @@ import { envelopeRecords, canonicalJSON } from './decision-read.mjs';
 import { displayFreshness } from './freshness.mjs';
 import { renderMarketChartSection } from './chart.mjs';
 import { STATIC_BROKER_ROUTING } from './broker-routing.mjs';
-import { renderAiOverseerPanel, renderAiModelCatalogPanel } from './ai-overseer.mjs';
+import { renderAiOverseerPanel, renderAiModelCatalogPanel, renderBankedProfitsHeroBanner } from './ai-overseer.mjs';
 import { renderMoneyFlowSection } from './money-flow.mjs';
 import { renderLiveFundingPanel } from './live-funding.mjs';
+import { renderQrPairingDrawer } from './qr-pairing.mjs';
 import {
   renderAiTopSwitcherBar,
   renderEquityAndAnalyticsSection,
@@ -75,25 +76,31 @@ function metrics(projection, state) {
   let openVal = projection.open_pnl;
   let realVal = projection.realized_pnl;
 
-  if (state?.liveStreamConnected === true && eqVal === null) {
-    const shieldEq = state.brokerRouting?.shield?.totalEquity;
-    const quotaEq = state.aiTrader?.dailyQuota?.startingEquityUsd;
-    const chosenEq = shieldEq ?? (typeof quotaEq === 'string' && /^[0-9]+(\.[0-9]+)?$/.test(quotaEq) && quotaEq !== '0' ? quotaEq : null);
-    if (chosenEq !== null) {
-      eqVal = Object.freeze({ amount: chosenEq, currency: 'USD' });
-      const posList = Array.isArray(state.aiTrader?.openPositions) ? state.aiTrader.openPositions : [];
-      const openSum = addExactDecimals(posList.map((p) => p.profit));
-      openVal = Object.freeze({ amount: openSum, currency: 'USD' });
-      const negOpen = openSum.startsWith('-') ? openSum.slice(1) : `-${openSum}`;
-      const balStr = addExactDecimals([chosenEq, negOpen]);
-      balVal = Object.freeze({ amount: balStr, currency: 'USD' });
+  if (state?.liveStreamConnected === true) {
+    if (eqVal === null) {
+      const shieldEq = state.brokerRouting?.shield?.totalEquity;
+      const quotaEq = state.aiTrader?.dailyQuota?.startingEquityUsd;
+      const chosenEq = shieldEq ?? (typeof quotaEq === 'string' && /^[0-9]+(\.[0-9]+)?$/.test(quotaEq) && quotaEq !== '0' ? quotaEq : null);
+      if (chosenEq !== null) {
+        eqVal = Object.freeze({ amount: chosenEq, currency: 'USD' });
+        const posList = Array.isArray(state.aiTrader?.openPositions) ? state.aiTrader.openPositions : [];
+        const openSum = addExactDecimals(posList.map((p) => p.profit));
+        openVal = Object.freeze({ amount: openSum, currency: 'USD' });
+        const negOpen = openSum.startsWith('-') ? openSum.slice(1) : `-${openSum}`;
+        const balStr = addExactDecimals([chosenEq, negOpen]);
+        balVal = Object.freeze({ amount: balStr, currency: 'USD' });
+      }
     }
     if (realVal === null && state.aiTrader?.connected && typeof state.aiTrader.dailyQuota?.realizedNetPnlUsd === 'string') {
       realVal = Object.freeze({ amount: state.aiTrader.dailyQuota.realizedNetPnlUsd, currency: 'USD' });
     }
   }
 
-  return `<section class="metrics" aria-label="Account snapshot">${[
+  const lockedHint = !state?.liveStreamConnected
+    ? '<p class="account-locked-hint" data-account-locked-hint="true">Locked preview — unlock Live Cockpit above to load live Hugo&#39;s Way, LHFX, and OANDA Equity, Balance, Open P/L, and Banked Realized P/L.</p>'
+    : '';
+
+  return `${lockedHint}<section class="metrics" aria-label="Account snapshot">${[
     ['Equity', eqVal], ['Balance', balVal], ['Open P/L', openVal], ['Realized P/L', realVal],
   ].map(([label, value]) => {
     const money = moneyLabel(value);
@@ -227,6 +234,7 @@ function setup(projection, state) {
   </section><section class="panel">${heading('APPEARANCE', 'Your workspace')}
     <fieldset class="theme-options"><legend>Theme</legend>${['system', 'light', 'dark'].map((theme) => `<label><input type="radio" name="theme" value="${theme}" ${state.theme === theme ? 'checked' : ''}>${theme[0].toUpperCase() + theme.slice(1)}</label>`).join('')}</fieldset><p class="quiet-note">Theme is held in this tab. No credentials or permissions are stored.</p>
     <dl class="metadata">${meta('Default view', 'Operate')}${meta('Decision presentation', state.reviewView === 'atlas' ? 'Atlas' : 'List')}${meta('Control requests', state.transport?.attached ? 'Explicit scoped requests' : 'Unavailable')}</dl>
+    ${state.liveStreamConnected && state.canPairDevice ? `<div class="direct-controls"><button type="button" class="button button-small button-primary qr-pair-btn" data-toggle-qr-pairing="true" aria-expanded="${Boolean(state.qrPairingOpen)}">${state.qrPairingOpen ? 'Hide Pairing QR' : 'Pair Phone / Tablet (QR)'}</button></div>` : ''}
   </section><section class="panel">${heading('EXPLICIT OWNER REQUEST', 'Resume permissions')}<p class="panel-copy">Resume is separate from Pause, Stop and Close. Core checks recovery before granting permission.</p><div class="direct-controls">${action('Resume new risk', 'RESUME_NEW_RISK', state.transport)}${action('Resume management', 'RESUME_MANAGEMENT', state.transport)}</div></section><section class="panel scope-panel">${heading('SOURCE IDENTITY', 'Account & run')}${projection ? `<dl class="metadata">${Object.entries(projection.scope).map(([key, value]) => meta(key.replaceAll('_', ' '), value)).join('')}</dl>` : '<p class="panel-copy">No valid source loaded.</p>'}</section></div>
   ${renderLiveFundingPanel(state)}
   <div class="setup-grid">${renderBrokerRoutingPanel(state.brokerRouting)}${renderAiModelCatalogPanel(state.aiModels)}<section class="panel">${heading('READINESS', 'Rehearsal stages')}
@@ -269,8 +277,17 @@ export function renderApp(state, now = Date.now(), monotonicNow = globalThis.per
   const sourceLabel = state.source === 'scoped simulator' ? 'Scoped simulator' : state.source === 'shared fixture' ? 'Shared fixture' : state.source === 'local snapshot' ? 'Local snapshot' : state.source === 'historical snapshot' ? 'Historical snapshot' : 'No valid source';
   const isLiveArmed = state.brokerRouting?.executionMode === 'LIVE' && state.brokerRouting?.liveArmed === true;
   const execModeBadge = `<span class="exec-mode-badge ${isLiveArmed ? 'is-live-armed' : 'is-demo-mode'}" data-execution-mode="${isLiveArmed ? 'LIVE' : 'DEMO'}">${isLiveArmed ? 'LIVE REAL-MONEY ARMED' : 'DEMO MODE'}</span>`;
+  const pairQrBtn = state.liveStreamConnected && state.canPairDevice
+    ? `<button type="button" class="button button-small button-secondary qr-pair-btn" data-toggle-qr-pairing="true" aria-expanded="${Boolean(state.qrPairingOpen)}">${state.qrPairingOpen ? 'Hide Pairing QR' : 'Pair Phone / Tablet (QR)'}</button>`
+    : '';
+  const qrDrawerMarkup = state.liveStreamConnected && state.qrPairingOpen && state.qrPairingSvg
+    ? renderQrPairingDrawer(state.qrPairingSvg, state.qrPairingCopiedNotice)
+    : '';
+  const unlockInputType = state.unlockKeyVisible ? 'text' : 'password';
+  const unlockDraftVal = e(state.unlockDraft ?? '');
+  const unlockVisLabel = state.unlockKeyVisible ? 'Hide' : 'Show';
   const topUnlockBar = !state.liveStreamConnected
-    ? '<form class="mobile-unlock-bar prominent-unlock-bar" data-cockpit-unlock-form="true" autocomplete="on"><label class="sr-only" for="top-cockpit-access-key">Cockpit access key</label><input id="top-cockpit-access-key" class="mobile-unlock-input" type="password" name="cockpit_access_key" autocomplete="current-password" placeholder="Locked preview — paste Cockpit access key here to connect live 24/7 cloud server"><button type="submit" class="button button-small button-primary">Unlock Live Cockpit</button></form>'
+    ? `<form class="mobile-unlock-bar prominent-unlock-bar" data-cockpit-unlock-form="true" autocomplete="on"><div class="unlock-bar-row"><label class="sr-only" for="top-cockpit-access-key">Cockpit access key</label><input id="top-cockpit-access-key" class="mobile-unlock-input" type="${unlockInputType}" name="cockpit_access_key" value="${unlockDraftVal}" autocomplete="current-password" spellcheck="false" autocapitalize="off" placeholder="Locked preview — paste Cockpit access key here to connect live 24/7 cloud server"><button type="button" class="button button-small button-secondary unlock-vis-btn" data-toggle-unlock-visibility="true" aria-pressed="${Boolean(state.unlockKeyVisible)}">${unlockVisLabel}</button><button type="submit" class="button button-small button-primary">Unlock Live Cockpit</button></div><p class="unlock-helper-note">Paste your 43-character key from <code>D:\\MetaTrader5\\.cloud_cockpit.token</code> on your PC — or scan the 1-second Pairing QR from an unlocked PC</p>${state.aiIssue ? `<p class="unlock-inline-error warning-text" role="alert">${e(state.aiIssue)}</p>` : ''}</form>`
     : '';
   const safetyTitle = state.liveStreamConnected
     ? (isLiveArmed ? 'Connected · Live 24/7 Cloud — REAL-MONEY LIVE ARMED' : 'Connected · Live 24/7 Cloud — DEMO PAPER ACCOUNTS (real-money locked)')
@@ -281,10 +298,12 @@ export function renderApp(state, now = Date.now(), monotonicNow = globalThis.per
   return `<div class="shell"><aside class="sidebar"><a class="brand" href="#operate" aria-label="CAS Forex personal cockpit"><span class="brand-symbol" aria-hidden="true"><span class="brand-line"></span><span class="brand-line brand-line-short"></span></span><span>CAS<span class="brand-caption">FOREX</span></span></a>
     <nav aria-label="Primary">${[['operate', '01', 'Operate'], ['review', '02', 'Review'], ['setup', '03', 'Setup']].map(([key, number, label]) => `<a href="#${key}" class="nav-link${page === key ? ' active' : ''}" ${page === key ? 'aria-current="page"' : ''}><span class="nav-number" aria-hidden="true">${number}</span>${label}<span class="nav-arrow" aria-hidden="true">↗</span></a>`).join('')}</nav>
     <div class="sidebar-foot"><span class="status-dot${state.liveStreamConnected ? '' : ' warning'}" aria-hidden="true"></span><strong>${state.liveStreamConnected ? 'Connected · Live 24/7 Cloud' : 'Disconnected'}</strong><p>${state.liveStreamConnected ? (isLiveArmed ? 'LIVE real-money armed' : 'Live cloud stream attached') : (state.transport?.attached ? 'Scoped simulator only' : 'No execution transport')}</p><span class="version">COCKPIT / 0.1</span></div></aside>
-    <div class="workspace"><header class="topbar"><span class="breadcrumb">CAS Forex <span>/</span> ${e(titles[page][1])}</span><div class="topbar-actions">${execModeBadge}${tag(sourceLabel)}${state.transport?.attached ? button('Read state', 'data-read-transport="true"', 'button-small') : ''}${button('Toggle theme', 'data-theme-toggle="true"', 'theme-toggle')}</div></header>
+    <div class="workspace"><header class="topbar"><span class="breadcrumb">CAS Forex <span>/</span> ${e(titles[page][1])}</span><div class="topbar-actions">${execModeBadge}${pairQrBtn}${tag(sourceLabel)}${state.transport?.attached ? button('Read state', 'data-read-transport="true"', 'button-small') : ''}${button('Toggle theme', 'data-theme-toggle="true"', 'theme-toggle')}</div></header>
     <main id="main" tabindex="-1"><div class="page-heading"><div><p class="eyebrow">${titles[page][0]}</p><h1>${titles[page][1]}</h1></div><div class="freshness" data-clock-basis="${age.clock_basis}" data-read-invalidated="${age.invalidated}"><span class="status-dot ${age.tone === 'warning' ? 'warning' : ''}" aria-hidden="true"></span><strong>${e(age.label)}</strong><span>${e(age.detail)}</span>${projection?.observed_at ? `<time datetime="${e(projection.observed_at)}">${e(projection.observed_at)}</time>` : ''}</div></div>
     <div class="safety-banner"><span class="safety-mark" aria-hidden="true">!</span><div><strong>${safetyTitle}</strong><span>${safetyCopy}</span></div></div>
     ${topUnlockBar}
+    ${qrDrawerMarkup}
+    ${renderBankedProfitsHeroBanner(state)}
     ${page !== 'operate' || !projection ? directControls(state.transport) : ''}${transportStatus(state.transport)}
     ${state.error ? `<section class="load-error" role="alert"><h2>Snapshot unavailable</h2><p>${e(state.error)}</p><p>No prior snapshot is shown as current. Controls remain unavailable.</p>${button('Open Setup', 'data-route="setup"')}</section>` : ''}
     ${page === 'setup' ? setup(projection, state) : projection ? (page === 'review' ? review(projection, state) : operate(projection, state)) : `<section class="panel positions-panel" aria-label="Unobserved inventory">${empty('Inventory unknown', state.loading ? 'Reading shared source; no venue inventory observed.' : 'No valid snapshot. Open Setup to read a disconnected source.', '?')}</section>`}
@@ -310,4 +329,4 @@ export function renderPreparedClose(transport) {
   const canRead = transport?.attached && close?.submitted && preview && !['PREPARING', 'REVIEW_REQUIRED', 'PREPARATION_FAILED', 'CHECKING', 'REQUESTING', 'READING'].includes(close.status);
   return `<div class="dialog-heading"><p class="eyebrow">EXACT TARGET / OWNER REVIEW</p><h2 id="dialog-title">Reviewed Close</h2></div><div role="status"><strong>${e(close?.status ?? 'Unavailable')}</strong><p>${e(close?.reason ?? 'No target prepared.')}</p></div>${preview ? `<dl class="metadata">${meta('Account / run', `${preview.scope.account_id} / ${preview.scope.run_id}`)}${meta('Source state', intent.source_state.state_id)}${meta('Position / version', `${intent.target_id} / ${intent.target_version}`)}${meta('Instrument', intent.instrument_id)}${meta('Exact quantity', `${intent.quantity} BASE_UNITS`)}${meta('Owner request', preview.owner_request_id)}${meta('Command ID', preview.command_id)}${meta('Intent SHA-256', preview.intent_sha256)}${meta('Expires at (simulator)', preview.expires_at)}</dl><details><summary>Full exact intent</summary><pre>${e(JSON.stringify(intent, null, 2))}</pre></details>` : ''}${q ? `<h3>Independent receipt / cumulative base units</h3><dl class="metadata">${Object.entries(q).map(([key, value]) => meta(key, value)).join('')}${meta('Receipt ID', close.observation.receipt.receipt_id)}${meta('Observed at', close.observation.receipt.observed_at)}</dl>` : '<p class="quiet-note">No independent filled quantity established for this request.</p>'}<p class="quiet-note">Close does not resume automation. Partial fills and cancelled remainders stay separate.</p><div class="dialog-actions">${button('Back', 'data-dialog-close="true"')}${button('Request reviewed Close', `data-submit-close="${e(preview?.preview_id ?? '')}" ${transport?.attached && close?.status === 'REVIEW_REQUIRED' ? '' : 'disabled'}`, 'button-primary')}${canRead ? button('Read venue receipt', 'data-read-close="true"') : ''}</div>${modalInterruption(transport)}`;
 }
-export { renderAiOverseerPanel, renderAiModelCatalogPanel, renderAiTopSwitcherBar, renderEquityAndAnalyticsSection, renderParallelTiersSection, renderLiveFundingPanel };
+export { renderAiOverseerPanel, renderAiModelCatalogPanel, renderBankedProfitsHeroBanner, renderAiTopSwitcherBar, renderEquityAndAnalyticsSection, renderParallelTiersSection, renderLiveFundingPanel };
