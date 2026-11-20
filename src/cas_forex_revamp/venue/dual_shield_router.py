@@ -36,6 +36,7 @@ from cas_forex_revamp.contracts import ActionKind, ContractError, Side, decimal_
 from cas_forex_revamp.contracts.primitives import decimal_value
 from cas_forex_revamp.valve.tks_meta_valve_controller import (
     DEFAULT_MAX_DRAWDOWN_PCT,
+    MAX_CONSTITUTIONAL_DRAWDOWN_PCT,
     ForexMetaValveGate,
     PeakEquityStore,
     ValveDecision,
@@ -49,8 +50,10 @@ from .external_paper_broker import (
     EXPANDED_FX_PAIRS,
     OandaOutcomeUnknownError,
     OandaPracticePaperClient,
+    PaperBrokerTransportError,
     assert_safe_json_numbers,
 )
+from .live_auth_ticket import LiveAuthorizationError
 from .live_market_stream import INDEX_INSTRUMENTS
 from .mt5_broker_bridge import (
     BROKER_HUGOSWAY_MT5,
@@ -74,6 +77,8 @@ from .mt5_broker_bridge import (
     Mt5OutcomeUnknownError,
     Mt5PaperBrokerVenue,
     Mt5Position,
+    Mt5PostFillObservationError,
+    Mt5PreDispatchTransportError,
     Mt5Tick,
     Mt5TransportError,
     OandaPracticeFallbackVenue,
@@ -87,6 +92,8 @@ __all__ = [
     "DualShieldBrokerRouter",
     "ENV_BARBELL_MAX_DRAWDOWN_PCT",
     "DualShieldExecution",
+    "MAX_CONSTITUTIONAL_DRAWDOWN_PCT",
+    "MAX_CONSTITUTIONAL_STOP_RISK_PCT",
     "MAJOR_FX_PAIRS",
     "OandaProtectiveOffsetPlanner",
     "OandaQuoteTruthOracle",
@@ -104,6 +111,7 @@ ENV_BARBELL_HUGOSWAY_SHARE = "CAS_FOREX_BARBELL_HUGOSWAY_SHARE"
 ENV_BARBELL_LHFX_SHARE = "CAS_FOREX_BARBELL_LHFX_SHARE"
 ENV_BARBELL_MAX_STOP_RISK_PCT = "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT"
 ENV_BARBELL_MAX_DRAWDOWN_PCT = "CAS_FOREX_MAX_DRAWDOWN_PCT"
+MAX_CONSTITUTIONAL_STOP_RISK_PCT = Decimal("1.00")
 ENV_DEMO_BARBELL_VIRTUAL_SLEEVE = "CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE"
 ENV_OANDA_LIVE_API_TOKEN = "CAS_FOREX_OANDA_LIVE_API_TOKEN"  # nosec B105: environment variable name constant, not a secret value
 ENV_HUGOSWAY_MT5_LIVE_TICKET = "CAS_FOREX_HUGOSWAY_MT5_LIVE_TICKET"
@@ -494,11 +502,15 @@ class BarbellCapitalPolicy:
         self.max_stop_loss_equity_risk_pct = decimal_value(
             max_stop_loss_equity_risk_pct, "max_stop_loss_equity_risk_pct", positive=True
         )
-        if self.max_stop_loss_equity_risk_pct > Decimal("5"):
-            raise ContractError("max_stop_loss_equity_risk_pct must not exceed 5%")
+        if self.max_stop_loss_equity_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
+            raise ContractError(
+                "CONSTITUTIONAL_STOP_RISK_CEILING_EXCEEDED: max_stop_loss_equity_risk_pct must not exceed 1.00%"
+            )
         self.max_drawdown_pct = decimal_value(max_drawdown_pct, "max_drawdown_pct", positive=True)
-        if self.max_drawdown_pct >= Decimal("1"):
-            raise ContractError("max_drawdown_pct must be strictly below 1 (100%)")
+        if self.max_drawdown_pct > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+            raise ContractError(
+                "CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: max_drawdown_pct must not exceed 0.10 (10.00%)"
+            )
         self.tolerance = _share(allocation_tolerance_share, "allocation_tolerance_share")
         self.demo_virtual_sleeve = bool(demo_virtual_sleeve)
         self._calc = Mt5MarginCalculator(account_currency=account_currency)
@@ -583,16 +595,21 @@ class BarbellCapitalPolicy:
             )
 
     def require_drawdown(self, *, current_equity: Decimal | None, peak_equity: Decimal | None) -> Decimal:
+        if self.max_drawdown_pct > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+            raise ContractError(
+                "CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: max_drawdown_pct must not exceed 0.10 (10.00%)"
+            )
         if current_equity is None or peak_equity is None or peak_equity <= Decimal("0"):
             raise BarbellPolicyRefusalError(
                 "peak_equity and current_equity are required before opening new risk",
                 "MISSING_DRAWDOWN_ACCOUNTING",
             )
         dd_pct = compute_drawdown_pct(current_equity, peak_equity)
-        if dd_pct >= self.max_drawdown_pct:
+        eff_limit = min(self.max_drawdown_pct, MAX_CONSTITUTIONAL_DRAWDOWN_PCT)
+        if dd_pct >= eff_limit:
             dd_disp = dd_pct.quantize(Decimal("0.00000001"), rounding=ROUND_CEILING)
             raise BarbellPolicyRefusalError(
-                f"barbell drawdown {decimal_text(dd_disp)} >= max_drawdown_pct {decimal_text(self.max_drawdown_pct)}",
+                f"barbell drawdown {decimal_text(dd_disp)} >= max_drawdown_pct {decimal_text(eff_limit)}",
                 "MAX_DRAWDOWN_EXCEEDED",
             )
         return dd_pct
@@ -612,6 +629,10 @@ class BarbellCapitalPolicy:
         return min(actual, virtual_total)
 
     def require_stop_risk(self, risk: Decimal, equities: Mapping[str, Decimal]) -> Decimal:
+        if self.max_stop_loss_equity_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
+            raise ContractError(
+                "CONSTITUTIONAL_STOP_RISK_CEILING_EXCEEDED: max_stop_loss_equity_risk_pct must not exceed 1.00%"
+            )
         total = self.effective_total_equity(equities)
         if total <= 0:
             raise BarbellPolicyRefusalError("barbell total equity is not positive", "NON_POSITIVE_TOTAL_EQUITY")
@@ -932,6 +953,12 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         self._oracle_cache: OandaQuoteTruthOracle | None = None
         self._index_reference_source = index_reference_source
         self.barbell = barbell or BarbellCapitalPolicy.from_environ(self._env)
+        if self.barbell.max_stop_loss_equity_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
+            raise ContractError("CONSTITUTIONAL_STOP_RISK_CEILING_EXCEEDED: router refuses stop-risk above 1.00%")
+        if self.barbell.max_drawdown_pct > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+            raise ContractError("CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: router refuses drawdown above 10.00%")
+        if self._valve_gate.max_drawdown_pct is not None and self._valve_gate.max_drawdown_pct > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+            raise ContractError("CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: valve gate drawdown exceeds 10.00%")
         if self.barbell.demo_virtual_sleeve and self.execution_mode != EXECUTION_MODE_DEMO:
             raise ContractError("CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE is strictly forbidden in LIVE execution mode")
         self.offset_planner = offset_planner or OandaProtectiveOffsetPlanner(venue_id=self._oanda_broker_id)
@@ -1050,7 +1077,74 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             "no regulated quote reference (OANDA practice or verified Kraken/ECB stream); offshore admission fails closed"
         )
 
-    def equities(self) -> dict[str, Decimal]:
+    def unresolved_mutations(self) -> list[dict[str, Any]]:
+        """Collect ALL unresolved (OUTCOME_UNKNOWN / PENDING_DISPATCH) mutations across EVERY venue & journal (Finding [1])."""
+        found: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str]] = set()
+
+        def _collect_mt5(journal: Any) -> None:
+            if journal is None or not hasattr(journal, "list_unresolved_mutations"):
+                return
+            for row in journal.list_unresolved_mutations():
+                key = ("MT5", str(row.get("request_id", "")))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    found.append({"journal": "MT5", **dict(row)})
+
+        def _collect_oanda(journal: Any) -> None:
+            if journal is None or not hasattr(journal, "list_unresolved_mutations"):
+                return
+            for row in journal.list_unresolved_mutations():
+                key = ("OANDA", str(row.get("client_ext_id", "")))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    found.append({"journal": "OANDA", **dict(row)})
+
+        _collect_mt5(self._mt5_mutation_journal)
+        _collect_oanda(self._oanda_mutation_journal)
+        for venue in self._venues.values():
+            if isinstance(venue, Mt5PaperBrokerVenue):
+                _collect_mt5(venue.mutation_journal)
+            elif isinstance(venue, OandaPracticeFallbackVenue):
+                _collect_oanda(venue.mutation_journal)
+        return found
+
+    def has_any_unresolved_mutation(self) -> bool:
+        """Barbell-wide unresolved mutation predicate across ALL venues and symbols (Finding [1])."""
+        return bool(self.unresolved_mutations())
+
+    def assert_no_unresolved_mutations(self, *, context: str = "OPEN") -> None:
+        """Barbell-wide pre-dispatch gate blocking ANY new risk while ANY venue/symbol has an unresolved mutation."""
+        unresolved = self.unresolved_mutations()
+        if not unresolved:
+            return
+        summary = ", ".join(
+            f"{r.get('broker_id') or r.get('account_id') or r.get('journal')}:{r.get('symbol')}:{r.get('request_id') or r.get('client_ext_id')}({r.get('status')})"
+            for r in unresolved[:4]
+        )
+        msg = (
+            f"BARBELL_UNRESOLVED_MUTATION_LATCH ({context}): unresolved mutation(s) [{summary}] "
+            f"freeze all new-risk dispatches across every venue and symbol until reconciled"
+        )
+        if any(r.get("journal") == "MT5" for r in unresolved):
+            raise Mt5OutcomeUnknownError(msg)
+        raise OandaOutcomeUnknownError(msg)
+
+    def _probe_oanda_fresh(self) -> dict[str, Any] | None:
+        """Refresh OANDA NAV & margin summary immediately before admission; fail closed if refresh fails (Finding [3])."""
+        oanda = self._venues.get(self._oanda_broker_id)
+        if not isinstance(oanda, OandaPracticeFallbackVenue):
+            return None
+        try:
+            return oanda.probe_account_summary(now=self._clock())
+        except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
+            raise
+        except (PaperBrokerTransportError, Mt5TransportError, ContractError, OSError) as exc:
+            raise Mt5TransportError(
+                f"{self._oanda_broker_id} account summary refresh failed ({type(exc).__name__}); refusing new risk"
+            ) from None
+
+    def equities(self, *, require_fresh_oanda: bool = False) -> dict[str, Decimal]:
         out: dict[str, Decimal] = {}
         for broker_id in (self._oanda_broker_id, BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
             venue = self._venues.get(broker_id)
@@ -1058,7 +1152,11 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             if isinstance(venue, Mt5PaperBrokerVenue) and venue.account is not None:
                 value = venue.account.equity
             elif isinstance(venue, OandaPracticeFallbackVenue):
-                value = venue.nav
+                if require_fresh_oanda:
+                    fresh = venue.require_fresh_summary(now=self._clock())
+                    value = parse_decimal(str(fresh["nav"]), "nav")
+                else:
+                    value = venue.nav
             if value is None:
                 value = self._last_equity.get(broker_id, self._attestations.get(broker_id, Decimal("0")))
             self._last_equity[broker_id] = value
@@ -1114,7 +1212,16 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         peak_equity: Decimal | None = None,
     ) -> tuple[bool, str]:
         """Fast deterministic zero-API-cost guard before paid LLM inference."""
-        eq = dict(equities) if equities is not None else self.equities()
+        if self.has_any_unresolved_mutation():
+            return False, "UNRESOLVED_MUTATION_LATCH"
+        if equities is None and isinstance(self._venues.get(self._oanda_broker_id), OandaPracticeFallbackVenue):
+            try:
+                self._probe_oanda_fresh()
+            except (Mt5TransportError, PaperBrokerTransportError, ContractError, OSError) as exc:
+                return False, f"{self._oanda_broker_id}=ACCOUNT_REFRESH_FAILED:{type(exc).__name__}"
+        eq = dict(equities) if equities is not None else self.equities(
+            require_fresh_oanda=isinstance(self._venues.get(self._oanda_broker_id), OandaPracticeFallbackVenue)
+        )
         total_eq = self.barbell.total_equity(eq)
         pk = peak_equity if peak_equity is not None else self.peak_equity()
         try:
@@ -1157,6 +1264,10 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         if not isinstance(order, OrderIntent) or order.kind is not ActionKind.OPEN:
             raise ContractError("execute_open requires an OPEN OrderIntent; use execute_management otherwise")
         require_valve_clearance(order, valve_decision, expected_weights_sha256=self._valve_gate.weights_sha256)
+        # Finding [1]: Barbell-wide unresolved-mutation latch checked before ANY new risk across every venue & symbol.
+        self.assert_no_unresolved_mutations(context="OPEN")
+        # Finding [3]: Refresh OANDA NAV & margin immediately before every new-risk admission; fail closed if stale/failed.
+        self._probe_oanda_fresh()
         if order.symbol in INDEX_INSTRUMENTS:
             oracle, reference = self._index_reference_quotes(order.symbol)
         else:
@@ -1169,7 +1280,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             )
         rbid, rask = reference[order.symbol]
         entry = rask if order.side is Side.BUY else rbid
-        equities = self.equities()
+        equities = self.equities(require_fresh_oanda=True)
         total_eq = self.barbell.total_equity(equities)
         peak_eq = self.peak_equity()
         self.barbell.require_drawdown(current_equity=total_eq, peak_equity=peak_eq)
@@ -1196,7 +1307,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 self._status[broker_id] = "DISCONNECTED"
                 self._record(trail, broker_id, "DISCONNECTED", type(exc).__name__)
                 continue
-            equities = self.equities()
+            equities = self.equities(require_fresh_oanda=True)
 
             def margin_guard(check: Mt5MarginCheck, _account: Mt5AccountSnapshot, _b: str = broker_id) -> None:
                 self.barbell.require_sleeve(_b, equities=equities, used_margin_after=check.used_margin_after)
@@ -1208,7 +1319,14 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                     quote_guard=oracle.guard(reference, verdicts),
                     margin_guard=margin_guard,
                 )
-            except (Mt5OutcomeUnknownError, OandaOutcomeUnknownError):
+            except (
+                Mt5OutcomeUnknownError,
+                OandaOutcomeUnknownError,
+                Mt5PostFillObservationError,
+                LiveAuthorizationError,
+                LiveBrokerEndpointForbiddenError,
+            ):
+                # Finding [4] & [6]: Never failover on OutcomeUnknown, post-fill observation failure, or LIVE auth failure.
                 self._record(trail, broker_id, "OUTCOME_UNKNOWN", "never re-routed")
                 raise
             except OffMarketBrokerQuoteError as exc:
@@ -1220,15 +1338,19 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             except Mt5MarginRefusalError as exc:
                 self._record(trail, broker_id, "MARGIN_REFUSED", str(exc)[:120])
                 continue
-            except Mt5TransportError as exc:
+            except Mt5PreDispatchTransportError as exc:
+                # Finding [4]: Failover allowlist permits ONLY explicit pre-dispatch connectivity/refusal errors.
                 self._status[broker_id] = "DISCONNECTED"
                 self._record(trail, broker_id, "DISCONNECTED", type(exc).__name__)
                 continue
+            except Mt5TransportError:
+                self._record(trail, broker_id, "POST_DISPATCH_TRANSPORT_ERROR", "never re-routed")
+                raise
             if result.receipt is not None and not result.receipt.accepted:
                 rej_msg = f"retcode={result.receipt.retcode}: {result.receipt.message}"[:120]
                 self._record(trail, broker_id, "BROKER_REJECTED", rej_msg)
                 continue
-            self._record(trail, broker_id, "EXECUTED", None)
+            self._record(trail, broker_id, "EXECUTED", "RECONCILIATION_REQUIRED" if result.reconciliation_required else None)
             return DualShieldExecution(
                 result=result, executed_on=broker_id, safe_harbor=False, trail=tuple(trail),
                 quote_verdicts=tuple(verdicts), stop_loss_risk=risk, stop_loss_risk_cap=cap,
@@ -1246,16 +1368,22 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 "offshore venues refused/unavailable and the OANDA safe harbor is not connected: "
                 + "; ".join(f"{t['broker_id']}={t['outcome']}" for t in trail)
             )
+        # Finding [3]: Probe OANDA summary fresh immediately before safe-harbor margin & sleeve admission.
+        fresh_summary = self._probe_oanda_fresh()
+        if fresh_summary is None:
+            fresh_summary = oanda.require_fresh_summary(now=self._clock())
         required = self._safe_harbor_calc.required_margin(
             order.symbol, order.side, order.quantity_units, reference  # type: ignore[arg-type]
         )
-        available = oanda.margin_available
-        nav = oanda.nav
-        if available is None or nav is None or required > available:
+        available = parse_decimal(str(fresh_summary["margin_available"]), "margin_available")
+        nav = parse_decimal(str(fresh_summary["nav"]), "nav")
+        if required > available:
             self._record(trail, self._oanda_broker_id, "MARGIN_REFUSED", "safe-harbor margin unavailable")
             raise Mt5MarginRefusalError("OANDA safe harbor lacks margin for this order at 1:50")
+        fresh_equities = self.equities(require_fresh_oanda=True)
+        self.barbell.require_drawdown(current_equity=self.barbell.total_equity(fresh_equities), peak_equity=self.peak_equity())
         self.barbell.require_sleeve(
-            self._oanda_broker_id, equities=self.equities(), used_margin_after=(nav - available) + required
+            self._oanda_broker_id, equities=fresh_equities, used_margin_after=(nav - available) + required
         )
         result = oanda.execute(order, valve_decision=valve_decision)
         self._record(trail, self._oanda_broker_id, "EXECUTED", "SAFE_HARBOR")

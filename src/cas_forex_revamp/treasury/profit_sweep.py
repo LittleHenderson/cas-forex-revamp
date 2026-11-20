@@ -14,7 +14,7 @@ from __future__ import annotations
 import base64
 from contextlib import closing
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from hashlib import sha256, sha512
 import hmac
@@ -49,6 +49,10 @@ RAIL_BROKER_2FA_MANUAL = "BROKER_2FA_MANUAL"
 RAIL_COINBASE_ACH = "COINBASE_ACH"
 RAIL_KRAKEN_ACH = "KRAKEN_ACH"
 VALID_PAYOUT_RAILS = (RAIL_BROKER_2FA_MANUAL, RAIL_COINBASE_ACH, RAIL_KRAKEN_ACH)
+
+INTENT_ACTION_BROKER_2FA = "BROKER_2FA_WITHDRAWAL"
+INTENT_ACTION_OFFRAMP_ACH = "OFFRAMP_ACH_PAYOUT"
+MAX_TREASURY_INTENT_TTL_SECONDS = 900
 
 COINBASE_API_HOST = "api.coinbase.com"
 KRAKEN_API_HOST = "api.kraken.com"
@@ -619,6 +623,26 @@ class ProfitSweepVault:
                     idempotency_key TEXT UNIQUE,
                     error_detail TEXT
                 );
+                CREATE TABLE IF NOT EXISTS treasury_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    intent_sha256 TEXT NOT NULL UNIQUE,
+                    scope_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    transfer_id TEXT NOT NULL,
+                    rail TEXT NOT NULL,
+                    broker_id TEXT,
+                    destination_bank_id TEXT NOT NULL,
+                    amount_usd_text TEXT NOT NULL,
+                    conversion_json TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    retry_transfer_id TEXT,
+                    owner_request_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS vault_audit (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
                     prev_sha256 TEXT NOT NULL,
@@ -1167,6 +1191,437 @@ class ProfitSweepVault:
         rem = total_equity - self.bank_sweep_reserved_usd()
         return rem if rem > Decimal("0") else Decimal("0")
 
+    @staticmethod
+    def _build_conversion_spec(
+        *,
+        rail: str,
+        convert_from_currency: str | None = None,
+        convert_amount: Decimal | None = None,
+        coinbase_source_account_uuid: str | None = None,
+        coinbase_usd_account_uuid: str | None = None,
+        kraken_pair: str = "USDCUSD",
+    ) -> dict[str, Any]:
+        if rail == RAIL_COINBASE_ACH:
+            if convert_from_currency is not None and convert_amount is not None:
+                if not coinbase_source_account_uuid or not coinbase_usd_account_uuid:
+                    raise ContractError("Coinbase source/USD account UUIDs are required for conversion")
+                conv_amt = decimal_value(convert_amount, "convert_amount", positive=True)
+                return {
+                    "enabled": True,
+                    "from_currency": str(convert_from_currency).strip().upper(),
+                    "to_currency": "USD",
+                    "amount": decimal_text(conv_amt),
+                    "source_account_uuid": str(coinbase_source_account_uuid).strip(),
+                    "usd_account_uuid": str(coinbase_usd_account_uuid).strip(),
+                }
+            return {
+                "enabled": False,
+                "from_currency": "USD",
+                "to_currency": "USD",
+                "amount": None,
+                "source_account_uuid": None,
+                "usd_account_uuid": None,
+            }
+        if rail == RAIL_KRAKEN_ACH:
+            clean_pair = str(kraken_pair).strip().upper()
+            if clean_pair not in ("USDCUSD", "USDTUSD", "XBTUSD", "ETHUSD"):
+                raise OfframpSecurityError(f"Unsupported conversion pair {clean_pair!r}; only USD pairs permitted")
+            if convert_amount is not None:
+                conv_amt = decimal_value(convert_amount, "convert_amount", positive=True)
+                return {
+                    "enabled": True,
+                    "pair": clean_pair,
+                    "to_currency": "ZUSD",
+                    "amount": decimal_text(conv_amt),
+                }
+            return {
+                "enabled": False,
+                "pair": clean_pair,
+                "to_currency": "ZUSD",
+                "amount": None,
+            }
+        return {
+            "enabled": False,
+            "from_currency": "USD",
+            "to_currency": "USD",
+            "amount": None,
+        }
+
+    def _canonical_intent_payload(
+        self,
+        *,
+        intent_id: str,
+        action: str,
+        transfer_id: str,
+        amt_q: Decimal,
+        rail: str,
+        broker_id: str | None,
+        destination_bank_id: str,
+        conversion_spec: Mapping[str, Any],
+        idempotency_key: str | None,
+        retry_transfer_id: str | None,
+        owner_request_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "protocol": "cas-forex-treasury-intent/1",
+            "intent_id": intent_id,
+            "scope_id": self.scope_id,
+            "action": action,
+            "transfer_id": transfer_id,
+            "amount_usd": decimal_text(amt_q),
+            "rail": rail,
+            "broker_id": broker_id,
+            "destination_bank_id": destination_bank_id,
+            "conversion": dict(conversion_spec),
+            "idempotency_key": idempotency_key,
+            "retry_transfer_id": retry_transfer_id,
+            "owner_request_id": owner_request_id,
+        }
+
+    def prepare_broker_2fa_withdrawal(
+        self,
+        *,
+        broker_id: str,
+        amount_usd: Decimal,
+        owner_request_id: str,
+        reason: str,
+        destination_bank_label: str = "OWNER_LINKED_BANK",
+        ttl_seconds: int = 900,
+    ) -> dict[str, Any]:
+        """Persist a canonical broker 2FA withdrawal intent BEFORE owner approval (Finding [13])."""
+        amt_q = decimal_value(amount_usd, "amount_usd", positive=True).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        if amt_q <= Decimal("0"):
+            raise ContractError("amount_usd must be >= $0.01")
+        clean_req_id = identifier(owner_request_id, "owner_request_id")
+        clean_reason = str(reason or "").strip()[:240]
+        clean_broker = str(broker_id or "").strip()
+        clean_dest = str(destination_bank_label or "").strip()
+        if not clean_reason or not clean_broker or not clean_dest:
+            raise ContractError("broker_id, destination_bank_label, owner_request_id, and reason are required")
+        if type(ttl_seconds) is not int or not (30 <= ttl_seconds <= MAX_TREASURY_INTENT_TTL_SECONDS):
+            raise ContractError(f"ttl_seconds must be in 30..{MAX_TREASURY_INTENT_TTL_SECONDS}")
+        now_dt = utc_time(self._clock(), "clock")
+        ts = _iso(now_dt)
+        exp_str = _iso(now_dt + timedelta(seconds=ttl_seconds))
+        intent_id = f"ti2fa-{uuid.uuid4().hex[:16]}"
+        transfer_id = f"tr2fa-{uuid.uuid4().hex[:16]}"
+        conv_spec = self._build_conversion_spec(rail=RAIL_BROKER_2FA_MANUAL)
+        canon = self._canonical_intent_payload(
+            intent_id=intent_id,
+            action=INTENT_ACTION_BROKER_2FA,
+            transfer_id=transfer_id,
+            amt_q=amt_q,
+            rail=RAIL_BROKER_2FA_MANUAL,
+            broker_id=clean_broker,
+            destination_bank_id=clean_dest,
+            conversion_spec=conv_spec,
+            idempotency_key=None,
+            retry_transfer_id=None,
+            owner_request_id=clean_req_id,
+        )
+        intent_sha = sha256(canonical_bytes(canon)).hexdigest()
+        conv_json = canonical_bytes(conv_spec).decode("utf-8")
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO treasury_intents(
+                    intent_id, intent_sha256, scope_id, action, transfer_id, rail, broker_id,
+                    destination_bank_id, amount_usd_text, conversion_json, idempotency_key,
+                    retry_transfer_id, owner_request_id, reason, status, created_at, expires_at, consumed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 'PREPARED', ?, ?, NULL)
+                """,
+                (
+                    intent_id,
+                    intent_sha,
+                    self.scope_id,
+                    INTENT_ACTION_BROKER_2FA,
+                    transfer_id,
+                    RAIL_BROKER_2FA_MANUAL,
+                    clean_broker,
+                    clean_dest,
+                    decimal_text(amt_q),
+                    conv_json,
+                    clean_req_id,
+                    clean_reason,
+                    ts,
+                    exp_str,
+                ),
+            )
+            self._append_audit(
+                conn,
+                "TREASURY_INTENT_PREPARED",
+                {
+                    "intent_id": intent_id,
+                    "intent_sha256": intent_sha,
+                    "action": INTENT_ACTION_BROKER_2FA,
+                    "transfer_id": transfer_id,
+                    "rail": RAIL_BROKER_2FA_MANUAL,
+                    "broker_id": clean_broker,
+                    "destination_bank_id": clean_dest,
+                    "amount_usd": decimal_text(amt_q),
+                    "owner_request_id": clean_req_id,
+                },
+                ts,
+            )
+            conn.execute("COMMIT")
+        return {
+            "intent_id": intent_id,
+            "intent_sha256": intent_sha,
+            "transfer_id": transfer_id,
+            "scope_id": self.scope_id,
+            "action": INTENT_ACTION_BROKER_2FA,
+            "amount_usd": decimal_text(amt_q),
+            "rail": RAIL_BROKER_2FA_MANUAL,
+            "broker_id": clean_broker,
+            "destination_bank_id": clean_dest,
+            "conversion": conv_spec,
+            "idempotency_key": None,
+            "retry_transfer_id": None,
+            "owner_request_id": clean_req_id,
+            "expires_at": exp_str,
+        }
+
+    def prepare_offramp_ach_payout(
+        self,
+        *,
+        rail: str,
+        amount_usd: Decimal,
+        owner_request_id: str,
+        reason: str,
+        coinbase_client: CoinbaseOfframpClient | None = None,
+        kraken_client: KrakenOfframpClient | None = None,
+        destination_bank_id: str | None = None,
+        convert_from_currency: str | None = None,
+        convert_amount: Decimal | None = None,
+        coinbase_source_account_uuid: str | None = None,
+        coinbase_usd_account_uuid: str | None = None,
+        kraken_pair: str = "USDCUSD",
+        idempotency_key: str | None = None,
+        retry_transfer_id: str | None = None,
+        ttl_seconds: int = 900,
+    ) -> dict[str, Any]:
+        """Persist a canonical ACH off-ramp payout intent BEFORE owner approval (Finding [13])."""
+        amt_q = decimal_value(amount_usd, "amount_usd", positive=True).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        if amt_q <= Decimal("0"):
+            raise ContractError("amount_usd must be >= $0.01")
+        clean_req_id = identifier(owner_request_id, "owner_request_id")
+        clean_reason = str(reason or "").strip()[:240]
+        if not clean_reason:
+            raise ContractError("owner_request_id and reason are required")
+        if type(ttl_seconds) is not int or not (30 <= ttl_seconds <= MAX_TREASURY_INTENT_TTL_SECONDS):
+            raise ContractError(f"ttl_seconds must be in 30..{MAX_TREASURY_INTENT_TTL_SECONDS}")
+        if rail not in (RAIL_COINBASE_ACH, RAIL_KRAKEN_ACH):
+            raise OfframpSecurityError(f"Unsupported automated ACH rail {rail!r}")
+        if rail == RAIL_COINBASE_ACH:
+            if coinbase_client is not None:
+                dest_bank = coinbase_client.linked_bank_account_id
+                if destination_bank_id is not None and str(destination_bank_id).strip() != dest_bank:
+                    raise OfframpSecurityError("Cannot override pinned Coinbase linked bank account ID")
+            elif destination_bank_id is not None and str(destination_bank_id).strip():
+                dest_bank = str(destination_bank_id).strip()
+            else:
+                raise OfframpSecurityError("CoinbaseOfframpClient is not configured")
+        else:
+            if kraken_client is not None:
+                dest_bank = kraken_client.linked_bank_account_id
+                if destination_bank_id is not None and str(destination_bank_id).strip() != dest_bank:
+                    raise OfframpSecurityError("Cannot override pinned Kraken bank withdrawal key")
+            elif destination_bank_id is not None and str(destination_bank_id).strip():
+                dest_bank = str(destination_bank_id).strip()
+            else:
+                raise OfframpSecurityError("KrakenOfframpClient is not configured")
+
+        conv_spec = self._build_conversion_spec(
+            rail=rail,
+            convert_from_currency=convert_from_currency,
+            convert_amount=convert_amount,
+            coinbase_source_account_uuid=coinbase_source_account_uuid,
+            coinbase_usd_account_uuid=coinbase_usd_account_uuid,
+            kraken_pair=kraken_pair,
+        )
+        retry_ref = str(retry_transfer_id).strip() if retry_transfer_id is not None and str(retry_transfer_id).strip() else None
+        transfer_id = retry_ref if retry_ref is not None else f"trach-{uuid.uuid4().hex[:16]}"
+        now_dt = utc_time(self._clock(), "clock")
+        ts = _iso(now_dt)
+        exp_str = _iso(now_dt + timedelta(seconds=ttl_seconds))
+        intent_id = f"tiach-{uuid.uuid4().hex[:16]}"
+        conv_json = canonical_bytes(conv_spec).decode("utf-8")
+
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if retry_ref is not None:
+                existing = conn.execute(
+                    "SELECT idempotency_key FROM bank_transfers WHERE transfer_id = ? AND scope_id = ?",
+                    (retry_ref, self.scope_id),
+                ).fetchone()
+                if existing is not None and existing["idempotency_key"]:
+                    eff_idem = str(existing["idempotency_key"])
+                elif idempotency_key is not None and str(idempotency_key).strip():
+                    eff_idem = str(idempotency_key).strip()
+                else:
+                    eff_idem = f"ach-{transfer_id}"
+            else:
+                eff_idem = (
+                    str(idempotency_key).strip()
+                    if idempotency_key is not None and str(idempotency_key).strip()
+                    else "ach-" + sha256(
+                        f"{self.scope_id}|{rail}|{clean_req_id}|{decimal_text(amt_q)}|{transfer_id}".encode("utf-8")
+                    ).hexdigest()[:24]
+                )
+            canon = self._canonical_intent_payload(
+                intent_id=intent_id,
+                action=INTENT_ACTION_OFFRAMP_ACH,
+                transfer_id=transfer_id,
+                amt_q=amt_q,
+                rail=rail,
+                broker_id=None,
+                destination_bank_id=dest_bank,
+                conversion_spec=conv_spec,
+                idempotency_key=eff_idem,
+                retry_transfer_id=retry_ref,
+                owner_request_id=clean_req_id,
+            )
+            intent_sha = sha256(canonical_bytes(canon)).hexdigest()
+            conn.execute(
+                """
+                INSERT INTO treasury_intents(
+                    intent_id, intent_sha256, scope_id, action, transfer_id, rail, broker_id,
+                    destination_bank_id, amount_usd_text, conversion_json, idempotency_key,
+                    retry_transfer_id, owner_request_id, reason, status, created_at, expires_at, consumed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, NULL)
+                """,
+                (
+                    intent_id,
+                    intent_sha,
+                    self.scope_id,
+                    INTENT_ACTION_OFFRAMP_ACH,
+                    transfer_id,
+                    rail,
+                    dest_bank,
+                    decimal_text(amt_q),
+                    conv_json,
+                    eff_idem,
+                    retry_ref,
+                    clean_req_id,
+                    clean_reason,
+                    ts,
+                    exp_str,
+                ),
+            )
+            self._append_audit(
+                conn,
+                "TREASURY_INTENT_PREPARED",
+                {
+                    "intent_id": intent_id,
+                    "intent_sha256": intent_sha,
+                    "action": INTENT_ACTION_OFFRAMP_ACH,
+                    "transfer_id": transfer_id,
+                    "rail": rail,
+                    "destination_bank_id": dest_bank,
+                    "amount_usd": decimal_text(amt_q),
+                    "idempotency_key": eff_idem,
+                    "owner_request_id": clean_req_id,
+                },
+                ts,
+            )
+            conn.execute("COMMIT")
+        return {
+            "intent_id": intent_id,
+            "intent_sha256": intent_sha,
+            "transfer_id": transfer_id,
+            "scope_id": self.scope_id,
+            "action": INTENT_ACTION_OFFRAMP_ACH,
+            "amount_usd": decimal_text(amt_q),
+            "rail": rail,
+            "broker_id": None,
+            "destination_bank_id": dest_bank,
+            "conversion": conv_spec,
+            "idempotency_key": eff_idem,
+            "retry_transfer_id": retry_ref,
+            "owner_request_id": clean_req_id,
+            "expires_at": exp_str,
+        }
+
+    def _lookup_and_verify_prepared_intent_unlocked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        intent_id: str | None,
+        intent_sha256: str | None,
+        expected_action: str,
+        amt_q: Decimal,
+        rail: str,
+        broker_id: str | None,
+        destination_bank_id: str,
+        conversion_spec: Mapping[str, Any],
+        explicit_idempotency_key: str | None,
+        retry_transfer_id: str | None,
+        owner_request_id: str,
+        now_dt: datetime,
+    ) -> tuple[str, str, str, str | None]:
+        clean_iid = str(intent_id or "").strip()
+        clean_isha = str(intent_sha256 or "").strip().lower()
+        if not clean_iid and not clean_isha:
+            raise ContractError(
+                "TREASURY_INTENT_REQUIRED: persist transfer intent via prepare_* and sign exact intent_sha256 before execution"
+            )
+        if clean_iid:
+            irow = conn.execute(
+                "SELECT * FROM treasury_intents WHERE intent_id = ? AND scope_id = ?",
+                (clean_iid, self.scope_id),
+            ).fetchone()
+            if irow is not None and clean_isha and str(irow["intent_sha256"]).lower() != clean_isha:
+                raise ContractError("TREASURY_INTENT_MISMATCH: intent_id and intent_sha256 do not match")
+        else:
+            irow = conn.execute(
+                "SELECT * FROM treasury_intents WHERE intent_sha256 = ? AND scope_id = ?",
+                (clean_isha, self.scope_id),
+            ).fetchone()
+        if irow is None:
+            raise ContractError("TREASURY_INTENT_NOT_FOUND: unknown prepared intent for this runtime scope")
+        if str(irow["status"]) != "PREPARED" or irow["consumed_at"] is not None:
+            raise ContractError(f"TREASURY_INTENT_ALREADY_USED: intent status is {irow['status']!r}")
+        exp_dt = utc_time(datetime.fromisoformat(str(irow["expires_at"]).replace("Z", "+00:00")), "expires_at")
+        if now_dt > exp_dt:
+            raise ContractError("TREASURY_INTENT_EXPIRED: prepared treasury intent has expired")
+        if str(irow["destination_bank_id"]) != destination_bank_id:
+            raise OfframpSecurityError("Treasury destination_bank_id does not match prepared intent")
+        stored_iid = str(irow["intent_id"])
+        stored_sha = str(irow["intent_sha256"])
+        stored_tid = str(irow["transfer_id"])
+        stored_idem = str(irow["idempotency_key"]) if irow["idempotency_key"] is not None else None
+        if explicit_idempotency_key is not None and str(explicit_idempotency_key).strip():
+            eff_idem: str | None = str(explicit_idempotency_key).strip()
+        else:
+            eff_idem = stored_idem
+        recomputed = self._canonical_intent_payload(
+            intent_id=stored_iid,
+            action=expected_action,
+            transfer_id=stored_tid,
+            amt_q=amt_q,
+            rail=rail,
+            broker_id=broker_id,
+            destination_bank_id=destination_bank_id,
+            conversion_spec=conversion_spec,
+            idempotency_key=eff_idem,
+            retry_transfer_id=retry_transfer_id,
+            owner_request_id=str(owner_request_id).strip(),
+        )
+        recomputed_sha = sha256(canonical_bytes(recomputed)).hexdigest()
+        if (
+            str(irow["action"]) != expected_action
+            or recomputed_sha != stored_sha
+        ):
+            raise ContractError(
+                "TREASURY_INTENT_MISMATCH: execution parameters differ from prepared canonical intent digest"
+            )
+        return stored_iid, stored_sha, stored_tid, eff_idem
+
     def request_broker_2fa_withdrawal(
         self,
         *,
@@ -1177,8 +1632,10 @@ class ProfitSweepVault:
         verifier: Any,
         recovery_token: str,
         destination_bank_label: str = "OWNER_LINKED_BANK",
+        intent_id: str | None = None,
+        intent_sha256: str | None = None,
     ) -> dict[str, Any]:
-        """Queue an owner-2FA-gated broker withdrawal against accrued Bank Vault reserve."""
+        """Queue an owner-2FA-gated broker withdrawal bound to a prepared canonical intent digest (Finding [13])."""
         amt_q = decimal_value(amount_usd, "amount_usd", positive=True).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
@@ -1186,52 +1643,146 @@ class ProfitSweepVault:
             raise ContractError("amount_usd must be >= $0.01")
         if not owner_request_id or not reason:
             raise ContractError("owner_request_id and reason are required")
-        transfer_id = f"tr2fa-{uuid.uuid4().hex[:16]}"
-        verifier.verify_and_consume(
-            recovery_token,
-            expected_scope="TREASURY_SWEEP",
-            target_ref=transfer_id,
-            owner_request_id=owner_request_id,
-            now=self._clock(),
+        if verifier is None or not callable(getattr(verifier, "verify_and_consume", None)):
+            raise ContractError("OWNER_RECOVERY_VERIFIER_REQUIRED")
+        clean_broker = str(broker_id or "").strip()
+        clean_dest = str(destination_bank_label or "").strip()
+        clean_req_id = identifier(owner_request_id, "owner_request_id")
+        conv_spec = self._build_conversion_spec(rail=RAIL_BROKER_2FA_MANUAL)
+        now_dt = utc_time(self._clock(), "clock")
+        ts = _iso(now_dt)
+
+        ver_db = getattr(verifier, "db_path", None)
+        same_db = (
+            isinstance(ver_db, Path)
+            and callable(getattr(verifier, "consume_on_connection", None))
+            and ver_db.resolve() == self.db_path.resolve()
         )
-        ts = _iso(self._clock())
-        with self._lock, closing(self._connect()) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            pending = self._pending_disbursement_unlocked(conn)
-            if amt_q > pending:
-                conn.execute("ROLLBACK")
-                raise ContractError(
-                    f"Requested sweep ${decimal_text(amt_q)} exceeds pending Bank Vault ${decimal_text(pending)}"
-                )
-            conn.execute(
-                """
-                INSERT INTO bank_transfers(
-                    transfer_id, scope_id, rail, broker_id, destination_bank_id, amount_usd_text,
-                    status, provider_tx_id, owner_request_id, reason, created_at, settled_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    transfer_id,
-                    self.scope_id,
-                    RAIL_BROKER_2FA_MANUAL,
-                    str(broker_id),
-                    str(destination_bank_label),
-                    decimal_text(amt_q),
-                    "PENDING_OWNER_BROKER_2FA",
-                    None,
-                    str(owner_request_id),
-                    str(reason)[:240],
-                    ts,
-                    None,
-                ),
-            )
-            self._append_audit(
-                conn,
-                "BROKER_2FA_WITHDRAWAL_REQUESTED",
-                {"transfer_id": transfer_id, "broker_id": str(broker_id), "amount_usd": decimal_text(amt_q)},
-                ts,
-            )
-            conn.execute("COMMIT")
+        if same_db and callable(getattr(verifier, "ensure_initialized", None)):
+            verifier.ensure_initialized()
+
+        def _reserve_2fa(*, consume_same_db: bool, consume_fallback: bool) -> str:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    stored_iid, stored_sha, transfer_id, _ = self._lookup_and_verify_prepared_intent_unlocked(
+                        conn,
+                        intent_id=intent_id,
+                        intent_sha256=intent_sha256,
+                        expected_action=INTENT_ACTION_BROKER_2FA,
+                        amt_q=amt_q,
+                        rail=RAIL_BROKER_2FA_MANUAL,
+                        broker_id=clean_broker,
+                        destination_bank_id=clean_dest,
+                        conversion_spec=conv_spec,
+                        explicit_idempotency_key=None,
+                        retry_transfer_id=None,
+                        owner_request_id=clean_req_id,
+                        now_dt=now_dt,
+                    )
+                    if consume_same_db:
+                        verifier.consume_on_connection(
+                            conn,
+                            recovery_token,
+                            expected_scope="TREASURY_SWEEP",
+                            target_ref=stored_sha,
+                            require_exact_target=True,
+                            owner_request_id=clean_req_id,
+                            now=now_dt,
+                        )
+                    pending = self._pending_disbursement_unlocked(conn)
+                    if amt_q > pending:
+                        raise ContractError(
+                            f"Requested sweep ${decimal_text(amt_q)} exceeds pending Bank Vault ${decimal_text(pending)}"
+                        )
+                    conn.execute(
+                        """
+                        INSERT INTO bank_transfers(
+                            transfer_id, scope_id, rail, broker_id, destination_bank_id, amount_usd_text,
+                            status, provider_tx_id, owner_request_id, reason, created_at, settled_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            transfer_id,
+                            self.scope_id,
+                            RAIL_BROKER_2FA_MANUAL,
+                            clean_broker,
+                            clean_dest,
+                            decimal_text(amt_q),
+                            "PENDING_OWNER_BROKER_2FA",
+                            None,
+                            clean_req_id,
+                            str(reason)[:240],
+                            ts,
+                            None,
+                        ),
+                    )
+                    cur_i = conn.execute(
+                        "UPDATE treasury_intents SET status = 'CONSUMED', consumed_at = ? WHERE intent_id = ? AND status = 'PREPARED'",
+                        (ts, stored_iid),
+                    )
+                    if cur_i.rowcount != 1:
+                        raise ContractError("TREASURY_INTENT_CONCURRENTLY_CONSUMED")
+                    self._append_audit(
+                        conn,
+                        "BROKER_2FA_WITHDRAWAL_REQUESTED",
+                        {
+                            "transfer_id": transfer_id,
+                            "intent_id": stored_iid,
+                            "intent_sha256": stored_sha,
+                            "broker_id": clean_broker,
+                            "amount_usd": decimal_text(amt_q),
+                        },
+                        ts,
+                    )
+                    if consume_fallback:
+                        verifier.verify_and_consume(
+                            recovery_token,
+                            expected_scope="TREASURY_SWEEP",
+                            target_ref=stored_sha,
+                            require_exact_target=True,
+                            owner_request_id=clean_req_id,
+                            now=now_dt,
+                        )
+                    conn.execute("COMMIT")
+                    return transfer_id
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+
+        with self._lock:
+            if same_db:
+                transfer_id = _reserve_2fa(consume_same_db=True, consume_fallback=False)
+            elif callable(getattr(verifier, "atomic_consume", None)):
+                with closing(self._connect_ro()) as ro_conn:
+                    _, pre_sha, _, _ = self._lookup_and_verify_prepared_intent_unlocked(
+                        ro_conn,
+                        intent_id=intent_id,
+                        intent_sha256=intent_sha256,
+                        expected_action=INTENT_ACTION_BROKER_2FA,
+                        amt_q=amt_q,
+                        rail=RAIL_BROKER_2FA_MANUAL,
+                        broker_id=clean_broker,
+                        destination_bank_id=clean_dest,
+                        conversion_spec=conv_spec,
+                        explicit_idempotency_key=None,
+                        retry_transfer_id=None,
+                        owner_request_id=clean_req_id,
+                        now_dt=now_dt,
+                    )
+                with verifier.atomic_consume(
+                    recovery_token,
+                    expected_scope="TREASURY_SWEEP",
+                    target_ref=pre_sha,
+                    require_exact_target=True,
+                    owner_request_id=clean_req_id,
+                    now=now_dt,
+                ):
+                    transfer_id = _reserve_2fa(consume_same_db=False, consume_fallback=False)
+            else:
+                transfer_id = _reserve_2fa(consume_same_db=False, consume_fallback=True)
+
         return {"transfer_id": transfer_id, "status": "PENDING_OWNER_BROKER_2FA", "vault": self.snapshot()}
 
     def confirm_broker_2fa_withdrawal(
@@ -1386,122 +1937,210 @@ class ProfitSweepVault:
         kraken_pair: str = "USDCUSD",
         idempotency_key: str | None = None,
         retry_transfer_id: str | None = None,
+        intent_id: str | None = None,
+        intent_sha256: str | None = None,
     ) -> dict[str, Any]:
-        """Atomically reserve funds & durable idempotency intent BEFORE dispatching ACH payout (Finding [9])."""
+        """Atomically verify prepared canonical intent digest, consume approval & reserve funds BEFORE ACH dispatch (Findings [9], [13])."""
         amt_q = decimal_value(amount_usd, "amount_usd", positive=True).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
         if amt_q <= Decimal("0"):
             raise ContractError("amount_usd must be >= $0.01")
+        clean_req_id = identifier(owner_request_id, "owner_request_id")
+        if not reason:
+            raise ContractError("owner_request_id and reason are required")
+        if verifier is None or not callable(getattr(verifier, "verify_and_consume", None)):
+            raise ContractError("OWNER_RECOVERY_VERIFIER_REQUIRED")
         if rail not in (RAIL_COINBASE_ACH, RAIL_KRAKEN_ACH):
             raise OfframpSecurityError(f"Unsupported automated ACH rail {rail!r}")
         if rail == RAIL_COINBASE_ACH:
             if coinbase_client is None:
                 raise OfframpSecurityError("CoinbaseOfframpClient is not configured")
             dest_bank = coinbase_client.linked_bank_account_id
-            if convert_from_currency is not None and convert_amount is not None:
-                if not coinbase_source_account_uuid or not coinbase_usd_account_uuid:
-                    raise ContractError("Coinbase source/USD account UUIDs are required for conversion")
         else:
             if kraken_client is None:
                 raise OfframpSecurityError("KrakenOfframpClient is not configured")
             dest_bank = kraken_client.linked_bank_account_id
 
-        retry_ref = str(retry_transfer_id).strip() if retry_transfer_id is not None and str(retry_transfer_id).strip() else None
-        planned_transfer_id = retry_ref if retry_ref is not None else f"trach-{uuid.uuid4().hex[:16]}"
-        verifier.verify_and_consume(
-            recovery_token,
-            expected_scope="TREASURY_SWEEP",
-            target_ref=planned_transfer_id,
-            owner_request_id=owner_request_id,
-            now=self._clock(),
+        conv_spec = self._build_conversion_spec(
+            rail=rail,
+            convert_from_currency=convert_from_currency,
+            convert_amount=convert_amount,
+            coinbase_source_account_uuid=coinbase_source_account_uuid,
+            coinbase_usd_account_uuid=coinbase_usd_account_uuid,
+            kraken_pair=kraken_pair,
         )
+        retry_ref = str(retry_transfer_id).strip() if retry_transfer_id is not None and str(retry_transfer_id).strip() else None
+        now_dt = utc_time(self._clock(), "clock")
+        ts_reserve = _iso(now_dt)
 
-        ts_reserve = _iso(self._clock())
-        with self._lock, closing(self._connect()) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            if retry_ref is not None:
-                existing = conn.execute(
-                    "SELECT * FROM bank_transfers WHERE transfer_id = ? AND scope_id = ?",
-                    (retry_ref, self.scope_id),
-                ).fetchone()
-                if existing is None:
-                    conn.execute("ROLLBACK")
-                    raise ContractError(f"Unknown retry_transfer_id {retry_transfer_id!r}")
-                if str(existing["status"]) not in ("OUTCOME_UNKNOWN", "RESERVED_PENDING_DISPATCH"):
-                    conn.execute("ROLLBACK")
-                    raise ContractError(f"Transfer {retry_transfer_id!r} cannot be retried from status {existing['status']}")
-                if str(existing["rail"]) != rail or Decimal(str(existing["amount_usd_text"])) != amt_q:
-                    conn.execute("ROLLBACK")
-                    raise ContractError("Retry transfer rail/amount does not match persisted intent")
-                if str(existing["destination_bank_id"]) != dest_bank:
-                    conn.execute("ROLLBACK")
-                    raise OfframpSecurityError("Retry transfer destination_bank_id does not match persisted intent")
-                transfer_id = str(existing["transfer_id"])
-                eff_idem = str(existing["idempotency_key"] or f"ach-{transfer_id}")
-                conn.execute(
-                    "UPDATE bank_transfers SET status = 'RESERVED_PENDING_DISPATCH' WHERE transfer_id = ?",
-                    (transfer_id,),
-                )
-                conn.execute("COMMIT")
+        ver_db = getattr(verifier, "db_path", None)
+        same_db = (
+            isinstance(ver_db, Path)
+            and callable(getattr(verifier, "consume_on_connection", None))
+            and ver_db.resolve() == self.db_path.resolve()
+        )
+        if same_db and callable(getattr(verifier, "ensure_initialized", None)):
+            verifier.ensure_initialized()
+
+        def _reserve_ach(*, consume_same_db: bool, consume_fallback: bool) -> tuple[str, str]:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    stored_iid, stored_sha, planned_tid, resolved_idem = self._lookup_and_verify_prepared_intent_unlocked(
+                        conn,
+                        intent_id=intent_id,
+                        intent_sha256=intent_sha256,
+                        expected_action=INTENT_ACTION_OFFRAMP_ACH,
+                        amt_q=amt_q,
+                        rail=rail,
+                        broker_id=None,
+                        destination_bank_id=dest_bank,
+                        conversion_spec=conv_spec,
+                        explicit_idempotency_key=idempotency_key,
+                        retry_transfer_id=retry_ref,
+                        owner_request_id=clean_req_id,
+                        now_dt=now_dt,
+                    )
+                    if consume_same_db:
+                        verifier.consume_on_connection(
+                            conn,
+                            recovery_token,
+                            expected_scope="TREASURY_SWEEP",
+                            target_ref=stored_sha,
+                            require_exact_target=True,
+                            owner_request_id=clean_req_id,
+                            now=now_dt,
+                        )
+                    if retry_ref is not None:
+                        existing = conn.execute(
+                            "SELECT * FROM bank_transfers WHERE transfer_id = ? AND scope_id = ?",
+                            (retry_ref, self.scope_id),
+                        ).fetchone()
+                        if existing is None:
+                            raise ContractError(f"Unknown retry_transfer_id {retry_transfer_id!r}")
+                        if str(existing["status"]) not in ("OUTCOME_UNKNOWN", "RESERVED_PENDING_DISPATCH"):
+                            raise ContractError(
+                                f"Transfer {retry_transfer_id!r} cannot be retried from status {existing['status']}"
+                            )
+                        if str(existing["rail"]) != rail or Decimal(str(existing["amount_usd_text"])) != amt_q:
+                            raise ContractError("Retry transfer rail/amount does not match persisted intent")
+                        if str(existing["destination_bank_id"]) != dest_bank:
+                            raise OfframpSecurityError("Retry transfer destination_bank_id does not match persisted intent")
+                        transfer_id = str(existing["transfer_id"])
+                        eff_idem = str(existing["idempotency_key"] or resolved_idem or f"ach-{transfer_id}")
+                        conn.execute(
+                            "UPDATE bank_transfers SET status = 'RESERVED_PENDING_DISPATCH' WHERE transfer_id = ?",
+                            (transfer_id,),
+                        )
+                    else:
+                        pending = self._pending_disbursement_unlocked(conn)
+                        if amt_q > pending:
+                            raise ContractError(
+                                f"Requested ACH payout ${decimal_text(amt_q)} exceeds pending Bank Vault ${decimal_text(pending)}"
+                            )
+                        transfer_id = planned_tid
+                        eff_idem = resolved_idem or (
+                            "ach-" + sha256(
+                                f"{self.scope_id}|{rail}|{clean_req_id}|{decimal_text(amt_q)}|{transfer_id}".encode("utf-8")
+                            ).hexdigest()[:24]
+                        )
+                        dup = conn.execute(
+                            "SELECT transfer_id, status FROM bank_transfers WHERE idempotency_key = ?",
+                            (eff_idem,),
+                        ).fetchone()
+                        if dup is not None:
+                            raise OfframpSecurityError(
+                                f"Duplicate ACH idempotency_key {eff_idem!r} already bound to {dup['transfer_id']} ({dup['status']})"
+                            )
+                        conn.execute(
+                            """
+                            INSERT INTO bank_transfers(
+                                transfer_id, scope_id, rail, broker_id, destination_bank_id, amount_usd_text,
+                                status, provider_tx_id, owner_request_id, reason, created_at, settled_at,
+                                idempotency_key, error_detail
+                            ) VALUES (?, ?, ?, ?, ?, ?, 'RESERVED_PENDING_DISPATCH', NULL, ?, ?, ?, NULL, ?, NULL)
+                            """,
+                            (
+                                transfer_id,
+                                self.scope_id,
+                                rail,
+                                None,
+                                dest_bank,
+                                decimal_text(amt_q),
+                                clean_req_id,
+                                str(reason)[:240],
+                                ts_reserve,
+                                eff_idem,
+                            ),
+                        )
+                        self._append_audit(
+                            conn,
+                            "ACH_OFFRAMP_RESERVED",
+                            {
+                                "transfer_id": transfer_id,
+                                "intent_id": stored_iid,
+                                "intent_sha256": stored_sha,
+                                "idempotency_key": eff_idem,
+                                "rail": rail,
+                                "destination_bank_id": dest_bank,
+                                "amount_usd": decimal_text(amt_q),
+                            },
+                            ts_reserve,
+                        )
+                    cur_i = conn.execute(
+                        "UPDATE treasury_intents SET status = 'CONSUMED', consumed_at = ? WHERE intent_id = ? AND status = 'PREPARED'",
+                        (ts_reserve, stored_iid),
+                    )
+                    if cur_i.rowcount != 1:
+                        raise ContractError("TREASURY_INTENT_CONCURRENTLY_CONSUMED")
+                    if consume_fallback:
+                        verifier.verify_and_consume(
+                            recovery_token,
+                            expected_scope="TREASURY_SWEEP",
+                            target_ref=stored_sha,
+                            require_exact_target=True,
+                            owner_request_id=clean_req_id,
+                            now=now_dt,
+                        )
+                    conn.execute("COMMIT")
+                    return transfer_id, eff_idem
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+
+        with self._lock:
+            if same_db:
+                transfer_id, eff_idem = _reserve_ach(consume_same_db=True, consume_fallback=False)
+            elif callable(getattr(verifier, "atomic_consume", None)):
+                with closing(self._connect_ro()) as ro_conn:
+                    _, pre_sha, _, _ = self._lookup_and_verify_prepared_intent_unlocked(
+                        ro_conn,
+                        intent_id=intent_id,
+                        intent_sha256=intent_sha256,
+                        expected_action=INTENT_ACTION_OFFRAMP_ACH,
+                        amt_q=amt_q,
+                        rail=rail,
+                        broker_id=None,
+                        destination_bank_id=dest_bank,
+                        conversion_spec=conv_spec,
+                        explicit_idempotency_key=idempotency_key,
+                        retry_transfer_id=retry_ref,
+                        owner_request_id=clean_req_id,
+                        now_dt=now_dt,
+                    )
+                with verifier.atomic_consume(
+                    recovery_token,
+                    expected_scope="TREASURY_SWEEP",
+                    target_ref=pre_sha,
+                    require_exact_target=True,
+                    owner_request_id=clean_req_id,
+                    now=now_dt,
+                ):
+                    transfer_id, eff_idem = _reserve_ach(consume_same_db=False, consume_fallback=False)
             else:
-                pending = self._pending_disbursement_unlocked(conn)
-                if amt_q > pending:
-                    conn.execute("ROLLBACK")
-                    raise ContractError(
-                        f"Requested ACH payout ${decimal_text(amt_q)} exceeds pending Bank Vault ${decimal_text(pending)}"
-                    )
-                transfer_id = planned_transfer_id
-                eff_idem = (
-                    str(idempotency_key).strip()
-                    if idempotency_key is not None and str(idempotency_key).strip()
-                    else "ach-" + sha256(
-                        f"{self.scope_id}|{rail}|{owner_request_id}|{decimal_text(amt_q)}|{transfer_id}".encode("utf-8")
-                    ).hexdigest()[:24]
-                )
-                dup = conn.execute(
-                    "SELECT transfer_id, status FROM bank_transfers WHERE idempotency_key = ?",
-                    (eff_idem,),
-                ).fetchone()
-                if dup is not None:
-                    conn.execute("ROLLBACK")
-                    raise OfframpSecurityError(
-                        f"Duplicate ACH idempotency_key {eff_idem!r} already bound to {dup['transfer_id']} ({dup['status']})"
-                    )
-                conn.execute(
-                    """
-                    INSERT INTO bank_transfers(
-                        transfer_id, scope_id, rail, broker_id, destination_bank_id, amount_usd_text,
-                        status, provider_tx_id, owner_request_id, reason, created_at, settled_at,
-                        idempotency_key, error_detail
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'RESERVED_PENDING_DISPATCH', NULL, ?, ?, ?, NULL, ?, NULL)
-                    """,
-                    (
-                        transfer_id,
-                        self.scope_id,
-                        rail,
-                        None,
-                        dest_bank,
-                        decimal_text(amt_q),
-                        str(owner_request_id),
-                        str(reason)[:240],
-                        ts_reserve,
-                        eff_idem,
-                    ),
-                )
-                self._append_audit(
-                    conn,
-                    "ACH_OFFRAMP_RESERVED",
-                    {
-                        "transfer_id": transfer_id,
-                        "idempotency_key": eff_idem,
-                        "rail": rail,
-                        "destination_bank_id": dest_bank,
-                        "amount_usd": decimal_text(amt_q),
-                    },
-                    ts_reserve,
-                )
-                conn.execute("COMMIT")
+                transfer_id, eff_idem = _reserve_ach(consume_same_db=False, consume_fallback=True)
 
         # External provider side effect executes ONLY after durable reservation & idempotency commit!
         try:

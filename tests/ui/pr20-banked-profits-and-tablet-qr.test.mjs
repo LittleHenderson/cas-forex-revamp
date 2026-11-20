@@ -233,14 +233,14 @@ test('PR20_01 ISO/IEC 18004 QR encoder passes Annex C/D vectors, finder/timing i
 
   const sampleHandle = ['pair', 'm'.repeat(38)].join('-');
   const pairUrl = buildPairingUrl('https://52-33-1-177.sslip.io', sampleHandle);
-  assert.equal(pairUrl, `https://52-33-1-177.sslip.io/ui/index.html?token=${sampleHandle}`);
+  assert.equal(pairUrl, `https://52-33-1-177.sslip.io/ui/index.html?pair_code=${sampleHandle}`);
   assert.throws(() => buildPairingUrl('file:///C:/index.html', sampleHandle));
   assert.throws(() => buildPairingUrl('https://52-33-1-177.sslip.io', 'short'));
 
   for (const testText of [
     'https://127.0.0.1:8765/',
     pairUrl,
-    `https://52-33-1-177.sslip.io/ui/index.html?token=${'x'.repeat(110)}`,
+    `https://52-33-1-177.sslip.io/ui/index.html?pair_code=${'x'.repeat(110)}`,
   ]) {
     const qr = encodeQrMatrix(testText, 'M');
     assert.equal(qr.size, 17 + qr.version * 4);

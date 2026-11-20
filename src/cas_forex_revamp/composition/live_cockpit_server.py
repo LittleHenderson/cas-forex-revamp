@@ -4,11 +4,14 @@ Security & Honesty Invariants:
 - Binds EXCLUSIVELY to a loopback IP address (127.0.0.1 / ::1); hard-refuses 0.0.0.0 or external NICs.
 - Validates loopback client peer IP, exact literal loopback `Host` (`127.0.0.1:<port>` / `[::1]:<port>`),
   and exact loopback `Origin` / `Sec-Fetch-Site` BEFORE reading any request body (defeating DNS rebinding & CSRF).
-- Generates a fresh `secrets.token_urlsafe(32)` bearer/cookie secret + `session_epoch` per `.start()` (and on
-  `.rotate_auth_token()`), rotating `ScopedUIService.rotate_adapter_session` so prior prepared operations invalidate.
-- Enforces constant-time `hmac.compare_digest` authentication on all state, stream, SSE, routing, and RPC `/api/*`
-  routes; supports `GET /?token=<token>` / `GET /ui/index.html?token=<token>` setting an `HttpOnly; SameSite=Strict;
-  Path=/api` session cookie for strict-CSP browser `EventSource` and `fetch` calls.
+- Enforces an absolute monotonic pre-auth wall-clock deadline and cumulative 16 KiB byte budget across BOTH
+  `raw_requestline` and all HTTP headers before `BaseHTTPRequestHandler` reads the first byte (Finding [14]).
+- Never places or accepts the owner primary bearer secret in URLs or stdout; `bootstrap_url` and `POST /api/pair-code`
+  mint single-use, 120-second pairing nonces exchanged via `POST /api/pair-exchange` for least-privilege
+  `DEVICE_READ_AND_EXPLAINER` tokens (Finding [2]).
+- Dedicated owner-only loopback emergency listener (`emergency_base_url`) guarantees `PAUSE_NEW_RISK`,
+  `STOP_AUTOMATION`, and `EMERGENCY_CLOSE_ALL` remain reachable even when all ordinary slots are saturated (Finding [14]).
+- Routes `/api/explainer-ask` and `/api/explainer-tts` through `DurableModelExecutionGate` (Finding [8]).
 - Serves static UI & contract files strictly within the pinned repository root (resolves and blocks .. traversal).
 - Emits strict Content-Security-Policy (default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self').
 - Importing and constructing LoopbackCockpitServer is strictly inert until .start() is called.
@@ -17,19 +20,23 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping
-import os
-import hmac
-from http import HTTPStatus
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
+import hmac
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
-import math
-import re
-import socket
+import inspect
 import ipaddress
 import json
+import math
+import os
 from pathlib import Path
+import re
 import secrets
+import socket
 import tempfile
 import threading
 import time
@@ -42,15 +49,59 @@ from cas_forex_revamp.composition.state_store import (
     open_verified_directory_fd,
     verify_and_read_owner_only_file,
 )
+from cas_forex_revamp.operator.decisions import OperatorUnavailable
 from cas_forex_revamp.operator.frontier_backends import assert_safe_ai_catalog_payload
+
 
 class _SessionRevokedError(Exception):
     """Raised when a session epoch is revoked prior to commit."""
 
 
 _COCKPIT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
+_PAIR_CODE_RE = re.compile(r"^pair-[A-Za-z0-9_-]{24,80}$")
 MAX_HTTP_HEADER_BYTES = 16384
 MAX_HTTP_HEADER_COUNT = 64
+
+SESSION_SCOPE_OWNER_FULL = "OWNER_FULL_CONTROL"
+SESSION_SCOPE_DEVICE_READ_EXPLAINER = "DEVICE_READ_AND_EXPLAINER"
+PAIR_CODE_TTL_SECONDS = 120
+DEVICE_SESSION_TTL_SECONDS = 43200
+MAX_ACTIVE_PAIRING_CODES = 8
+MAX_ACTIVE_DEVICE_SESSIONS = 16
+PAIR_EXCHANGE_WINDOW_SECONDS = 60.0
+MAX_PAIR_EXCHANGE_ATTEMPTS_PER_WINDOW = 10
+
+_DEVICE_ALLOWED_POST_ROUTES: frozenset[str] = frozenset({
+    "/api/explainer-ask",
+    "/api/explainer-tts",
+})
+
+_EMERGENCY_CHANNEL_POST_ROUTES: frozenset[str] = frozenset({
+    "/api/ai-overseer-action",
+    "/api/ai-trader-control",
+    "/api/prepare-control",
+    "/api/request-control",
+    "/api/prepare-close",
+    "/api/request-reviewed-close",
+})
+
+
+@dataclass(slots=True)
+class _PairingCodeRecord:
+    code_sha256: str
+    epoch: str
+    created_mono: float
+    expires_mono: float
+    expires_at_iso: str
+
+
+@dataclass(slots=True)
+class _DeviceSessionRecord:
+    token_sha256: str
+    epoch: str
+    created_mono: float
+    expires_mono: float
+    expires_at_iso: str
 
 
 def _is_valid_generated_cockpit_token(raw: str) -> bool:
@@ -69,55 +120,83 @@ def _is_valid_generated_cockpit_token(raw: str) -> bool:
 
 
 class _DeadlineRFile:
-    """Wrap socket rfile with an absolute header-read wall-clock deadline and cumulative byte ceiling (Finding [8])."""
+    """Wrap socket rfile with ONE cumulative pre-auth wall-clock deadline and byte cap across request-line + headers (Finding [14])."""
 
-    def __init__(self, sock: socket.socket, raw_rfile: Any, *, deadline: float, max_bytes: int) -> None:
+    def __init__(
+        self,
+        sock: socket.socket,
+        raw_rfile: Any,
+        *,
+        deadline: float,
+        max_bytes: int,
+        mono_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._sock = sock
         self._raw = raw_rfile
         self._deadline = deadline
         self._max_bytes = max_bytes
+        self._mono = mono_clock
         self._total_read = 0
         self.header_deadline_exceeded = False
         self.header_size_exceeded = False
 
     def readline(self, limit: int = -1) -> bytes:
-        rem = self._deadline - time.monotonic()
-        if rem <= 0:
-            self.header_deadline_exceeded = True
-            raise TimeoutError("absolute HTTP header deadline exceeded")
-        self._sock.settimeout(min(rem, 1.0))
-        budget = self._max_bytes - self._total_read
-        if budget <= 0:
-            self.header_size_exceeded = True
-            raise ValueError("HTTP header byte limit exceeded")
-        eff_limit = budget + 1 if limit < 0 else min(limit, budget + 1)
-        try:
-            line = self._raw.readline(eff_limit)
-        except (TimeoutError, socket.timeout):
-            if time.monotonic() >= self._deadline:
+        chunks = bytearray()
+        has_peek = callable(getattr(self._raw, "peek", None))
+        while True:
+            rem = self._deadline - self._mono()
+            if rem <= 0:
                 self.header_deadline_exceeded = True
-                raise TimeoutError("absolute HTTP header deadline exceeded") from None
-            rem2 = self._deadline - time.monotonic()
-            if rem2 <= 0:
+                raise TimeoutError("absolute pre-auth HTTP deadline exceeded")
+            budget = self._max_bytes - self._total_read
+            if budget <= 0:
+                self.header_size_exceeded = True
+                raise ValueError("HTTP pre-auth byte limit exceeded")
+            max_more = budget + 1 if limit < 0 else min(limit - len(chunks), budget + 1)
+            if max_more <= 0:
+                break
+            self._sock.settimeout(min(rem, 0.10))
+            if has_peek:
+                try:
+                    peeked = self._raw.peek(1)
+                except (TimeoutError, socket.timeout):
+                    if self._mono() >= self._deadline:
+                        self.header_deadline_exceeded = True
+                        raise TimeoutError("absolute pre-auth HTTP deadline exceeded") from None
+                    continue
+                if not peeked:
+                    break
+                nl_pos = peeked.find(b"\n")
+                take = min(max_more, nl_pos + 1 if nl_pos >= 0 else len(peeked))
+                part = self._raw.read(take)
+            else:
+                try:
+                    part = self._raw.readline(max_more)
+                except (TimeoutError, socket.timeout):
+                    if self._mono() >= self._deadline:
+                        self.header_deadline_exceeded = True
+                        raise TimeoutError("absolute pre-auth HTTP deadline exceeded") from None
+                    continue
+            if not part:
+                break
+            chunks.extend(part)
+            self._total_read += len(part)
+            if self._total_read > self._max_bytes:
+                self.header_size_exceeded = True
+                raise ValueError("HTTP pre-auth byte limit exceeded")
+            if self._mono() > self._deadline:
                 self.header_deadline_exceeded = True
-                raise TimeoutError("absolute HTTP header deadline exceeded") from None
-            self._sock.settimeout(rem2)
-            line = self._raw.readline(eff_limit)
-        self._total_read += len(line)
-        if self._total_read > self._max_bytes:
-            self.header_size_exceeded = True
-            raise ValueError("HTTP header byte limit exceeded")
-        if time.monotonic() > self._deadline:
-            self.header_deadline_exceeded = True
-            raise TimeoutError("absolute HTTP header deadline exceeded")
-        return line
+                raise TimeoutError("absolute pre-auth HTTP deadline exceeded")
+            if part.endswith(b"\n") or (limit >= 0 and len(chunks) >= limit):
+                break
+        return bytes(chunks)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._raw, name)
 
 
 class _ExclusiveThreadingHTTPServer(HTTPServer):
-    """Bounded loopback HTTP server preventing SO_REUSEADDR hijacking and pre-auth thread exhaustion (Finding [8])."""
+    """Bounded loopback HTTP server preventing SO_REUSEADDR hijacking and pre-auth slot exhaustion (Findings [8], [14])."""
 
     allow_reuse_address = False
 
@@ -127,20 +206,22 @@ class _ExclusiveThreadingHTTPServer(HTTPServer):
         RequestHandlerClass: type[BaseHTTPRequestHandler],
         *,
         ordinary_slots: int = 16,
-        emergency_slots: int = 4,
+        peer_rate_limit_per_window: int = 256,
+        peer_rate_window_seconds: float = 10.0,
+        thread_name_prefix: str = "cas-cockpit-worker",
     ) -> None:
         self._ordinary_slots = max(1, int(ordinary_slots))
-        self._emergency_slots = max(1, int(emergency_slots))
         self._ordinary_conn_sem = threading.BoundedSemaphore(self._ordinary_slots)
-        self._emergency_conn_sem = threading.BoundedSemaphore(self._emergency_slots)
+        self._peer_rate_limit = max(1, int(peer_rate_limit_per_window))
+        self._peer_rate_window = max(0.5, float(peer_rate_window_seconds))
         self._slot_lock = threading.Lock()
-        self._conn_slot_kind: dict[int, str] = {}
+        self._peer_conn_times: dict[str, list[float]] = {}
         self._active_workers = 0
         self._peak_workers = 0
         self._rejected_pre_auth = 0
         self._executor = ThreadPoolExecutor(
-            max_workers=self._ordinary_slots + self._emergency_slots,
-            thread_name_prefix="cas-cockpit-worker",
+            max_workers=self._ordinary_slots,
+            thread_name_prefix=thread_name_prefix,
         )
         if ":" in str(server_address[0]):
             self.address_family = socket.AF_INET6
@@ -151,37 +232,56 @@ class _ExclusiveThreadingHTTPServer(HTTPServer):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
 
-    def slot_kind_for(self, request: socket.socket) -> str:
+    def _reject_raw_socket(self, request: Any, status_line: bytes, body: bytes) -> None:
         with self._slot_lock:
-            return self._conn_slot_kind.get(id(request), "ordinary")
+            self._rejected_pre_auth += 1
+        try:
+            if isinstance(request, socket.socket):
+                request.settimeout(0.25)
+                payload = (
+                    status_line
+                    + b"\r\nContent-Type: application/json; charset=utf-8\r\n"
+                    + b"Connection: close\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                    + body
+                )
+                request.sendall(payload)
+        except OSError as exc:
+            _drop_err = str(exc)
+        self.shutdown_request(request)
 
     def process_request(self, request: Any, client_address: Any) -> None:
-        if self._ordinary_conn_sem.acquire(blocking=False):
-            slot_kind = "ordinary"
-            sem = self._ordinary_conn_sem
-        elif self._emergency_conn_sem.acquire(blocking=False):
-            slot_kind = "emergency_probe"
-            sem = self._emergency_conn_sem
-        else:
-            with self._slot_lock:
-                self._rejected_pre_auth += 1
-            try:
-                if isinstance(request, socket.socket):
-                    request.settimeout(0.25)
-                    request.sendall(
-                        b"HTTP/1.1 503 Service Unavailable\r\n"
-                        b"Content-Type: application/json; charset=utf-8\r\n"
-                        b"Connection: close\r\n"
-                        b"Content-Length: 43\r\n\r\n"
-                        b"{\"error\": \"Cockpit connection pool full\"}\n"
-                    )
-            except OSError as exc:
-                _drop_err = str(exc)  # best-effort 503 before pre-auth close
-            self.shutdown_request(request)
+        peer_ip = str(client_address[0]) if isinstance(client_address, tuple) and client_address else "unknown"
+        now_m = time.monotonic()
+        with self._slot_lock:
+            cutoff = now_m - self._peer_rate_window
+            hist = [t for t in self._peer_conn_times.get(peer_ip, ()) if t >= cutoff]
+            if len(hist) >= self._peer_rate_limit:
+                self._peer_conn_times[peer_ip] = hist
+                rate_exceeded = True
+            else:
+                hist.append(now_m)
+                self._peer_conn_times[peer_ip] = hist
+                rate_exceeded = False
+        if rate_exceeded:
+            self._reject_raw_socket(
+                request,
+                b"HTTP/1.1 429 Too Many Requests",
+                b'{"error": "Pre-auth connection rate limit exceeded"}\n',
+            )
             return
 
+        # Finding [14]: unauthenticated sockets NEVER acquire emergency capacity!
+        if not self._ordinary_conn_sem.acquire(blocking=False):
+            self._reject_raw_socket(
+                request,
+                b"HTTP/1.1 503 Service Unavailable",
+                b'{"error": "Cockpit connection pool full"}\n',
+            )
+            return
+
+        sem = self._ordinary_conn_sem
         with self._slot_lock:
-            self._conn_slot_kind[id(request)] = slot_kind
             self._active_workers += 1
             if self._active_workers > self._peak_workers:
                 self._peak_workers = self._active_workers
@@ -196,7 +296,6 @@ class _ExclusiveThreadingHTTPServer(HTTPServer):
                     self.shutdown_request(request)
                 finally:
                     with self._slot_lock:
-                        self._conn_slot_kind.pop(id(request), None)
                         self._active_workers = max(0, self._active_workers - 1)
                     sem.release()
 
@@ -204,7 +303,6 @@ class _ExclusiveThreadingHTTPServer(HTTPServer):
             self._executor.submit(_worker)
         except RuntimeError:
             with self._slot_lock:
-                self._conn_slot_kind.pop(id(request), None)
                 self._active_workers = max(0, self._active_workers - 1)
             sem.release()
             self.shutdown_request(request)
@@ -391,6 +489,13 @@ _KNOWN_METRICS_ROUTES: frozenset[str] = frozenset({
     "/api/read-command",
     "/api/explainer-ask",
     "/api/explainer-tts",
+    "/api/pair-code",
+    "/api/pair-revoke",
+    "/api/pair-exchange",
+    "/api/auth-session",
+    "/api/rotate-token",
+    "/api/treasury-prepare",
+    "/api/ai-model-select",
 })
 
 _CONTENT_TYPES: dict[str, str] = {
@@ -482,6 +587,7 @@ class LoopbackCockpitServer:
         repo_root: str | Path,
         host: str = "127.0.0.1",
         port: int = 0,
+        emergency_port: int = 0,
         ui_service: Any | None = None,
         market_stream_reader: Callable[[], dict[str, Any] | None] | None = None,
         broker_router_reader: Callable[[], dict[str, Any] | None] | None = None,
@@ -491,17 +597,24 @@ class LoopbackCockpitServer:
         profit_vault: Any | None = None,
         parallel_tiers: Any | None = None,
         owner_recovery: Any | None = None,
+        model_execution_gate: Any | None = None,
         token_file: str | Path | None = None,
         public_origin: str | None = None,
         withdrawal_provider_verifier: Callable[[str, str], Mapping[str, Any]] | None = None,
         max_ordinary_connections: int = 16,
         max_emergency_connections: int = 4,
         header_deadline_seconds: float = 3.0,
+        pre_auth_timeout_seconds: float | None = None,
+        pre_auth_conn_rate_limit: int = 256,
+        mono_clock: Callable[[], float] | None = None,
     ) -> None:
         self._host = validate_loopback_host(host)
         if type(port) is not int or not (0 <= port <= 65535):
             raise ContractError("port must be an integer in 0..65535")
+        if type(emergency_port) is not int or not (0 <= emergency_port <= 65535):
+            raise ContractError("emergency_port must be an integer in 0..65535")
         self._port = port
+        self._emergency_port_cfg = emergency_port
         self._repo_root = Path(repo_root).resolve()
         self._ui_dir = (self._repo_root / "ui").resolve()
         self._contracts_dir = (self._repo_root / "docs" / "contracts").resolve()
@@ -520,8 +633,26 @@ class LoopbackCockpitServer:
         self._owner_recovery = owner_recovery or (
             getattr(autonomous_trader, "_owner_verifier", None) if autonomous_trader is not None else None
         )
-        self._httpd: ThreadingHTTPServer | None = None
+        inferred_gate = None
+        if autonomous_trader is not None:
+            cand_gate = getattr(autonomous_trader, "_execution_gate", None)
+            if cand_gate is not None and (
+                callable(getattr(cand_gate, "authorize_auxiliary_call", None))
+                or callable(getattr(cand_gate, "admit_scout_call", None))
+            ):
+                inferred_gate = cand_gate
+        self._model_gate = model_execution_gate if model_execution_gate is not None else inferred_gate
+        if (
+            self._model_gate is not None
+            and self._ai_model_registry is not None
+            and callable(getattr(self._ai_model_registry, "bind_execution_gate", None))
+        ):
+            self._ai_model_registry.bind_execution_gate(self._model_gate)
+
+        self._httpd: _ExclusiveThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._emergency_httpd: _ExclusiveThreadingHTTPServer | None = None
+        self._emergency_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._sse_cond = threading.Condition()
         self._sse_version = 0
@@ -529,13 +660,19 @@ class LoopbackCockpitServer:
         self._withdrawal_provider_verifier = withdrawal_provider_verifier
         self._max_ordinary_connections = max(1, int(max_ordinary_connections))
         self._max_emergency_connections = max(1, int(max_emergency_connections))
-        self._header_deadline_seconds = max(0.2, float(header_deadline_seconds))
+        eff_deadline = header_deadline_seconds if pre_auth_timeout_seconds is None else pre_auth_timeout_seconds
+        self._header_deadline_seconds = max(0.1, float(eff_deadline))
+        self._pre_auth_conn_rate_limit = max(1, int(pre_auth_conn_rate_limit))
+        self._mono = mono_clock or time.monotonic
         self._auth_lock = threading.RLock()
         self._auth_cond = threading.Condition(self._auth_lock)
         self._auth_secret: _CockpitSecret | None = None
         self._session_epoch: str | None = None
         self._revoked_epochs: set[str] = set()
         self._inflight_commits: dict[str, int] = {}
+        self._pairing_codes: dict[str, _PairingCodeRecord] = {}
+        self._device_sessions: dict[str, _DeviceSessionRecord] = {}
+        self._pair_exchange_attempts: dict[str, list[float]] = {}
         self._worker_sem = threading.BoundedSemaphore(self._max_ordinary_connections)
         self._emergency_sem = threading.BoundedSemaphore(self._max_emergency_connections)
         self._sse_sem = threading.BoundedSemaphore(4)
@@ -545,11 +682,11 @@ class LoopbackCockpitServer:
         self._started_mono: float | None = None
         self._requests_total = 0
         self._auth_failures_total = 0
+        self._pre_auth_timeouts_total = 0
         self._sse_active_clients = 0
         self._sse_events_sent_total = 0
         self._sse_heartbeats_sent_total = 0
         self._route_counts: dict[str, int] = {}
-        # Finding [2]: preserve un-resolved Path so symlink/parent custody checks run BEFORE any open!
         if token_file is not None and str(token_file).strip():
             tf_raw = str(token_file).strip()
             tf_path = Path(tf_raw)
@@ -573,13 +710,33 @@ class LoopbackCockpitServer:
         return int(self._httpd.server_address[1])
 
     @property
+    def emergency_port(self) -> int:
+        if self._emergency_httpd is None:
+            raise ContractError("server has not been started")
+        return int(self._emergency_httpd.server_address[1])
+
+    @property
     def expected_host_header(self) -> str:
         port = self.bound_port
         return f"[{self._host}]:{port}" if ":" in self._host else f"{self._host}:{port}"
 
     @property
+    def emergency_expected_host_header(self) -> str:
+        port = self.emergency_port
+        return f"[{self._host}]:{port}" if ":" in self._host else f"{self._host}:{port}"
+
+    @property
     def base_url(self) -> str:
         return f"http://{self.expected_host_header}"
+
+    @property
+    def emergency_base_url(self) -> str:
+        return f"http://{self.emergency_expected_host_header}"
+
+    @property
+    def pre_auth_timeouts_total(self) -> int:
+        with self._metrics_lock:
+            return int(self._pre_auth_timeouts_total)
 
     @property
     def auth_token(self) -> str:
@@ -596,13 +753,162 @@ class LoopbackCockpitServer:
             return self._session_epoch
 
     def auth_headers(self) -> dict[str, str]:
-        """Convenience header mapping (`Authorization: Bearer <token>`) for authenticated local clients."""
+        """Convenience header mapping (`Authorization: Bearer <token>`) for authenticated local owner clients."""
         return {"Authorization": f"Bearer {self.auth_token}"}
+
+    def _prune_ephemeral_auth_unlocked(self, now_m: float) -> None:
+        expired_codes = [
+            k for k, rec in self._pairing_codes.items()
+            if now_m >= rec.expires_mono or rec.epoch != self._session_epoch
+        ]
+        for k in expired_codes:
+            self._pairing_codes.pop(k, None)
+        expired_sessions = [
+            k for k, rec in self._device_sessions.items()
+            if now_m >= rec.expires_mono or rec.epoch != self._session_epoch
+        ]
+        for k in expired_sessions:
+            self._device_sessions.pop(k, None)
+
+    def mint_pairing_code(
+        self,
+        *,
+        ttl_seconds: int = PAIR_CODE_TTL_SECONDS,
+        base_origin: str | None = None,
+    ) -> dict[str, Any]:
+        """Mint a single-use, short-lived pairing nonce (NEVER exposing the owner primary bearer in URLs)."""
+        if type(ttl_seconds) is not int or not (10 <= ttl_seconds <= PAIR_CODE_TTL_SECONDS):
+            raise ContractError(f"pairing ttl_seconds must be in 10..{PAIR_CODE_TTL_SECONDS}")
+        with self._auth_lock:
+            if self._httpd is None or self._auth_secret is None or self._session_epoch is None:
+                raise ContractError("server has not been started")
+            now_m = self._mono()
+            self._prune_ephemeral_auth_unlocked(now_m)
+            while len(self._pairing_codes) >= MAX_ACTIVE_PAIRING_CODES:
+                oldest_key = min(self._pairing_codes, key=lambda k: self._pairing_codes[k].created_mono)
+                self._pairing_codes.pop(oldest_key, None)
+            pair_code = "pair-" + secrets.token_urlsafe(24)
+            code_sha = sha256(pair_code.encode("utf-8")).hexdigest()
+            exp_iso = (
+                datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            self._pairing_codes[code_sha] = _PairingCodeRecord(
+                code_sha256=code_sha,
+                epoch=self._session_epoch,
+                created_mono=now_m,
+                expires_mono=now_m + float(ttl_seconds),
+                expires_at_iso=exp_iso,
+            )
+            eff_origin = base_origin or self._public_origin or self.base_url
+            quoted = urllib.parse.quote(pair_code, safe="")
+            return {
+                "pair_code": pair_code,
+                "pairing_url": f"{eff_origin}/ui/index.html?pair_code={quoted}",
+                "expires_at": exp_iso,
+                "ttl_seconds": int(ttl_seconds),
+                "scope": SESSION_SCOPE_DEVICE_READ_EXPLAINER,
+            }
+
+    def revoke_pairing(
+        self,
+        *,
+        pair_code: str | None = None,
+        revoke_sessions: bool = True,
+        exclude_sock: socket.socket | None = None,
+    ) -> dict[str, Any]:
+        """Immediately revoke active pairing code(s) and optionally paired device sessions."""
+        close_socks = False
+        with self._auth_cond:
+            now_m = self._mono()
+            self._prune_ephemeral_auth_unlocked(now_m)
+            if pair_code is not None and str(pair_code).strip():
+                target_sha = sha256(str(pair_code).strip().encode("utf-8")).hexdigest()
+                revoked_codes = 1 if self._pairing_codes.pop(target_sha, None) is not None else 0
+            else:
+                revoked_codes = len(self._pairing_codes)
+                self._pairing_codes.clear()
+            revoked_sessions = 0
+            if revoke_sessions:
+                revoked_sessions = len(self._device_sessions)
+                if revoked_sessions > 0:
+                    close_socks = True
+                self._device_sessions.clear()
+            self._auth_cond.notify_all()
+        self.notify_stream_updated()
+        if close_socks:
+            self._close_active_sockets(exclude_sock=exclude_sock)
+        return {
+            "ok": True,
+            "revoked_codes": int(revoked_codes),
+            "revoked_sessions": int(revoked_sessions),
+        }
+
+    def exchange_pairing_code(
+        self,
+        pair_code: str,
+        *,
+        peer_key: str = "127.0.0.1",
+    ) -> tuple[int, dict[str, Any]]:
+        """Atomically exchange a single-use pairing code for a least-privilege device bearer token."""
+        now_m = self._mono()
+        with self._auth_cond:
+            cutoff = now_m - PAIR_EXCHANGE_WINDOW_SECONDS
+            hist = [t for t in self._pair_exchange_attempts.get(peer_key, ()) if t >= cutoff]
+            if len(hist) >= MAX_PAIR_EXCHANGE_ATTEMPTS_PER_WINDOW:
+                self._pair_exchange_attempts[peer_key] = hist
+                return int(HTTPStatus.TOO_MANY_REQUESTS), {"error": "Too many pairing exchange attempts"}
+            hist.append(now_m)
+            self._pair_exchange_attempts[peer_key] = hist
+
+            if (
+                self._stop_event.is_set()
+                or self._httpd is None
+                or self._session_epoch is None
+                or not isinstance(pair_code, str)
+                or not _PAIR_CODE_RE.match(pair_code.strip())
+            ):
+                return int(HTTPStatus.UNAUTHORIZED), {"error": "Invalid, expired, or already-used pairing code"}
+
+            self._prune_ephemeral_auth_unlocked(now_m)
+            cand_sha = sha256(pair_code.strip().encode("utf-8")).hexdigest()
+            matched_key: str | None = None
+            for k_sha in list(self._pairing_codes.keys()):
+                if hmac.compare_digest(k_sha, cand_sha):
+                    matched_key = k_sha
+            if matched_key is None:
+                return int(HTTPStatus.UNAUTHORIZED), {"error": "Invalid, expired, or already-used pairing code"}
+            rec = self._pairing_codes.pop(matched_key)
+            if now_m >= rec.expires_mono or rec.epoch != self._session_epoch:
+                return int(HTTPStatus.UNAUTHORIZED), {"error": "Invalid, expired, or already-used pairing code"}
+
+            while len(self._device_sessions) >= MAX_ACTIVE_DEVICE_SESSIONS:
+                oldest_s = min(self._device_sessions, key=lambda k: self._device_sessions[k].created_mono)
+                self._device_sessions.pop(oldest_s, None)
+
+            dev_tok = "casdev-" + secrets.token_urlsafe(32)
+            dev_sha = sha256(dev_tok.encode("utf-8")).hexdigest()
+            exp_iso = (
+                datetime.now(timezone.utc) + timedelta(seconds=DEVICE_SESSION_TTL_SECONDS)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            self._device_sessions[dev_sha] = _DeviceSessionRecord(
+                token_sha256=dev_sha,
+                epoch=self._session_epoch,
+                created_mono=now_m,
+                expires_mono=now_m + float(DEVICE_SESSION_TTL_SECONDS),
+                expires_at_iso=exp_iso,
+            )
+            return int(HTTPStatus.OK), {
+                "session_token": dev_tok,
+                "session_scope": SESSION_SCOPE_DEVICE_READ_EXPLAINER,
+                "owner_controls_allowed": False,
+                "session_epoch": self._session_epoch,
+                "expires_at": exp_iso,
+            }
 
     @property
     def bootstrap_url(self) -> str:
-        """Loopback browser bootstrap URL exchanging `?token=` for an HttpOnly `/api` cookie."""
-        return f"{self.base_url}/ui/index.html?token={self.auth_token}"
+        """Ephemeral single-use `?pair_code=` URL (NEVER embeds the primary owner bearer token)."""
+        return str(self.mint_pairing_code(ttl_seconds=PAIR_CODE_TTL_SECONDS, base_origin=self.base_url)["pairing_url"])
 
     def _register_socket(self, sock: socket.socket) -> None:
         with self._sockets_lock:
@@ -612,10 +918,13 @@ class LoopbackCockpitServer:
         with self._sockets_lock:
             self._active_sockets.discard(sock)
 
-    def _close_active_sockets(self) -> None:
+    def _close_active_sockets(self, *, exclude_sock: socket.socket | None = None) -> None:
         with self._sockets_lock:
-            socks = list(self._active_sockets)
-            self._active_sockets.clear()
+            socks = [s for s in self._active_sockets if s is not exclude_sock]
+            if exclude_sock is not None and exclude_sock in self._active_sockets:
+                self._active_sockets = {exclude_sock}
+            else:
+                self._active_sockets.clear()
         for s in socks:
             try:
                 s.shutdown(socket.SHUT_RDWR)
@@ -626,36 +935,56 @@ class LoopbackCockpitServer:
             except OSError:
                 pass
 
-    def _verify_commit_epoch(self, bearer_token: str | None, captured_epoch: str) -> bool:
+    def _verify_token_unlocked(self, bearer_token: str, captured_epoch: str, *, allow_device_scope: bool = False) -> bool:
+        if (
+            self._stop_event.is_set()
+            or self._httpd is None
+            or captured_epoch in self._revoked_epochs
+            or self._auth_secret is None
+            or self._session_epoch != captured_epoch
+        ):
+            return False
+        if hmac.compare_digest(bearer_token.encode("utf-8"), self._auth_secret.reveal().encode("utf-8")):
+            return True
+        if not allow_device_scope:
+            return False
+        now_m = self._mono()
+        self._prune_ephemeral_auth_unlocked(now_m)
+        cand_sha = sha256(bearer_token.encode("utf-8")).hexdigest()
+        for k_sha, rec in self._device_sessions.items():
+            if hmac.compare_digest(k_sha, cand_sha) and rec.epoch == captured_epoch and now_m < rec.expires_mono:
+                return True
+        return False
+
+    def _verify_commit_epoch(
+        self,
+        bearer_token: str | None,
+        captured_epoch: str,
+        *,
+        allow_device_scope: bool = False,
+    ) -> bool:
         if not bearer_token or not captured_epoch:
             return False
         with self._auth_cond:
-            if self._stop_event.is_set() or self._httpd is None:
-                return False
-            if captured_epoch in self._revoked_epochs:
-                return False
-            if self._auth_secret is None or self._session_epoch != captured_epoch:
-                return False
-            return hmac.compare_digest(bearer_token.encode("utf-8"), self._auth_secret.reveal().encode("utf-8"))
+            return self._verify_token_unlocked(bearer_token, captured_epoch, allow_device_scope=allow_device_scope)
 
     @contextmanager
-    def _commit_lease(self, bearer_token: str | None, captured_epoch: str, *, hold_lock: bool = True):
+    def _commit_lease(
+        self,
+        bearer_token: str | None,
+        captured_epoch: str,
+        *,
+        hold_lock: bool = True,
+        allow_device_scope: bool = False,
+    ):
         """Acquire a revocable commit lease verified at commit time; rotation drains active leases before returning (Finding [10])."""
         if not bearer_token or not captured_epoch:
             raise _SessionRevokedError("missing bearer or epoch")
         with self._auth_cond:
-            if (
-                self._stop_event.is_set()
-                or self._httpd is None
-                or captured_epoch in self._revoked_epochs
-                or self._auth_secret is None
-                or self._session_epoch != captured_epoch
-                or not hmac.compare_digest(bearer_token.encode("utf-8"), self._auth_secret.reveal().encode("utf-8"))
-            ):
+            if not self._verify_token_unlocked(bearer_token, captured_epoch, allow_device_scope=allow_device_scope):
                 raise _SessionRevokedError("session epoch revoked or bearer mismatch")
             self._inflight_commits[captured_epoch] = self._inflight_commits.get(captured_epoch, 0) + 1
             if hold_lock:
-                # Hold auth_lock strictly across short in-memory/SQLite state commits so rotation cannot interleave
                 try:
                     yield captured_epoch
                 finally:
@@ -666,7 +995,6 @@ class LoopbackCockpitServer:
                         self._inflight_commits[captured_epoch] = rem
                     self._auth_cond.notify_all()
                 return
-        # Non-blocking lease for external network I/O routes: tracked for deterministic rotation drain
         try:
             yield captured_epoch
         finally:
@@ -718,10 +1046,11 @@ class LoopbackCockpitServer:
                     with self._auth_cond:
                         self._auth_secret = _CockpitSecret(raw)
                         self._session_epoch = new_epoch
+                        self._pairing_codes.clear()
+                        self._device_sessions.clear()
                         if self._ui_service is not None and callable(getattr(self._ui_service, "rotate_adapter_session", None)):
                             self._ui_service.rotate_adapter_session(new_epoch)
                     return
-                # Missing: generate new secret and create exclusively relative to verified parent dir_fd
                 new_tok = _CockpitSecret(secrets.token_urlsafe(32))
                 new_epoch = "epoch-" + secrets.token_hex(16)
                 create_owner_only_file_atomic(
@@ -735,6 +1064,8 @@ class LoopbackCockpitServer:
                 with self._auth_cond:
                     self._auth_secret = new_tok
                     self._session_epoch = new_epoch
+                    self._pairing_codes.clear()
+                    self._device_sessions.clear()
                     if self._ui_service is not None and callable(getattr(self._ui_service, "rotate_adapter_session", None)):
                         self._ui_service.rotate_adapter_session(new_epoch)
                 return
@@ -743,8 +1074,8 @@ class LoopbackCockpitServer:
                     os.close(dir_fd)
         self.rotate_auth_token()
 
-    def rotate_auth_token(self) -> str:
-        """Rotate per-launch bearer secret + session_epoch, revoking prior epoch and draining active commits (Finding [10])."""
+    def rotate_auth_token(self, *, exclude_sock: socket.socket | None = None) -> str:
+        """Rotate per-launch bearer secret + session_epoch, revoking prior epoch, pairing codes & device sessions."""
         with self._auth_cond:
             old_epoch = self._session_epoch
             if old_epoch is not None:
@@ -753,13 +1084,15 @@ class LoopbackCockpitServer:
             new_epoch = "epoch-" + secrets.token_hex(16)
             self._auth_secret = new_tok
             self._session_epoch = new_epoch
+            self._pairing_codes.clear()
+            self._device_sessions.clear()
             if self._ui_service is not None and callable(getattr(self._ui_service, "rotate_adapter_session", None)):
                 self._ui_service.rotate_adapter_session(new_epoch)
             if self._token_file is not None:
                 self._write_token_file(new_tok.reveal())
             self._auth_cond.notify_all()
         self.notify_stream_updated()
-        self._close_active_sockets()
+        self._close_active_sockets(exclude_sock=exclude_sock)
         if old_epoch is not None:
             drain_deadline = time.monotonic() + 5.0
             with self._auth_cond:
@@ -781,6 +1114,10 @@ class LoopbackCockpitServer:
     def _record_auth_failure(self) -> None:
         with self._metrics_lock:
             self._auth_failures_total += 1
+
+    def _record_pre_auth_timeout(self) -> None:
+        with self._metrics_lock:
+            self._pre_auth_timeouts_total += 1
 
     def _record_sse_client(self, delta: int) -> None:
         with self._metrics_lock:
@@ -891,6 +1228,35 @@ class LoopbackCockpitServer:
             return None
         return candidate
 
+    def _authorize_auxiliary_gate_fallback(
+        self,
+        *,
+        route_kind: str,
+        model_id: str,
+        max_output_tokens: int,
+        input_bytes: int = 0,
+        audio_bytes: int = 0,
+    ) -> dict[str, Any] | None:
+        gate = self._model_gate
+        if gate is None:
+            return None
+        auth_fn = getattr(gate, "authorize_auxiliary_call", None)
+        if callable(auth_fn):
+            return auth_fn(
+                route_kind=route_kind,
+                model_id=model_id,
+                max_output_tokens=max_output_tokens,
+                input_bytes=input_bytes,
+                audio_bytes=audio_bytes,
+            )
+        scout_fn = getattr(gate, "admit_scout_call", None)
+        if callable(scout_fn):
+            return scout_fn(
+                model_id=model_id,
+                request_id=f"{route_kind}-{secrets.token_hex(8)}",
+            )
+        return None
+
     def start(self) -> str:
         if self._httpd is not None:
             return self.base_url
@@ -898,9 +1264,15 @@ class LoopbackCockpitServer:
 
         class _Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            _emergency_channel = False
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 return
+
+            def _pre_auth_budget(self) -> float:
+                if self._emergency_channel:
+                    return min(outer._header_deadline_seconds, 1.5)
+                return outer._header_deadline_seconds
 
             def _send_security_headers(
                 self,
@@ -941,6 +1313,16 @@ class LoopbackCockpitServer:
                 self.wfile.flush()
                 self.close_connection = True
 
+            def _allowed_hosts_and_origins(self) -> tuple[set[str], set[str]]:
+                if self._emergency_channel:
+                    return {outer.emergency_expected_host_header}, {outer.emergency_base_url}
+                allowed_hosts = {outer.expected_host_header}
+                allowed_origins = {outer.base_url}
+                if outer._public_host and outer._public_origin:
+                    allowed_hosts.add(outer._public_host)
+                    allowed_origins.add(outer._public_origin)
+                return allowed_hosts, allowed_origins
+
             def _enforce_loopback_envelope(self) -> bool:
                 """Pre-body check: peer IP, exact literal loopback Host, and exact loopback Origin."""
                 try:
@@ -951,11 +1333,7 @@ class LoopbackCockpitServer:
                     self._write_json(HTTPStatus.FORBIDDEN, {"error": "Loopback clients only"})
                     return False
 
-                allowed_hosts = {outer.expected_host_header}
-                allowed_origins = {outer.base_url}
-                if outer._public_host and outer._public_origin:
-                    allowed_hosts.add(outer._public_host)
-                    allowed_origins.add(outer._public_origin)
+                allowed_hosts, allowed_origins = self._allowed_hosts_and_origins()
                 hosts = self.headers.get_all("Host") or []
                 if len(hosts) != 1 or hosts[0].strip() not in allowed_hosts:
                     self._write_json(HTTPStatus.FORBIDDEN, {"error": "Invalid or foreign Host header"})
@@ -980,57 +1358,88 @@ class LoopbackCockpitServer:
 
             def setup(self) -> None:
                 super().setup()
-                self._slot_kind = (
-                    self.server.slot_kind_for(self.connection)
-                    if hasattr(self.server, "slot_kind_for")
-                    else "ordinary"
-                )
+                self.requestline = ""
+                self.request_version = "HTTP/1.1"
+                self.command = ""
+                self._orig_rfile = self.rfile
+                self._pre_auth_rfile: _DeadlineRFile | None = None
                 if isinstance(self.connection, socket.socket):
-                    self.connection.settimeout(min(outer._header_deadline_seconds, 5.0))
+                    self.connection.settimeout(min(self._pre_auth_budget(), 5.0))
                     outer._register_socket(self.connection)
+
+            def handle_one_request(self) -> None:
+                wrapped: _DeadlineRFile | None = None
+                timeout_counted = False
+                if isinstance(self.connection, socket.socket):
+                    wrapped = _DeadlineRFile(
+                        self.connection,
+                        self._orig_rfile,
+                        deadline=outer._mono() + self._pre_auth_budget(),
+                        max_bytes=MAX_HTTP_HEADER_BYTES,
+                        mono_clock=outer._mono,
+                    )
+                    self._pre_auth_rfile = wrapped
+                    self.rfile = wrapped  # type: ignore[assignment]
+                try:
+                    super().handle_one_request()
+                except TimeoutError:
+                    timeout_counted = True
+                    outer._record_pre_auth_timeout()
+                    self.close_connection = True
+                except ValueError:
+                    if wrapped is not None and wrapped.header_size_exceeded:
+                        try:
+                            self._write_json(
+                                HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE,
+                                {"error": "Pre-auth HTTP request line and headers exceed 16 KiB limit"},
+                            )
+                        except OSError:
+                            pass
+                    self.close_connection = True
+                finally:
+                    if wrapped is not None and wrapped.header_deadline_exceeded and not timeout_counted:
+                        outer._record_pre_auth_timeout()
+                    self.rfile = self._orig_rfile  # type: ignore[assignment]
+                    self._pre_auth_rfile = None
 
             def parse_request(self) -> bool:
                 if isinstance(self.connection, socket.socket):
-                    hdr_budget = (
-                        min(1.0, outer._header_deadline_seconds)
-                        if getattr(self, "_slot_kind", "ordinary") == "emergency_probe"
-                        else outer._header_deadline_seconds
-                    )
-                    orig_rfile = self.rfile
-                    wrapped = _DeadlineRFile(
-                        self.connection,
-                        orig_rfile,
-                        deadline=time.monotonic() + hdr_budget,
-                        max_bytes=MAX_HTTP_HEADER_BYTES,
-                    )
-                    self.rfile = wrapped  # type: ignore[assignment]
+                    if self._pre_auth_rfile is None:
+                        self._pre_auth_rfile = _DeadlineRFile(
+                            self.connection,
+                            self._orig_rfile,
+                            deadline=outer._mono() + self._pre_auth_budget(),
+                            max_bytes=MAX_HTTP_HEADER_BYTES,
+                            mono_clock=outer._mono,
+                        )
+                    self.rfile = self._pre_auth_rfile  # type: ignore[assignment]
                     try:
                         ok = super().parse_request()
                     except TimeoutError:
                         self.close_connection = True
                         return False
                     except ValueError:
+                        if self._pre_auth_rfile is not None and self._pre_auth_rfile.header_size_exceeded:
+                            try:
+                                self._write_json(
+                                    HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE,
+                                    {"error": "Pre-auth HTTP request line and headers exceed 16 KiB limit"},
+                                )
+                            except OSError:
+                                pass
                         self.close_connection = True
                         return False
                     finally:
-                        self.rfile = orig_rfile
+                        self.rfile = self._orig_rfile  # type: ignore[assignment]
                         try:
                             self.connection.settimeout(5.0)
                         except OSError as exc:
-                            _to_err = str(exc)  # socket already closed
+                            _to_err = str(exc)
                     if not ok:
                         return False
                     if len(self.headers) > MAX_HTTP_HEADER_COUNT:
                         self._write_json(HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE, {"error": "Too many HTTP headers"})
                         return False
-                    if getattr(self, "_slot_kind", "ordinary") == "emergency_probe":
-                        req_route = urllib.parse.urlsplit(self.path).path
-                        if not (
-                            str(self.command).upper() == "POST"
-                            and req_route in ("/api/ai-overseer-action", "/api/ai-trader-control", "/api/request-control")
-                        ):
-                            self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Ordinary cockpit connection slots full; emergency capacity reserved"})
-                            return False
                     return True
                 return super().parse_request()
 
@@ -1041,41 +1450,71 @@ class LoopbackCockpitServer:
                     if isinstance(self.connection, socket.socket):
                         outer._unregister_socket(self.connection)
 
-            def _check_auth(self, *, is_post: bool) -> tuple[bool, bool, str, str]:
-                """Bearer-only constant-time check returning (authed, supplied, epoch, candidate_token)."""
+            def _check_auth_scoped(self, *, is_post: bool) -> tuple[bool, bool, str, str, str, str | None]:
+                """Constant-time bearer check returning (authed, supplied, epoch, candidate, scope, expires_at)."""
                 with outer._auth_lock:
                     secret = outer._auth_secret
                     epoch = outer._session_epoch or ""
-                if secret is None or outer._stop_event.is_set():
-                    return False, False, "", ""
-                expected_bytes = secret.reveal().encode("utf-8")
+                    if secret is None or outer._stop_event.is_set() or not epoch:
+                        return False, False, "", "", "", None
+                    expected_owner_bytes = secret.reveal().encode("utf-8")
+                    now_m = outer._mono()
+                    outer._prune_ephemeral_auth_unlocked(now_m)
+                    dev_snapshot = list(outer._device_sessions.items())
 
                 auth_hdrs = self.headers.get_all("Authorization") or []
                 if len(auth_hdrs) > 1:
-                    return False, True, epoch, ""
+                    return False, True, epoch, "", "", None
                 if len(auth_hdrs) == 1:
                     raw_auth = auth_hdrs[0].strip()
                     if not raw_auth.startswith("Bearer "):
-                        return False, True, epoch, ""
+                        return False, True, epoch, "", "", None
                     candidate = raw_auth[7:].strip()
                     if not candidate:
-                        return False, True, epoch, ""
+                        return False, True, epoch, "", "", None
                     if is_post:
                         origins = self.headers.get_all("Origin") or []
-                        allowed_origins = {outer.base_url} | ({outer._public_origin} if outer._public_origin else set())
+                        _, allowed_origins = self._allowed_hosts_and_origins()
                         if len(origins) == 1 and origins[0].strip() not in allowed_origins:
-                            return False, True, epoch, ""
-                    ok = hmac.compare_digest(candidate.encode("utf-8"), expected_bytes)
-                    return ok, True, epoch, candidate
+                            return False, True, epoch, "", "", None
+                    if hmac.compare_digest(candidate.encode("utf-8"), expected_owner_bytes):
+                        return True, True, epoch, candidate, SESSION_SCOPE_OWNER_FULL, None
+                    if self._emergency_channel:
+                        return False, True, epoch, "", "", None
+                    cand_sha = sha256(candidate.encode("utf-8")).hexdigest()
+                    matched_rec: _DeviceSessionRecord | None = None
+                    for k_sha, rec in dev_snapshot:
+                        if hmac.compare_digest(k_sha, cand_sha) and rec.epoch == epoch and now_m < rec.expires_mono:
+                            matched_rec = rec
+                    if matched_rec is not None:
+                        return (
+                            True,
+                            True,
+                            epoch,
+                            candidate,
+                            SESSION_SCOPE_DEVICE_READ_EXPLAINER,
+                            matched_rec.expires_at_iso,
+                        )
+                    return False, True, epoch, "", "", None
 
-                return False, bool(self.headers.get_all("Cookie")), epoch, "" 
+                return False, bool(self.headers.get_all("Cookie")), epoch, "", "", None
 
-            def _reject_unauthorized(self) -> None:
+            def _reject_unauthorized(self, message: str = "Authentication required") -> None:
                 outer._record_auth_failure()
                 self._write_json(
                     HTTPStatus.UNAUTHORIZED,
-                    {"error": "Authentication required"},
+                    {"error": message},
                     extra_headers=[("WWW-Authenticate", 'Bearer realm="cas-forex-cockpit"')],
+                )
+
+            def _reject_insufficient_scope(self) -> None:
+                outer._record_auth_failure()
+                self._write_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "error": "Owner primary bearer required for privileged control",
+                        "required_scope": SESSION_SCOPE_OWNER_FULL,
+                    },
                 )
 
             def _read_json_body(self, *, max_bytes: int = MAX_HTTP_RPC_BYTES) -> Any:
@@ -1088,19 +1527,30 @@ class LoopbackCockpitServer:
                 data = self.rfile.read(length)
                 if len(data) != length:
                     raise ContractError("incomplete HTTP request body")
+
                 def _reject_non_finite(token: str) -> Any:
                     raise ContractError(f"non-finite JSON constant {token!r} forbidden")
 
                 return json.loads(data.decode("utf-8"), parse_constant=_reject_non_finite)
 
+            def _read_optional_json_body(self, *, max_bytes: int = MAX_HTTP_RPC_BYTES) -> dict[str, Any]:
+                raw_len = self.headers.get("Content-Length")
+                if raw_len is None or int(raw_len) == 0:
+                    return {}
+                parsed = self._read_json_body(max_bytes=max_bytes)
+                if type(parsed) is not dict:
+                    raise ContractError("JSON object required")
+                return parsed
+
             def do_GET(self) -> None:
-                if not outer._worker_sem.acquire(blocking=False):
+                sem = outer._emergency_sem if self._emergency_channel else outer._worker_sem
+                if not sem.acquire(blocking=False):
                     self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Cockpit worker capacity reached"})
                     return
                 try:
                     self._handle_get()
                 finally:
-                    outer._worker_sem.release()
+                    sem.release()
 
             def _handle_get(self) -> None:
                 if not self._enforce_loopback_envelope():
@@ -1109,10 +1559,25 @@ class LoopbackCockpitServer:
                 route = parsed.path
                 outer._record_request(route)
 
+                if self._emergency_channel and route != "/api/health":
+                    self._write_json(
+                        HTTPStatus.FORBIDDEN,
+                        {"error": "Emergency channel accepts owner safety controls and /api/health only"},
+                    )
+                    return
+
                 if route == "/api/health":
-                    authed, supplied, epoch, _ = self._check_auth(is_post=False)
+                    if parsed.query:
+                        qmap_h = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+                        if "token" in qmap_h or "pair_code" in qmap_h:
+                            self._reject_unauthorized()
+                            return
+                    authed, supplied, epoch, _, scope, _ = self._check_auth_scoped(is_post=False)
                     if supplied and not authed:
-                        self._reject_unauthorized()
+                        if self._emergency_channel:
+                            self._reject_insufficient_scope()
+                        else:
+                            self._reject_unauthorized()
                         return
                     if not authed:
                         self._write_json(HTTPStatus.OK, {"status": "OK", "auth_required": True, "authenticated": False})
@@ -1128,9 +1593,23 @@ class LoopbackCockpitServer:
                     return
 
                 if route == "/api" or route.startswith("/api/"):
-                    authed, _, initial_epoch, supplied_tok = self._check_auth(is_post=False)
+                    if parsed.query:
+                        qmap_api = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+                        if "token" in qmap_api or "pair_code" in qmap_api:
+                            self._reject_unauthorized()
+                            return
+                    authed, _, initial_epoch, supplied_tok, auth_scope, auth_exp = self._check_auth_scoped(is_post=False)
                     if not authed:
                         self._reject_unauthorized()
+                        return
+                    if route == "/api/auth-session":
+                        self._write_json(HTTPStatus.OK, {
+                            "authenticated": True,
+                            "session_scope": auth_scope,
+                            "owner_controls_allowed": auth_scope == SESSION_SCOPE_OWNER_FULL,
+                            "session_epoch": initial_epoch,
+                            "expires_at": auth_exp,
+                        })
                         return
                     if route == "/api/market-stream":
                         try:
@@ -1138,11 +1617,11 @@ class LoopbackCockpitServer:
                         except Exception as exc:
                             outer._last_routing_error = type(exc).__name__
                             self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Market stream unavailable"})
-                            return
-                        if stream is None:
-                            self._write_json(HTTPStatus.NOT_FOUND, {"error": "Market stream not configured"})
                         else:
-                            self._write_json(HTTPStatus.OK, stream)
+                            if stream is None:
+                                self._write_json(HTTPStatus.NOT_FOUND, {"error": "Market stream not configured"})
+                            else:
+                                self._write_json(HTTPStatus.OK, stream)
                         return
                     if route == "/api/broker-routing":
                         try:
@@ -1150,11 +1629,11 @@ class LoopbackCockpitServer:
                         except Exception as exc:
                             outer._last_routing_error = type(exc).__name__
                             self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Broker routing unavailable"})
-                            return
-                        if routing is None:
-                            self._write_json(HTTPStatus.NOT_FOUND, {"error": "Broker routing not configured"})
                         else:
-                            self._write_json(HTTPStatus.OK, routing)
+                            if routing is None:
+                                self._write_json(HTTPStatus.NOT_FOUND, {"error": "Broker routing not configured"})
+                            else:
+                                self._write_json(HTTPStatus.OK, routing)
                         return
                     if route == "/api/ai-models":
                         if outer._ai_model_registry is None:
@@ -1270,19 +1749,23 @@ class LoopbackCockpitServer:
                             sse_client_recorded = True
                             try:
                                 while not outer._stop_event.is_set():
-                                    if not outer._verify_commit_epoch(supplied_tok, initial_epoch):
+                                    if not outer._verify_commit_epoch(supplied_tok, initial_epoch, allow_device_scope=True):
                                         break
                                     if last_emit_mono > 0.0:
                                         since_emit = time.monotonic() - last_emit_mono
                                         if since_emit < 0.25:
                                             outer._stop_event.wait(0.25 - since_emit)
-                                            if outer._stop_event.is_set() or not outer._verify_commit_epoch(supplied_tok, initial_epoch):
+                                            if outer._stop_event.is_set() or not outer._verify_commit_epoch(
+                                                supplied_tok, initial_epoch, allow_device_scope=True
+                                            ):
                                                 break
                                     with outer._sse_cond:
                                         if outer._sse_version == seen_ver:
                                             outer._sse_cond.wait(timeout=1.5)
                                         cur_ver = outer._sse_version
-                                    if outer._stop_event.is_set() or not outer._verify_commit_epoch(supplied_tok, initial_epoch):
+                                    if outer._stop_event.is_set() or not outer._verify_commit_epoch(
+                                        supplied_tok, initial_epoch, allow_device_scope=True
+                                    ):
                                         break
                                     if cur_ver != seen_ver:
                                         seen_ver = cur_ver
@@ -1404,19 +1887,19 @@ class LoopbackCockpitServer:
                     self._write_json(HTTPStatus.NOT_FOUND, {"error": "Unknown API endpoint"})
                     return
 
+                # Finding [2]: NEVER accept `?token=` in URLs; only clean static URLs or `?pair_code=<nonce>` on UI entry!
                 if parsed.query:
                     qmap = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-                    if "token" in qmap:
-                        if route not in ("/", "/ui", "/ui/", "/ui/index.html") or len(qmap["token"]) != 1:
-                            self._reject_unauthorized()
-                            return
-                        with outer._auth_lock:
-                            secret = outer._auth_secret
-                        if secret is None or not hmac.compare_digest(
-                            qmap["token"][0].encode("utf-8"),
-                            secret.reveal().encode("utf-8"),
+                    if "token" in qmap or "auth_token" in qmap or "bearer" in qmap:
+                        self._reject_unauthorized("Bearer tokens in URL query strings are forbidden; use single-use pair_code")
+                        return
+                    if "pair_code" in qmap:
+                        if (
+                            route not in ("/", "/ui", "/ui/", "/ui/index.html")
+                            or len(qmap["pair_code"]) != 1
+                            or not _PAIR_CODE_RE.match(qmap["pair_code"][0].strip())
                         ):
-                            self._reject_unauthorized()
+                            self._reject_unauthorized("Invalid pairing URL")
                             return
 
                 static_file = outer._resolve_static_path(self.path)
@@ -1433,8 +1916,11 @@ class LoopbackCockpitServer:
 
             def do_POST(self) -> None:
                 route = urllib.parse.urlsplit(self.path).path
-                is_emergency = route in ("/api/ai-overseer-action", "/api/ai-trader-control", "/api/request-control")
-                sem = outer._emergency_sem if is_emergency else outer._worker_sem
+                if self._emergency_channel:
+                    sem = outer._emergency_sem
+                else:
+                    is_emergency = route in ("/api/ai-overseer-action", "/api/ai-trader-control", "/api/request-control")
+                    sem = outer._emergency_sem if is_emergency else outer._worker_sem
                 if not sem.acquire(blocking=False):
                     self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Cockpit POST capacity reached"})
                     return
@@ -1447,11 +1933,104 @@ class LoopbackCockpitServer:
                 if not self._enforce_loopback_envelope():
                     return
                 outer._record_request(route)
-                authed, _, auth_epoch, supplied_tok = self._check_auth(is_post=True)
-                if not authed:
-                    self._reject_unauthorized()
+
+                if self._emergency_channel and route not in _EMERGENCY_CHANNEL_POST_ROUTES:
+                    self._write_json(
+                        HTTPStatus.FORBIDDEN,
+                        {"error": "Emergency channel accepts owner safety controls only"},
+                    )
                     return
-                if route == "/api/select-ai-model":
+
+                # Pre-bearer single-use pairing code exchange (Finding [2])
+                if route == "/api/pair-exchange":
+                    try:
+                        body = self._read_json_body(max_bytes=4096)
+                        if type(body) is not dict or not isinstance(body.get("pair_code"), str):
+                            raise ContractError("pair_code field required")
+                        peer_k = str(self.client_address[0]) if self.client_address else "127.0.0.1"
+                        st_code, resp_doc = outer.exchange_pairing_code(body["pair_code"], peer_key=peer_k)
+                        if st_code == int(HTTPStatus.UNAUTHORIZED):
+                            outer._record_auth_failure()
+                        self._write_json(HTTPStatus(st_code), resp_doc)
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+
+                authed, supplied, auth_epoch, supplied_tok, auth_scope, _ = self._check_auth_scoped(is_post=True)
+                if not authed:
+                    if self._emergency_channel and supplied:
+                        self._reject_insufficient_scope()
+                    else:
+                        self._reject_unauthorized()
+                    return
+
+                # Enforce strict least-privilege separation: paired devices CANNOT invoke owner controls (Finding [2])
+                if auth_scope != SESSION_SCOPE_OWNER_FULL and route not in _DEVICE_ALLOWED_POST_ROUTES:
+                    self._reject_insufficient_scope()
+                    return
+
+                if route == "/api/pair-code":
+                    try:
+                        body_opt = self._read_optional_json_body(max_bytes=4096)
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        _, allowed_origins = self._allowed_hosts_and_origins()
+                        origins = self.headers.get_all("Origin") or []
+                        req_origin = origins[0].strip() if len(origins) == 1 and origins[0].strip() in allowed_origins else None
+                        ttl_req = int(body_opt.get("ttl_seconds", PAIR_CODE_TTL_SECONDS))
+                        with outer._commit_lease(supplied_tok, auth_epoch):
+                            minted = outer.mint_pairing_code(
+                                ttl_seconds=ttl_req,
+                                base_origin=req_origin or outer._public_origin or outer.base_url,
+                            )
+                        self._write_json(HTTPStatus.OK, minted)
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+
+                if route == "/api/pair-revoke":
+                    try:
+                        body_opt = self._read_optional_json_body(max_bytes=4096)
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        raw_pc = body_opt.get("pair_code")
+                        if raw_pc is not None and not isinstance(raw_pc, str):
+                            raise ContractError("pair_code must be a string or null")
+                        rev_sess = bool(body_opt.get("revoke_sessions", True))
+                        cur_sock = self.connection if isinstance(self.connection, socket.socket) else None
+                        with outer._commit_lease(supplied_tok, auth_epoch):
+                            rev_res = outer.revoke_pairing(
+                                pair_code=raw_pc,
+                                revoke_sessions=rev_sess,
+                                exclude_sock=cur_sock,
+                            )
+                        self._write_json(HTTPStatus.OK, rev_res)
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+
+                if route == "/api/rotate-token":
+                    try:
+                        _ = self._read_optional_json_body(max_bytes=4096)
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        cur_sock = self.connection if isinstance(self.connection, socket.socket) else None
+                        outer.rotate_auth_token(exclude_sock=cur_sock)
+                        self._write_json(HTTPStatus.OK, {"ok": True, "session_epoch": outer.session_epoch})
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+
+                if route in ("/api/select-ai-model", "/api/ai-model-select"):
                     if outer._ai_model_registry is None:
                         self._write_json(HTTPStatus.NOT_FOUND, {"error": "AI model registry not configured"})
                         return
@@ -1475,6 +2054,7 @@ class LoopbackCockpitServer:
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
+
                 if route == "/api/thinking-depth":
                     if outer._ai_model_registry is None:
                         self._write_json(HTTPStatus.NOT_FOUND, {"error": "AI model registry not configured"})
@@ -1497,6 +2077,7 @@ class LoopbackCockpitServer:
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
+
                 if route == "/api/treasury-config":
                     if outer._profit_vault is None:
                         self._write_json(HTTPStatus.NOT_FOUND, {"error": "Profit Sweep Vault not configured"})
@@ -1537,6 +2118,68 @@ class LoopbackCockpitServer:
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
+
+                if route == "/api/treasury-prepare":
+                    if outer._profit_vault is None:
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "Profit Sweep Vault not configured"})
+                        return
+                    try:
+                        body = self._read_json_body()
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        if type(body) is not dict or "action" not in body or "amount_usd" not in body:
+                            raise ContractError("action and amount_usd fields required")
+                        act_p = str(body["action"]).strip().upper()
+                        from decimal import Decimal as _Dec
+                        req_id_p = str(body.get("owner_request_id") or f"treasury-prep-{secrets.token_hex(6)}")
+                        reason_p = str(body.get("reason") or "Owner treasury disbursement")
+                        ttl_p = int(body.get("ttl_seconds", 900))
+                        if act_p in ("REQUEST_BROKER_2FA_WITHDRAWAL", "BROKER_2FA_WITHDRAWAL"):
+                            dest_lbl = str(body.get("destination_bank_label") or body.get("destination_bank_id") or "OWNER_LINKED_BANK")
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                prep = outer._profit_vault.prepare_broker_2fa_withdrawal(
+                                    broker_id=str(body.get("broker_id") or "HUGOSWAY_MT5"),
+                                    amount_usd=_Dec(str(body["amount_usd"])),
+                                    owner_request_id=req_id_p,
+                                    reason=reason_p,
+                                    destination_bank_label=dest_lbl,
+                                    ttl_seconds=ttl_p,
+                                )
+                        elif act_p in ("EXECUTE_OFFRAMP_ACH", "OFFRAMP_ACH_PAYOUT"):
+                            from cas_forex_revamp.treasury.profit_sweep import CoinbaseOfframpClient, KrakenOfframpClient
+                            rail_p = str(body.get("rail") or "COINBASE_ACH").strip().upper()
+                            cb_p = CoinbaseOfframpClient.from_environ(os.environ) if rail_p == "COINBASE_ACH" else None
+                            krk_p = KrakenOfframpClient.from_environ(os.environ) if rail_p == "KRAKEN_ACH" else None
+                            dest_override = str(body["destination_bank_id"]).strip() if body.get("destination_bank_id") else None
+                            conv_amt = _Dec(str(body["convert_amount"])) if body.get("convert_amount") is not None else None
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                prep = outer._profit_vault.prepare_offramp_ach_payout(
+                                    rail=rail_p,
+                                    amount_usd=_Dec(str(body["amount_usd"])),
+                                    owner_request_id=req_id_p,
+                                    reason=reason_p,
+                                    coinbase_client=cb_p,
+                                    kraken_client=krk_p,
+                                    destination_bank_id=dest_override,
+                                    convert_from_currency=body.get("convert_from_currency"),
+                                    convert_amount=conv_amt,
+                                    coinbase_source_account_uuid=body.get("coinbase_source_account_uuid"),
+                                    coinbase_usd_account_uuid=body.get("coinbase_usd_account_uuid"),
+                                    kraken_pair=str(body.get("kraken_pair") or "USDCUSD"),
+                                    idempotency_key=body.get("idempotency_key"),
+                                    retry_transfer_id=body.get("retry_transfer_id"),
+                                    ttl_seconds=ttl_p,
+                                )
+                        else:
+                            raise ContractError(f"unsupported treasury prepare action {act_p!r}")
+                        self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(prep))
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+
                 if route == "/api/treasury-action":
                     if outer._profit_vault is None:
                         self._write_json(HTTPStatus.NOT_FOUND, {"error": "Profit Sweep Vault not configured"})
@@ -1556,6 +2199,7 @@ class LoopbackCockpitServer:
                         reason = str(body.get("reason") or "Owner treasury disbursement")
                         rec_tok = body.get("recovery_token") or body.get("owner_authorization")
                         if act == "REQUEST_BROKER_2FA_WITHDRAWAL":
+                            dest_lbl = str(body.get("destination_bank_label") or body.get("destination_bank_id") or "OWNER_LINKED_BANK")
                             with outer._commit_lease(supplied_tok, auth_epoch):
                                 res = outer._profit_vault.request_broker_2fa_withdrawal(
                                     broker_id=str(body.get("broker_id") or "HUGOSWAY_MT5"),
@@ -1564,6 +2208,9 @@ class LoopbackCockpitServer:
                                     reason=reason,
                                     verifier=outer._owner_recovery,
                                     recovery_token=str(rec_tok or ""),
+                                    destination_bank_label=dest_lbl,
+                                    intent_id=body.get("intent_id"),
+                                    intent_sha256=body.get("intent_sha256"),
                                 )
                         elif act == "CONFIRM_BROKER_2FA_WITHDRAWAL":
                             with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=False):
@@ -1580,6 +2227,7 @@ class LoopbackCockpitServer:
                             rail_name = str(body.get("rail") or "COINBASE_ACH").strip().upper()
                             cb = CoinbaseOfframpClient.from_environ(os.environ) if rail_name == "COINBASE_ACH" else None
                             krk = KrakenOfframpClient.from_environ(os.environ) if rail_name == "KRAKEN_ACH" else None
+                            conv_amt = _Dec(str(body["convert_amount"])) if body.get("convert_amount") is not None else None
                             with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=False):
                                 res = outer._profit_vault.execute_offramp_ach_payout(
                                     rail=rail_name,
@@ -1590,6 +2238,15 @@ class LoopbackCockpitServer:
                                     recovery_token=str(rec_tok or ""),
                                     coinbase_client=cb,
                                     kraken_client=krk,
+                                    convert_from_currency=body.get("convert_from_currency"),
+                                    convert_amount=conv_amt,
+                                    coinbase_source_account_uuid=body.get("coinbase_source_account_uuid"),
+                                    coinbase_usd_account_uuid=body.get("coinbase_usd_account_uuid"),
+                                    kraken_pair=str(body.get("kraken_pair") or "USDCUSD"),
+                                    idempotency_key=body.get("idempotency_key"),
+                                    retry_transfer_id=body.get("retry_transfer_id"),
+                                    intent_id=body.get("intent_id"),
+                                    intent_sha256=body.get("intent_sha256"),
                                 )
                         else:
                             raise ContractError(f"unsupported treasury action {act!r}")
@@ -1601,6 +2258,7 @@ class LoopbackCockpitServer:
                         code = HTTPStatus.FORBIDDEN if "OWNER_RECOVERY" in str(exc) else HTTPStatus.BAD_REQUEST
                         self._write_json(code, {"error": str(exc)})
                     return
+
                 if route == "/api/explainer-ask":
                     if outer._ai_model_registry is None:
                         self._write_json(HTTPStatus.NOT_FOUND, {"error": "AI model registry not configured"})
@@ -1622,7 +2280,7 @@ class LoopbackCockpitServer:
                         if raw_mime is not None and not isinstance(raw_mime, str):
                             raise ContractError("audio_mime_type must be a string")
 
-                        with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=False):
+                        with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=False, allow_device_scope=True):
                             ctx_summary: dict[str, Any] = {}
                             if outer._broker_router_reader is not None:
                                 try:
@@ -1833,18 +2491,45 @@ class LoopbackCockpitServer:
                                     outer._last_routing_error = type(exc_ctx).__name__
 
                             safe_ctx = assert_safe_ai_catalog_payload(ctx_summary)
-                            ans_doc = outer._ai_model_registry.answer_explainer_question(
-                                question=raw_q,
-                                context_summary=safe_ctx,
-                                audio_base64=raw_audio,
-                                audio_mime_type=raw_mime,
-                            )
+                            ask_fn = outer._ai_model_registry.answer_explainer_question
+                            ask_params = inspect.signature(ask_fn).parameters
+                            if "execution_gate" in ask_params:
+                                ans_doc = ask_fn(
+                                    question=raw_q,
+                                    context_summary=safe_ctx,
+                                    audio_base64=raw_audio,
+                                    audio_mime_type=raw_mime,
+                                    execution_gate=outer._model_gate,
+                                )
+                            else:
+                                est_audio_bytes = (len(raw_audio.strip()) * 3) // 4 if isinstance(raw_audio, str) and has_audio else 0
+                                est_input_bytes = len(raw_q.encode("utf-8")) + len(json.dumps(safe_ctx).encode("utf-8"))
+                                exp_model = str(getattr(outer._ai_model_registry, "_explainer_model_slug", "gemini-4-neon"))
+                                outer._authorize_auxiliary_gate_fallback(
+                                    route_kind="transcription" if has_audio else "explainer",
+                                    model_id=exp_model,
+                                    max_output_tokens=1024,
+                                    input_bytes=est_input_bytes,
+                                    audio_bytes=est_audio_bytes,
+                                )
+                                ans_doc = ask_fn(
+                                    question=raw_q,
+                                    context_summary=safe_ctx,
+                                    audio_base64=raw_audio,
+                                    audio_mime_type=raw_mime,
+                                )
                         self._write_json(HTTPStatus.OK, ans_doc)
                     except _SessionRevokedError:
                         self._reject_unauthorized()
+                    except OperatorUnavailable as exc:
+                        self._write_json(
+                            HTTPStatus.TOO_MANY_REQUESTS,
+                            {"error": str(exc), "code": "MODEL_BUDGET_EXHAUSTED"},
+                        )
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
+
                 if route == "/api/explainer-tts":
                     try:
                         body = self._read_json_body()
@@ -1857,7 +2542,7 @@ class LoopbackCockpitServer:
                             clean_voice = raw_voice.strip()
                         else:
                             raise ContractError("voice_name must be a string")
-                        with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=False):
+                        with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=False, allow_device_scope=True):
                             if outer._ai_model_registry is None:
                                 tts_doc = {
                                     "schema": "cas-forex.explainer-tts/1",
@@ -1866,16 +2551,40 @@ class LoopbackCockpitServer:
                                     "reason": "AI_REGISTRY_NOT_ATTACHED",
                                 }
                             else:
-                                tts_doc = outer._ai_model_registry.synthesize_explainer_speech(
-                                    body["text"],
-                                    voice_name=clean_voice,
-                                )
+                                tts_fn = outer._ai_model_registry.synthesize_explainer_speech
+                                tts_params = inspect.signature(tts_fn).parameters
+                                if "execution_gate" in tts_params:
+                                    tts_doc = tts_fn(
+                                        body["text"],
+                                        voice_name=clean_voice,
+                                        execution_gate=outer._model_gate,
+                                    )
+                                else:
+                                    tts_model = str(
+                                        getattr(outer._ai_model_registry, "_explainer_tts_model_slug", "gemini-2.5-flash-preview-tts")
+                                    )
+                                    outer._authorize_auxiliary_gate_fallback(
+                                        route_kind="tts",
+                                        model_id=tts_model,
+                                        max_output_tokens=2048,
+                                        input_bytes=len(body["text"].encode("utf-8")),
+                                    )
+                                    tts_doc = tts_fn(
+                                        body["text"],
+                                        voice_name=clean_voice,
+                                    )
                         self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(tts_doc))
                     except _SessionRevokedError:
                         self._reject_unauthorized()
+                    except OperatorUnavailable as exc:
+                        self._write_json(
+                            HTTPStatus.TOO_MANY_REQUESTS,
+                            {"error": str(exc), "code": "MODEL_BUDGET_EXHAUSTED"},
+                        )
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
+
                 if route in ("/api/ai-overseer-action", "/api/ai-trader-control"):
                     try:
                         body = self._read_json_body()
@@ -1951,6 +2660,7 @@ class LoopbackCockpitServer:
                         code = HTTPStatus.FORBIDDEN if "OWNER_RECOVERY" in str(exc) else HTTPStatus.BAD_REQUEST
                         self._write_json(code, {"error": str(exc)})
                     return
+
                 if outer._ui_service is None:
                     self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "ScopedUIService not attached"})
                     return
@@ -1980,6 +2690,9 @@ class LoopbackCockpitServer:
                 except Exception as exc:
                     self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
+        class _EmergencyHandler(_Handler):
+            _emergency_channel = True
+
         self._stop_event.clear()
         self._started_mono = time.monotonic()
         self._load_or_init_auth_token()
@@ -1987,11 +2700,31 @@ class LoopbackCockpitServer:
             (self._host, self._port),
             _Handler,
             ordinary_slots=self._max_ordinary_connections,
-            emergency_slots=self._max_emergency_connections,
+            peer_rate_limit_per_window=self._pre_auth_conn_rate_limit,
+            thread_name_prefix="cas-cockpit-worker",
         )
         self._httpd.request_queue_size = 32
+        try:
+            self._emergency_httpd = _ExclusiveThreadingHTTPServer(
+                (self._host, self._emergency_port_cfg),
+                _EmergencyHandler,
+                ordinary_slots=self._max_emergency_connections,
+                peer_rate_limit_per_window=max(64, self._pre_auth_conn_rate_limit),
+                thread_name_prefix="cas-cockpit-emerg",
+            )
+            self._emergency_httpd.request_queue_size = 16
+        except Exception:
+            self._httpd.server_close()
+            self._httpd = None
+            raise
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="cas-forex-cockpit-http", daemon=True)
+        self._emergency_thread = threading.Thread(
+            target=self._emergency_httpd.serve_forever,
+            name="cas-forex-cockpit-emerg-http",
+            daemon=True,
+        )
         self._thread.start()
+        self._emergency_thread.start()
         return self.base_url
 
     def stop(self) -> None:
@@ -1999,11 +2732,20 @@ class LoopbackCockpitServer:
         with self._auth_lock:
             self._auth_secret = None
             self._session_epoch = None
+            self._pairing_codes.clear()
+            self._device_sessions.clear()
             if self._ui_service is not None and callable(getattr(self._ui_service, "rotate_adapter_session", None)):
                 self._ui_service.rotate_adapter_session()
         with self._sse_cond:
             self._sse_cond.notify_all()
         self._close_active_sockets()
+        if self._emergency_httpd is not None:
+            self._emergency_httpd.shutdown()
+            self._emergency_httpd.server_close()
+            self._emergency_httpd = None
+        if self._emergency_thread is not None:
+            self._emergency_thread.join(timeout=5.0)
+            self._emergency_thread = None
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
@@ -2047,6 +2789,7 @@ def run_cockpit_cli(
     ap.add_argument("--env-file", type=Path, default=None, help="Optional KEY=VALUE file with CAS_FOREX_* settings")
     ap.add_argument("--host", default="127.0.0.1", help="Loopback bind IP (127.0.0.1 or ::1)")
     ap.add_argument("--port", type=int, default=8787, help="Loopback port (0 picks an ephemeral port)")
+    ap.add_argument("--emergency-port", type=int, default=0, help="Dedicated owner-only loopback emergency port (0 picks ephemeral)")
     ap.add_argument("--poll-seconds", type=int, default=15, help="Live 18-market poll interval in seconds (0=disable)")
     ap.add_argument("--fast-tick-ms", type=int, default=50, help="Direct MT5 fast-tick interval in ms for NAS100/US30 (0=disable)")
     ap.add_argument("--no-autonomous-ai", dest="autonomous_ai", action="store_false", default=True, help="Disable continuous autonomous AI trading loop")
@@ -2055,6 +2798,7 @@ def run_cockpit_cli(
     ap.add_argument("--print-check-only", action="store_true", help="Validate config/routing/AI catalog, print JSON, and exit")
     ap.add_argument("--mint-recovery-token", action="store_true", help="Mint a single-use OwnerRecoveryVerifier token and exit")
     ap.add_argument("--recovery-scope", default="UNLOCK_QUOTA_SESSION", help="Scope for --mint-recovery-token")
+    ap.add_argument("--target-ref", "--recovery-target-ref", dest="target_ref", default="*", help="Exact target_ref / intent_sha256 for --mint-recovery-token (required for TREASURY_SWEEP)")
     ap.add_argument("--recovery-ttl-seconds", type=int, default=900, help="TTL for --mint-recovery-token (30..900s)")
     ap.add_argument("--mint-live-auth-ticket", action="store_true", help="Mint signed LiveAuthorizationTicket bundle from env and exit")
     ap.add_argument("--live-ticket-ttl-seconds", type=int, default=3600, help="TTL for --mint-live-auth-ticket (60..86400s)")
@@ -2099,9 +2843,15 @@ def run_cockpit_cli(
     if args.mint_recovery_token:
         tok = runtime_state.owner_recovery.mint_token(
             action_scope=args.recovery_scope,
+            target_ref=args.target_ref,
             ttl_seconds=args.recovery_ttl_seconds,
         )
-        print(json.dumps({"status": "RECOVERY_TOKEN_MINTED", "scope": args.recovery_scope.upper(), "recovery_token": tok}))
+        print(json.dumps({
+            "status": "RECOVERY_TOKEN_MINTED",
+            "scope": args.recovery_scope.upper(),
+            "target_ref": str(args.target_ref).strip() or "*",
+            "recovery_token": tok,
+        }))
         return 0
     if args.mint_live_auth_ticket:
         from cas_forex_revamp.venue.live_auth_ticket import (
@@ -2163,6 +2913,7 @@ def run_cockpit_cli(
 
     registry.bind_thinking_depth_persister(_persist_thinking_depth)
     quota_store = runtime_state.quota_store
+    from decimal import Decimal
     raw_init_cap_cli = str(merged.get("CAS_FOREX_INITIAL_CAPITAL_USD", "")).strip()
     cli_init_cap = Decimal(raw_init_cap_cli) if raw_init_cap_cli else None
     if (
@@ -2241,10 +2992,13 @@ def run_cockpit_cli(
         with stream_lock:
             return latest_index_stream[0]
 
+    if callable(getattr(registry, "bind_execution_gate", None)):
+        registry.bind_execution_gate(runtime_state.model_gate)
     srv = LoopbackCockpitServer(
         repo_root=root,
         host=args.host,
         port=args.port,
+        emergency_port=args.emergency_port,
         market_stream_reader=_read_stream,
         broker_router_reader=router.routing_snapshot,
         ai_model_registry=registry,
@@ -2253,6 +3007,7 @@ def run_cockpit_cli(
         profit_vault=runtime_state.profit_vault,
         parallel_tiers=runtime_state.parallel_tiers,
         owner_recovery=runtime_state.owner_recovery,
+        model_execution_gate=runtime_state.model_gate,
         token_file=str(merged.get("CAS_FOREX_COCKPIT_TOKEN_FILE", "")).strip() or None,
         public_origin=str(merged.get("CAS_FOREX_PUBLIC_ORIGIN", "")).strip() or None,
     )
@@ -2331,7 +3086,15 @@ def run_cockpit_cli(
     print(f"CAS Forex Cockpit Execution Mode : {router.execution_mode} (live_armed={routing_summary['live_trading_armed']})")
     for row in routing_summary["chain"]:
         print(f"  [{row['priority']}] {row['broker_id']} ({row['server']}) configured={row['configured']} status={row['status']}")
-    print(f"Open Authenticated UI            : {srv.bootstrap_url}")
+    create_owner_only_file_atomic(
+        runtime_state.state_dir,
+        "cockpit_emergency.json",
+        (json.dumps({"emergency_base_url": srv.emergency_base_url, "base_url": srv.base_url}) + "\n").encode("utf-8"),
+        replace_existing=True,
+        label="cockpit emergency endpoint file",
+    )
+    print(f"Open Cockpit Pairing URL (120s)  : {srv.bootstrap_url}")
+    print(f"Local Owner Emergency Channel    : {srv.emergency_base_url}")
     print("Press Ctrl+C to stop cleanly.")
     try:
         while not stop_flag.wait(1.0):

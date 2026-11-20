@@ -298,7 +298,15 @@ class Tier4WorkflowsE2ETests(unittest.TestCase):
                 clock=clk,
             )
             rec = OwnerRecoveryVerifier(db_path=db_path, clock=clk)
-            tok1 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep_wf1 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("100.00"),
+                owner_request_id="req-wf5-1",
+                reason="Workflow 5 payout",
+                coinbase_client=cb,
+                idempotency_key="e2e-ach-001",
+            )
+            tok1 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep_wf1["intent_sha256"], now=T0)
             out = vault.execute_offramp_ach_payout(
                 rail=RAIL_COINBASE_ACH,
                 amount_usd=D("100.00"),
@@ -308,9 +316,19 @@ class Tier4WorkflowsE2ETests(unittest.TestCase):
                 recovery_token=tok1,
                 coinbase_client=cb,
                 idempotency_key="e2e-ach-001",
+                intent_id=prep_wf1["intent_id"],
+                intent_sha256=prep_wf1["intent_sha256"],
             )
             self.assertEqual(out["provider_tx_id"], "cb-wf5-01")
-            tok2 = rec.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+            prep_wf2 = vault.prepare_offramp_ach_payout(
+                rail=RAIL_COINBASE_ACH,
+                amount_usd=D("50.00"),
+                owner_request_id="req-wf5-2",
+                reason="Duplicate key replay",
+                coinbase_client=cb,
+                idempotency_key="e2e-ach-001",
+            )
+            tok2 = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep_wf2["intent_sha256"], now=T0)
             with self.assertRaises(OfframpSecurityError):
                 vault.execute_offramp_ach_payout(
                     rail=RAIL_COINBASE_ACH,
@@ -321,6 +339,8 @@ class Tier4WorkflowsE2ETests(unittest.TestCase):
                     recovery_token=tok2,
                     coinbase_client=cb,
                     idempotency_key="e2e-ach-001",
+                    intent_id=prep_wf2["intent_id"],
+                    intent_sha256=prep_wf2["intent_sha256"],
                 )
 
             if not hasattr(vault, "verify_audit_chain"):
@@ -365,7 +385,8 @@ class Tier4WorkflowsE2ETests(unittest.TestCase):
             st_new, _, _ = loopback_http_request(srv, "GET", "/api/cockpit", headers=srv.auth_headers())
             self.assertEqual(st_new, 200)
 
-            st_ui, hdr_ui, _ = loopback_http_request(srv, "GET", f"/ui/index.html?token={srv.auth_token}")
+            pair_doc = srv.mint_pairing_code()
+            st_ui, hdr_ui, _ = loopback_http_request(srv, "GET", f"/ui/index.html?pair_code={pair_doc['pair_code']}")
             self.assertEqual(st_ui, 200)
             self.assertEqual(hdr_ui.get("content-security-policy"), STRICT_CSP)
 

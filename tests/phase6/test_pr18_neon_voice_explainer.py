@@ -190,8 +190,8 @@ class Pr18NeonVoiceExplainerTests(unittest.TestCase):
                     ENV_EXECUTION_MODE: EXECUTION_MODE_DEMO,
                     ENV_HUGOSWAY_MT5_LOGIN: "7009911",
                     ENV_HUGOSWAY_MT5_PASSWORD: DUMMY_VAL,
-                    "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "5.00",
-                    "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.20",
+                    "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "1.00",
+                    "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.10",
                 },
                 valve_gate=GATE,
                 oracle=oracle,
@@ -212,8 +212,19 @@ class Pr18NeonVoiceExplainerTests(unittest.TestCase):
                 trade_id="t-1", symbol="NAS100", broker_id=BROKER_HUGOSWAY_MT5, realized_net_usd=Decimal("400.00")
             )
             verifier = OwnerRecoveryVerifier(db_path=root / "rec.sqlite3", clock=lambda: T0)
-            rec_tok = verifier.mint_token(action_scope="TREASURY_SWEEP", now=T0)
             secret_bank_uuid = "bank-acct-uuid-99887766"
+            prep_2fa = vault.prepare_broker_2fa_withdrawal(
+                broker_id=BROKER_HUGOSWAY_MT5,
+                amount_usd=Decimal("50.00"),
+                owner_request_id="req-2fa-1",
+                reason="test 2fa reserve",
+                destination_bank_label=secret_bank_uuid,
+            )
+            rec_tok = verifier.mint_token(
+                action_scope="TREASURY_SWEEP",
+                target_ref=prep_2fa["intent_sha256"],
+                now=T0,
+            )
             vault.request_broker_2fa_withdrawal(
                 broker_id=BROKER_HUGOSWAY_MT5,
                 amount_usd=Decimal("50.00"),
@@ -222,6 +233,8 @@ class Pr18NeonVoiceExplainerTests(unittest.TestCase):
                 verifier=verifier,
                 recovery_token=rec_tok,
                 destination_bank_label=secret_bank_uuid,
+                intent_id=prep_2fa["intent_id"],
+                intent_sha256=prep_2fa["intent_sha256"],
             )
             tiers = ParallelTierEngine(root / "tiers.sqlite3", valve_gate=GATE, clock=lambda: T0)
 

@@ -140,8 +140,8 @@ class AdaptiveRiskAndDemoVirtualSleeveTests(unittest.TestCase):
         router = DualShieldBrokerRouter(
             environ={
                 "CAS_FOREX_EXECUTION_MODE": EXECUTION_MODE_DEMO,
-                "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "5.00",
-                "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.20",
+                "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "1.00",
+                "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.10",
                 ENV_DEMO_BARBELL_VIRTUAL_SLEEVE: "1",
             },
             valve_gate=GATE,
@@ -191,48 +191,48 @@ class AdaptiveRiskAndDemoVirtualSleeveTests(unittest.TestCase):
 
     def test_three_gear_auto_adaptive_risk_and_dynamic_daily_quota_envelope(self) -> None:
         base = dict(
-            owner_max_risk_pct=Decimal("5.00"),
-            owner_max_drawdown_pct=Decimal("0.20"),
+            owner_max_risk_pct=Decimal("1.00"),
+            owner_max_drawdown_pct=Decimal("0.10"),
             owner_soft_quota_usd=Decimal("2000"),
             owner_hard_quota_usd=Decimal("3000"),
         )
-        # 1. CHOP_RANGE -> Conservative (1.00%, $500/$1,000)
+        # 1. CHOP_RANGE -> Conservative (0.50%, $500/$1,000)
         g_chop = resolve_adaptive_risk_and_quota(
             owner_gear_mode=RISK_GEAR_AUTO_ADAPTIVE, regime=REGIME_CHOP_RANGE,
             drawdown_pct=Decimal("0.02"), consecutive_losses=0, **base,
         )
         self.assertEqual(g_chop["active_gear"], ACTIVE_GEAR_CONSERVATIVE)
-        self.assertEqual(g_chop["effective_risk_pct"], "1")
+        self.assertEqual(g_chop["effective_risk_pct"], "0.5")
         self.assertEqual(g_chop["effective_soft_quota_usd"], "500")
         self.assertEqual(g_chop["effective_hard_quota_usd"], "1000")
 
-        # 2. TREND_IGNITION -> Growth (2.50%, $2,000/$2,500)
+        # 2. TREND_IGNITION -> Growth (0.75%, $2,000/$2,500)
         g_grow = resolve_adaptive_risk_and_quota(
             owner_gear_mode=RISK_GEAR_AUTO_ADAPTIVE, regime=REGIME_TREND_IGNITION,
             drawdown_pct=Decimal("0.03"), consecutive_losses=0, **base,
         )
         self.assertEqual(g_grow["active_gear"], ACTIVE_GEAR_GROWTH)
-        self.assertEqual(g_grow["effective_risk_pct"], "2.5")
+        self.assertEqual(g_grow["effective_risk_pct"], "0.75")
         self.assertEqual(g_grow["effective_soft_quota_usd"], "2000")
         self.assertEqual(g_grow["effective_hard_quota_usd"], "2500")
 
-        # 3. STRONG_TREND with 0 losses & <10% DD -> Strong-Trend Runner (5.00%, $2,000/$3,000)
+        # 3. STRONG_TREND with 0 losses & <5% DD -> Strong-Trend Runner (1.00% constitutional cap, $2,000/$3,000)
         g_run = resolve_adaptive_risk_and_quota(
             owner_gear_mode=RISK_GEAR_AUTO_ADAPTIVE, regime=REGIME_STRONG_TREND,
             drawdown_pct=Decimal("0.04"), consecutive_losses=0, **base,
         )
         self.assertEqual(g_run["active_gear"], ACTIVE_GEAR_STRONG_TREND_RUNNER)
-        self.assertEqual(g_run["effective_risk_pct"], "5")
+        self.assertEqual(g_run["effective_risk_pct"], "1")
         self.assertEqual(g_run["effective_soft_quota_usd"], "2000")
         self.assertEqual(g_run["effective_hard_quota_usd"], "3000")
 
-        # 4. Drawdown >= 10% auto-downshifts even on STRONG_TREND
+        # 4. Drawdown >= 5% / 10% auto-downshifts even on STRONG_TREND
         g_dd = resolve_adaptive_risk_and_quota(
             owner_gear_mode=RISK_GEAR_AUTO_ADAPTIVE, regime=REGIME_STRONG_TREND,
             drawdown_pct=Decimal("0.10"), consecutive_losses=0, **base,
         )
         self.assertEqual(g_dd["active_gear"], ACTIVE_GEAR_CONSERVATIVE)
-        self.assertEqual(g_dd["effective_risk_pct"], "1")
+        self.assertEqual(g_dd["effective_risk_pct"], "0.5")
 
         # 5. Losing streak >= 1 auto-downshifts even on STRONG_TREND
         g_ls = resolve_adaptive_risk_and_quota(
@@ -240,7 +240,7 @@ class AdaptiveRiskAndDemoVirtualSleeveTests(unittest.TestCase):
             drawdown_pct=Decimal("0.01"), consecutive_losses=1, **base,
         )
         self.assertEqual(g_ls["active_gear"], ACTIVE_GEAR_CONSERVATIVE)
-        self.assertEqual(g_ls["effective_risk_pct"], "1")
+        self.assertEqual(g_ls["effective_risk_pct"], "0.5")
 
         # 6. Owner hard ceiling is UNBREAKABLE (AI can NEVER exceed owner_max_risk_pct or owner_hard_quota_usd)
         g_cap = resolve_adaptive_risk_and_quota(
@@ -259,8 +259,8 @@ class AdaptiveRiskAndDemoVirtualSleeveTests(unittest.TestCase):
             st = initialize_shared_runtime_state({}, explicit_state_dir=td, clock=lambda: T0)
             router = DualShieldBrokerRouter(
                 environ={
-                    "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "5.00",
-                    "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.20",
+                    "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "1.00",
+                    "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.10",
                     ENV_DEMO_BARBELL_VIRTUAL_SLEEVE: "1",
                 },
                 valve_gate=st.valve_gate,

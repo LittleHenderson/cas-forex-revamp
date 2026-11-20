@@ -8,6 +8,7 @@ confirmation phrases.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import hmac
@@ -32,6 +33,73 @@ MAX_LIVE_TICKET_TTL_SECONDS = 86_400
 
 class LiveAuthTicketError(ContractError):
     """Raised when LIVE authorization key material or ticket verification fails closed."""
+
+
+LiveAuthorizationError = LiveAuthTicketError
+
+
+@dataclass(frozen=True, slots=True)
+class LiveAuthorizationContext:
+    """Immutable verified LIVE authorization context revalidated before every dispatch sink."""
+
+    broker_id: str
+    account_id: str
+    server: str
+    execution_mode: str
+    issued_at: datetime
+    expires_at: datetime
+    ticket_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.broker_id, str) or not self.broker_id.strip():
+            raise LiveAuthorizationError("LiveAuthorizationContext requires a non-empty broker_id")
+        if not isinstance(self.account_id, str) or not self.account_id.strip():
+            raise LiveAuthorizationError("LiveAuthorizationContext requires a non-empty account_id")
+        if not isinstance(self.server, str) or not self.server.strip():
+            raise LiveAuthorizationError("LiveAuthorizationContext requires a non-empty server")
+        if self.execution_mode != "LIVE":
+            raise LiveAuthorizationError("LiveAuthorizationContext is valid only for execution_mode='LIVE'")
+        issued = utc_time(self.issued_at, "issued_at")
+        expires = utc_time(self.expires_at, "expires_at")
+        if expires <= issued or (expires - issued).total_seconds() > MAX_LIVE_TICKET_TTL_SECONDS:
+            raise LiveAuthorizationError("LiveAuthorizationContext TTL window invalid or exceeds 86400s")
+        if not isinstance(self.ticket_sha256, str) or len(self.ticket_sha256) != 64:
+            raise LiveAuthorizationError("LiveAuthorizationContext requires a 64-char hex ticket_sha256")
+        if any(ch not in "0123456789abcdef" for ch in self.ticket_sha256.lower()):
+            raise LiveAuthorizationError("LiveAuthorizationContext ticket_sha256 must be lowercase hex")
+
+    def assert_valid_at(
+        self,
+        now: datetime | None = None,
+        *,
+        expected_broker_id: str | None = None,
+        expected_account_id: str | int | None = None,
+        expected_server: str | None = None,
+    ) -> None:
+        """Fail closed with LiveAuthorizationError if ticket is expired, not yet valid, or mismatched."""
+        check_now = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        if check_now < self.issued_at - timedelta(seconds=30) or check_now > self.expires_at:
+            raise LiveAuthorizationError(
+                f"LIVE authorization expired or not yet valid for {self.broker_id} "
+                f"(expires_at={_iso_utc(self.expires_at)}, checked_at={_iso_utc(check_now)})"
+            )
+        if expected_broker_id is not None and self.broker_id.strip().upper() != expected_broker_id.strip().upper():
+            raise LiveAuthorizationError(f"LIVE authorization broker_id mismatch for {expected_broker_id}")
+        if expected_account_id is not None and self.account_id.strip() != str(expected_account_id).strip():
+            raise LiveAuthorizationError(f"LIVE authorization account_id mismatch for {self.broker_id}")
+        if expected_server is not None and self.server.strip().casefold() != expected_server.strip().casefold():
+            raise LiveAuthorizationError(f"LIVE authorization server mismatch for {self.broker_id}")
+
+    def to_wire_dict(self) -> dict[str, str]:
+        return {
+            "broker_id": self.broker_id,
+            "account_id": self.account_id,
+            "server": self.server,
+            "execution_mode": self.execution_mode,
+            "issued_at": _iso_utc(self.issued_at),
+            "expires_at": _iso_utc(self.expires_at),
+            "ticket_sha256": self.ticket_sha256,
+        }
 
 
 class _RedactedLiveKey:
@@ -320,3 +388,47 @@ def verify_live_environ_authorization(
         expected_server=expected_server,
         now=now,
     )
+
+
+def build_live_authorization_context(verified_ticket: Mapping[str, str]) -> LiveAuthorizationContext:
+    """Construct an immutable LiveAuthorizationContext from an already-verified ticket mapping."""
+    if not isinstance(verified_ticket, Mapping):
+        raise LiveAuthorizationError("verified_ticket must be a Mapping")
+    canonical_raw = json.dumps(
+        dict(verified_ticket), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return LiveAuthorizationContext(
+        broker_id=str(verified_ticket.get("broker_id", "")).strip().upper(),
+        account_id=str(verified_ticket.get("account_login", "")).strip(),
+        server=str(verified_ticket.get("server", "")).strip(),
+        execution_mode=str(verified_ticket.get("execution_mode", "")).strip(),
+        issued_at=_parse_iso_utc(verified_ticket.get("issued_at_utc"), "issued_at_utc"),
+        expires_at=_parse_iso_utc(verified_ticket.get("expires_at_utc"), "expires_at_utc"),
+        ticket_sha256=sha256(canonical_raw).hexdigest(),
+    )
+
+
+def verify_live_environ_authorization_context(
+    environ: Mapping[str, str] | None,
+    *,
+    expected_broker_id: str | None = None,
+    expected_account_login: str | int | None = None,
+    expected_server: str | None = None,
+    now: datetime | None = None,
+) -> tuple[dict[str, str], LiveAuthorizationContext]:
+    """Verify LIVE env ticket and return both verified ticket dict and immutable LiveAuthorizationContext."""
+    ticket = verify_live_environ_authorization(
+        environ,
+        expected_broker_id=expected_broker_id,
+        expected_account_login=expected_account_login,
+        expected_server=expected_server,
+        now=now,
+    )
+    ctx = build_live_authorization_context(ticket)
+    ctx.assert_valid_at(
+        now,
+        expected_broker_id=expected_broker_id,
+        expected_account_id=expected_account_login,
+        expected_server=expected_server,
+    )
+    return ticket, ctx

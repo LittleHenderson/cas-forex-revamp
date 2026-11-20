@@ -6,7 +6,10 @@ export const MONEY_FLOW_CAPITAL_PRESETS = Object.freeze([
   300, 1000, 3000, 6000, 10000, 25000, 50000, 100000, 300000,
 ]);
 
-export const MONEY_FLOW_RISK_PRESETS = Object.freeze([1, 2, 3, 5]);
+export const CONSTITUTIONAL_MAX_STOP_RISK_PCT = 1;
+export const CONSTITUTIONAL_MAX_DRAWDOWN_PCT = 10;
+
+export const MONEY_FLOW_RISK_PRESETS = Object.freeze([0.25, 0.5, 0.75, 1]);
 
 export const MONEY_FLOW_LOT_PRESETS = Object.freeze([
   '0.01', '0.05', '0.09', '0.15', '0.25', '0.50', '0.90', '1.00', '2.00', '5.00', '10.00',
@@ -177,7 +180,7 @@ export function computeMoneyFlowScenario({
   riskPct = 1,
   directLotHundredths = 9,
   splitMode = '50_50',
-  ownerMaxRiskPct = 5,
+  ownerMaxRiskPct = 1,
 }) {
   const mkt = MONEY_FLOW_MARKETS[marketId] ?? MONEY_FLOW_MARKETS.EURUSD;
   const capCents = Math.max(5000, Math.round(Number(capitalCents) || 100000));
@@ -186,7 +189,7 @@ export function computeMoneyFlowScenario({
 
   let lotHundredths;
   if (lotMode === 'risk') {
-    const safePct = Math.max(0.25, Math.min(5, Number(riskPct) || 1));
+    const safePct = Math.max(0.25, Math.min(CONSTITUTIONAL_MAX_STOP_RISK_PCT, Number(riskPct) || 1));
     const riskBudgetCents = Math.floor((capCents * safePct) / 100);
     const rawHundredths = Math.floor((riskBudgetCents * 100) / Math.max(1, stopLossPerLotCents));
     lotHundredths = Math.max(1, Math.min(5000, rawHundredths));
@@ -217,25 +220,26 @@ export function computeMoneyFlowScenario({
 
   const marginOk = marginLevelPct >= 1000;
   const lotCapOk = lotHundredths <= 5000;
-  const riskCapPct = Math.max(1, Math.min(5, Number(ownerMaxRiskPct) || 5));
+  const rawOwnerCap = Number(ownerMaxRiskPct);
+  const riskCapPct = Math.max(
+    0.25,
+    Math.min(CONSTITUTIONAL_MAX_STOP_RISK_PCT, Number.isFinite(rawOwnerCap) && rawOwnerCap > 0 ? rawOwnerCap : 1),
+  );
   const riskWithin1Pct = riskPctActual <= 1.005;
-  const riskWithinOwnerCap = riskPctActual <= (riskCapPct + 0.05);
-  const allowed = marginOk && lotCapOk && riskWithinOwnerCap;
+  const riskWithinOwnerCap = riskPctActual <= (riskCapPct + 0.005);
+  const allowed = marginOk && lotCapOk && riskWithinOwnerCap && riskWithin1Pct;
 
   let shortVerdict;
   let badge;
   if (!marginOk) {
     shortVerdict = `HARD BLOCKED: Margin ${marginLevelPct.toFixed(0)}% < 1,000%`;
     badge = `HARD BLOCKED · Fails 1,000% Margin Cushion (${marginLevelPct.toFixed(2)}%)`;
-  } else if (!riskWithinOwnerCap) {
-    shortVerdict = `BLOCKED: ${riskPctActual.toFixed(2)}% > ${riskCapPct.toFixed(0)}% Cap`;
-    badge = `BLOCKED BY ${riskCapPct.toFixed(0)}% RISK CAP (${riskPctActual.toFixed(2)}% Risk · Margin OK)`;
-  } else if (riskWithin1Pct) {
-    shortVerdict = `ADMITTED (Safe ${riskPctActual.toFixed(2)}%)`;
-    badge = `ALLOWED · Clears Valve & 1,000% Margin (${riskPctActual.toFixed(2)}% Risk)`;
+  } else if (!riskWithinOwnerCap || !riskWithin1Pct) {
+    shortVerdict = `BLOCKED: ${riskPctActual.toFixed(2)}% > ${riskCapPct.toFixed(2)}% Cap`;
+    badge = `BLOCKED BY ${riskCapPct.toFixed(2)}% CONSTITUTIONAL RISK CAP (${riskPctActual.toFixed(2)}% Risk · Margin OK)`;
   } else {
-    shortVerdict = `ADMITTED (${riskPctActual.toFixed(2)}% <= ${riskCapPct.toFixed(0)}% Cap)`;
-    badge = `ALLOWED · Within Owner ${riskCapPct.toFixed(0)}% Cap & 1,000% Margin`;
+    shortVerdict = `ADMITTED (Safe ${riskPctActual.toFixed(2)}%)`;
+    badge = `ALLOWED · Clears Valve, ${riskCapPct.toFixed(2)}% Stop-Risk Cap & 1,000% Margin (${riskPctActual.toFixed(2)}% Risk)`;
   }
 
   const to10dd = lossNetCents > 0 ? ((capCents * 0.10) / lossNetCents) : 0;
@@ -283,7 +287,7 @@ export function computeMoneyFlowScenario({
   });
 }
 
-export function stepMoneyFlowSimulation(mfState, stepKind, ownerMaxRiskPct = 5) {
+export function stepMoneyFlowSimulation(mfState, stepKind, ownerMaxRiskPct = 1) {
   const next = { ...mfState };
   if (stepKind === 'reset') {
     next.simWins = 0;
@@ -321,30 +325,31 @@ export function computeLotComparisonRows({
   capitalCents,
   marketId = 'EURUSD',
   splitMode = '50_50',
-  ownerMaxRiskPct = 5,
+  ownerMaxRiskPct = 1,
   selectedLotMode = 'risk',
   selectedRiskPct = 1,
   selectedDirectLotHundredths = 9,
 }) {
   const candidates = [
-    { key: 'risk:1', title: 'Safe 1% Rule', lotMode: 'risk', riskPct: 1, directLotHundredths: 9 },
-    { key: 'risk:2', title: '2% Growth Risk', lotMode: 'risk', riskPct: 2, directLotHundredths: 9 },
-    { key: 'risk:5', title: '5% Strong-Trend', lotMode: 'risk', riskPct: 5, directLotHundredths: 9 },
+    { key: 'risk:0.5', title: 'Conservative 0.50% Gear', lotMode: 'risk', riskPct: 0.5, directLotHundredths: 9 },
+    { key: 'risk:0.75', title: 'Adaptive 0.75% Gear', lotMode: 'risk', riskPct: 0.75, directLotHundredths: 9 },
+    { key: 'risk:1', title: 'Safe 1% Rule (1.00% Cap)', lotMode: 'risk', riskPct: 1, directLotHundredths: 9 },
     { key: 'direct:9', title: '0.09 Lots Fixed', lotMode: 'direct', riskPct: 1, directLotHundredths: 9 },
     { key: 'direct:90', title: '0.90 Lots Fixed', lotMode: 'direct', riskPct: 1, directLotHundredths: 90 },
     { key: 'direct:500', title: '5.00 Lots Fixed', lotMode: 'direct', riskPct: 1, directLotHundredths: 500 },
   ];
+  const clampedSelRisk = Math.max(0.25, Math.min(CONSTITUTIONAL_MAX_STOP_RISK_PCT, Number(selectedRiskPct) || 1));
   const activeKey = selectedLotMode === 'risk'
-    ? `risk:${selectedRiskPct}`
+    ? `risk:${clampedSelRisk}`
     : `direct:${selectedDirectLotHundredths}`;
   if (!candidates.some((c) => c.key === activeKey)) {
     candidates.push({
       key: activeKey,
       title: selectedLotMode === 'risk'
-        ? `${selectedRiskPct}% Custom Risk`
+        ? `${clampedSelRisk.toFixed(2)}% Custom Risk`
         : `${formatLots(selectedDirectLotHundredths)} Lots Custom`,
       lotMode: selectedLotMode,
-      riskPct: selectedRiskPct,
+      riskPct: clampedSelRisk,
       directLotHundredths: selectedDirectLotHundredths,
     });
   }
@@ -365,7 +370,8 @@ export function computeLotComparisonRows({
 
 export function renderMoneyFlowSection(state) {
   const mf = state?.moneyFlow ?? createDefaultMoneyFlowState();
-  const ownerMaxRisk = Number(state?.aiTrader?.riskGear?.ownerMaxRiskPct ?? state?.brokerRouting?.barbell?.maxStopLossEquityRiskPct ?? 5) || 5;
+  const rawMaxRisk = Number(state?.aiTrader?.riskGear?.ownerMaxRiskPct ?? state?.brokerRouting?.barbell?.maxStopLossEquityRiskPct ?? 1) || 1;
+  const ownerMaxRisk = Math.max(0.25, Math.min(CONSTITUTIONAL_MAX_STOP_RISK_PCT, rawMaxRisk));
   const scen = computeMoneyFlowScenario({
     capitalCents: mf.simCapitalCents,
     marketId: mf.market,
@@ -385,7 +391,9 @@ export function renderMoneyFlowSection(state) {
 
   const riskButtons = MONEY_FLOW_RISK_PRESETS.map((pct) => {
     const active = mf.lotMode === 'risk' && mf.riskPct === pct;
-    const lbl = pct === 1 ? 'Safe 1%' : `${pct}% Risk`;
+    const lbl = pct === 1
+      ? 'Safe 1.00% Cap'
+      : (pct === 0.5 ? '0.50% Conservative' : `${pct.toFixed(2)}% Risk`);
     return `<button type="button" class="button button-small ${active ? 'selected' : 'button-secondary'}" data-mf-risk="${pct}" aria-pressed="${active}">${esc(lbl)}</button>`;
   }).join('');
 
@@ -423,7 +431,7 @@ export function renderMoneyFlowSection(state) {
         <div><dt>${esc(s.stopUnits)}-${esc(s.unitLabel)} Loss Net</dt><dd class="mf-neg">-${esc(formatCentsUsd(s.lossNetCents))} (-${esc(s.netLossPctActual.toFixed(2))}%)</dd></div>
         <div><dt>${mf.splitMode === '100_COMPOUND' ? '100% Compound / Bank' : '50% Bank / Compound'}</dt><dd>${esc(formatCentsUsd(s.bankAddCents))} / ${esc(formatCentsUsd(s.compAddCents))}</dd></div>
         <div><dt>1:${esc(s.leverage)} Margin</dt><dd>${esc(formatCentsUsd(s.marginCents))} (${esc(s.marginLevelPct.toFixed(0))}%)</dd></div>
-        <div><dt>To 10% / 20% Lock</dt><dd>${esc(s.to10ddLabel)} · ${esc(s.to20ddLabel)}</dd></div>
+        <div><dt>To 10.00% Drawdown Lock</dt><dd>${esc(s.to10ddLabel)}</dd></div>
         <div><dt>To $0</dt><dd>${esc(s.toZeroLabel)}</dd></div>
       </dl>
       <button type="button" class="button button-small button-secondary" ${row.lotMode === 'risk' ? `data-mf-risk="${row.riskPct}"` : `data-mf-lot="${esc(formatLots(row.directLotHundredths))}"`}>Inspect in Flowchart</button>
@@ -460,7 +468,7 @@ export function renderMoneyFlowSection(state) {
       </div>
 
       <div class="mf-control-group">
-        <span class="control-label">Lot Size / Risk Choice (Active: ${esc(scen.lotText)} lots · ${esc(scen.riskPctActual.toFixed(2))}% stop risk)</span>
+        <span class="control-label">Lot Size / Risk Choice (Active: ${esc(scen.lotText)} lots · ${esc(scen.riskPctActual.toFixed(2))}% stop risk · Cap 1.00%)</span>
         <div class="mf-btn-wrap">
           ${riskButtons}
           ${lotButtons}
@@ -483,7 +491,7 @@ export function renderMoneyFlowSection(state) {
     ${mf.tab === 'flow'
       ? `<div class="mf-svg-wrap" data-money-flow-mount="true"></div>`
       : `<div class="mf-lots-panel">
-          <p class="quiet-note">Comparing lot sizes on <strong>${esc(scen.marketLabel)}</strong> (${esc(scen.stopUnits)}-${esc(scen.unitLabel)} stop, ${esc(scen.winUnits)}-${esc(scen.unitLabel)} win, ${esc(formatCentsUsd(MONEY_FLOW_MARKETS[mf.market].commissionPerLotCents))}/lot ECN fee, 1:${esc(scen.leverage)} leverage at ${esc(scen.refPriceLabel)}, owner risk ceiling ${esc(ownerMaxRisk)}%).</p>
+          <p class="quiet-note">Comparing lot sizes on <strong>${esc(scen.marketLabel)}</strong> (${esc(scen.stopUnits)}-${esc(scen.unitLabel)} stop, ${esc(scen.winUnits)}-${esc(scen.unitLabel)} win, ${esc(formatCentsUsd(MONEY_FLOW_MARKETS[mf.market].commissionPerLotCents))}/lot ECN fee, 1:${esc(scen.leverage)} leverage at ${esc(scen.refPriceLabel)}, immutable constitutional ceiling ${esc(ownerMaxRisk.toFixed(2))}% max stop risk · 10.00% max drawdown).</p>
           <div class="mf-lots-grid">${comparisonCards}</div>
         </div>`}
   </section>`;
@@ -505,7 +513,8 @@ export function mountMoneyFlowWidget(root, state) {
   const host = root.querySelector('[data-money-flow-mount="true"]');
   if (!host) return;
   const mf = state?.moneyFlow ?? createDefaultMoneyFlowState();
-  const ownerMaxRisk = Number(state?.aiTrader?.riskGear?.ownerMaxRiskPct ?? state?.brokerRouting?.barbell?.maxStopLossEquityRiskPct ?? 5) || 5;
+  const rawMaxRisk = Number(state?.aiTrader?.riskGear?.ownerMaxRiskPct ?? state?.brokerRouting?.barbell?.maxStopLossEquityRiskPct ?? 1) || 1;
+  const ownerMaxRisk = Math.max(0.25, Math.min(CONSTITUTIONAL_MAX_STOP_RISK_PCT, rawMaxRisk));
   const s = computeMoneyFlowScenario({
     capitalCents: mf.simCapitalCents,
     marketId: mf.market,

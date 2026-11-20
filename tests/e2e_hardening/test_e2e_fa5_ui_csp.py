@@ -77,7 +77,8 @@ class UiCspE2ETests(unittest.TestCase):
             srv.start()
             self.addCleanup(srv.stop)
 
-            st_html, hdr_html, body_html = loopback_http_request(srv, "GET", f"/ui/index.html?token={srv.auth_token}")
+            pair_doc = srv.mint_pairing_code()
+            st_html, hdr_html, body_html = loopback_http_request(srv, "GET", f"/ui/index.html?pair_code={pair_doc['pair_code']}")
             self.assertEqual(st_html, 200)
             self.assertEqual(hdr_html.get("content-security-policy"), STRICT_CSP)
             self.assertEqual(hdr_html.get("x-frame-options"), "SAMEORIGIN")

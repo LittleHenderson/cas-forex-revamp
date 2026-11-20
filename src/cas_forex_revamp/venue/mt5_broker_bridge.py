@@ -76,6 +76,9 @@ from cas_forex_revamp.contracts.primitives import decimal_value, identifier, utc
 from cas_forex_revamp.valve.tks_meta_valve_controller import ForexMetaValveGate, ValveDecision, ValveRefusalError
 from .live_auth_ticket import (
     LiveAuthTicketError,
+    LiveAuthorizationContext,
+    LiveAuthorizationError,
+    build_live_authorization_context,
     verify_live_environ_authorization,
 )
 from .external_paper_broker import (
@@ -134,8 +137,23 @@ __all__ = [
     "Mt5SpoolPaperTerminalEmulator",
     "Mt5Tick",
     "Mt5Transport",
+    "DEFAULT_OANDA_SUMMARY_MAX_AGE_SECONDS",
+    "ENV_MT5_SPOOL_KEY_DIR",
+    "ENV_VALVE_ADMISSION_KEY_FILE",
+    "Mt5PostFillObservationError",
+    "Mt5PreDispatchTransportError",
     "Mt5TransportError",
     "DEFAULT_WINDOWS_PORTABLE_SPOOL_DIR",
+    "SpoolCustodyAce",
+    "SpoolPathCustodyObservation",
+    "VALVE_ADMISSION_PROTOCOL",
+    "derive_spool_channel_key",
+    "inspect_spool_path_custody",
+    "resolve_spool_key_dir",
+    "sign_spool_valve_admission",
+    "spool_channel_key_id",
+    "verify_spool_path_custody",
+    "verify_spool_valve_admission",
     "ENV_INDEX_CONTRACT_SIZE",
     "ENV_INDEX_LEVERAGE",
     "EXPANDED_MARKETS",
@@ -258,6 +276,11 @@ _SDK_DEFAULTS: dict[str, int] = {
 ENV_PRIMARY_BROKER = "CAS_FOREX_PRIMARY_BROKER"
 ENV_MT5_TRANSPORT_MODE = "CAS_FOREX_MT5_TRANSPORT_MODE"
 ENV_MT5_SPOOL_DIR = "CAS_FOREX_MT5_SPOOL_DIR"
+ENV_MT5_SPOOL_KEY_DIR = "CAS_FOREX_MT5_SPOOL_KEY_DIR"
+ENV_VALVE_ADMISSION_KEY_FILE = "CAS_FOREX_VALVE_ADMISSION_KEY_FILE"  # nosec B105: environment variable name constant
+DEFAULT_OANDA_SUMMARY_MAX_AGE_SECONDS = 15.0
+VALVE_ADMISSION_PROTOCOL = "cas-forex-valve-admission/1"
+MAX_VALVE_ADMISSION_TTL_SECONDS = 60
 ENV_HUGOSWAY_MT5_LOGIN = "CAS_FOREX_HUGOSWAY_MT5_LOGIN"
 ENV_HUGOSWAY_MT5_PASSWORD = "CAS_FOREX_HUGOSWAY_MT5_PASSWORD"  # nosec B105: environment variable name constant, not a secret value
 ENV_HUGOSWAY_MT5_SERVER = "CAS_FOREX_HUGOSWAY_MT5_SERVER"
@@ -316,6 +339,14 @@ class Mt5NotConfiguredError(Mt5BridgeError):
 
 class Mt5TransportError(Mt5BridgeError):
     """Sanitized transport failure; never carries credentials or raw terminal payloads."""
+
+
+class Mt5PreDispatchTransportError(Mt5TransportError):
+    """Explicit pre-dispatch connectivity/read failure strictly before order_send; failover-safe."""
+
+
+class Mt5PostFillObservationError(Mt5BridgeError):
+    """Post-fill refresh/observation failure after confirmed execution; NEVER failover-safe."""
 
 
 class Mt5OutcomeUnknownError(Mt5TransportError):
@@ -400,6 +431,427 @@ def _sha256_flat(doc: Mapping[str, str]) -> str:
     return sha256(canonical_bytes(dict(doc))).hexdigest()
 
 
+_WIN_TRUSTED_SYSTEM_SIDS = frozenset({
+    "S-1-5-18",      # LOCAL SYSTEM
+    "S-1-5-32-544",  # BUILTIN\Administrators
+    "S-1-3-4",       # OWNER RIGHTS
+})
+_WIN_TRUSTED_ANCESTOR_OWNER_SIDS = _WIN_TRUSTED_SYSTEM_SIDS | frozenset({
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",  # NT SERVICE\TrustedInstaller
+})
+_WIN_BROAD_PRINCIPAL_SIDS = frozenset({
+    "S-1-1-0",       # Everyone
+    "S-1-5-32-545",  # BUILTIN\Users
+    "S-1-5-11",      # Authenticated Users
+    "S-1-5-7",       # Anonymous Logon
+    "S-1-5-32-546",  # BUILTIN\Guests
+    "S-1-5-4",       # Interactive
+    "S-1-5-2",       # Network
+})
+_WIN_ACCESS_ALLOWED_ACE_TYPE = 0
+_WIN_INHERITED_ACE_FLAG = 0x10
+_WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_WIN_SE_DACL_PROTECTED = 0x1000
+_WIN_ANCESTOR_DANGEROUS_MASK = 0x10000000 | 0x00080000 | 0x00040000 | 0x00000040  # GENERIC_ALL|WRITE_OWNER|WRITE_DAC|DELETE_CHILD
+_WIN_EVERYONE_WRITE_MASK = _WIN_ANCESTOR_DANGEROUS_MASK | 0x40000000 | 0x00010000 | 0x00000002 | 0x00000004 | 0x00000100
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, slots=True)
+class SpoolCustodyAce:
+    """Normalized Windows ACE entry for spool custody verification."""
+
+    ace_type: int
+    ace_flags: int
+    access_mask: int
+    sid: str
+
+    @property
+    def is_allow(self) -> bool:
+        return self.ace_type == _WIN_ACCESS_ALLOWED_ACE_TYPE
+
+    @property
+    def is_inherited(self) -> bool:
+        return bool(self.ace_flags & _WIN_INHERITED_ACE_FLAG)
+
+
+@dataclass(frozen=True, slots=True)
+class SpoolPathCustodyObservation:
+    """Cross-platform filesystem custody observation (Win32 SID/DACL/reparse or POSIX mode/uid/symlink)."""
+
+    path: str
+    platform: str
+    exists: bool
+    is_dir: bool
+    is_reg: bool
+    is_reparse_or_symlink: bool
+    owner_sid: str | None = None
+    current_user_sid: str | None = None
+    dacl_present: bool = True
+    dacl_protected: bool = False
+    aces: tuple[SpoolCustodyAce, ...] = ()
+    posix_mode: int | None = None
+    posix_uid: int | None = None
+    current_uid: int | None = None
+
+
+SpoolCustodyInspector = Callable[[Path], SpoolPathCustodyObservation]
+_CACHED_WIN_USER_SID: str | None = None
+
+
+def _win32_current_user_sid() -> str:
+    global _CACHED_WIN_USER_SID
+    if _CACHED_WIN_USER_SID is not None:
+        return _CACHED_WIN_USER_SID
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class _SID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+    class _TOKEN_USER(ctypes.Structure):
+        _fields_ = [("User", _SID_AND_ATTRIBUTES)]
+
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+    tok = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(tok)):
+        raise Mt5TransportError("MT5_SPOOL_CUSTODY_VIOLATION: unable to query Windows process token")
+    try:
+        needed = wintypes.DWORD(0)
+        advapi32.GetTokenInformation(tok, 1, None, 0, ctypes.byref(needed))
+        if needed.value == 0:
+            raise Mt5TransportError("MT5_SPOOL_CUSTODY_VIOLATION: empty Windows TokenUser buffer")
+        buf = ctypes.create_string_buffer(needed.value)
+        if not advapi32.GetTokenInformation(tok, 1, buf, needed.value, ctypes.byref(needed)):
+            raise Mt5TransportError("MT5_SPOOL_CUSTODY_VIOLATION: GetTokenInformation failed")
+        tu = ctypes.cast(buf, ctypes.POINTER(_TOKEN_USER)).contents
+        out = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(tu.User.Sid, ctypes.byref(out)):
+            raise Mt5TransportError("MT5_SPOOL_CUSTODY_VIOLATION: ConvertSidToStringSidW failed")
+        try:
+            sid_str = str(out.value or "").strip()
+        finally:
+            kernel32.LocalFree(out)
+        if not sid_str:
+            raise Mt5TransportError("MT5_SPOOL_CUSTODY_VIOLATION: empty Windows owner SID")
+        _CACHED_WIN_USER_SID = sid_str
+        return sid_str
+    finally:
+        kernel32.CloseHandle(tok)
+
+
+def _win32_apply_owner_only_dacl(path: Path) -> None:
+    """Apply a protected explicit owner-only DACL (Owner + SYSTEM + Administrators, zero broad/inherited ACEs)."""
+    import ctypes
+    from ctypes import wintypes
+
+    owner_sid = _win32_current_user_sid()
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.ULONG)
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.GetSecurityDescriptorDacl.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)
+    ]
+    advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+    advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    is_dir = path.is_dir()
+    flags = "OICI" if is_dir else ""
+    sddl = f"D:P(A;{flags};FA;;;{owner_sid})(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)"
+    sd = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(sd), None):
+        raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: failed to build owner-only DACL for {path.name}")
+    try:
+        present = wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        defaulted = wintypes.BOOL()
+        if not advapi32.GetSecurityDescriptorDacl(sd, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)):
+            raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: GetSecurityDescriptorDacl failed for {path.name}")
+        rc = advapi32.SetNamedSecurityInfoW(
+            str(path), 1, 0x00000004 | 0x80000000, None, None, dacl, None
+        )
+        if rc != 0:
+            raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: SetNamedSecurityInfoW failed ({rc}) for {path.name}")
+    finally:
+        kernel32.LocalFree(sd)
+
+
+def _is_reparse_or_symlink(path: Path, st: os.stat_result) -> bool:
+    if stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) != 0:
+        return True
+    is_junc = getattr(path, "is_junction", None)
+    return bool(callable(is_junc) and is_junc())
+
+
+def inspect_spool_path_custody(path: Path) -> SpoolPathCustodyObservation:
+    """Inspect real Win32 owner SID / DACL / reparse attributes (or POSIX uid / mode / symlink) on ``path``."""
+    target = Path(path)
+    if not os.path.lexists(target):
+        return SpoolPathCustodyObservation(
+            path=str(target), platform=os.name, exists=False, is_dir=False, is_reg=False, is_reparse_or_symlink=False
+        )
+    st = os.lstat(target)
+    reparse_or_link = _is_reparse_or_symlink(target, st)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _ACL_SIZE_INFO(ctypes.Structure):
+            _fields_ = [
+                ("AceCount", wintypes.DWORD),
+                ("AclBytesInUse", wintypes.DWORD),
+                ("AclBytesFree", wintypes.DWORD),
+            ]
+
+        class _ACE_HEADER(ctypes.Structure):
+            _fields_ = [("AceType", ctypes.c_ubyte), ("AceFlags", ctypes.c_ubyte), ("AceSize", wintypes.WORD)]
+
+        class _ACCESS_ALLOWED_ACE(ctypes.Structure):
+            _fields_ = [("Header", _ACE_HEADER), ("Mask", wintypes.DWORD), ("SidStart", wintypes.DWORD)]
+
+        kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetFileAttributesW.restype = wintypes.DWORD
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+        advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+        advapi32.GetNamedSecurityInfoW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+        advapi32.GetSecurityDescriptorControl.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD)
+        ]
+        advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
+        advapi32.GetAclInformation.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD]
+        advapi32.GetAclInformation.restype = wintypes.BOOL
+        advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+        advapi32.GetAce.restype = wintypes.BOOL
+
+        attrs = kernel32.GetFileAttributesW(str(target))
+        if attrs != 0xFFFFFFFF and (attrs & _WIN_FILE_ATTRIBUTE_REPARSE_POINT):
+            reparse_or_link = True
+
+        def _sid_str(psid: Any) -> str:
+            if not psid:
+                return ""
+            out = wintypes.LPWSTR()
+            if not advapi32.ConvertSidToStringSidW(psid, ctypes.byref(out)):
+                return ""
+            try:
+                return str(out.value or "").strip()
+            finally:
+                kernel32.LocalFree(out)
+
+        owner_p = ctypes.c_void_p()
+        dacl_p = ctypes.c_void_p()
+        sd_p = ctypes.c_void_p()
+        rc = advapi32.GetNamedSecurityInfoW(
+            str(target), 1, 0x00000001 | 0x00000004,
+            ctypes.byref(owner_p), None, ctypes.byref(dacl_p), None, ctypes.byref(sd_p),
+        )
+        if rc != 0:
+            raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: GetNamedSecurityInfoW failed ({rc}) on {target}")
+        try:
+            owner_sid = _sid_str(owner_p.value)
+            ctrl = wintypes.WORD()
+            rev = wintypes.DWORD()
+            protected = False
+            if advapi32.GetSecurityDescriptorControl(sd_p, ctypes.byref(ctrl), ctypes.byref(rev)):
+                protected = bool(ctrl.value & _WIN_SE_DACL_PROTECTED)
+            dacl_present = bool(dacl_p.value)
+            aces_list: list[SpoolCustodyAce] = []
+            if dacl_present:
+                info = _ACL_SIZE_INFO()
+                if advapi32.GetAclInformation(dacl_p.value, ctypes.byref(info), ctypes.sizeof(info), 2):
+                    for idx in range(info.AceCount):
+                        p_ace = ctypes.c_void_p()
+                        if advapi32.GetAce(dacl_p.value, idx, ctypes.byref(p_ace)):
+                            ace_obj = ctypes.cast(p_ace, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
+                            sid_addr = p_ace.value + _ACCESS_ALLOWED_ACE.SidStart.offset
+                            aces_list.append(
+                                SpoolCustodyAce(
+                                    ace_type=int(ace_obj.Header.AceType),
+                                    ace_flags=int(ace_obj.Header.AceFlags),
+                                    access_mask=int(ace_obj.Mask),
+                                    sid=_sid_str(sid_addr),
+                                )
+                            )
+            return SpoolPathCustodyObservation(
+                path=str(target),
+                platform="nt",
+                exists=True,
+                is_dir=stat.S_ISDIR(st.st_mode),
+                is_reg=stat.S_ISREG(st.st_mode),
+                is_reparse_or_symlink=reparse_or_link,
+                owner_sid=owner_sid,
+                current_user_sid=_win32_current_user_sid(),
+                dacl_present=dacl_present,
+                dacl_protected=protected,
+                aces=tuple(aces_list),
+            )
+        finally:
+            kernel32.LocalFree(sd_p)
+
+    cur_uid = os.geteuid() if hasattr(os, "geteuid") else None
+    return SpoolPathCustodyObservation(
+        path=str(target),
+        platform="posix",
+        exists=True,
+        is_dir=stat.S_ISDIR(st.st_mode),
+        is_reg=stat.S_ISREG(st.st_mode),
+        is_reparse_or_symlink=reparse_or_link,
+        posix_mode=stat.S_IMODE(st.st_mode),
+        posix_uid=int(st.st_uid),
+        current_uid=cur_uid,
+    )
+
+
+def _validate_single_custody_observation(obs: SpoolPathCustodyObservation, *, is_ancestor: bool) -> None:
+    if not obs.exists:
+        return
+    if obs.is_reparse_or_symlink:
+        raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: reparse point or symlink refused at {obs.path}")
+    if is_ancestor and not obs.is_dir:
+        raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: non-directory ancestor at {obs.path}")
+
+    if obs.platform == "nt":
+        cur_sid = (obs.current_user_sid or "").strip()
+        owner_sid = (obs.owner_sid or "").strip()
+        if not cur_sid or not owner_sid:
+            raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: missing Windows owner SID on {obs.path}")
+        if is_ancestor:
+            allowed_owners = _WIN_TRUSTED_ANCESTOR_OWNER_SIDS | {cur_sid}
+            if owner_sid not in allowed_owners:
+                raise Mt5TransportError(
+                    f"MT5_SPOOL_CUSTODY_VIOLATION: untrusted Windows ancestor owner SID {owner_sid} on {obs.path}"
+                )
+            if not obs.dacl_present:
+                raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: NULL DACL on ancestor {obs.path}")
+            allowed_principals = _WIN_TRUSTED_SYSTEM_SIDS | {cur_sid}
+            for ace in obs.aces:
+                if not ace.is_allow:
+                    continue
+                if ace.sid in allowed_principals:
+                    continue
+                if ace.sid == "S-1-1-0" and (ace.access_mask & _WIN_EVERYONE_WRITE_MASK):
+                    raise Mt5TransportError(
+                        f"MT5_SPOOL_CUSTODY_VIOLATION: Everyone write ACE on ancestor {obs.path}"
+                    )
+                if ace.access_mask & _WIN_ANCESTOR_DANGEROUS_MASK:
+                    raise Mt5TransportError(
+                        f"MT5_SPOOL_CUSTODY_VIOLATION: dangerous broad/foreign ACE ({ace.sid}) on ancestor {obs.path}"
+                    )
+            return
+
+        # Spool root, channel, key dir, key file, nonce ledger, snapshot, request, receipt:
+        allowed_obj_owners = {cur_sid} | ({"S-1-5-32-544", "S-1-5-18"} if cur_sid in ("S-1-5-32-544", "S-1-5-18") else set())
+        if owner_sid not in allowed_obj_owners:
+            raise Mt5TransportError(
+                f"MT5_SPOOL_CUSTODY_VIOLATION: spool object owner SID {owner_sid} != process owner {cur_sid} on {obs.path}"
+            )
+        if not obs.dacl_present:
+            raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: NULL DACL refused on spool object {obs.path}")
+        allowed_principals = _WIN_TRUSTED_SYSTEM_SIDS | {cur_sid}
+        for ace in obs.aces:
+            if not ace.is_allow:
+                continue
+            if ace.sid in _WIN_BROAD_PRINCIPAL_SIDS or ace.sid not in allowed_principals:
+                inh = "inherited " if ace.is_inherited else ""
+                raise Mt5TransportError(
+                    f"MT5_SPOOL_CUSTODY_VIOLATION: {inh}permissive/foreign Windows ACE ({ace.sid}) refused on {obs.path}"
+                )
+        return
+
+    # POSIX custody checks
+    mode = obs.posix_mode if obs.posix_mode is not None else 0
+    if is_ancestor:
+        if obs.current_uid is not None and obs.posix_uid is not None and obs.posix_uid not in (0, obs.current_uid):
+            raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: untrusted POSIX ancestor uid on {obs.path}")
+        if (mode & 0o002) and not (mode & stat.S_ISVTX):
+            raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: world-writable non-sticky ancestor {obs.path}")
+        return
+    if obs.current_uid is not None and obs.posix_uid is not None and obs.posix_uid != obs.current_uid:
+        raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: spool object uid mismatch on {obs.path}")
+    if (mode & 0o077) != 0:
+        raise Mt5TransportError(
+            f"MT5_SPOOL_CUSTODY_VIOLATION: unsafe POSIX group/world permissions ({oct(mode)}) on {obs.path}"
+        )
+
+
+def verify_spool_path_custody(
+    path: str | Path,
+    *,
+    expect_dir: bool | None = None,
+    expect_file: bool | None = None,
+    inspector: SpoolCustodyInspector | None = None,
+    check_ancestors: bool = True,
+) -> SpoolPathCustodyObservation:
+    """Verify Windows SID/DACL/reparse (or POSIX uid/mode/symlink) custody across target and all ancestors (Finding [7])."""
+    target = Path(path)
+    inspect_fn = inspector or inspect_spool_path_custody
+    if check_ancestors:
+        for ancestor in reversed(target.parents):
+            anc_obs = inspect_fn(ancestor)
+            if anc_obs.exists:
+                _validate_single_custody_observation(anc_obs, is_ancestor=True)
+    obs = inspect_fn(target)
+    if obs.exists:
+        if expect_dir is True and not obs.is_dir:
+            raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: expected directory at {target}")
+        if expect_file is True and not obs.is_reg:
+            raise Mt5TransportError(f"MT5_SPOOL_CUSTODY_VIOLATION: expected regular file at {target}")
+        _validate_single_custody_observation(obs, is_ancestor=False)
+    return obs
+
+
+def _canonical_valve_admission_input(doc: Mapping[str, str]) -> str:
+    """Canonical signed Valve admission message verified independently by EA and Emulator (Finding [7])."""
+    fields = (
+        "broker_channel",
+        "account_login",
+        "server",
+        "execution_mode",
+        "action",
+        "symbol",
+        "side",
+        "volume",
+        "sl",
+        "tp",
+        "position_ticket",
+        "valve_decision_sha256",
+        "valve_admission_expires_at",
+    )
+    return VALVE_ADMISSION_PROTOCOL + "|" + "|".join(str(doc.get(k, "")) for k in fields)
+
+
 def _canonical_spool_request_hmac_input(doc: Mapping[str, str]) -> str:
     fields = (
         "protocol",
@@ -408,10 +860,13 @@ def _canonical_spool_request_hmac_input(doc: Mapping[str, str]) -> str:
         "issued_at",
         "expires_at",
         "broker_channel",
+        "channel_key_id",
         "account_login",
         "server",
         "execution_mode",
         "valve_decision_sha256",
+        "valve_admission_expires_at",
+        "valve_admission_sig",
         "action",
         "symbol",
         "side",
@@ -453,31 +908,92 @@ def _spool_hmac_hex(key_bytes: bytes, message: str) -> str:
     return hmac.new(key_bytes, message.encode("utf-8"), sha256).hexdigest()
 
 
+def derive_spool_channel_key(master_key: bytes, broker_channel: str) -> bytes:
+    """Derive an isolated 32-byte per-channel HMAC key: HMAC-SHA256(master_key, f'channel:{broker_channel}')."""
+    if not isinstance(master_key, (bytes, bytearray)) or len(master_key) < 32:
+        raise Mt5TransportError("master spool HMAC key must be >= 32 bytes")
+    ch = str(broker_channel or "").strip().lower()
+    if ch not in ("hugosway_mt5", "lhfx_mt5"):
+        raise Mt5TransportError(f"unsupported MT5 broker channel {broker_channel!r}")
+    return hmac.new(bytes(master_key), f"channel:{ch}".encode("utf-8"), sha256).digest()
+
+
+def spool_channel_key_id(channel_key: bytes, broker_channel: str) -> str:
+    """Deterministic 16-hex key identifier bound to the derived per-channel key."""
+    ch = str(broker_channel or "").strip().lower()
+    if ch not in ("hugosway_mt5", "lhfx_mt5"):
+        raise Mt5TransportError(f"unsupported MT5 broker channel {broker_channel!r}")
+    return sha256(f"key-id:{ch}:".encode("utf-8") + bytes(channel_key)).hexdigest()[:16]
+
+
 def _spool_meta_root(spool_dir: Path) -> Path:
     if spool_dir.name.lower() in ("hugosway_mt5", "lhfx_mt5"):
         return spool_dir.parent
     return spool_dir
 
 
-def _spool_hmac_key_path(spool_dir: Path) -> Path:
-    return _spool_meta_root(spool_dir) / ".spool_hmac.key"
+def resolve_spool_key_dir(
+    spool_dir: Path,
+    *,
+    key_dir: str | Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Resolve isolated key storage directory (CAS_FOREX_MT5_SPOOL_KEY_DIR) or default meta root (Finding [7])."""
+    if key_dir is not None and str(key_dir).strip():
+        return Path(str(key_dir).strip())
+    env_map = environ if environ is not None else os.environ
+    env_val = str(env_map.get(ENV_MT5_SPOOL_KEY_DIR, "")).strip()
+    if env_val:
+        return Path(env_val)
+    return _spool_meta_root(spool_dir)
 
 
-def _load_or_create_spool_hmac_key(spool_dir: Path) -> bytes:
-    key_path = _spool_hmac_key_path(spool_dir)
-    key_path.parent.mkdir(parents=True, exist_ok=True)
+def _spool_hmac_key_path(
+    spool_dir: Path,
+    *,
+    key_dir: str | Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    return resolve_spool_key_dir(spool_dir, key_dir=key_dir, environ=environ) / ".spool_hmac.key"
+
+
+def _valve_admission_key_path(
+    spool_dir: Path,
+    *,
+    key_dir: str | Path | None = None,
+    valve_key_file: str | Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    if valve_key_file is not None and str(valve_key_file).strip():
+        return Path(str(valve_key_file).strip())
+    env_map = environ if environ is not None else os.environ
+    env_val = str(env_map.get(ENV_VALVE_ADMISSION_KEY_FILE, "")).strip()
+    if env_val:
+        return Path(env_val)
+    return resolve_spool_key_dir(spool_dir, key_dir=key_dir, environ=environ) / ".valve_admission.key"
+
+
+def _load_or_create_secret_key_file(
+    key_path: Path,
+    *,
+    label: str,
+    custody_inspector: SpoolCustodyInspector | None = None,
+) -> bytes:
+    parent = key_path.parent
+    if not os.path.lexists(parent):
+        verify_spool_path_custody(parent, inspector=custody_inspector, check_ancestors=True)
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        apply_verified_directory_mode(parent, 0o700, custody_inspector=custody_inspector, newly_created=True)
+    else:
+        verify_spool_path_custody(parent, expect_dir=True, inspector=custody_inspector, check_ancestors=True)
     if os.path.lexists(key_path):
-        st = os.lstat(key_path)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            raise Mt5TransportError("Refusing non-regular or symlink spool HMAC key file")
-        if os.name == "posix" and (st.st_mode & 0o077) != 0:
-            raise Mt5TransportError("Spool HMAC key file has unsafe group/world permissions")
+        verify_spool_path_custody(key_path, expect_file=True, inspector=custody_inspector, check_ancestors=False)
         raw = key_path.read_bytes().strip()
         if len(raw) == 64:
             return bytes.fromhex(raw.decode("ascii"))
         if len(raw) >= 32:
             return raw
-        raise Mt5TransportError("Spool HMAC key shorter than 32 bytes")
+        raise Mt5TransportError(f"{label} shorter than 32 bytes")
     key_bytes = secrets.token_bytes(32)
     flags = (
         os.O_WRONLY
@@ -494,22 +1010,150 @@ def _load_or_create_spool_hmac_key(spool_dir: Path) -> bytes:
     finally:
         os.close(fd)
     if os.name == "posix":
-        os.chmod(key_path, 0o600)  # nosec B103: owner-only 0o600 MT5 spool HMAC key on verified regular fd
+        os.chmod(key_path, 0o600)  # nosec B103: owner-only 0o600 key file on verified regular fd
+    elif os.name == "nt" and custody_inspector is None:
+        _win32_apply_owner_only_dacl(key_path)
+    verify_spool_path_custody(key_path, expect_file=True, inspector=custody_inspector, check_ancestors=False)
     return key_bytes
+
+
+def _load_or_create_spool_hmac_key(
+    spool_dir: Path,
+    *,
+    key_dir: str | Path | None = None,
+    environ: Mapping[str, str] | None = None,
+    custody_inspector: SpoolCustodyInspector | None = None,
+) -> bytes:
+    key_path = _spool_hmac_key_path(spool_dir, key_dir=key_dir, environ=environ)
+    return _load_or_create_secret_key_file(
+        key_path, label="Spool HMAC key", custody_inspector=custody_inspector
+    )
+
+
+def _load_or_create_valve_admission_key(
+    spool_dir: Path,
+    *,
+    key_dir: str | Path | None = None,
+    valve_key_file: str | Path | None = None,
+    environ: Mapping[str, str] | None = None,
+    custody_inspector: SpoolCustodyInspector | None = None,
+) -> bytes:
+    vpath = _valve_admission_key_path(
+        spool_dir, key_dir=key_dir, valve_key_file=valve_key_file, environ=environ
+    )
+    vkey = _load_or_create_secret_key_file(
+        vpath, label="Valve admission key", custody_inspector=custody_inspector
+    )
+    spool_key_path = _spool_hmac_key_path(spool_dir, key_dir=key_dir, environ=environ)
+    if os.path.lexists(spool_key_path):
+        spool_master = _load_or_create_spool_hmac_key(
+            spool_dir, key_dir=key_dir, environ=environ, custody_inspector=custody_inspector
+        )
+        if hmac.compare_digest(vkey, spool_master):
+            raise Mt5TransportError(
+                "MT5_SPOOL_CUSTODY_VIOLATION: valve admission key must be strictly distinct from spool HMAC key"
+            )
+    return vkey
+
+
+def sign_spool_valve_admission(
+    request: "Mt5OrderRequest",
+    *,
+    spool_dir: str | Path | None = None,
+    key_dir: str | Path | None = None,
+    valve_key_file: str | Path | None = None,
+    valve_key_bytes: bytes | None = None,
+    expires_at: datetime | None = None,
+    environ: Mapping[str, str] | None = None,
+    custody_inspector: SpoolCustodyInspector | None = None,
+) -> "Mt5OrderRequest":
+    """Sign a short-lived Valve admission capability bound to exact order/risk/routing fields (Finding [7])."""
+    import dataclasses as _dc
+
+    if not _HEX64_RE.fullmatch(str(request.valve_decision_sha256 or "").lower()):
+        raise Mt5ValveClearanceError("valve_decision_sha256 must be a 64-char hex digest before signing Valve admission")
+    eff_issued = request.issued_at if request.issued_at is not None else request.created_at
+    eff_exp = expires_at if expires_at is not None else (
+        request.valve_admission_expires_at if request.valve_admission_expires_at is not None else (
+            request.expires_at if request.expires_at is not None else (eff_issued + timedelta(seconds=30))
+        )
+    )
+    eff_exp = utc_time(eff_exp, "valve_admission_expires_at")
+    ttl = (eff_exp - eff_issued).total_seconds()
+    if ttl <= 0 or ttl > MAX_VALVE_ADMISSION_TTL_SECONDS:
+        raise Mt5ValveClearanceError(
+            f"valve_admission_expires_at TTL must be in (0, {MAX_VALVE_ADMISSION_TTL_SECONDS}] seconds"
+        )
+    if valve_key_bytes is not None:
+        vkey = bytes(valve_key_bytes)
+        if len(vkey) < 32:
+            raise Mt5TransportError("Valve admission key must be >= 32 bytes")
+    else:
+        if spool_dir is None and key_dir is None and valve_key_file is None:
+            raise Mt5TransportError("sign_spool_valve_admission requires spool_dir, key_dir, valve_key_file, or valve_key_bytes")
+        base_dir = Path(spool_dir) if spool_dir is not None else Path(key_dir or ".")
+        vkey = _load_or_create_valve_admission_key(
+            base_dir,
+            key_dir=key_dir,
+            valve_key_file=valve_key_file,
+            environ=environ,
+            custody_inspector=custody_inspector,
+        )
+    staged = _dc.replace(request, valve_admission_expires_at=eff_exp, valve_admission_sig="")
+    sig = _spool_hmac_hex(vkey, _canonical_valve_admission_input(staged._core_dict()))
+    return _dc.replace(staged, valve_admission_sig=sig)
+
+
+def verify_spool_valve_admission(
+    doc: Mapping[str, str],
+    *,
+    valve_key_bytes: bytes,
+    now: datetime,
+    spool_master_key: bytes | None = None,
+) -> tuple[bool, str]:
+    """Verify short-lived signed Valve admission against exact request fields and clock (Finding [7])."""
+    if len(valve_key_bytes) < 32:
+        return False, "valve admission key unavailable"
+    if spool_master_key is not None and hmac.compare_digest(valve_key_bytes, spool_master_key):
+        return False, "valve admission key equals spool key"
+    dec_sha = str(doc.get("valve_decision_sha256", "")).lower()
+    if not _HEX64_RE.fullmatch(dec_sha):
+        return False, "missing or invalid valve_decision_sha256"
+    actual_sig = str(doc.get("valve_admission_sig", "")).lower()
+    if not _HEX64_RE.fullmatch(actual_sig):
+        return False, "missing or invalid valve_admission_sig"
+    raw_exp = str(doc.get("valve_admission_expires_at", ""))
+    raw_iss = str(doc.get("issued_at", ""))
+    try:
+        exp_dt = _parse_iso(raw_exp, "valve_admission_expires_at")
+        iss_dt = _parse_iso(raw_iss, "issued_at")
+    except Mt5TransportError:
+        return False, "invalid valve_admission_expires_at"
+    check_now = utc_time(now, "now")
+    if check_now > exp_dt:
+        return False, "valve admission expired"
+    ttl = (exp_dt - iss_dt).total_seconds()
+    if ttl <= 0 or ttl > MAX_VALVE_ADMISSION_TTL_SECONDS:
+        return False, "valve admission ttl exceeds bound"
+    expected_sig = _spool_hmac_hex(valve_key_bytes, _canonical_valve_admission_input(doc))
+    if not hmac.compare_digest(expected_sig, actual_sig):
+        return False, "valve admission signature mismatch"
+    return True, "ok"
 
 
 class _SpoolReplayLedger:
     """Durable JSON replay & monotonic nonce ledger stored outside the terminal inbox directory."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, custody_inspector: SpoolCustodyInspector | None = None) -> None:
         self.path = path
+        self._custody_inspector = custody_inspector
         self._lock = threading.RLock()
 
     def load(self) -> tuple[int, list[str]]:
         with self._lock:
             if not os.path.lexists(self.path):
                 return 0, []
-            data = _read_spool_json(self.path, max_bytes=262_144)
+            data = _read_spool_json(self.path, max_bytes=262_144, custody_inspector=self._custody_inspector)
             if type(data) is not dict:
                 raise Mt5TransportError("corrupted MT5 spool replay ledger")
             last_nonce = int(str(data.get("last_monotonic_nonce", "0")))
@@ -523,6 +1167,7 @@ class _SpoolReplayLedger:
             _atomic_write_json(
                 self.path,
                 {"last_monotonic_nonce": str(nxt), "seen_request_ids": seen[-512:]},
+                custody_inspector=self._custody_inspector,
             )
             return nxt
 
@@ -535,29 +1180,73 @@ class _SpoolReplayLedger:
             _atomic_write_json(
                 self.path,
                 {"last_monotonic_nonce": str(nonce), "seen_request_ids": seen[-512:]},
+                custody_inspector=self._custody_inspector,
+            )
+
+    def verify_and_record_global_id(self, *, request_id: str) -> None:
+        """Global cross-channel replay domain check on request_id (Finding [9])."""
+        with self._lock:
+            last_nonce, seen = self.load()
+            if request_id in seen:
+                raise Mt5TransportError(f"MT5 global replay domain duplicate request_id={request_id}")
+            seen.append(request_id)
+            _atomic_write_json(
+                self.path,
+                {"last_monotonic_nonce": str(last_nonce), "seen_request_ids": seen[-2048:]},
+                custody_inspector=self._custody_inspector,
             )
 
 
-def apply_verified_directory_mode(path: str | Path, dir_mode: int = 0o700) -> Path:
-    """Apply a restrictive mode to an existing real directory (never a symlink or file).
-
-    Used for the MT5 file spool so request/receipt JSON is private to the operator account.
-    """
+def apply_verified_directory_mode(
+    path: str | Path,
+    dir_mode: int = 0o700,
+    *,
+    custody_inspector: SpoolCustodyInspector | None = None,
+    newly_created: bool = False,
+) -> Path:
+    """Verify and harden an existing real directory across Windows SID/DACL/reparse and POSIX mode (Finding [7])."""
     target = Path(path)
     st = os.lstat(target)
-    if not stat.S_ISDIR(st.st_mode):
-        raise Mt5TransportError("spool path must be a real directory, not a file or symlink")
-    os.chmod(target, dir_mode)  # nosec B103: owner-only 0o700 spool directory verified via lstat + S_ISDIR above
+    if _is_reparse_or_symlink(target, st) or not stat.S_ISDIR(st.st_mode):
+        raise Mt5TransportError("spool path must be a real directory, not a file, junction, or symlink")
+    if not newly_created:
+        verify_spool_path_custody(target, expect_dir=True, inspector=custody_inspector, check_ancestors=True)
+    if os.name == "posix":
+        os.chmod(target, dir_mode)  # nosec B103: owner-only 0o700 spool directory verified via lstat + S_ISDIR above
+    elif os.name == "nt" and custody_inspector is None:
+        _win32_apply_owner_only_dacl(target)
+    verify_spool_path_custody(target, expect_dir=True, inspector=custody_inspector, check_ancestors=True)
     return target
 
 
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
+def _atomic_write_bytes(
+    path: Path,
+    data: bytes,
+    *,
+    custody_inspector: SpoolCustodyInspector | None = None,
+) -> None:
+    verify_spool_path_custody(path.parent, expect_dir=True, inspector=custody_inspector, check_ancestors=True)
+    if os.path.lexists(path):
+        verify_spool_path_custody(path, expect_file=True, inspector=custody_inspector, check_ancestors=False)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp")
     try:
-        with open(tmp, "wb") as handle:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
+        fd = os.open(tmp, flags, 0o600)
+        with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        if os.name == "posix":
+            os.chmod(tmp, 0o600)  # nosec B103: owner-only 0o600 spool artifact
+        elif os.name == "nt" and custody_inspector is None:
+            _win32_apply_owner_only_dacl(tmp)
         os.replace(tmp, path)
     except OSError as exc:
         try:
@@ -568,13 +1257,23 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise Mt5TransportError(f"atomic spool write failed for {path.name}: {type(exc).__name__}") from None
 
 
-def _atomic_write_json(path: Path, doc: Mapping[str, Any]) -> None:
+def _atomic_write_json(
+    path: Path,
+    doc: Mapping[str, Any],
+    *,
+    custody_inspector: SpoolCustodyInspector | None = None,
+) -> None:
     assert_safe_json_numbers(dict(doc))
     raw = (json.dumps(doc, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
-    _atomic_write_bytes(path, raw)
+    _atomic_write_bytes(path, raw, custody_inspector=custody_inspector)
 
 
-def _read_spool_json(path: Path, *, max_bytes: int = MAX_SPOOL_FILE_BYTES) -> Any:
+def _read_spool_json(
+    path: Path,
+    *,
+    max_bytes: int = MAX_SPOOL_FILE_BYTES,
+    custody_inspector: SpoolCustodyInspector | None = None,
+) -> Any:
     last_err: Exception | None = None
     for attempt in range(5):
         try:
@@ -587,8 +1286,9 @@ def _read_spool_json(path: Path, *, max_bytes: int = MAX_SPOOL_FILE_BYTES) -> An
             continue
         except OSError as exc:
             raise Mt5TransportError(f"spool file {path.name} unreadable: {type(exc).__name__}") from None
-        if not stat.S_ISREG(st.st_mode):
-            raise Mt5TransportError(f"spool file {path.name} must be a regular file")
+        if _is_reparse_or_symlink(path, st) or not stat.S_ISREG(st.st_mode):
+            raise Mt5TransportError(f"spool file {path.name} must be a regular non-symlink file")
+        verify_spool_path_custody(path, expect_file=True, inspector=custody_inspector, check_ancestors=False)
         if st.st_size > max_bytes:
             raise Mt5TransportError(f"spool file {path.name} exceeds {max_bytes} bytes")
         try:
@@ -782,6 +1482,7 @@ class Mt5Credentials:
     password: _RedactedSecret | None = None
     execution_mode: str = EXECUTION_MODE_DEMO
     live_auth_ticket_json: str | None = None
+    live_auth_context: LiveAuthorizationContext | None = None
 
     def __post_init__(self) -> None:
         if self.broker_id not in (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
@@ -798,6 +1499,11 @@ class Mt5Credentials:
         )
         if self.password is not None and not isinstance(self.password, _RedactedSecret):
             raise ContractError("MT5 password must be wrapped in _RedactedSecret")
+        if self.live_auth_context is not None:
+            if not isinstance(self.live_auth_context, LiveAuthorizationContext):
+                raise ContractError("live_auth_context must be a LiveAuthorizationContext")
+            if self.execution_mode != EXECUTION_MODE_LIVE:
+                raise ContractError("live_auth_context is only valid when execution_mode=LIVE")
 
     def __repr__(self) -> str:
         return (
@@ -849,6 +1555,7 @@ def load_mt5_credentials(
     password_required: bool = True,
     execution_mode: str | None = None,
     live_arm_phrase: str | None = None,
+    now: datetime | None = None,
 ) -> Mt5Credentials | None:
     """Load MT5 credentials from an explicit runtime mapping (never a ``.env`` file).
 
@@ -860,7 +1567,7 @@ def load_mt5_credentials(
     if not isinstance(environ, Mapping):
         raise ContractError("environ must be a key-value Mapping (never a .env file path)")
     mode, armed = resolve_execution_mode(
-        environ, execution_mode=execution_mode, live_arm_phrase=live_arm_phrase
+        environ, execution_mode=execution_mode, live_arm_phrase=live_arm_phrase, now=now
     )
     spec = BROKER_SPECS[broker_id]
     server = resolve_server(broker_id, environ, execution_mode=mode, live_armed=armed)
@@ -875,6 +1582,7 @@ def load_mt5_credentials(
     if not password_raw and password_required:
         raise Mt5NotConfiguredError(f"{spec.login_env} and {spec.password_env} are required together")
     live_ticket_json: str | None = None
+    live_auth_ctx: LiveAuthorizationContext | None = None
     if mode == EXECUTION_MODE_LIVE:
         try:
             ticket_obj = verify_live_environ_authorization(
@@ -882,7 +1590,9 @@ def load_mt5_credentials(
                 expected_broker_id=broker_id,
                 expected_account_login=login_raw,
                 expected_server=str(server),
+                now=now,
             )
+            live_auth_ctx = build_live_authorization_context(ticket_obj)
             live_ticket_json = json.dumps(ticket_obj, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
         except LiveAuthTicketError as exc:
             raise LiveBrokerEndpointForbiddenError(f"{broker_id} LIVE ticket invalid: {exc}") from None
@@ -893,6 +1603,7 @@ def load_mt5_credentials(
         password=_RedactedSecret(password_raw) if password_raw else None,
         execution_mode=mode,
         live_auth_ticket_json=live_ticket_json,
+        live_auth_context=live_auth_ctx,
     )
 
 
@@ -1313,10 +2024,13 @@ class Mt5OrderRequest:
     issued_at: datetime | None = None
     expires_at: datetime | None = None
     broker_channel: str = "hugosway_mt5"
+    channel_key_id: str = ""
     account_login: str = "0"
     server: str = ""
     execution_mode: str = EXECUTION_MODE_DEMO
-    valve_decision_sha256: str = "" 
+    valve_decision_sha256: str = ""
+    valve_admission_expires_at: datetime | None = None
+    valve_admission_sig: str = "" 
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_id, str) or not _SPOOL_ID_RE.fullmatch(self.request_id):
@@ -1354,10 +2068,13 @@ class Mt5OrderRequest:
             "issued_at": _iso(eff_issued),
             "expires_at": _iso(eff_expires),
             "broker_channel": self.broker_channel,
+            "channel_key_id": self.channel_key_id,
             "account_login": self.account_login,
             "server": self.server,
             "execution_mode": self.execution_mode,
             "valve_decision_sha256": self.valve_decision_sha256,
+            "valve_admission_expires_at": "" if self.valve_admission_expires_at is None else _iso(self.valve_admission_expires_at),
+            "valve_admission_sig": self.valve_admission_sig,
             "action": self.action,
             "symbol": self.symbol,
             "side": self.side.value,
@@ -1711,8 +2428,24 @@ class Mt5NativePythonTransport:
             ))
         return tuple(out)
 
+    def _assert_live_dispatch_authorized(self) -> None:
+        creds = self._credentials
+        if creds is None or creds.execution_mode != EXECUTION_MODE_LIVE:
+            return
+        if creds.live_auth_context is None:
+            raise LiveAuthorizationError(
+                f"LIVE dispatch on {creds.broker_id} refused: missing verified LiveAuthorizationContext"
+            )
+        creds.live_auth_context.assert_valid_at(
+            self._clock(),
+            expected_broker_id=creds.broker_id,
+            expected_account_id=str(creds.login),
+            expected_server=creds.server,
+        )
+
     def send_order(self, request: Mt5OrderRequest) -> Mt5OrderReceipt:
         sdk = self._require_connected()
+        self._assert_live_dispatch_authorized()
         payload = request.to_native_request(sdk)
         result = sdk.order_send(payload)
         if result is None:
@@ -1782,12 +2515,22 @@ class Mt5SpoolBridgeTransport:
         monotonic: Callable[[], float] = time.monotonic,
         max_leverage: int = MAX_DEMO_LEVERAGE,
         max_file_bytes: int = MAX_SPOOL_FILE_BYTES,
+        key_dir: str | Path | None = None,
+        valve_admission_key_file: str | Path | None = None,
+        custody_inspector: SpoolCustodyInspector | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(spool_dir, (str, Path)) or not str(spool_dir).strip():
             raise Mt5NotConfiguredError("spool_dir must be a non-empty path")
         if not (0 < receipt_timeout_seconds <= 300) or not (0 < poll_interval_seconds <= 5):
             raise ContractError("receipt timeout must be in (0, 300] s and poll interval in (0, 5] s")
         self.spool_dir = Path(spool_dir)
+        self.key_dir = resolve_spool_key_dir(self.spool_dir, key_dir=key_dir)
+        self.valve_key_file = _valve_admission_key_path(
+            self.spool_dir, key_dir=self.key_dir, valve_key_file=valve_admission_key_file
+        )
+        self._custody_inspector = custody_inspector
+        self._clock = clock or _utc_now
         self._timeout = float(receipt_timeout_seconds)
         self._poll = float(poll_interval_seconds)
         self._sleep = sleep
@@ -1796,16 +2539,51 @@ class Mt5SpoolBridgeTransport:
         self._max_file_bytes = max_file_bytes
         self._credentials: Mt5Credentials | None = None
         self._hmac_key: bytes | None = None
-        self._nonce_ledger = _SpoolReplayLedger(_spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.outbound_nonce.json")
+        self._nonce_ledger = _SpoolReplayLedger(
+            _spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.outbound_nonce.json",
+            custody_inspector=custody_inspector,
+        )
+        self._global_nonce_ledger = _SpoolReplayLedger(
+            self.key_dir / ".global_outbound_nonce.json",
+            custody_inspector=custody_inspector,
+        )
         self._prepared_nonces: dict[str, int] = {}
 
     def __repr__(self) -> str:
         return f"Mt5SpoolBridgeTransport(spool_dir={self.spool_dir.name!r}, connected={self._credentials is not None})"
 
+    def _channel_for(self, creds: Mt5Credentials | None = None) -> str:
+        eff = creds or self._credentials
+        if eff is not None:
+            return eff.broker_id.lower()
+        name = self.spool_dir.name.lower()
+        return name if name in ("hugosway_mt5", "lhfx_mt5") else "hugosway_mt5"
+
+    def _channel_hmac_key_and_id(self, creds: Mt5Credentials | None = None) -> tuple[bytes, str]:
+        master = self._hmac_key if self._hmac_key is not None else _load_or_create_spool_hmac_key(
+            self.spool_dir, key_dir=self.key_dir, custody_inspector=self._custody_inspector
+        )
+        ch = self._channel_for(creds)
+        ch_key = derive_spool_channel_key(master, ch)
+        return ch_key, spool_channel_key_id(ch_key, ch)
+
     def prepare_spool_directory(self) -> Path:
-        self.spool_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        apply_verified_directory_mode(self.spool_dir, 0o700)
-        self._hmac_key = _load_or_create_spool_hmac_key(self.spool_dir)
+        meta_root = _spool_meta_root(self.spool_dir)
+        if os.path.lexists(meta_root):
+            verify_spool_path_custody(meta_root, expect_dir=True, inspector=self._custody_inspector, check_ancestors=True)
+        else:
+            verify_spool_path_custody(meta_root, inspector=self._custody_inspector, check_ancestors=True)
+            meta_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            apply_verified_directory_mode(meta_root, 0o700, custody_inspector=self._custody_inspector, newly_created=True)
+        existed = os.path.lexists(self.spool_dir)
+        if existed:
+            apply_verified_directory_mode(self.spool_dir, 0o700, custody_inspector=self._custody_inspector, newly_created=False)
+        else:
+            self.spool_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            apply_verified_directory_mode(self.spool_dir, 0o700, custody_inspector=self._custody_inspector, newly_created=True)
+        self._hmac_key = _load_or_create_spool_hmac_key(
+            self.spool_dir, key_dir=self.key_dir, custody_inspector=self._custody_inspector
+        )
         return self.spool_dir
 
     def connect(self, credentials: Mt5Credentials) -> Mt5AccountSnapshot:
@@ -1823,7 +2601,11 @@ class Mt5SpoolBridgeTransport:
             if os.path.lexists(ticket_file):
                 ticket_file.unlink()
         elif credentials.live_auth_ticket_json:
-            _atomic_write_bytes(ticket_file, credentials.live_auth_ticket_json.encode("ascii"))
+            _atomic_write_bytes(
+                ticket_file,
+                credentials.live_auth_ticket_json.encode("ascii"),
+                custody_inspector=self._custody_inspector,
+            )
         self._credentials = credentials
         try:
             snap = self.account_info()
@@ -1839,10 +2621,24 @@ class Mt5SpoolBridgeTransport:
             raise Mt5TransportError("spool MT5 transport is not connected")
         return self._credentials
 
+    def _assert_live_dispatch_authorized(self, creds: Mt5Credentials) -> None:
+        if creds.execution_mode != EXECUTION_MODE_LIVE:
+            return
+        if creds.live_auth_context is None:
+            raise LiveAuthorizationError(
+                f"LIVE dispatch on {creds.broker_id} refused: missing verified LiveAuthorizationContext"
+            )
+        creds.live_auth_context.assert_valid_at(
+            self._clock(),
+            expected_broker_id=creds.broker_id,
+            expected_account_id=str(creds.login),
+            expected_server=creds.server,
+        )
+
     def _market_doc(self) -> dict[str, Any]:
         path = self.spool_dir / "market_ticks.json"
         try:
-            doc = _read_spool_json(path, max_bytes=self._max_file_bytes)
+            doc = _read_spool_json(path, max_bytes=self._max_file_bytes, custody_inspector=self._custody_inspector)
         except FileNotFoundError:
             raise Mt5TransportError("market_ticks.json not published yet; is CasForexMt5Bridge EA running?") from None
         if type(doc) is not dict or doc.get("protocol") != MT5_SPOOL_PROTOCOL:
@@ -1970,7 +2766,13 @@ class Mt5SpoolBridgeTransport:
     def prepare_request(self, request: Mt5OrderRequest) -> Mt5OrderRequest:
         creds = self._require_connected()
         import dataclasses as _dc
-        prebound = request.issued_at is not None and request.expires_at is not None and request.server == creds.server
+        _, expected_key_id = self._channel_hmac_key_and_id(creds)
+        prebound = (
+            request.issued_at is not None
+            and request.expires_at is not None
+            and request.server == creds.server
+            and request.channel_key_id == expected_key_id
+        )
         with self._nonce_ledger._lock:
             if prebound and self._prepared_nonces.get(request.request_id) == request.monotonic_nonce:
                 return request
@@ -1979,8 +2781,12 @@ class Mt5SpoolBridgeTransport:
             if len(self._prepared_nonces) > 1024:
                 oldest = next(iter(self._prepared_nonces))
                 self._prepared_nonces.pop(oldest, None)
-        if prebound:
-            return _dc.replace(request, monotonic_nonce=nonce_val)
+        if request.issued_at is not None and request.expires_at is not None and request.server == creds.server:
+            return _dc.replace(
+                request,
+                monotonic_nonce=nonce_val,
+                channel_key_id=request.channel_key_id or expected_key_id,
+            )
         mkt_doc = self._market_doc()
         obs_raw = mkt_doc.get("observed_at")
         term_now = _parse_iso(obs_raw, "observed_at") if isinstance(obs_raw, str) and obs_raw.strip() else _utc_now()
@@ -1992,6 +2798,7 @@ class Mt5SpoolBridgeTransport:
             issued_at=eff_issued,
             expires_at=eff_expires,
             broker_channel=creds.broker_id.lower(),
+            channel_key_id=expected_key_id,
             account_login=str(creds.login),
             server=creds.server,
             execution_mode=creds.execution_mode,
@@ -1999,19 +2806,26 @@ class Mt5SpoolBridgeTransport:
 
     def send_order(self, request: Mt5OrderRequest) -> Mt5OrderReceipt:
         creds = self._require_connected()
-        hmac_key = self._hmac_key if self._hmac_key is not None else _load_or_create_spool_hmac_key(self.spool_dir)
+        self._assert_live_dispatch_authorized(creds)
+        channel_key, expected_key_id = self._channel_hmac_key_and_id(creds)
         bound_req = self.prepare_request(request)
+        if bound_req.channel_key_id != expected_key_id:
+            raise Mt5TransportError("spool request channel_key_id mismatch")
+        if not _HEX64_RE.fullmatch(str(bound_req.valve_admission_sig or "").lower()) or bound_req.valve_admission_expires_at is None:
+            raise Mt5ValveClearanceError(
+                "MT5 spool dispatch refused: missing short-lived signed Valve admission (valve_admission_sig)"
+            )
         doc = bound_req.to_spool_dict()
-        doc["request_hmac_sha256"] = _spool_hmac_hex(hmac_key, _canonical_spool_request_hmac_input(doc))
+        doc["request_hmac_sha256"] = _spool_hmac_hex(channel_key, _canonical_spool_request_hmac_input(doc))
         request_path = self.spool_dir / f"order_request_{bound_req.request_id}.json"
         receipt_path = self.spool_dir / f"order_receipt_{bound_req.request_id}.json"
         if request_path.exists() or receipt_path.exists():
             raise Mt5TransportError(f"request_id {bound_req.request_id} already present in spool; never resubmitted")
-        _atomic_write_json(request_path, doc)
+        _atomic_write_json(request_path, doc, custody_inspector=self._custody_inspector)
         deadline = self._monotonic() + self._timeout
         while True:
             if receipt_path.exists():
-                receipt = self._parse_receipt(receipt_path, bound_req, creds, hmac_key=hmac_key)
+                receipt = self._parse_receipt(receipt_path, bound_req, creds, hmac_key=channel_key)
                 try:
                     receipt_path.unlink()
                 except OSError as exc:
@@ -2031,7 +2845,7 @@ class Mt5SpoolBridgeTransport:
         *,
         hmac_key: bytes | None = None,
     ) -> Mt5OrderReceipt:
-        doc = _read_spool_json(path, max_bytes=self._max_file_bytes)
+        doc = _read_spool_json(path, max_bytes=self._max_file_bytes, custody_inspector=self._custody_inspector)
         if type(doc) is not dict or doc.get("protocol") != MT5_SPOOL_PROTOCOL:
             raise Mt5TransportError("receipt protocol mismatch")
         if any(type(v) is not str for v in doc.values()):
@@ -2040,7 +2854,10 @@ class Mt5SpoolBridgeTransport:
             raise Mt5TransportError("receipt does not bind the exact request_id/request_sha256")
         if str(doc.get("monotonic_nonce", "")) != str(request.monotonic_nonce):
             raise Mt5TransportError("receipt monotonic_nonce mismatch")
-        key = hmac_key if hmac_key is not None else _load_or_create_spool_hmac_key(self.spool_dir)
+        if hmac_key is not None:
+            key = hmac_key
+        else:
+            key, _ = self._channel_hmac_key_and_id(creds)
         expected_mac = _spool_hmac_hex(key, _canonical_spool_receipt_hmac_input(doc))
         actual_mac = str(doc.get("receipt_hmac_sha256", "")).lower()
         if len(actual_mac) != 64 or not hmac.compare_digest(expected_mac, actual_mac):
@@ -2108,6 +2925,11 @@ class Mt5SpoolPaperTerminalEmulator:
         trade_mode: str = "DEMO",
         max_volume_lots: Decimal = MT5_MAX_VOLUME_DEFAULT,
         clock: Callable[[], datetime] | None = None,
+        broker_channel: str | None = None,
+        execution_mode: str | None = None,
+        key_dir: str | Path | None = None,
+        valve_admission_key_file: str | Path | None = None,
+        custody_inspector: SpoolCustodyInspector | None = None,
     ) -> None:
         self.spool_dir = Path(spool_dir)
         self.server = server
@@ -2117,6 +2939,24 @@ class Mt5SpoolPaperTerminalEmulator:
         self.currency = currency
         self.leverage = leverage
         self.trade_mode = trade_mode
+        if broker_channel is not None:
+            self.broker_channel = broker_channel.strip().lower()
+        elif self.spool_dir.name.lower() in ("hugosway_mt5", "lhfx_mt5"):
+            self.broker_channel = self.spool_dir.name.lower()
+        elif "lhfx" in str(server).lower():
+            self.broker_channel = "lhfx_mt5"
+        else:
+            self.broker_channel = "hugosway_mt5"
+        self.execution_mode = (
+            execution_mode.strip().upper()
+            if execution_mode is not None
+            else (EXECUTION_MODE_LIVE if str(trade_mode).upper() == "REAL" else EXECUTION_MODE_DEMO)
+        )
+        self.key_dir = resolve_spool_key_dir(self.spool_dir, key_dir=key_dir)
+        self.valve_key_file = _valve_admission_key_path(
+            self.spool_dir, key_dir=self.key_dir, valve_key_file=valve_admission_key_file
+        )
+        self._custody_inspector = custody_inspector
         self._max_lots = decimal_value(max_volume_lots, "max_volume_lots", positive=True)
         self._clock = clock or _utc_now
         self._calc = Mt5MarginCalculator(leverage=min(leverage, MAX_DEMO_LEVERAGE), account_currency=currency)
@@ -2124,7 +2964,14 @@ class Mt5SpoolPaperTerminalEmulator:
         self._next_ticket = 500_000_001
         self._next_deal = 700_000_001
         self.processed: list[str] = []
-        self._replay_ledger = _SpoolReplayLedger(_spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.emu_replay.json")
+        self._replay_ledger = _SpoolReplayLedger(
+            _spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.emu_replay.json",
+            custody_inspector=custody_inspector,
+        )
+        self._global_replay_ledger = _SpoolReplayLedger(
+            _spool_meta_root(self.spool_dir) / ".global_emu_replay.json",
+            custody_inspector=custody_inspector,
+        )
 
     def set_quote(self, symbol: str, bid: Decimal, ask: Decimal) -> None:
         self.quotes[symbol] = (bid, ask)
@@ -2156,9 +3003,32 @@ class Mt5SpoolPaperTerminalEmulator:
             rate = self._calc.conversion_rate(quote_ccy, self.quotes) if quote_ccy != self.currency else Decimal(1)
             return (pnl_quote * rate).quantize(Decimal("0.01"))
 
+    def _channel_hmac_key_and_id(self) -> tuple[bytes, bytes, str]:
+        master = _load_or_create_spool_hmac_key(
+            self.spool_dir, key_dir=self.key_dir, custody_inspector=self._custody_inspector
+        )
+        ch_key = derive_spool_channel_key(master, self.broker_channel)
+        return master, ch_key, spool_channel_key_id(ch_key, self.broker_channel)
+
     def publish_market(self) -> None:
-        self.spool_dir.mkdir(parents=True, exist_ok=True)
-        _load_or_create_spool_hmac_key(self.spool_dir)
+        existed = os.path.lexists(self.spool_dir)
+        if existed:
+            apply_verified_directory_mode(
+                self.spool_dir, 0o700, custody_inspector=self._custody_inspector, newly_created=False
+            )
+        else:
+            verify_spool_path_custody(self.spool_dir, inspector=self._custody_inspector, check_ancestors=True)
+            self.spool_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            apply_verified_directory_mode(
+                self.spool_dir, 0o700, custody_inspector=self._custody_inspector, newly_created=True
+            )
+        _load_or_create_spool_hmac_key(self.spool_dir, key_dir=self.key_dir, custody_inspector=self._custody_inspector)
+        _load_or_create_valve_admission_key(
+            self.spool_dir,
+            key_dir=self.key_dir,
+            valve_key_file=self.valve_key_file,
+            custody_inspector=self._custody_inspector,
+        )
         floating = self._floating()
         used = self._used_margin()
         equity = self.balance + floating
@@ -2196,13 +3066,21 @@ class Mt5SpoolPaperTerminalEmulator:
                 for ticket, pos in sorted(self._positions.items())
             ],
         }
-        _atomic_write_json(self.spool_dir / "market_ticks.json", doc)
+        _atomic_write_json(self.spool_dir / "market_ticks.json", doc, custody_inspector=self._custody_inspector)
 
-    def _receipt(self, req: Mapping[str, str], status: str, retcode: int, **extra: str) -> dict[str, str]:
+    def _receipt(
+        self,
+        req: Mapping[str, str],
+        status: str,
+        retcode: int,
+        *,
+        override_request_id: str | None = None,
+        **extra: str,
+    ) -> dict[str, str]:
         out = {
             "protocol": MT5_SPOOL_PROTOCOL,
-            "request_id": req["request_id"],
-            "request_sha256": req["request_sha256"],
+            "request_id": override_request_id if override_request_id is not None else str(req.get("request_id", "")),
+            "request_sha256": str(req.get("request_sha256", "")),
             "monotonic_nonce": str(req.get("monotonic_nonce", "0")),
             "status": status,
             "retcode": str(retcode),
@@ -2218,38 +3096,72 @@ class Mt5SpoolPaperTerminalEmulator:
             "message": "",
         }
         out.update(extra)
-        hmac_key = _load_or_create_spool_hmac_key(self.spool_dir)
-        out["receipt_hmac_sha256"] = _spool_hmac_hex(hmac_key, _canonical_spool_receipt_hmac_input(out))
+        _, channel_key, _ = self._channel_hmac_key_and_id()
+        out["receipt_hmac_sha256"] = _spool_hmac_hex(channel_key, _canonical_spool_receipt_hmac_input(out))
         return out
 
     def _deal_ticket(self) -> str:
         self._next_deal += 1
         return str(self._next_deal)
 
-    def _execute(self, req: Mapping[str, str]) -> dict[str, str]:
+    def _execute(self, req: Mapping[str, str], *, filename_request_id: str | None = None) -> dict[str, str]:
+        req_id = str(req.get("request_id", ""))
+        eff_rid = filename_request_id if filename_request_id is not None else req_id
+        # 1. Exact filename-to-JSON request_id equality (Finding [9])
+        if not req_id or (filename_request_id is not None and req_id != filename_request_id):
+            return self._receipt(req, "REJECTED", 10013, override_request_id=eff_rid, message="request_id filename mismatch")
+        # 2. Core SHA-256 integrity
         core = {k: v for k, v in req.items() if k not in ("request_sha256", "request_hmac_sha256")}
         if req.get("protocol") != MT5_SPOOL_PROTOCOL or _sha256_flat(core) != req.get("request_sha256"):
             return self._receipt(req, "REJECTED", 10013, message="request hash mismatch")
-        hmac_key = _load_or_create_spool_hmac_key(self.spool_dir)
-        expected_mac = _spool_hmac_hex(hmac_key, _canonical_spool_request_hmac_input(req))
+        # 3. Per-channel HMAC key & channel_key_id binding (Findings [7] & [9])
+        master_key, channel_key, expected_key_id = self._channel_hmac_key_and_id()
+        if str(req.get("channel_key_id", "")) != expected_key_id:
+            return self._receipt(req, "REJECTED", 10017, message="channel_key_id mismatch")
+        expected_mac = _spool_hmac_hex(channel_key, _canonical_spool_request_hmac_input(req))
         actual_mac = str(req.get("request_hmac_sha256", "")).lower()
         if len(actual_mac) != 64 or not hmac.compare_digest(expected_mac, actual_mac):
             return self._receipt(req, "REJECTED", 10013, message="request hmac mismatch")
+        # 4. Full EA sink context binding (Finding [9]): channel, account_login, normalized server, execution_mode
+        if str(req.get("broker_channel", "")).strip().lower() != self.broker_channel:
+            return self._receipt(req, "REJECTED", 10017, message="broker_channel binding mismatch")
+        if str(req.get("account_login", "")).strip() != str(self.login):
+            return self._receipt(req, "REJECTED", 10017, message="account_login binding mismatch")
+        if str(req.get("server", "")).strip().casefold() != self.server.strip().casefold():
+            return self._receipt(req, "REJECTED", 10017, message="server binding mismatch")
+        if str(req.get("execution_mode", "")).strip().upper() != self.execution_mode:
+            return self._receipt(req, "REJECTED", 10017, message="execution_mode binding mismatch")
+        # 5. Request TTL check (read-only, before nonce mutation)
         try:
             exp_dt = _parse_iso(req.get("expires_at"), "expires_at")
             if self._clock() > exp_dt:
                 return self._receipt(req, "REJECTED", 10013, message="request expired")
         except Exception:
             return self._receipt(req, "REJECTED", 10013, message="invalid expires_at")
+        # 6. Independent short-lived signed Valve admission verification (Finding [7])
+        try:
+            valve_key = _load_or_create_valve_admission_key(
+                self.spool_dir,
+                key_dir=self.key_dir,
+                valve_key_file=self.valve_key_file,
+                custody_inspector=self._custody_inspector,
+            )
+        except Exception:
+            return self._receipt(req, "REJECTED", 10017, message="valve admission key unavailable")
+        valve_ok, valve_reason = verify_spool_valve_admission(
+            req, valve_key_bytes=valve_key, now=self._clock(), spool_master_key=master_key
+        )
+        if not valve_ok:
+            return self._receipt(req, "REJECTED", 10017, message=valve_reason[:60])
+        # 7. Per-channel monotonic nonce + global replay domain (Finding [9])
         nonce_raw = str(req.get("monotonic_nonce", ""))
         if not nonce_raw.isdigit() or int(nonce_raw) <= 0:
             return self._receipt(req, "REJECTED", 10013, message="invalid monotonic_nonce")
         try:
-            self._replay_ledger.verify_and_record(request_id=req["request_id"], nonce=int(nonce_raw))
+            self._global_replay_ledger.verify_and_record_global_id(request_id=req_id)
+            self._replay_ledger.verify_and_record(request_id=req_id, nonce=int(nonce_raw))
         except Mt5TransportError:
             return self._receipt(req, "REJECTED", 10013, message="replayed nonce or request_id")
-        if str(req.get("account_login", "")) != str(self.login) or str(req.get("server", "")).casefold() != self.server.casefold():
-            return self._receipt(req, "REJECTED", 10017, message="account or server binding mismatch")
         action = req["action"]
         symbol = req["symbol"]
         if symbol not in self.quotes:
@@ -2319,13 +3231,19 @@ class Mt5SpoolPaperTerminalEmulator:
     def process_pending(self) -> int:
         count = 0
         for path in sorted(self.spool_dir.glob("order_request_*.json")):
-            req = _read_spool_json(path)
+            fname = path.name
+            filename_id = fname[len("order_request_"):-len(".json")]
+            req = _read_spool_json(path, custody_inspector=self._custody_inspector)
             if type(req) is not dict or any(type(v) is not str for v in req.values()):
                 raise Mt5TransportError("emulator received a malformed request")
-            receipt = self._execute(req)
-            _atomic_write_json(self.spool_dir / f"order_receipt_{req['request_id']}.json", receipt)
+            receipt = self._execute(req, filename_request_id=filename_id)
+            _atomic_write_json(
+                self.spool_dir / f"order_receipt_{filename_id}.json",
+                receipt,
+                custody_inspector=self._custody_inspector,
+            )
             path.unlink()
-            self.processed.append(req["request_id"])
+            self.processed.append(filename_id)
             count += 1
         return count
 
@@ -2434,12 +3352,16 @@ class Mt5ExecutionResult:
     margin_check: Mt5MarginCheck | None
     valve_mode: str
     audit_record: BrokerAuditReceipt
+    reconciliation_required: bool = False
+    post_fill_refresh_error: str | None = None
 
     @property
     def accepted(self) -> bool:
         if self.receipt is not None:
             return self.receipt.accepted
-        return self.oanda_receipt is not None and self.oanda_receipt.get("status") in ("FILLED", "CREATED")
+        return self.oanda_receipt is not None and self.oanda_receipt.get("status") in (
+            "FILLED", "CREATED", "MODIFIED", "CLOSED", "REDUCED"
+        )
 
 
 class Mt5MutationJournal:
@@ -2589,12 +3511,32 @@ class Mt5MutationJournal:
                 matched.append(r)
         return matched
 
+    def list_unresolved_mutations(self) -> list[dict[str, Any]]:
+        """Enumerate ALL unresolved (OUTCOME_UNKNOWN / PENDING_DISPATCH) MT5 mutations across all venues & symbols."""
+        return self.unknown_mutations(
+            broker_id=None, account_login=None, server=None, symbol=None, position_ticket=None, semantic_key=None
+        )
+
+    def has_any_unresolved_mutation(self) -> bool:
+        """True when ANY unresolved MT5 mutation exists across any broker, account, or symbol (Finding [1])."""
+        return bool(self.list_unresolved_mutations())
+
+    def require_global_clear(self, *, context: str = "NEW_RISK") -> None:
+        """Fail closed if ANY unresolved mutation exists anywhere in the MT5 journal (Finding [1])."""
+        frozen = self.list_unresolved_mutations()
+        if frozen:
+            ids = ", ".join(f"{x['broker_id']}:{x['symbol']}:{x['request_id']}({x['status']})" for x in frozen[:4])
+            raise Mt5OutcomeUnknownError(
+                f"BARBELL_UNRESOLVED_MUTATION_LATCH ({context}): unresolved MT5 mutation(s) [{ids}] "
+                f"block all new-risk dispatches until reconciled"
+            )
+
     def require_clear(
         self,
         *,
-        broker_id: str,
-        account_login: int,
-        server: str,
+        broker_id: str | None = None,
+        account_login: int | None = None,
+        server: str | None = None,
         symbol: str | None = None,
         position_ticket: str | None = None,
         semantic_key: str | None = None,
@@ -2627,15 +3569,24 @@ class Mt5MutationJournal:
         semantic_key: str,
         now_utc: str,
     ) -> None:
+        is_risk_reducing = str(action_kind).upper() in ("CLOSE", "REDUCE", "AMEND_STOP")
         if self._path is None:
-            self.require_clear(
-                broker_id=broker_id,
-                account_login=account_login,
-                server=server,
-                symbol=symbol,
-                position_ticket=position_ticket,
-                semantic_key=semantic_key,
-            )
+            if not is_risk_reducing:
+                self.require_global_clear(context=str(action_kind))
+            else:
+                targeted = [
+                    row
+                    for row in self.unknown_mutations(
+                        broker_id=broker_id, account_login=account_login, server=server
+                    )
+                    if row.get("semantic_key") == semantic_key
+                    or (position_ticket is not None and row.get("position_ticket") == position_ticket)
+                ]
+                if targeted:
+                    ids = ", ".join(f"{x['request_id']}({x['status']})" for x in targeted[:4])
+                    raise Mt5OutcomeUnknownError(
+                        f"MT5_OUTCOME_UNKNOWN_FREEZE: unresolved {broker_id} mutation(s) on target position [{ids}]"
+                    )
             if request_id in self._memory:
                 raise Mt5OutcomeUnknownError(
                     f"Duplicate MT5 request_id={request_id!r} (status={self._memory[request_id]['status']}); never resubmitted"
@@ -2660,19 +3611,25 @@ class Mt5MutationJournal:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            frozen = conn.execute(
-                "SELECT request_id, status FROM mt5_mutation_journal "
-                "WHERE broker_id = ? AND account_login = ? AND server = ? "
-                "AND status IN ('OUTCOME_UNKNOWN', 'PENDING_DISPATCH') "
-                "AND (symbol = ? OR semantic_key = ? OR (position_ticket IS NOT NULL AND position_ticket = ?))",
-                (broker_id, int(account_login), server, symbol, semantic_key, position_ticket or ""),
-            ).fetchall()
+            if not is_risk_reducing:
+                frozen = conn.execute(
+                    "SELECT request_id, status, broker_id, symbol FROM mt5_mutation_journal "
+                    "WHERE status IN ('OUTCOME_UNKNOWN', 'PENDING_DISPATCH')",
+                ).fetchall()
+            else:
+                frozen = conn.execute(
+                    "SELECT request_id, status, broker_id, symbol FROM mt5_mutation_journal "
+                    "WHERE broker_id = ? AND account_login = ? AND server = ? "
+                    "AND status IN ('OUTCOME_UNKNOWN', 'PENDING_DISPATCH') "
+                    "AND (semantic_key = ? OR (position_ticket IS NOT NULL AND position_ticket = ?))",
+                    (broker_id, int(account_login), server, semantic_key, position_ticket or ""),
+                ).fetchall()
             if frozen:
                 conn.rollback()
-                ids = ", ".join(f"{r[0]}({r[1]})" for r in frozen[:4])
+                ids = ", ".join(f"{r[2]}:{r[3]}:{r[0]}({r[1]})" for r in frozen[:4])
+                prefix = "BARBELL_UNRESOLVED_MUTATION_LATCH" if not is_risk_reducing else "MT5_OUTCOME_UNKNOWN_FREEZE"
                 raise Mt5OutcomeUnknownError(
-                    f"MT5_OUTCOME_UNKNOWN_FREEZE: unresolved {broker_id} ({account_login}@{server}) mutation(s) "
-                    f"[{ids}] must be reconciled before new dispatches"
+                    f"{prefix}: unresolved mutation(s) [{ids}] must be reconciled before new dispatches"
                 )
             existing = conn.execute(
                 "SELECT status FROM mt5_mutation_journal WHERE request_id = ?",
@@ -2896,9 +3853,20 @@ class Mt5PaperBrokerVenue:
         if not isinstance(order, OrderIntent):
             raise ContractError("execute requires an OrderIntent")
         if self._account is None:
-            raise Mt5TransportError(f"{self.broker_id} venue is not connected")
+            raise Mt5PreDispatchTransportError(f"{self.broker_id} venue is not connected")
         decision = require_valve_clearance(order, valve_decision, expected_weights_sha256=self._valve_sha)
         now = self._clock()
+        if self._credentials.execution_mode == EXECUTION_MODE_LIVE:
+            if self._credentials.live_auth_context is None:
+                raise LiveAuthorizationError(
+                    f"LIVE dispatch on {self.broker_id} refused: missing verified LiveAuthorizationContext"
+                )
+            self._credentials.live_auth_context.assert_valid_at(
+                now,
+                expected_broker_id=self.broker_id,
+                expected_account_id=str(self._credentials.login),
+                expected_server=self._credentials.server,
+            )
         margin_check: Mt5MarginCheck | None = None
         request_id = self._next_request_id(order)
         comment = f"cas-{order.kind.value.lower()}"[:31]
@@ -2915,7 +3883,14 @@ class Mt5PaperBrokerVenue:
             lots = self._calc.units_to_lots(units, symbol=order.symbol)
             if lots > self._max_lots:
                 raise Mt5MarginRefusalError(f"OPEN volume {decimal_text(lots)} lots exceeds venue cap {decimal_text(self._max_lots)}")
-            quotes = self._quotes_for(order.symbol)
+            try:
+                quotes = self._quotes_for(order.symbol)
+            except Mt5PreDispatchTransportError:
+                raise
+            except (Mt5TransportError, OSError) as exc:
+                raise Mt5PreDispatchTransportError(
+                    f"{self.broker_id} pre-dispatch quote read failed: {type(exc).__name__}"
+                ) from None
             bid, ask = quotes[order.symbol]
             if quote_guard is not None:
                 quote_guard(self.broker_id, Mt5Tick(symbol=order.symbol, bid=bid, ask=ask, time_msc="0"))
@@ -2934,7 +3909,14 @@ class Mt5PaperBrokerVenue:
                     raise Mt5MarginRefusalError("current ask exceeds the BUY limit price; not sent")
                 if side is Side.SELL and price < order.limit_price:
                     raise Mt5MarginRefusalError("current bid is below the SELL limit price; not sent")
-            account = self._transport.account_info()
+            try:
+                account = self._transport.account_info()
+            except Mt5PreDispatchTransportError:
+                raise
+            except (Mt5TransportError, OSError) as exc:
+                raise Mt5PreDispatchTransportError(
+                    f"{self.broker_id} pre-dispatch account_info read failed: {type(exc).__name__}"
+                ) from None
             margin_check = self._calc.check_new_position(
                 symbol=order.symbol,
                 side=side,
@@ -3009,7 +3991,23 @@ class Mt5PaperBrokerVenue:
                     comment=comment, created_at=now,
                 valve_decision_sha256=valve_sha, broker_channel=v_channel, account_login=v_login, server=v_srv, execution_mode=v_mode)
         if hasattr(self._transport, "prepare_request"):
-            request = self._transport.prepare_request(request)
+            try:
+                request = self._transport.prepare_request(request)
+            except Mt5PreDispatchTransportError:
+                raise
+            except (Mt5TransportError, OSError) as exc:
+                raise Mt5PreDispatchTransportError(
+                    f"{self.broker_id} pre-dispatch request preparation failed: {type(exc).__name__}"
+                ) from None
+        if isinstance(self._transport, Mt5SpoolBridgeTransport):
+            request = sign_spool_valve_admission(
+                request,
+                spool_dir=self._transport.spool_dir,
+                key_dir=self._transport.key_dir,
+                valve_key_file=self._transport.valve_key_file,
+                expires_at=request.expires_at,
+                custody_inspector=self._transport._custody_inspector,
+            )
         now_utc_str = _iso(self._clock())
         sem_key = (
             f"{order.kind.value}|{self.broker_id}|{self._credentials.login}|{self._credentials.server}|"
@@ -3028,6 +4026,14 @@ class Mt5PaperBrokerVenue:
         )
         try:
             receipt = self._transport.send_order(request)
+        except LiveAuthorizationError:
+            self._mutation_journal.mark_outcome(
+                request_id=request.request_id,
+                status="CONFIRMED_ABSENT",
+                now_utc=_iso(self._clock()),
+                error_detail="LIVE_AUTHORIZATION_EXPIRED",
+            )
+            raise
         except Mt5OutcomeUnknownError as exc:
             self._mutation_journal.mark_outcome(
                 request_id=request.request_id,
@@ -3086,8 +4092,40 @@ class Mt5PaperBrokerVenue:
                 order_ticket=None if receipt.position_ticket is None else str(receipt.position_ticket),
                 deal_ticket=None if receipt.deal_ticket is None else str(receipt.deal_ticket),
             )
-        self._account = self._transport.account_info()
-        self._positions = self._transport.positions()
+        # Finding [4]: Separate confirmed dispatch outcome from post-fill account/position refresh.
+        # Once a valid non-rejected receipt is committed as CONFIRMED_FILLED, post-fill refresh failures
+        # must NEVER escape as failover-eligible transport errors or reroute the order to sibling venues.
+        reconciliation_required = False
+        refresh_errors: list[str] = []
+        account_after: Mt5AccountSnapshot | None = None
+        positions_after: tuple[Mt5Position, ...] = self._positions
+        try:
+            refreshed_account = self._transport.account_info()
+            self._account = refreshed_account
+            account_after = refreshed_account
+        except Exception as exc:
+            reconciliation_required = True
+            refresh_errors.append(f"account_info:{type(exc).__name__}")
+            logger.warning(
+                "%s post-fill account_info refresh failed after confirmed receipt %s (%s); reconciliation required",
+                self.broker_id,
+                request.request_id,
+                type(exc).__name__,
+            )
+        try:
+            refreshed_positions = self._transport.positions()
+            self._positions = refreshed_positions
+            positions_after = refreshed_positions
+        except Exception as exc:
+            reconciliation_required = True
+            refresh_errors.append(f"positions:{type(exc).__name__}")
+            logger.warning(
+                "%s post-fill positions refresh failed after confirmed receipt %s (%s); reconciliation required",
+                self.broker_id,
+                request.request_id,
+                type(exc).__name__,
+            )
+        post_fill_err = ";".join(refresh_errors) if refresh_errors else None
         record = self._audit.append("MT5_ORDER_RECEIPT", self._clock(), {
             "broker_id": self.broker_id,
             "order_id": order.order_id,
@@ -3098,8 +4136,10 @@ class Mt5PaperBrokerVenue:
             "request": request.to_spool_dict(),
             "receipt": receipt.to_wire_dict(),
             "margin_check": None if margin_check is None else margin_check.to_wire_dict(),
-            "account_after": self._account.to_wire_dict(),
-            "positions_after": [p.to_wire_dict() for p in self._positions],
+            "account_after": None if account_after is None else account_after.to_wire_dict(),
+            "positions_after": [p.to_wire_dict() for p in positions_after],
+            "reconciliation_required": reconciliation_required,
+            "post_fill_refresh_error": post_fill_err,
         })
         return Mt5ExecutionResult(
             broker_id=self.broker_id,
@@ -3107,11 +4147,13 @@ class Mt5PaperBrokerVenue:
             request=request,
             receipt=receipt,
             oanda_receipt=None,
-            account_after=self._account,
-            positions_after=self._positions,
+            account_after=account_after,
+            positions_after=positions_after,
             margin_check=margin_check,
             valve_mode=decision.valve_mode,
             audit_record=record,
+            reconciliation_required=reconciliation_required,
+            post_fill_refresh_error=post_fill_err,
         )
 
     @property
@@ -3238,18 +4280,27 @@ class OandaPracticeFallbackVenue:
         valve_gate: ForexMetaValveGate | None = None,
         expected_valve_weights_sha256: str | None = None,
         clock: Callable[[], datetime] | None = None,
+        summary_max_age_seconds: float = DEFAULT_OANDA_SUMMARY_MAX_AGE_SECONDS,
     ) -> None:
         if not isinstance(client, OandaPracticePaperClient):
-            raise ContractError("client must be OandaPracticePaperClient")
+            raise ContractError("OandaPracticeFallbackVenue requires an OandaPracticePaperClient")
+        if not isinstance(summary_max_age_seconds, (int, float)) or isinstance(summary_max_age_seconds, bool) or summary_max_age_seconds <= 0:
+            raise ContractError("summary_max_age_seconds must be a positive finite number")
         self.broker_id = BROKER_OANDA_LIVE if client.execution_mode == EXECUTION_MODE_LIVE else BROKER_OANDA_PRACTICE
         self._client = client
         self._valve_sha = _expected_valve_sha(valve_gate, expected_valve_weights_sha256)
         self._clock = clock or _utc_now
         self._audit = _AuditChain()
         self._summary: dict[str, Any] | None = None
+        self._summary_observed_at: datetime | None = None
+        self._summary_max_age_seconds = float(summary_max_age_seconds)
+        self._positions: tuple[Mt5Position, ...] = ()
+        self._open_trades: tuple[dict[str, Any], ...] = ()
+        self._position_units: dict[str, Decimal] = {}
+        self._calc = Mt5MarginCalculator(leverage=50)
 
     def __repr__(self) -> str:
-        return f"OandaPracticeFallbackVenue(client={self._client!r}, connected={self._summary is not None})"
+        return f"OandaPracticeFallbackVenue(connected={self._summary is not None})"
 
     @property
     def server(self) -> str:
@@ -3260,8 +4311,75 @@ class OandaPracticeFallbackVenue:
         return self._client
 
     @property
+    def mutation_journal(self) -> OandaMutationJournal:
+        return self._client._mutation_journal
+
+    @property
     def summary(self) -> dict[str, Any] | None:
         return self._summary
+
+    @property
+    def summary_observed_at(self) -> datetime | None:
+        return self._summary_observed_at
+
+    @property
+    def summary_max_age_seconds(self) -> float:
+        return self._summary_max_age_seconds
+
+    def is_summary_fresh(self, *, now: datetime | None = None, max_age_seconds: float | None = None) -> bool:
+        """Return True only when cached OANDA summary exists and observed_at is within the strict freshness TTL."""
+        if self._summary is None or self._summary_observed_at is None:
+            return False
+        check_now = self._clock() if now is None else utc_time(now, "now")
+        ttl = self._summary_max_age_seconds if max_age_seconds is None else float(max_age_seconds)
+        if ttl <= 0:
+            return False
+        age = (check_now - self._summary_observed_at).total_seconds()
+        return -5.0 <= age <= ttl
+
+    def require_fresh_summary(self, *, now: datetime | None = None, max_age_seconds: float | None = None) -> dict[str, Any]:
+        """Fail closed if OANDA account summary is missing or older than the freshness TTL (Finding [3])."""
+        if not self.is_summary_fresh(now=now, max_age_seconds=max_age_seconds):
+            raise Mt5TransportError(
+                f"{self.broker_id} account summary missing or stale beyond freshness TTL; refusing admission"
+            )
+        return dict(self._summary)  # type: ignore[arg-type]
+
+    def probe_account_summary(
+        self,
+        *,
+        now: datetime | None = None,
+        max_age_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Fetch a fresh OANDA NAV/margin summary with explicit observed_at & TTL enforcement (Finding [3])."""
+        if not self._client.is_active:
+            self._summary_observed_at = None
+            raise Mt5TransportError(f"{self.broker_id} client is inactive")
+        ts = self._clock() if now is None else utc_time(now, "now")
+        ttl = self._summary_max_age_seconds if max_age_seconds is None else float(max_age_seconds)
+        if ttl <= 0:
+            raise ContractError("max_age_seconds must be positive")
+        try:
+            summary = self._client.fetch_account_summary(now=ts)
+        except Exception:
+            self._summary_observed_at = None
+            raise
+        if not isinstance(summary, Mapping) or "observed_at" not in summary:
+            self._summary_observed_at = None
+            raise Mt5TransportError(f"{self.broker_id} account summary missing observed_at")
+        obs_dt = _parse_iso(summary["observed_at"], "observed_at")
+        age = (ts - obs_dt).total_seconds()
+        if age > ttl or age < -5.0:
+            self._summary_observed_at = None
+            raise Mt5TransportError(
+                f"{self.broker_id} account summary stale (age={age:.2f}s > ttl={ttl:.2f}s); failing closed"
+            )
+        # Validate NAV and margin_available parse cleanly as Decimals
+        parse_decimal(str(summary["nav"]), "nav")
+        parse_decimal(str(summary["margin_available"]), "margin_available")
+        self._summary = dict(summary)
+        self._summary_observed_at = obs_dt
+        return dict(summary)
 
     @property
     def nav(self) -> Decimal | None:
@@ -3291,22 +4409,92 @@ class OandaPracticeFallbackVenue:
                 else ENV_OANDA_PRACTICE_ACCOUNT_ID
             )
             raise Mt5NotConfiguredError(f"OANDA fallback requires {tok_env} and {acct_env}")
-        self._summary = self._client.fetch_account_summary(now=self._clock())
-        self._audit.append("OANDA_CONNECTED", self._clock(), {"broker_id": self.broker_id, "summary": self._summary})
-        return self._summary
+        summary = self.probe_account_summary(now=self._clock())
+        self._audit.append("OANDA_CONNECTED", self._clock(), {"broker_id": self.broker_id, "summary": summary})
+        return summary
+
+    def open_trades(self, *, now: datetime | None = None, refresh: bool = True) -> tuple[dict[str, Any], ...]:
+        """Fetch and cache authoritative open OANDA trades (Finding [12])."""
+        if self._summary is None:
+            raise Mt5TransportError(f"{self.broker_id} venue is not connected")
+        if refresh:
+            ts = self._clock() if now is None else utc_time(now, "now")
+            trades = self._client.fetch_open_trades(now=ts)
+            positions: list[Mt5Position] = []
+            units_map: dict[str, Decimal] = {}
+            for tr in trades:
+                tid = str(tr["trade_id"])
+                sym = str(tr["symbol"])
+                units_dec = parse_decimal(str(tr["units"]), "units")
+                units_map[tid] = units_dec
+                csize = self._calc.contract_size_for(sym)
+                with localcontext() as ctx:
+                    ctx.prec = 40
+                    lots_dec = (units_dec / csize).normalize()
+                positions.append(
+                    Mt5Position(
+                        ticket=tid,
+                        symbol=sym,
+                        side=Side(str(tr["side"])),
+                        volume_lots=lots_dec,
+                        price_open=parse_decimal(str(tr["price"]), "price"),
+                        stop_loss=(
+                            None
+                            if tr.get("stop_loss_price") is None
+                            else parse_decimal(str(tr["stop_loss_price"]), "stop_loss_price")
+                        ),
+                        profit=parse_decimal(str(tr["unrealized_pnl"]), "unrealized_pnl"),
+                        take_profit=(
+                            None
+                            if tr.get("take_profit_price") is None
+                            else parse_decimal(str(tr["take_profit_price"]), "take_profit_price")
+                        ),
+                    )
+                )
+            self._open_trades = tuple(dict(tr) for tr in trades)
+            self._positions = tuple(positions)
+            self._position_units = units_map
+        return self._open_trades
+
+    def positions(self, *, now: datetime | None = None, refresh: bool = True) -> tuple[Mt5Position, ...]:
+        """Return open OANDA positions mapped to typed Mt5Position snapshots (Finding [12])."""
+        if refresh:
+            self.open_trades(now=now, refresh=True)
+        return self._positions
+
+    def position_units(self, ticket: str) -> Decimal | None:
+        """Exact base units for an open OANDA trade_id (no lot-rounding loss)."""
+        return self._position_units.get(str(ticket))
+
+    def symbol_quote(self, symbol: str, *, now: datetime | None = None) -> tuple[Decimal, Decimal]:
+        """Fetch a fresh (bid, ask) quote for ``symbol`` via OANDA pricing."""
+        ts = self._clock() if now is None else utc_time(now, "now")
+        norm = str(symbol).strip().upper()
+        snap = self._client.fetch_pricing(pairs=(norm,), now=ts)
+        for q in snap.quotes:
+            if q.symbol == norm:
+                return q.bid, q.ask
+        raise Mt5TransportError(f"OANDA pricing missing quote for {norm}")
+
+    def reconcile_unknown_mutations(self, *, now: datetime | None = None, max_pages: int = 50) -> dict[str, Any]:
+        ts = self._clock() if now is None else utc_time(now, "now")
+        return self._client.reconcile_unknown_mutations(now=ts, max_pages=max_pages)
 
     def execute(self, order: OrderIntent, *, valve_decision: ValveDecision) -> Mt5ExecutionResult:
         if self._summary is None:
             raise Mt5TransportError("OANDA practice fallback is not connected")
         decision = require_valve_clearance(order, valve_decision, expected_weights_sha256=self._valve_sha)
+        now = self._clock()
         if order.kind is ActionKind.AMEND_STOP:
             receipt = self._client.amend_trade_protection(
                 trade_id=str(order.position_ticket),
                 stop_loss_price=order.stop_price,
                 take_profit_price=order.take_profit_price,
-                now=self._clock(),
+                now=now,
             )
         elif order.kind is ActionKind.OPEN:
+            # Finding [3]: Ensure fresh OANDA NAV & margin summary immediately before new-risk OPEN.
+            self.probe_account_summary(now=now)
             receipt = self._client.submit_paper_market_order(
                 symbol=order.symbol,
                 side=order.side,  # type: ignore[arg-type]
@@ -3315,16 +4503,69 @@ class OandaPracticeFallbackVenue:
                 stop_loss_price=order.stop_price,
                 take_profit_price=order.take_profit_price,
                 price_bound=order.limit_price,
-                now=self._clock(),
+                now=now,
+            )
+        elif order.kind in (ActionKind.CLOSE, ActionKind.REDUCE):
+            # Finding [12]: Fetch current trade state and validate symbol/ticket/units before closing/reducing.
+            tid = str(order.position_ticket)
+            current_trades = self.open_trades(now=now, refresh=True)
+            matched = next((tr for tr in current_trades if tr["trade_id"] == tid), None)
+            if matched is None:
+                raise Mt5BridgeError(f"OANDA open trade {tid} not found on {self.broker_id}")
+            if matched["symbol"] != order.symbol:
+                raise ContractError(f"OANDA trade {tid} symbol {matched['symbol']} does not match order {order.symbol}")
+            open_units = parse_decimal(str(matched["units"]), "units")
+            if order.kind is ActionKind.CLOSE:
+                if order.quantity_units is not None and order.quantity_units != open_units:
+                    raise ContractError("OANDA CLOSE quantity must equal full open trade units")
+                close_units: Decimal | str = "ALL"
+            else:
+                if order.quantity_units is None or not (Decimal("0") < order.quantity_units < open_units):
+                    raise ContractError("OANDA REDUCE quantity must be strictly positive and below open trade units")
+                close_units = order.quantity_units
+            receipt = self._client.close_trade(
+                trade_id=tid,
+                units=close_units,
+                client_order_id=order.order_id,
+                symbol=order.symbol,
+                action_kind=order.kind.value,
+                now=now,
             )
         else:
-            raise Mt5BridgeError(f"{order.kind.value} is not supported on the OANDA practice fallback v1")
+            raise Mt5BridgeError(f"{order.kind.value} is not supported on {self.broker_id}")
+
+        # Finding [3] & [12]: Immediately refresh account summary (and positions on CLOSE/REDUCE) after mutation.
+        # Never discard or reroute a confirmed mutation if post-mutation refresh fails; invalidate freshness TTL instead.
+        reconciliation_required = False
+        refresh_errors: list[str] = []
+        try:
+            self.probe_account_summary(now=self._clock())
+        except Exception as exc:
+            self._summary_observed_at = None
+            reconciliation_required = True
+            refresh_errors.append(f"summary:{type(exc).__name__}")
+            logger.warning(
+                "%s post-mutation summary refresh failed (%s); summary invalidated until reconciled",
+                self.broker_id,
+                type(exc).__name__,
+            )
+        positions_after: tuple[Mt5Position, ...] = self._positions
+        if order.kind in (ActionKind.CLOSE, ActionKind.REDUCE):
+            try:
+                positions_after = self.positions(now=self._clock(), refresh=True)
+            except Exception as exc:
+                reconciliation_required = True
+                refresh_errors.append(f"open_trades:{type(exc).__name__}")
+        post_err = ";".join(refresh_errors) if refresh_errors else None
         record = self._audit.append("OANDA_ORDER_RECEIPT", self._clock(), {
             "broker_id": self.broker_id,
             "order_id": order.order_id,
             "action_ref": order.action_ref,
+            "kind": order.kind.value,
             "valve_mode": decision.valve_mode,
             "receipt": receipt,
+            "reconciliation_required": reconciliation_required,
+            "post_fill_refresh_error": post_err,
         })
         return Mt5ExecutionResult(
             broker_id=self.broker_id,
@@ -3333,14 +4574,20 @@ class OandaPracticeFallbackVenue:
             receipt=None,
             oanda_receipt=receipt,
             account_after=None,
-            positions_after=(),
+            positions_after=positions_after,
             margin_check=None,
             valve_mode=decision.valve_mode,
             audit_record=record,
+            reconciliation_required=reconciliation_required,
+            post_fill_refresh_error=post_err,
         )
 
     def shutdown(self) -> None:
         self._summary = None
+        self._summary_observed_at = None
+        self._positions = ()
+        self._open_trades = ()
+        self._position_units = {}
 
 
 # ---------------------------------------------------------------------------
@@ -3354,19 +4601,26 @@ def _spool_channel(broker_id: str) -> str:
     return broker_id.lower()
 
 
-def build_default_mt5_transport(broker_id: str, mode: str, spool_root: str | None) -> Mt5Transport:
+def build_default_mt5_transport(
+    broker_id: str,
+    mode: str,
+    spool_root: str | None,
+    *,
+    key_dir: str | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> Mt5Transport:
     """Pick the MT5 transport for ``mode``; evaluated only at activation time (never on import)."""
     if mode == TRANSPORT_NATIVE_PYTHON:
-        return Mt5NativePythonTransport()
+        return Mt5NativePythonTransport(clock=clock)
     if mode == TRANSPORT_SPOOL_BRIDGE:
         if not spool_root:
             raise Mt5NotConfiguredError(f"{ENV_MT5_SPOOL_DIR} is required for SPOOL_BRIDGE transport")
-        return Mt5SpoolBridgeTransport(Path(spool_root) / _spool_channel(broker_id))
+        return Mt5SpoolBridgeTransport(Path(spool_root) / _spool_channel(broker_id), key_dir=key_dir, clock=clock)
     if mode == TRANSPORT_AUTO:
         if os.name == "nt" and importlib.util.find_spec("MetaTrader5") is not None:
-            return Mt5NativePythonTransport()
+            return Mt5NativePythonTransport(clock=clock)
         if spool_root:
-            return Mt5SpoolBridgeTransport(Path(spool_root) / _spool_channel(broker_id))
+            return Mt5SpoolBridgeTransport(Path(spool_root) / _spool_channel(broker_id), key_dir=key_dir, clock=clock)
         raise Mt5NotConfiguredError(
             f"AUTO transport found neither the MetaTrader5 SDK nor {ENV_MT5_SPOOL_DIR}"
         )
@@ -3402,7 +4656,10 @@ class BrokerHierarchyRouter:
             raise ContractError("BrokerHierarchyRouter requires a ForexMetaValveGate; 1:500 never bypasses the Valve")
         self._env = {k: v for k, v in environ.items() if isinstance(k, str) and k.startswith("CAS_FOREX_")}
         self.execution_mode, self._live_armed = resolve_execution_mode(
-            self._env, execution_mode=execution_mode, live_arm_phrase=live_arm_phrase
+            self._env,
+            execution_mode=execution_mode,
+            live_arm_phrase=live_arm_phrase,
+            now=(clock() if clock is not None else None),
         )
         if execution_mode is not None:
             self._env[ENV_EXECUTION_MODE] = self.execution_mode
@@ -3448,6 +4705,7 @@ class BrokerHierarchyRouter:
         self.primary_broker = primary
         self.transport_mode = mode
         self._spool_root = resolve_mt5_spool_dir(self._env)
+        self._spool_key_dir = _env_get(self._env, ENV_MT5_SPOOL_KEY_DIR) or None
         self.priority_order: tuple[str, ...] = (primary,) + tuple(b for b in base_chain if b != primary)
 
         self._servers: dict[str, str | None] = {
@@ -3461,6 +4719,7 @@ class BrokerHierarchyRouter:
                 password_required=(mode != TRANSPORT_SPOOL_BRIDGE),
                 execution_mode=self.execution_mode,
                 live_arm_phrase=(REQUIRED_LIVE_ARM_PHRASE if self._live_armed else None),
+                now=self._clock() if clock is not None else None,
             )
             for b in (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5)
         }
@@ -3518,12 +4777,22 @@ class BrokerHierarchyRouter:
                     execution_mode=self.execution_mode,
                     live_arm_phrase=(REQUIRED_LIVE_ARM_PHRASE if self._live_armed else None),
                     mutation_journal=self._oanda_mutation_journal,
+                    clock=self._clock,
                 )
             return OandaPracticeFallbackVenue(client=client, valve_gate=self._valve_gate, clock=self._clock)
         creds = self._credentials[broker_id]
         if creds is None:
             raise Mt5NotConfiguredError(f"{broker_id} has no runtime credentials")
-        transport = self._transport_factory(broker_id, self.transport_mode, self._spool_root)
+        if self._transport_factory is build_default_mt5_transport:
+            transport = build_default_mt5_transport(
+                broker_id,
+                self.transport_mode,
+                self._spool_root,
+                key_dir=self._spool_key_dir,
+                clock=self._clock,
+            )
+        else:
+            transport = self._transport_factory(broker_id, self.transport_mode, self._spool_root)
         raw_idx_lev = str(self._env.get(ENV_INDEX_LEVERAGE, "")).strip()
         if raw_idx_lev:
             try:

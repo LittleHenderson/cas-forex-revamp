@@ -259,7 +259,7 @@ class Pr17LiveReadinessAndCloseAccountingTests(unittest.TestCase):
                     BROKER_HUGOSWAY_MT5: Decimal("1200"),
                     BROKER_LHFX_MT5: Decimal("800"),
                 },
-                clock=lambda: T0,
+                clock=lambda: datetime.now(timezone.utc),
             )
             snap_live = safe_broker_routing_payload(router_live.routing_snapshot())
             lr_live = snap_live["live_readiness"]
@@ -275,8 +275,8 @@ class Pr17LiveReadinessAndCloseAccountingTests(unittest.TestCase):
         router = DualShieldBrokerRouter(
             environ={
                 ENV_EXECUTION_MODE: EXECUTION_MODE_DEMO,
-                "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "5.00",
-                "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.20",
+                "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "1.00",
+                "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.10",
             },
             valve_gate=GATE,
             oracle=oracle,
@@ -335,7 +335,7 @@ class Pr17LiveReadinessAndCloseAccountingTests(unittest.TestCase):
         trader._last_regime = REGIME_STRONG_TREND
         pre_snap = trader.status_snapshot(now=T0)
         self.assertEqual(pre_snap["risk_gear"]["active_gear"], ACTIVE_GEAR_STRONG_TREND_RUNNER)
-        self.assertEqual(pre_snap["risk_gear"]["effective_risk_pct"], "5")
+        self.assertEqual(pre_snap["risk_gear"]["effective_risk_pct"], "1")
 
         trader._open_position_meta["88001"] = {
             "ticket": "88001",
@@ -368,7 +368,7 @@ class Pr17LiveReadinessAndCloseAccountingTests(unittest.TestCase):
 
         post_snap = trader.status_snapshot(now=t1)
         self.assertEqual(post_snap["risk_gear"]["active_gear"], ACTIVE_GEAR_CONSERVATIVE)
-        self.assertEqual(post_snap["risk_gear"]["effective_risk_pct"], "1")
+        self.assertEqual(post_snap["risk_gear"]["effective_risk_pct"], "0.5")
 
         # 3. Zero-profit metadata estimates realized P&L from quote & sanitizes non-identifier ticket safely
         trader._open_position_meta["#tkt/sl 99"] = {
@@ -396,8 +396,8 @@ class Pr17LiveReadinessAndCloseAccountingTests(unittest.TestCase):
         router = DualShieldBrokerRouter(
             environ={
                 ENV_EXECUTION_MODE: EXECUTION_MODE_DEMO,
-                "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "5.00",
-                "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.20",
+                "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "1.00",
+                "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.10",
             },
             valve_gate=GATE,
             oracle=oracle,

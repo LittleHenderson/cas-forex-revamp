@@ -36,6 +36,8 @@ from cas_forex_revamp.operator.frontier_backends import (
     FrontierConfigurationError,
     FrontierModelRegistry,
     FrontierTransportError,
+    SupervisedOllamaBinding,
+    SupervisedOllamaReceiptSigner,
     _RedactedSecret,
     _validate_frontier_https_url,
 )
@@ -288,7 +290,12 @@ class _FakeFrontierHttp:
             "reason": f"ID=0{self.choice_ref} ollama fallback verified",
             "evidence_ids": [e["evidence_id"] for e in user_doc["evidence"][:1]] or ["ev-1"],
         }
-        return 200, json.dumps({"message": {"content": json.dumps(sel)}, "eval_count": 35}).encode()
+        sel_json = json.dumps(sel)
+        resp_obj: dict = {"message": {"content": sel_json}, "eval_count": 35}
+        sup_cb = getattr(self, "ollama_receipt_builder", None)
+        if callable(sup_cb):
+            resp_obj["cas_supervisor_receipt"] = sup_cb(sel_json)
+        return 200, json.dumps(resp_obj).encode()
 
 
 def _decision_proposal(order: OrderIntent, *, gate, view: dict, reason: str = "Verified signal"):
@@ -655,7 +662,39 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
             "CAS_FOREX_DEEPSEEK_API_KEY": "test-placeholder-ds-alpha-01",
             "CAS_FOREX_OLLAMA_FALLBACK_ENABLED": "1",
         }
-        reg = FrontierModelRegistry(environ=env, clock=lambda: T0, http_post=fake_http, ollama_http_post=fake_http, resolve_dns=lambda _h: None)
+        import os
+        from hashlib import sha256 as _sha256
+
+        sup_signer = SupervisedOllamaReceiptSigner(
+            algorithm="Ed25519",
+            signing_key=bytes(range(10, 42)),
+            pid=os.getpid(),
+            start_time="p6-ollama-start-1",
+        )
+        sup_binding = SupervisedOllamaBinding(
+            pid=os.getpid(),
+            start_time="p6-ollama-start-1",
+            executable_sha256="a" * 64,
+            model_manifest_sha256="b" * 64,
+            weights_sha256="c" * 64,
+            template_sha256="d" * 64,
+            tokenizer_sha256="e" * 64,
+            endpoint_url="http://127.0.0.1:21435/api/chat",
+            auth_secret="p6-sup-token-" + ("z" * 32),
+            receipt_verify_key=sup_signer.public_verify_key(),
+            receipt_algorithm="Ed25519",
+            process_verifier=lambda _b: True,
+            artifact_verifier=lambda _b: True,
+            listener_ownership_verifier=lambda _b: True,
+        )
+        reg = FrontierModelRegistry(
+            environ=env,
+            clock=lambda: T0,
+            http_post=fake_http,
+            ollama_http_post=fake_http,
+            resolve_dns=lambda _h: None,
+            supervised_ollama=sup_binding,
+        )
         snap = assert_safe_ai_catalog_payload(reg.catalog_snapshot())
         self.assertEqual([m["model_id"] for m in snap["models"]], expected_order)
         self.assertEqual(snap["active_model_id"], "claude-fable-5.2")
@@ -722,6 +761,25 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
         budget = InferenceBudget(max_calls=1, max_input_tokens_per_call=16_384, max_generated_tokens_per_call=256, max_seconds_per_call=10, max_total_seconds=10)
         for mid in ("claude-fable-5.2", "gemini-decision-1", "openai-astra", "qwen3:0.6b"):
             spec, backend, verifier = reg.build_backend(mid)
+            if mid == "qwen3:0.6b":
+                from cas_forex_revamp.operator.model import ModelInvocation
+
+                expected_inv = ModelInvocation(
+                    content_digest(req),
+                    spec,
+                    "session-" + content_digest(("isolated", req.request_id, 0)),
+                    SYSTEM_POLICY,
+                    canonical_bytes(req).decode("utf-8"),
+                    budget,
+                )
+                exp_inv_sha = content_digest(expected_inv)
+                fake_http.ollama_receipt_builder = lambda sel_text, _sha=exp_inv_sha, _sp=spec: sup_signer.sign_receipt(
+                    receipt_id="rcpt-ollama-p6-1",
+                    invocation_sha256=_sha,
+                    model_id=_sp.model_id,
+                    artifact_sha256=_sp.artifact_sha256,
+                    response_sha256=_sha256(sel_text.encode("utf-8")).hexdigest(),
+                )
             out = ActualModelDecisionAdapter(
                 adapter_id=f"test-{mid}",
                 model=spec,
@@ -779,7 +837,7 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
             )
             srv.start()
             try:
-                tok = srv.bootstrap_url.split("token=")[1]
+                tok = srv.auth_token
                 conn = http.client.HTTPConnection("127.0.0.1", srv.bound_port, timeout=5)
                 conn.request("GET", "/api/ai-models")
                 r_unauth = conn.getresponse()

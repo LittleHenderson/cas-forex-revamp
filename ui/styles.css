@@ -1295,3 +1295,46 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
   color: #94a3b8;
   font-size: 11.5px;
 }
+
+/* PR #25: Single-Use Pairing Nonce Privilege Badges & Paired Read-Only Session Guards */
+.session-scope-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 4px 10px;
+  border: 2px solid var(--mf-green);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.session-scope-badge.is-owner-control {
+  border-color: var(--mf-green);
+  color: var(--mf-green);
+  background: rgba(22, 163, 74, 0.12);
+}
+.session-scope-badge.is-paired-readonly {
+  border-color: var(--orange);
+  color: var(--orange);
+  background: var(--warning-surface);
+}
+.stepup-unlock-bar {
+  margin-bottom: 16px;
+  border-color: var(--orange);
+  background: var(--warning-surface);
+}
+.stepup-lock-label {
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--orange);
+}
+.paired-readonly-note {
+  margin: 8px 0 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--orange);
+  border-left-width: 4px;
+  background: var(--warning-surface);
+  color: var(--ink);
+}

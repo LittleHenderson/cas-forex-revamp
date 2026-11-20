@@ -489,39 +489,165 @@ export function renderQrSvg(text, { margin = 4, ecLevel = 'M', ariaLabel = 'Devi
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${viewSize} ${viewSize}" width="220" height="220" class="qr-pairing-svg" shape-rendering="crispEdges" role="img" aria-label="${esc(ariaLabel)}"><rect width="${viewSize}" height="${viewSize}" fill="#ffffff"/><path fill="#000000" d="${paths.join('')}"/></svg>`;
 }
 
-/** Build a validated same-origin private cockpit pairing URL without storing or logging secrets. */
-export function buildPairingUrl(origin, token) {
-  if (typeof token !== 'string' || token.trim().length < 16 || /[\r\n\0]/.test(token)) {
-    throw new Error('Valid cockpit access token required to generate pairing QR.');
+export const SESSION_SCOPES = Object.freeze({
+  OWNER_FULL_CONTROL: 'OWNER_FULL_CONTROL',
+  DEVICE_READ_AND_EXPLAINER: 'DEVICE_READ_AND_EXPLAINER',
+});
+
+export const PAIRING_DEFAULT_TTL_SECONDS = 120;
+
+/** Return true only when the live cockpit session holds full owner control authority. */
+export function isOwnerControlSession(state) {
+  if (!state?.liveStreamConnected) return false;
+  if (state?.sessionScope === SESSION_SCOPES.DEVICE_READ_AND_EXPLAINER) return false;
+  if (state?.ownerControlsAllowed === false) return false;
+  return true;
+}
+
+/** Build a validated same-origin single-use pairing URL (?pair_code=...) without ever embedding a bearer token. */
+export function buildPairingUrl(origin, pairCode) {
+  if (typeof pairCode !== 'string') {
+    throw new Error('Valid single-use pairing code required to generate pairing QR.');
+  }
+  const trimmed = pairCode.trim();
+  if (trimmed.length < 16 || /[\r\n\0\s]/.test(trimmed) || /(?:^|[?&])token=/i.test(trimmed)) {
+    throw new Error('Valid single-use pairing code required to generate pairing QR.');
   }
   const parsedOrigin = new URL(String(origin));
   if (!['http:', 'https:'].includes(parsedOrigin.protocol)) {
     throw new Error('Pairing QR requires HTTP or HTTPS origin.');
   }
-  return `${parsedOrigin.origin}/ui/index.html?token=${encodeURIComponent(token.trim())}`;
+  return `${parsedOrigin.origin}/ui/index.html?pair_code=${encodeURIComponent(trimmed)}`;
 }
 
-export function renderQrPairingDrawer(qrSvgMarkup, copiedNotice = null) {
+/**
+ * Strip ?pair_code= and any legacy ?token= from browser URL immediately on boot before network I/O.
+ * Never accepts or returns ?token= as an authentication credential.
+ */
+export function extractAndStripBootPairingParams(locationObj, historyObj = null) {
+  if (!locationObj || typeof locationObj.search !== 'string') {
+    return Object.freeze({ pairCode: null, strippedLegacyToken: false, cleanPath: '' });
+  }
+  const params = new URLSearchParams(locationObj.search);
+  const hadLegacyToken = params.has('token');
+  const hadPairCode = params.has('pair_code');
+  const rawPairCode = params.get('pair_code');
+  let cleanPath = `${locationObj.pathname ?? '/'}${locationObj.search ?? ''}${locationObj.hash ?? ''}`;
+  if (hadLegacyToken || hadPairCode) {
+    params.delete('token');
+    params.delete('pair_code');
+    const qs = params.toString();
+    cleanPath = `${locationObj.pathname ?? '/'}${qs ? `?${qs}` : ''}${locationObj.hash ?? ''}`;
+    try { historyObj?.replaceState?.(null, '', cleanPath); } catch { /* Optional history API */ }
+  }
+  let validPairCode = null;
+  if (typeof rawPairCode === 'string') {
+    const trimmed = rawPairCode.trim();
+    if (trimmed.length >= 16 && !/[\r\n\0\s]/.test(trimmed)) {
+      validPairCode = trimmed;
+    }
+  }
+  return Object.freeze({
+    pairCode: validPairCode,
+    strippedLegacyToken: Boolean(hadLegacyToken),
+    cleanPath,
+  });
+}
+
+/** Validate POST /api/pair-code response and guarantee primary bearer is never echoed as pair_code. */
+export function normalizePairCodeMintResponse(doc, primaryOwnerBearer = null) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+    throw new Error('Invalid pair-code response payload.');
+  }
+  const code = typeof doc.pair_code === 'string' ? doc.pair_code.trim() : '';
+  if (code.length < 16 || /[\r\n\0\s]/.test(code)) {
+    throw new Error('Server returned an invalid single-use pairing code.');
+  }
+  if (typeof primaryOwnerBearer === 'string' && primaryOwnerBearer.trim().length > 0 && code === primaryOwnerBearer.trim()) {
+    throw new Error('Refusing pairing code that matches primary owner bearer.');
+  }
+  const rawTtl = Number.isSafeInteger(doc.ttl_seconds) ? doc.ttl_seconds : PAIRING_DEFAULT_TTL_SECONDS;
+  const ttlSeconds = Math.max(5, Math.min(300, rawTtl));
+  const expiresAt = typeof doc.expires_at === 'string' && doc.expires_at.length <= 64 ? doc.expires_at : null;
+  const scope = doc.scope === SESSION_SCOPES.OWNER_FULL_CONTROL
+    ? SESSION_SCOPES.OWNER_FULL_CONTROL
+    : SESSION_SCOPES.DEVICE_READ_AND_EXPLAINER;
+  return Object.freeze({ pairCode: code, expiresAt, ttlSeconds, scope });
+}
+
+/** Validate POST /api/pair-exchange response returning a least-privilege device bearer. */
+export function normalizePairExchangeResponse(doc) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+    throw new Error('Invalid pair-exchange response payload.');
+  }
+  const sessionToken = typeof doc.session_token === 'string' ? doc.session_token.trim() : '';
+  if (sessionToken.length < 16 || /[\r\n\0]/.test(sessionToken)) {
+    throw new Error('Server returned an invalid paired device session credential.');
+  }
+  const sessionScope = doc.session_scope === SESSION_SCOPES.OWNER_FULL_CONTROL
+    ? SESSION_SCOPES.OWNER_FULL_CONTROL
+    : SESSION_SCOPES.DEVICE_READ_AND_EXPLAINER;
+  const ownerControlsAllowed = Boolean(
+    doc.owner_controls_allowed === true && sessionScope === SESSION_SCOPES.OWNER_FULL_CONTROL,
+  );
+  const sessionEpoch = typeof doc.session_epoch === 'string' && doc.session_epoch.length <= 64 ? doc.session_epoch : null;
+  const expiresAt = typeof doc.expires_at === 'string' && doc.expires_at.length <= 64 ? doc.expires_at : null;
+  return Object.freeze({
+    sessionToken,
+    sessionScope,
+    ownerControlsAllowed,
+    sessionEpoch,
+    expiresAt,
+  });
+}
+
+/** Validate GET /api/auth-session readback for authoritative session privilege display. */
+export function normalizeAuthSessionResponse(doc) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc) || doc.authenticated !== true) {
+    return null;
+  }
+  const sessionScope = doc.session_scope === SESSION_SCOPES.DEVICE_READ_AND_EXPLAINER
+    ? SESSION_SCOPES.DEVICE_READ_AND_EXPLAINER
+    : SESSION_SCOPES.OWNER_FULL_CONTROL;
+  const ownerControlsAllowed = sessionScope === SESSION_SCOPES.OWNER_FULL_CONTROL
+    && doc.owner_controls_allowed !== false;
+  const expiresAt = typeof doc.expires_at === 'string' && doc.expires_at.length <= 64 ? doc.expires_at : null;
+  return Object.freeze({
+    authenticated: true,
+    sessionScope,
+    ownerControlsAllowed,
+    expiresAt,
+  });
+}
+
+export function renderQrPairingDrawer(qrSvgMarkup, copiedNotice = null, options = null) {
   if (typeof qrSvgMarkup !== 'string' || !qrSvgMarkup.startsWith('<svg ')) return '';
-  return `<section class="panel qr-pairing-drawer" data-qr-pairing-panel="true" aria-label="One-Second Phone and Tablet QR Pairing">
+  const ttlSeconds = Number.isSafeInteger(options?.ttlSeconds) ? options.ttlSeconds : PAIRING_DEFAULT_TTL_SECONDS;
+  const expiresAt = typeof options?.expiresAt === 'string' && options.expiresAt.trim() ? options.expiresAt.trim() : null;
+  const scopeLabel = typeof options?.scopeLabel === 'string' && options.scopeLabel.trim()
+    ? options.scopeLabel.trim()
+    : SESSION_SCOPES.DEVICE_READ_AND_EXPLAINER;
+  const expiryDetail = expiresAt ? `${ttlSeconds}s single-use TTL · Expires ${esc(expiresAt)}` : `${ttlSeconds}s single-use server TTL`;
+  return `<section class="panel qr-pairing-drawer" data-qr-pairing-panel="true" aria-label="Single-Use Phone and Tablet QR Pairing">
     <div class="section-heading">
       <div>
-        <p class="eyebrow">INSTANT CAMERA UNLOCK · AUTO-CLOSES IN 120 SECONDS</p>
-        <h2>Pair Phone or Android Tablet (1-Second QR Scan)</h2>
+        <p class="eyebrow">SINGLE-USE PAIRING NONCE · ${expiryDetail} · ZERO PRIMARY BEARER IN URL</p>
+        <h2>Pair Phone or Android Tablet (Least-Privilege Read &amp; Explainer Session)</h2>
       </div>
       <div class="qr-pairing-actions">
-        <button type="button" class="button button-small button-secondary" data-copy-unlock-link="true">Copy Private Unlock Link</button>
+        <button type="button" class="button button-small button-secondary" data-copy-unlock-link="true">Copy Single-Use Pairing Link</button>
+        <button type="button" class="button button-small button-warning" data-revoke-qr-pairing="true">Revoke Pairing Code</button>
         <button type="button" class="button button-small button-primary" data-toggle-qr-pairing="true">Hide QR</button>
       </div>
     </div>
     <div class="qr-pairing-body">
       <div class="qr-pairing-frame">${qrSvgMarkup}</div>
       <div class="qr-pairing-instructions">
-        <p><strong>How to unlock your tablet or phone without typing:</strong></p>
+        <p><strong>Least-Privilege Read &amp; Explainer Session (<code>${esc(scopeLabel)}</code>):</strong></p>
         <ol class="qr-pairing-steps">
-          <li>Open the Camera app on your Android tablet or iPhone and point it at this QR square.</li>
-          <li>Tap the link banner that appears — your tablet signs in automatically, strips <code>?token=</code> from the address bar, and loads live Banked Session Profits &amp; Gemini 4 Neon Voice.</li>
-          <li>Keep this QR private (anyone who scans it can view your cockpit until rotated). It hides automatically after 120 seconds.</li>
+          <li>Open the Camera app on your Android tablet or iPhone and scan this single-use QR square within <strong>${esc(ttlSeconds)} seconds</strong>.</li>
+          <li>Your tablet strips <code>?pair_code=</code> immediately from browser history and exchanges the one-time nonce via <code>POST /api/pair-exchange</code> — your Primary Owner Key is never placed in URLs, QR codes, or server query logs.</li>
+          <li>Paired devices can view live 3-Broker Equity, Realized P&amp;L Provenance, and Gemini 4 Neon Voice Explainer while <strong>owner trading, model, risk-gear, and treasury controls stay locked</strong>. Click <strong>Revoke Pairing Code</strong> anytime to invalidate unused codes and active paired device sessions on the server.</li>
         </ol>
         ${copiedNotice ? `<p class="quiet-note" role="status">${esc(copiedNotice)}</p>` : ''}
       </div>

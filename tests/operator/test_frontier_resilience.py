@@ -40,6 +40,8 @@ from cas_forex_revamp.operator.frontier_backends import (
     FrontierOperationKind,
     FrontierReceiptVerifier,
     FrontierTransportError,
+    SupervisedOllamaBinding,
+    SupervisedOllamaReceiptSigner,
     ProviderCircuitBreaker,
     RetryPolicy,
     assert_safe_ai_catalog_payload,
@@ -556,9 +558,35 @@ class FrontierResilienceTests(unittest.TestCase):
         self.assertEqual(reg.catalog_snapshot()["models"][7]["calls"], 1)
 
     def test_failed_and_ollama_calls_meter_zero_and_adapter_compatible(self) -> None:
+        import os
+        from hashlib import sha256 as _sha256
+
         env = dict(self._test_secrets())
         env["CAS_FOREX_OLLAMA_FALLBACK_ENABLED"] = "1"
         fail_flag = [True]
+        signer = SupervisedOllamaReceiptSigner(
+            algorithm="Ed25519",
+            signing_key=bytes(range(1, 33)),
+            pid=os.getpid(),
+            start_time="unit-start-1",
+        )
+        binding = SupervisedOllamaBinding(
+            pid=os.getpid(),
+            start_time="unit-start-1",
+            executable_sha256="1" * 64,
+            model_manifest_sha256="2" * 64,
+            weights_sha256="3" * 64,
+            template_sha256="4" * 64,
+            tokenizer_sha256="5" * 64,
+            endpoint_url="http://127.0.0.1:21434/api/chat",
+            auth_secret="sup-auth-" + ("a" * 32),
+            receipt_verify_key=signer.public_verify_key(),
+            receipt_algorithm="Ed25519",
+            process_verifier=lambda _b: True,
+            artifact_verifier=lambda _b: True,
+            listener_ownership_verifier=lambda _b: True,
+        )
+        pending_inv_ref: list[tuple[str, str, str]] = []
 
         def mixed_http(url: str, headers: dict, body: bytes, timeout: float, max_bytes: int):
             if "127.0.0.1" in url:
@@ -570,10 +598,20 @@ class FrontierResilienceTests(unittest.TestCase):
                     "reason": "ID=0wait_none",
                     "evidence_ids": ["ev-1"],
                 }
+                sel_json = json.dumps(sel)
+                inv_sha, m_id, art_sha = pending_inv_ref[0]
+                sup_rcpt = signer.sign_receipt(
+                    receipt_id="rcpt-ollama-sup-1",
+                    invocation_sha256=inv_sha,
+                    model_id=m_id,
+                    artifact_sha256=art_sha,
+                    response_sha256=_sha256(sel_json.encode("utf-8")).hexdigest(),
+                )
                 return 200, json.dumps({
-                    "message": {"content": json.dumps(sel)},
+                    "message": {"content": sel_json},
                     "prompt_eval_count": 500,
                     "eval_count": 30,
+                    "cas_supervisor_receipt": sup_rcpt,
                 }).encode("utf-8")
             if fail_flag[0]:
                 return 503, b"{}"
@@ -588,6 +626,7 @@ class FrontierResilienceTests(unittest.TestCase):
             ollama_http_post=mixed_http,
             resolve_dns=lambda _h: None,
             retry_policy=RetryPolicy(max_attempts=1),
+            supervised_ollama=binding,
         )
         # Failed Anthropic call charges 0
         spec_a, backend_a, _ = reg.build_backend("claude-fable-5.2")
@@ -596,9 +635,12 @@ class FrontierResilienceTests(unittest.TestCase):
         self.assertEqual(reg.catalog_snapshot()["total_spend_micro_usd"], 0)
         self.assertEqual(reg.catalog_snapshot()["total_units"], 0)
 
-        # Ollama fallback call meters units but strictly 0 USD
-        spec_q, backend_q, _ = reg.build_backend("qwen3:0.6b")
-        backend_q.infer(_make_invocation(backend_q, spec_q, req_id="req-adp"))
+        # Ollama fallback call meters units but strictly 0 USD (requires SupervisedOllamaBinding & independent receipt)
+        spec_q, backend_q, verifier_q = reg.build_backend("qwen3:0.6b")
+        inv_q = _make_invocation(backend_q, spec_q, req_id="req-adp")
+        pending_inv_ref.append((content_digest(inv_q), spec_q.model_id, spec_q.artifact_sha256))
+        rep_q = backend_q.infer(inv_q)
+        self.assertTrue(verifier_q.verify(rep_q, inv_q))
         snap_q = assert_safe_ai_catalog_payload(reg.catalog_snapshot())
         q_item = snap_q["models"][8]
         self.assertEqual(q_item["model_id"], "qwen3:0.6b")

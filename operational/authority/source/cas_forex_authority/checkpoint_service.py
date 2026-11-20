@@ -5,8 +5,10 @@ bootstrap must separately supply the listener and selected process identities.
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 import array
 import os
 import socket
@@ -14,8 +16,8 @@ import stat
 import struct
 
 from cas_forex_operational_contracts import checkpoint as ck, capture
-from cas_forex_operational_contracts.common import MAX_OBJECT, canonical_bytes, digest
-from .authentication import AuthorityError, need, same
+from cas_forex_operational_contracts.common import MAX_OBJECT, canonical_bytes, digest, utc
+from .authentication import AuthorityError, need, same, stamp_le
 
 
 def _process_stat(pid):
@@ -154,17 +156,123 @@ class CredentialFramer:
         self._peer(connection, expected)
 
 
+def _stamp_expired(actual, deadline) -> bool:
+    """Return True once ``actual`` has reached or passed ``deadline`` in UTC or boottime_ns.
+
+    Matches OriginalGuard.remaining() which requires strictly positive remaining time in both
+    clocks; once expired, any replayed request with that deadline is rejected with
+    SETUP_DEADLINE_EXPIRED before replay-cache consultation.
+    """
+    return utc(actual["utc"]) >= utc(deadline["utc"]) or actual["boottime_ns"] >= deadline["boottime_ns"]
+
+
 class CheckpointService:
-    def __init__(self, *, authentication, store, signer, peers, own_process):
+    DEFAULT_PER_PRINCIPAL_READ_CAPACITY = 256
+    DEFAULT_PER_PRINCIPAL_RATE_LIMIT = 256
+    DEFAULT_RATE_WINDOW_NS = 1_000_000_000  # 1s sliding rate window per principal
+
+    def __init__(
+        self,
+        *,
+        authentication,
+        store,
+        signer,
+        peers,
+        own_process,
+        per_principal_read_capacity: int = DEFAULT_PER_PRINCIPAL_READ_CAPACITY,
+        per_principal_rate_limit: int = DEFAULT_PER_PRINCIPAL_RATE_LIMIT,
+        rate_window_ns: int = DEFAULT_RATE_WINDOW_NS,
+    ):
+        need(type(per_principal_read_capacity) is int and per_principal_read_capacity >= 1, "CONTEXT_MISMATCH")
+        need(type(per_principal_rate_limit) is int and per_principal_rate_limit >= 1, "CONTEXT_MISMATCH")
+        need(type(rate_window_ns) is int and rate_window_ns >= 1, "CONTEXT_MISMATCH")
         self.auth, self.store, self.signer = authentication, store, signer
         self.peers, self.own_process = peers, own_process
         self.framer = CredentialFramer(guard=authentication.guard, peers=peers)
         self.authority_id = authentication.principal("INDEPENDENT_CHECKPOINT_CUSTODIAN")["principal_id"]
-        self._seen = set()
+        self._per_principal_read_capacity = per_principal_read_capacity
+        self._per_principal_rate_limit = per_principal_rate_limit
+        self._rate_window_ns = rate_window_ns
+        self._lock = RLock()
+        # Isolated per-principal expiring replay windows for READ_CURRENT / LOOKUP_TRANSITION.
+        # Filling Principal A's capacity NEVER exhausts or affects Principal B.
+        self._read_replay_by_principal: dict[str, dict[str, dict]] = {
+            g["principal_id"]: {} for g in self.auth.access["callers"]
+        }
+        # Isolated per-principal sliding-window rate limiter (boottime_ns timestamps).
+        self._rate_window_by_principal: dict[str, deque[int]] = {
+            g["principal_id"]: deque() for g in self.auth.access["callers"]
+        }
+        # Operation-aware durable mutation nonce ledger for ADVANCE (never evicted on cache maintenance).
+        self._advance_nonces_by_principal: dict[str, dict[str, str]] = {
+            g["principal_id"]: {} for g in self.auth.access["callers"]
+        }
+
+    def _prune_principal_unlocked(self, principal_id: str, actual) -> int:
+        read_map = self._read_replay_by_principal.setdefault(principal_id, {})
+        expired = [n for n, dl in read_map.items() if _stamp_expired(actual, dl)]
+        for n in expired:
+            del read_map[n]
+        rate_q = self._rate_window_by_principal.setdefault(principal_id, deque())
+        cutoff_ns = actual["boottime_ns"] - self._rate_window_ns
+        while rate_q and rate_q[0] <= cutoff_ns:
+            rate_q.popleft()
+        return len(expired)
+
+    def expire_replay_windows(self, *, now=None) -> int:
+        """Expire all past-deadline read/lookup replay entries across principals.
+
+        Mutating ADVANCE nonces are preserved intact across cache maintenance.
+        """
+        _, actual = self.auth.current(now)
+        removed = 0
+        with self._lock:
+            for principal_id in list(self._read_replay_by_principal.keys()):
+                removed += self._prune_principal_unlocked(principal_id, actual)
+        return removed
+
+    def replay_cache_stats(self) -> dict[str, dict[str, int]]:
+        with self._lock:
+            principals = set(self._read_replay_by_principal) | set(self._advance_nonces_by_principal)
+            return {
+                pid: {
+                    "active_read_nonces": len(self._read_replay_by_principal.get(pid, {})),
+                    "read_capacity": self._per_principal_read_capacity,
+                    "durable_advance_nonces": len(self._advance_nonces_by_principal.get(pid, {})),
+                    "rate_window_count": len(self._rate_window_by_principal.get(pid, ())),
+                    "rate_limit": self._per_principal_rate_limit,
+                }
+                for pid in sorted(principals)
+            }
+
+    def _record_durable_advance_nonce(self, *, principal_id: str, nonce_hex: str, request_sha256: str, issued, deadline) -> None:
+        database = getattr(self.store, "database", None)
+        tx_fn = getattr(database, "transaction", None)
+        if not callable(tx_fn):
+            return
+        with tx_fn(final_guard=self.auth.current) as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS rpc_advance_nonces ("
+                "principal_id TEXT NOT NULL,"
+                "nonce_hex TEXT NOT NULL,"
+                "request_sha256 TEXT NOT NULL,"
+                "issued_utc TEXT NOT NULL,"
+                "deadline_utc TEXT NOT NULL,"
+                "PRIMARY KEY (principal_id, nonce_hex))"
+            )
+            existing = db.execute(
+                "SELECT request_sha256 FROM rpc_advance_nonces WHERE principal_id=? AND nonce_hex=?",
+                (principal_id, nonce_hex),
+            ).fetchone()
+            need(existing is None, "REPLAY_OR_EQUIVOCATION")
+            db.execute(
+                "INSERT INTO rpc_advance_nonces VALUES (?,?,?,?,?)",
+                (principal_id, nonce_hex, request_sha256, issued["utc"], deadline["utc"]),
+            )
 
     def handle(self, envelope, *, actual_peer, now):
         """Internal handler; serve_connection supplies an independently read peer."""
-        self.auth.current(now)
+        _, actual = self.auth.current(now)
         candidates = [g for g in self.auth.access["callers"] if same(g["actual_process"], actual_peer)]
         need(len(candidates) == 1, "SIGNER_UNAPPOINTED")
         grant = candidates[0]
@@ -174,12 +282,42 @@ class CheckpointService:
         request = self.auth.verify_rpc(envelope, domain=ck.REQUEST_DOMAIN, public_key=key, type_name="CheckpointRpcRequest")
         need(request["caller_id"] == grant["principal_id"] and request["operation"] in grant["operations"]
              and request["use"] in grant["uses"], "PURPOSE_MISMATCH")
-        nonce = (grant["principal_id"], request["nonce_hex"])
-        need(len(self._seen) < 1024 and nonce not in self._seen, "REPLAY_OR_EQUIVOCATION")
-        self._seen.add(nonce)
+        # Validate authenticated issue/deadline timestamps BEFORE allocating replay-window capacity.
         self.auth.guard.remaining(request["deadline"])
+        need(stamp_le(request["issued"], actual)
+             and stamp_le(request["issued"], request["deadline"])
+             and request["issued"] != request["deadline"], "CONTEXT_MISMATCH")
+
+        principal_id = grant["principal_id"]
+        nonce_hex = request["nonce_hex"]
+        op_name = request["operation"]
+        request_sha256 = digest(canonical_bytes(request))
+
+        with self._lock:
+            self._prune_principal_unlocked(principal_id, actual)
+            rate_q = self._rate_window_by_principal.setdefault(principal_id, deque())
+            need(len(rate_q) < self._per_principal_rate_limit, "REPLAY_OR_EQUIVOCATION")
+            if op_name == "ADVANCE":
+                adv_map = self._advance_nonces_by_principal.setdefault(principal_id, {})
+                need(nonce_hex not in adv_map, "REPLAY_OR_EQUIVOCATION")
+                self._record_durable_advance_nonce(
+                    principal_id=principal_id,
+                    nonce_hex=nonce_hex,
+                    request_sha256=request_sha256,
+                    issued=request["issued"],
+                    deadline=request["deadline"],
+                )
+                adv_map[nonce_hex] = request_sha256
+                rate_q.append(actual["boottime_ns"])
+            else:
+                read_map = self._read_replay_by_principal.setdefault(principal_id, {})
+                need(nonce_hex not in read_map, "REPLAY_OR_EQUIVOCATION")
+                need(len(read_map) < self._per_principal_read_capacity, "REPLAY_OR_EQUIVOCATION")
+                read_map[nonce_hex] = dict(request["deadline"])
+                rate_q.append(actual["boottime_ns"])
+
         operation = {"READ_CURRENT": self.store.read_current, "ADVANCE": self.store.compare_and_append,
-                     "LOOKUP_TRANSITION": self.store.lookup_exact}[request["operation"]]
+                     "LOOKUP_TRANSITION": self.store.lookup_exact}[op_name]
         result = operation(request, authenticated_caller=grant, now=self.auth.guard.check())
         self.auth.current()
         self.peers.observe(grant["actual_process"])

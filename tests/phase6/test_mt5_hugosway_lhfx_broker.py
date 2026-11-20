@@ -53,6 +53,7 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
     OrderIntent,
     apply_verified_directory_mode,
     load_mt5_credentials,
+    sign_spool_valve_admission,
     validate_demo_server,
 )
 from cas_forex_revamp.venue.dual_shield_router import (
@@ -257,6 +258,27 @@ class FakeOandaTransport:
             amend = json.loads(body)
             self.orders.append(amend)
             return json.dumps({"stopLossOrderTransaction": {"id": "12"}, "lastTransactionID": "12"}).encode()
+        if method == "GET" and url.endswith("/openTrades"):
+            trades = []
+            for idx, ord_item in enumerate(self.orders, start=1):
+                if "instrument" in ord_item and "units" in ord_item:
+                    trades.append({
+                        "id": str(idx),
+                        "instrument": ord_item["instrument"],
+                        "currentUnits": str(ord_item["units"]),
+                        "price": "1.10010",
+                        "unrealizedPL": "0.00",
+                        "state": "OPEN",
+                    })
+            return json.dumps({"trades": trades, "lastTransactionID": "12"}).encode()
+        if method == "PUT" and "/trades/" in url and url.endswith("/close"):
+            close_doc = json.loads(body)
+            self.orders.append(close_doc)
+            return json.dumps({
+                "orderCreateTransaction": {"id": "13"},
+                "orderFillTransaction": {"id": "14", "price": "1.10000", "pl": "0.00"},
+                "lastTransactionID": "14",
+            }).encode()
         raise RuntimeError("unexpected OANDA call")
 
 
@@ -596,7 +618,7 @@ class SpoolBridgeTransportTests(unittest.TestCase):
             creds = Mt5Credentials(broker_id=BROKER_HUGOSWAY_MT5, login=7001234, server="Hugo demo PRO5")
             req = Mt5OrderRequest(request_id="req-tamper", action="OPEN", symbol="EURUSD", side=Side.BUY, volume_lots=D("0.10"),
                                   price=D("1.10010"), stop_loss=D("1.09500"), position_ticket=None, deviation_points=20,
-                                  magic=20261116, comment="cas-open", created_at=T0)
+                                  magic=20261116, comment="cas-open", created_at=T0, valve_decision_sha256="a" * 64)
 
             def tamper(_seconds: float) -> None:
                 emu.process_pending()
@@ -607,14 +629,17 @@ class SpoolBridgeTransportTests(unittest.TestCase):
 
             transport = Mt5SpoolBridgeTransport(tmp, sleep=tamper, poll_interval_seconds=0.01)
             transport.connect(creds)
+            signed_req = sign_spool_valve_admission(transport.prepare_request(req), spool_dir=tmp)
             with self.assertRaises(Mt5TransportError):
-                transport.send_order(req)
+                transport.send_order(signed_req)
 
             ticks = iter(range(1000))
             silent = Mt5SpoolBridgeTransport(tmp, sleep=lambda _s: None, monotonic=lambda: float(next(ticks)),
                                              receipt_timeout_seconds=3, poll_interval_seconds=0.01)
             silent.connect(creds)
-            req2 = dataclasses.replace(req, request_id="req-silent")
+            req2 = sign_spool_valve_admission(
+                silent.prepare_request(dataclasses.replace(req, request_id="req-silent")), spool_dir=tmp
+            )
             with self.assertRaises(Mt5OutcomeUnknownError):
                 silent.send_order(req2)
             with self.assertRaises(Mt5TransportError):
@@ -736,10 +761,15 @@ class HierarchyFailoverTests(unittest.TestCase):
             amend_res = router.execute(amend, valve_decision=clear(amend))
             self.assertEqual(amend_res.oanda_receipt["status"], "MODIFIED")
             self.assertEqual(rig.oanda.orders[-1]["takeProfit"]["price"], "1.106")
-            close_bad = OrderIntent(order_id="oanda-close", action_ref="act-oanda-close", kind=ActionKind.CLOSE,
-                                    symbol="EURUSD", quantity_units=D("1000"), position_ticket="1")
+            close_ok = OrderIntent(order_id="oanda-close", action_ref="act-oanda-close", kind=ActionKind.CLOSE,
+                                   symbol="EURUSD", quantity_units=D("100000"), position_ticket="1")
+            close_res = router.execute(close_ok, valve_decision=clear(close_ok))
+            self.assertTrue(close_res.accepted)
+            self.assertEqual(close_res.oanda_receipt["status"], "CLOSED")
+            close_missing = OrderIntent(order_id="oanda-close-miss", action_ref="act-oanda-close-miss", kind=ActionKind.CLOSE,
+                                        symbol="EURUSD", quantity_units=D("1000"), position_ticket="999")
             with self.assertRaises(Mt5BridgeError):
-                router.execute(close_bad, valve_decision=clear(close_bad))
+                router.execute(close_missing, valve_decision=clear(close_missing))
             self.assertTrue(router.active_venue.verify_audit_chain())
 
     def test_nothing_configured_and_live_account_abort(self) -> None:
@@ -1215,8 +1245,8 @@ class Mql5BridgeSourceContractTests(unittest.TestCase):
     def test_cas_forex_mt5_bridge_all_receipt_json_calls_pass_11_typed_args(self) -> None:
         mq5_path = REPO_ROOT / "mt5" / "CasForexMt5Bridge.mq5"
         src = mq5_path.read_text(encoding="utf-8")
-        _, calls = self._assert_receipt_json_contract(src, expected_min_calls=11)
-        self.assertEqual(len(calls), 11)
+        _, calls = self._assert_receipt_json_contract(src, expected_min_calls=15)
+        self.assertEqual(len(calls), 15)
 
     def test_receipt_json_contract_catches_10_arg_and_untyped_number_regressions(self) -> None:
         sig_header = (

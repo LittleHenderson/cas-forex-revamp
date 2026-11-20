@@ -482,8 +482,11 @@ class LoopbackCockpitAuthRemediationTests(unittest.TestCase):
         self.assertEqual(st_bad, 401)
         self.assertNotIn("set-cookie", hdr_bad)
 
-        # Valid bootstrap token serves UI without setting any browser cookie ([1])
-        st_ok, hdr_ok, _ = self._raw_http("GET", f"/ui/index.html?token={self.server.auth_token}")
+        # Primary bearer in ?token= URL is forbidden (401); single-use ?pair_code= serves UI with zero cookies ([1], [2])
+        st_tok_forbidden, _, _ = self._raw_http("GET", f"/ui/index.html?token={self.server.auth_token}")
+        self.assertEqual(st_tok_forbidden, 401)
+        pair_doc = self.server.mint_pairing_code()
+        st_ok, hdr_ok, _ = self._raw_http("GET", f"/ui/index.html?pair_code={pair_doc['pair_code']}")
         self.assertEqual(st_ok, 200)
         self.assertNotIn("set-cookie", hdr_ok)
 

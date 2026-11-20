@@ -39,7 +39,17 @@ import {
   evaluateLiveArmingPreflight,
   renderLiveFundingPanel,
 } from './live-funding.mjs';
-import { buildPairingUrl, renderQrSvg } from './qr-pairing.mjs';
+import {
+  PAIRING_DEFAULT_TTL_SECONDS,
+  SESSION_SCOPES,
+  buildPairingUrl,
+  extractAndStripBootPairingParams,
+  isOwnerControlSession,
+  normalizeAuthSessionResponse,
+  normalizePairCodeMintResponse,
+  normalizePairExchangeResponse,
+  renderQrSvg,
+} from './qr-pairing.mjs';
 
 // Fixed same-origin assets. Only explicit trusted bootstrap may inject a scoped bridge.
 const schemaURL = new URL('../docs/contracts/cockpit.schema.json', document.baseURI);
@@ -56,6 +66,7 @@ let reviewSchema = null;
 let rawReviewSchema = null;
 let marketSchema = null;
 const SESSION_TOKEN_KEY = 'cas_forex_bearer_token';
+const SESSION_SCOPE_KEY = 'cas_forex_session_scope';
 let liveSseAbort = null;
 let controller = null;
 let dialogContext = null;
@@ -68,53 +79,84 @@ let activePointerPress = false;
 let streamRenderTimer = null;
 let deferredRenderPending = false;
 let loopbackAuthToken = null;
+let pendingBootPairCode = null;
+let bootSecurityIssue = null;
+let initialSessionScope = SESSION_SCOPES.OWNER_FULL_CONTROL;
+let initialOwnerControlsAllowed = true;
 try {
-  const bootParams = new URLSearchParams(window.location.search);
-  const tok = bootParams.get('token');
-  if (tok && tok.trim().length >= 16 && !/[\r\n\0]/.test(tok)) {
-    loopbackAuthToken = tok.trim();
-    try { window.sessionStorage?.setItem?.(SESSION_TOKEN_KEY, loopbackAuthToken); } catch { /* Optional storage */ }
-    bootParams.delete('token');
-    const qs = bootParams.toString();
-    const cleanPath = `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`;
-    window.history?.replaceState?.(null, '', cleanPath);
+  const bootPairing = extractAndStripBootPairingParams(window.location, window.history);
+  if (bootPairing.pairCode) {
+    pendingBootPairCode = bootPairing.pairCode;
   } else {
+    if (bootPairing.strippedLegacyToken) {
+      bootSecurityIssue = 'URL ?token= bearer parameter is disabled for security. Paste your Owner Key or scan a single-use ?pair_code= QR.';
+    }
     const stored = window.sessionStorage?.getItem?.(SESSION_TOKEN_KEY);
     if (stored && stored.trim().length >= 16 && !/[\r\n\0]/.test(stored)) {
       loopbackAuthToken = stored.trim();
+      const storedScope = window.sessionStorage?.getItem?.(SESSION_SCOPE_KEY);
+      if (storedScope === SESSION_SCOPES.DEVICE_READ_AND_EXPLAINER) {
+        initialSessionScope = SESSION_SCOPES.DEVICE_READ_AND_EXPLAINER;
+        initialOwnerControlsAllowed = false;
+      }
     }
   }
-} catch { /* Static preview has no token query. */ }
+} catch { /* Static preview has no pairing query. */ }
 
 let qrAutoCloseTimer = null;
+let activePairCode = null;
 
 function closeQrPairingDrawer(shouldRender = false) {
   if (qrAutoCloseTimer !== null) {
     window.clearTimeout(qrAutoCloseTimer);
     qrAutoCloseTimer = null;
   }
+  activePairCode = null;
   if (state.qrPairingOpen || state.qrPairingSvg || state.qrPairingCopiedNotice) {
-    state = { ...state, qrPairingOpen: false, qrPairingSvg: null, qrPairingCopiedNotice: null };
+    state = {
+      ...state,
+      qrPairingOpen: false,
+      qrPairingSvg: null,
+      qrPairingCopiedNotice: null,
+      qrPairingExpiresAt: null,
+      qrPairingTtlSeconds: PAIRING_DEFAULT_TTL_SECONDS,
+      qrPairingScope: SESSION_SCOPES.DEVICE_READ_AND_EXPLAINER,
+    };
     if (shouldRender) render();
   }
 }
 
 /** Explicitly set or clear the origin-scoped loopback bearer token (sessionStorage + memory, zero cookies). */
-export function setLoopbackAuthToken(token) {
+export function setLoopbackAuthToken(token, options = {}) {
   if (token === null) {
     loopbackAuthToken = null;
-    try { window.sessionStorage?.removeItem?.(SESSION_TOKEN_KEY); } catch { /* Ignore */ }
+    try {
+      window.sessionStorage?.removeItem?.(SESSION_TOKEN_KEY);
+      window.sessionStorage?.removeItem?.(SESSION_SCOPE_KEY);
+    } catch { /* Ignore */ }
     if (typeof state === 'object' && state) {
+      state.sessionScope = SESSION_SCOPES.OWNER_FULL_CONTROL;
+      state.ownerControlsAllowed = false;
       state.canPairDevice = false;
       closeQrPairingDrawer(false);
     }
     return;
   }
   if (typeof token !== 'string' || token.trim().length < 16 || /[\r\n\0]/.test(token)) throw new Error('Invalid loopback auth token.');
+  const scope = options?.scope === SESSION_SCOPES.DEVICE_READ_AND_EXPLAINER
+    ? SESSION_SCOPES.DEVICE_READ_AND_EXPLAINER
+    : SESSION_SCOPES.OWNER_FULL_CONTROL;
+  const ownerAllowed = scope === SESSION_SCOPES.OWNER_FULL_CONTROL && options?.ownerControlsAllowed !== false;
   loopbackAuthToken = token.trim();
-  try { window.sessionStorage?.setItem?.(SESSION_TOKEN_KEY, loopbackAuthToken); } catch { /* Ignore */ }
+  try {
+    window.sessionStorage?.setItem?.(SESSION_TOKEN_KEY, loopbackAuthToken);
+    window.sessionStorage?.setItem?.(SESSION_SCOPE_KEY, scope);
+  } catch { /* Ignore */ }
   if (typeof state === 'object' && state) {
-    state.canPairDevice = true;
+    state.sessionScope = scope;
+    state.ownerControlsAllowed = ownerAllowed;
+    state.canPairDevice = Boolean(ownerAllowed);
+    if (!ownerAllowed) closeQrPairingDrawer(false);
   }
 }
 let state = {
@@ -124,16 +166,21 @@ let state = {
   reviewEnvelope: null, reviewIssue: null, reviewSchemaReady: false, lastLoaded: null, transport: null,
   marketStream: null, chartPair: 'EURUSD', chartTimeframe: 'M5', chartLayout: 'single', chartCategory: 'all',
   liveStreamConnected: false, chartMicroBars: {}, brokerRouting: null,
-  aiModels: null, aiTrader: null, indexStream: null, aiActionBusy: false, aiIssue: null,
+  aiModels: null, aiTrader: null, indexStream: null, aiActionBusy: false, aiIssue: bootSecurityIssue,
   treasury: null, parallelTiers: null, chartZoomBars: 60, inspectedTradeIdx: 0,
   moneyFlow: createDefaultMoneyFlowState(),
   liveFunding: createDefaultLiveFundingState(),
   unlockDraft: '',
   unlockKeyVisible: false,
-  canPairDevice: Boolean(loopbackAuthToken),
+  sessionScope: initialSessionScope,
+  ownerControlsAllowed: Boolean(loopbackAuthToken && initialOwnerControlsAllowed),
+  canPairDevice: Boolean(loopbackAuthToken && initialOwnerControlsAllowed),
   qrPairingOpen: false,
   qrPairingSvg: null,
   qrPairingCopiedNotice: null,
+  qrPairingExpiresAt: null,
+  qrPairingTtlSeconds: PAIRING_DEFAULT_TTL_SECONDS,
+  qrPairingScope: SESSION_SCOPES.DEVICE_READ_AND_EXPLAINER,
 };
 
 function routeFromHash() {
@@ -276,19 +323,24 @@ function render(focusMain = false) {
         selEnd: typeof active.selectionEnd === 'number' ? active.selectionEnd : null,
       }
     : null;
-  if (activeUnlock && !state.liveStreamConnected) {
+  if (activeUnlock && (!state.liveStreamConnected || !isOwnerControlSession(state))) {
     state.unlockDraft = activeUnlock.value;
   }
   const identity = root.contains(active) && active?.tagName === 'BUTTON' ? JSON.stringify(active.dataset) : null;
   document.documentElement.dataset.theme = state.theme;
   try { releaseDetachedCanvases(root); } catch { /* Best-effort buffer release. */ }
   replaceSafeHTML(root, renderApp(state));
+  if (state.liveStreamConnected && !isOwnerControlSession(state)) {
+    for (const el of root.querySelectorAll('[data-thinking-depth], [data-select-ai-model], [data-treasury-rail], [data-treasury-action]')) {
+      el.disabled = true;
+    }
+  }
   try { mountMarketCharts(root, state); mountAnalyticsCanvases(root, state); mountMoneyFlowWidget(root, state); } catch { /* Chart/SVG optional in headless environments. */ }
   if (!focusMain && typeof window.scrollTo === 'function') window.scrollTo(prevScrollX, prevScrollY);
   try { explainer?.sync(); } catch { disableExplainer(); }
   document.title = `${state.route[0].toUpperCase() + state.route.slice(1)} / CAS Forex`;
   if (focusMain) document.querySelector('#main')?.focus({ preventScroll: true });
-  else if (activeUnlock && !state.liveStreamConnected) {
+  else if (activeUnlock && (!state.liveStreamConnected || !isOwnerControlSession(state))) {
     const restoredInput = activeUnlock.id
       ? root.querySelector(`#${activeUnlock.id}`)
       : root.querySelector('input[name="cockpit_access_key"]');
@@ -511,6 +563,56 @@ async function startFetchSseStream(abortCtrl) {
   }
 }
 
+async function readAuthSession() {
+  try {
+    const raw = await readStatic(new URL('/api/auth-session', window.location.origin), MAX_AI_PAYLOAD_BYTES);
+    const info = normalizeAuthSessionResponse(parseUniqueJSON(raw, MAX_AI_PAYLOAD_BYTES));
+    if (info) {
+      state.sessionScope = info.sessionScope;
+      state.ownerControlsAllowed = info.ownerControlsAllowed;
+      state.canPairDevice = Boolean(loopbackAuthToken && info.ownerControlsAllowed);
+      try { window.sessionStorage?.setItem?.(SESSION_SCOPE_KEY, info.sessionScope); } catch { /* Ignore */ }
+      if (!info.ownerControlsAllowed) closeQrPairingDrawer(false);
+    }
+  } catch { /* Optional endpoint on older or fixture-only previews. */ }
+}
+
+async function exchangePairCodeAndConnect(pairCode) {
+  const url = new URL('/api/pair-exchange', window.location.origin);
+  if (url.origin !== window.location.origin || !['http:', 'https:'].includes(url.protocol)) {
+    throw new Error('Pairing exchange requires same-origin HTTP or HTTPS preview.');
+  }
+  const resp = await fetch(url, {
+    method: 'POST',
+    credentials: 'omit',
+    cache: 'no-store',
+    redirect: 'error',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ pair_code: pairCode }),
+    signal: AbortSignal.timeout(10000),
+  });
+  const raw = await resp.text();
+  const parsed = parseUniqueJSON(raw, MAX_AI_PAYLOAD_BYTES);
+  if (!resp.ok) {
+    throw new Error(parsed?.error || `Pairing code expired, already used, or revoked (${resp.status}).`);
+  }
+  const exchanged = normalizePairExchangeResponse(parsed);
+  setLoopbackAuthToken(exchanged.sessionToken, {
+    scope: exchanged.sessionScope,
+    ownerControlsAllowed: exchanged.ownerControlsAllowed,
+  });
+  await connectLoopbackLiveFeed();
+  announce('Paired device connected in Least-Privilege Read + Explainer mode. Owner trading controls remain locked.');
+}
+
+function requireOwnerControlOrWarn(actionLabel) {
+  if (isOwnerControlSession(state)) return true;
+  state.aiIssue = `${actionLabel} blocked: paired device session is Read + Explainer only. Paste Primary Owner Key to step up to Owner Full Control.`;
+  render();
+  announce(state.aiIssue);
+  return false;
+}
+
 async function connectLoopbackLiveFeed() {
   if (!marketSchema) marketSchema = parseUniqueJSON(await readStatic(marketSchemaURL));
   const streamURL = new URL('/api/market-stream', window.location.origin);
@@ -527,11 +629,12 @@ async function connectLoopbackLiveFeed() {
     });
   }
   state.liveStreamConnected = true;
-  state.canPairDevice = Boolean(loopbackAuthToken);
+  await readAuthSession();
+  state.canPairDevice = Boolean(loopbackAuthToken && isOwnerControlSession(state));
   state.aiIssue = null;
   state.unlockDraft = '';
   state.unlockKeyVisible = false;
-  if (!controller?.attached) {
+  if (!controller?.attached && isOwnerControlSession(state)) {
     try {
       const health = parseUniqueJSON(await readStatic(new URL('/api/health', window.location.origin)));
       if (health.bridge_attached) {
@@ -613,6 +716,7 @@ async function postTraderControlJson(payload) {
 }
 
 async function advanceRecoverySession() {
+  if (!requireOwnerControlOrWarn('Recovery session advance')) return;
   if (state.aiActionBusy) return;
   state.aiActionBusy = true;
   state.aiIssue = null;
@@ -635,6 +739,7 @@ async function advanceRecoverySession() {
 }
 
 async function setSessionCadence(rawCadence) {
+  if (!requireOwnerControlOrWarn('Session cadence update')) return;
   const cadence = String(rawCadence ?? '').trim().toUpperCase();
   if (!SESSION_CADENCE_MODES.includes(cadence) || state.aiActionBusy) return;
   state.aiActionBusy = true;
@@ -659,6 +764,7 @@ async function setSessionCadence(rawCadence) {
 }
 
 async function sendOverseerAction(action) {
+  if (!requireOwnerControlOrWarn(`Overseer action ${action}`)) return;
   if (state.aiActionBusy) return;
   state.aiActionBusy = true;
   state.aiIssue = null;
@@ -678,6 +784,7 @@ async function sendOverseerAction(action) {
 }
 
 async function setRiskGearMode(riskGear) {
+  if (!requireOwnerControlOrWarn('Risk gear update')) return;
   if (state.aiActionBusy) return;
   state.aiActionBusy = true;
   state.aiIssue = null;
@@ -697,6 +804,7 @@ async function setRiskGearMode(riskGear) {
 }
 
 async function setThinkingDepth(depth) {
+  if (!requireOwnerControlOrWarn('Thinking depth update')) return;
   if (state.aiActionBusy) return;
   state.aiActionBusy = true;
   state.aiIssue = null;
@@ -716,6 +824,7 @@ async function setThinkingDepth(depth) {
 }
 
 async function updateTreasuryConfig(patch) {
+  if (!requireOwnerControlOrWarn('Treasury configuration update')) return;
   if (state.aiActionBusy) return;
   state.aiActionBusy = true;
   state.aiIssue = null;
@@ -734,6 +843,7 @@ async function updateTreasuryConfig(patch) {
 }
 
 async function selectAiModel(modelId) {
+  if (!requireOwnerControlOrWarn('AI model switch')) return;
   if (state.aiActionBusy) return;
   state.aiActionBusy = true;
   state.aiIssue = null;
@@ -904,33 +1014,57 @@ root.addEventListener('click', (event) => {
       announce('Pairing QR hidden.');
       return;
     }
-    if (!state.liveStreamConnected || !loopbackAuthToken) return;
-    try {
-      const pairUrl = buildPairingUrl(window.location.origin, loopbackAuthToken);
-      const svg = renderQrSvg(pairUrl, { ariaLabel: 'Scan with tablet or phone camera to unlock live CAS Forex cockpit' });
-      if (qrAutoCloseTimer !== null) window.clearTimeout(qrAutoCloseTimer);
-      state = { ...state, qrPairingOpen: true, qrPairingSvg: svg, qrPairingCopiedNotice: null };
-      qrAutoCloseTimer = window.setTimeout(() => {
-        qrAutoCloseTimer = null;
-        closeQrPairingDrawer(true);
-        announce('Pairing QR auto-closed after 120 seconds.');
-      }, 120000);
-      render();
-      announce('Device pairing QR code opened for 120 seconds.');
-    } catch (error) {
-      state.aiIssue = error instanceof Error ? error.message : 'Unable to generate pairing QR.';
-      render();
+    if (!state.liveStreamConnected || !loopbackAuthToken || !isOwnerControlSession(state)) {
+      requireOwnerControlOrWarn('Device QR pairing');
+      return;
     }
+    void (async () => {
+      try {
+        const res = await postLoopbackJson('/api/pair-code', {});
+        const minted = normalizePairCodeMintResponse(res, loopbackAuthToken);
+        activePairCode = minted.pairCode;
+        const pairUrl = buildPairingUrl(window.location.origin, activePairCode);
+        const svg = renderQrSvg(pairUrl, { ariaLabel: 'Scan with tablet or phone camera for single-use Read and Explainer pairing' });
+        if (qrAutoCloseTimer !== null) window.clearTimeout(qrAutoCloseTimer);
+        state = {
+          ...state,
+          aiIssue: null,
+          qrPairingOpen: true,
+          qrPairingSvg: svg,
+          qrPairingCopiedNotice: null,
+          qrPairingExpiresAt: minted.expiresAt,
+          qrPairingTtlSeconds: minted.ttlSeconds,
+          qrPairingScope: minted.scope,
+        };
+        qrAutoCloseTimer = window.setTimeout(() => {
+          qrAutoCloseTimer = null;
+          closeQrPairingDrawer(true);
+          announce(`Pairing QR auto-closed after ${minted.ttlSeconds} seconds.`);
+        }, minted.ttlSeconds * 1000);
+        render();
+        announce(`Single-use device pairing QR opened (${minted.ttlSeconds}s server expiry).`);
+      } catch (error) {
+        activePairCode = null;
+        state.aiIssue = error instanceof Error ? error.message : 'Unable to mint single-use pairing QR.';
+        render();
+        announce(state.aiIssue);
+      }
+    })();
     return;
   }
   if (target.dataset.copyUnlockLink) {
-    if (!loopbackAuthToken) return;
+    if (!activePairCode || !isOwnerControlSession(state)) {
+      state.qrPairingCopiedNotice = 'Pairing code expired — reopen QR to mint a fresh single-use code.';
+      render();
+      announce(state.qrPairingCopiedNotice);
+      return;
+    }
     void (async () => {
       try {
-        const pairUrl = buildPairingUrl(window.location.origin, loopbackAuthToken);
+        const pairUrl = buildPairingUrl(window.location.origin, activePairCode);
         if (navigator.clipboard?.writeText) {
           await navigator.clipboard.writeText(pairUrl);
-          state.qrPairingCopiedNotice = 'Private unlock link copied to clipboard.';
+          state.qrPairingCopiedNotice = 'Single-use pairing link (?pair_code=...) copied to clipboard.';
         } else {
           state.qrPairingCopiedNotice = 'Clipboard unavailable in this browser — scan the QR square above.';
         }
@@ -939,6 +1073,34 @@ root.addEventListener('click', (event) => {
       }
       render();
       announce(state.qrPairingCopiedNotice);
+    })();
+    return;
+  }
+  if (target.dataset.revokeQrPairing) {
+    if (!state.liveStreamConnected || !loopbackAuthToken || !isOwnerControlSession(state)) {
+      requireOwnerControlOrWarn('Pairing revocation');
+      return;
+    }
+    const codeToRevoke = activePairCode;
+    void (async () => {
+      let notice = 'Pairing code and paired device sessions revoked on server.';
+      try {
+        const payload = codeToRevoke
+          ? { pair_code: codeToRevoke, revoke_sessions: true }
+          : { revoke_sessions: true };
+        const res = await postLoopbackJson('/api/pair-revoke', payload);
+        const rc = Number.isSafeInteger(res?.revoked_codes) ? res.revoked_codes : 0;
+        const rs = Number.isSafeInteger(res?.revoked_sessions) ? res.revoked_sessions : 0;
+        notice = `Server revoked ${rc} pairing code(s) and ${rs} paired device session(s).`;
+        state.aiIssue = null;
+      } catch (error) {
+        notice = error instanceof Error ? error.message : 'Pairing revocation failed.';
+        state.aiIssue = notice;
+      } finally {
+        closeQrPairingDrawer(false);
+        render();
+        announce(notice);
+      }
     })();
     return;
   }
@@ -1005,7 +1167,7 @@ root.addEventListener('click', (event) => {
     return;
   }
   if (target.dataset.mfRisk) {
-    const pct = Number(target.dataset.mfRisk) || 1;
+    const pct = Math.max(0.25, Math.min(1, Number(target.dataset.mfRisk) || 1));
     state.moneyFlow = { ...state.moneyFlow, lotMode: 'risk', riskPct: pct, simWins: 0, simLosses: 0, simCapitalCents: state.moneyFlow.capitalUsd * 100, simBankCents: 0 };
     rerenderMoneyFlowInPlace(`[data-mf-risk="${pct}"]`);
     return;
@@ -1019,7 +1181,7 @@ root.addEventListener('click', (event) => {
   }
   if (target.dataset.mfStep) {
     const safeStep = String(target.dataset.mfStep).replace(/[^a-z0-9]/gi, '');
-    const maxRisk = Number(state.aiTrader?.riskGear?.ownerMaxRiskPct ?? 5) || 5;
+    const maxRisk = Math.min(1, Number(state.aiTrader?.riskGear?.ownerMaxRiskPct ?? 1) || 1);
     state.moneyFlow = stepMoneyFlowSimulation(state.moneyFlow, safeStep, maxRisk);
     rerenderMoneyFlowInPlace(`[data-mf-step="${safeStep}"]`);
     return;
@@ -1302,6 +1464,19 @@ try {
 render();
 void (async () => {
   await loadFixture();
+  if (pendingBootPairCode) {
+    const codeToExchange = pendingBootPairCode;
+    pendingBootPairCode = null;
+    try {
+      await exchangePairCodeAndConnect(codeToExchange);
+    } catch (error) {
+      setLoopbackAuthToken(null);
+      state.aiIssue = error instanceof Error ? error.message : 'Single-use pairing exchange failed.';
+      render();
+      announce(state.aiIssue);
+    }
+    return;
+  }
   if (shouldAutoConnectLiveFeed(window.location, loopbackAuthToken)) {
     await connectLoopbackLiveFeed().catch(() => {});
   }

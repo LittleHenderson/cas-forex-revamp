@@ -244,15 +244,21 @@ class _FakeOandaPracticeTransport:
 class TestProfitSweepAuditChain(unittest.TestCase):
     def _populate_three_events(self, db_path: Path) -> ProfitSweepVault:
         vault = ProfitSweepVault(db_path, scope_id="main", clock=lambda: T0)
-        vault.set_config(sweep_ratio=Decimal("0.50"), auto_sweep_enabled=True)
         vault.record_realized_close(
             trade_id="tr-1",
             symbol="EURUSD",
             broker_id=BROKER_HUGOSWAY_MT5,
             realized_net_usd=Decimal("400.00"),
         )
+        prep = vault.prepare_broker_2fa_withdrawal(
+            broker_id=BROKER_HUGOSWAY_MT5,
+            amount_usd=Decimal("100.00"),
+            destination_bank_label="bank-chase-01",
+            owner_request_id="req-2fa-1",
+            reason="sweep profit",
+        )
         ver = OwnerRecoveryVerifier(db_path=db_path.parent / "recovery.sqlite3", clock=lambda: T0)
-        tok = ver.mint_token(action_scope="TREASURY_SWEEP", now=T0)
+        tok = ver.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep["intent_sha256"], now=T0)
         vault.request_broker_2fa_withdrawal(
             broker_id=BROKER_HUGOSWAY_MT5,
             amount_usd=Decimal("100.00"),
@@ -261,6 +267,8 @@ class TestProfitSweepAuditChain(unittest.TestCase):
             reason="sweep profit",
             verifier=ver,
             recovery_token=tok,
+            intent_id=prep["intent_id"],
+            intent_sha256=prep["intent_sha256"],
         )
         return vault
 

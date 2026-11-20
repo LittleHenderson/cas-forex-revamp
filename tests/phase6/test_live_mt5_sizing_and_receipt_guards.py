@@ -47,7 +47,7 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
 )
 
 NOW = datetime(2026, 11, 19, 10, 35, 0, tzinfo=timezone.utc)
-GATE = load_default_forex_valve_gate(max_drawdown_pct=Decimal("0.20"))
+GATE = load_default_forex_valve_gate(max_drawdown_pct=Decimal("0.10"))
 
 
 class _StubMt5Transport:
@@ -183,7 +183,7 @@ def _admitted_valve_decision(order: OrderIntent):
         "new_risk_permission": "ALLOWED",
         "management_permission": "ALLOWED",
         "max_entry_quantity": "10000000",
-        "max_drawdown_pct": "0.20",
+        "max_drawdown_pct": "0.10",
     }
     return GATE.require_admissible(prop, current_view=view, policy=pol, now=NOW + timedelta(seconds=1))
 
@@ -199,13 +199,13 @@ class TestLiveMt5SizingAndReceiptGuards(unittest.TestCase):
             regime="TREND_IGNITION",
             drawdown_pct=dd,
             consecutive_losses=0,
-            owner_max_risk_pct=Decimal("5.00"),
-            owner_max_drawdown_pct=Decimal("0.20"),
+            owner_max_risk_pct=Decimal("1.00"),
+            owner_max_drawdown_pct=Decimal("0.10"),
             owner_soft_quota_usd=Decimal("2000"),
             owner_hard_quota_usd=Decimal("3000"),
         )
         self.assertEqual(gear["active_gear"], "GROWTH")
-        self.assertEqual(gear["effective_risk_pct"], "2.5")
+        self.assertEqual(gear["effective_risk_pct"], "0.75")
 
         # Also test >=10% repeating drawdown auto-downshift formatting and Barbell refusal formatting.
         dd_high = compute_drawdown_pct(Decimal("269999.99"), Decimal("300049.20"))
@@ -214,8 +214,8 @@ class TestLiveMt5SizingAndReceiptGuards(unittest.TestCase):
             regime="STRONG_TREND",
             drawdown_pct=dd_high,
             consecutive_losses=0,
-            owner_max_risk_pct=Decimal("5.00"),
-            owner_max_drawdown_pct=Decimal("0.20"),
+            owner_max_risk_pct=Decimal("1.00"),
+            owner_max_drawdown_pct=Decimal("0.10"),
             owner_soft_quota_usd=Decimal("2000"),
             owner_hard_quota_usd=Decimal("3000"),
         )
@@ -242,8 +242,8 @@ class TestLiveMt5SizingAndReceiptGuards(unittest.TestCase):
             "CAS_FOREX_HUGOSWAY_MT5_SERVER": "Hugosway-Demo",
             ENV_INDEX_LEVERAGE: "200",
             ENV_INDEX_CONTRACT_SIZE: "100",
-            "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "5.00",
-            "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.20",
+            "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT": "1.00",
+            "CAS_FOREX_MAX_DRAWDOWN_PCT": "0.10",
             "CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE": "1",
         }
         router = DualShieldBrokerRouter(
@@ -359,8 +359,8 @@ class TestLiveMt5SizingAndReceiptGuards(unittest.TestCase):
             valve_gate=GATE,
             oracle=oracle,
             barbell=BarbellCapitalPolicy(
-                max_stop_loss_equity_risk_pct=Decimal("5.00"),
-                max_drawdown_pct=Decimal("0.20"),
+                max_stop_loss_equity_risk_pct=Decimal("1.00"),
+                max_drawdown_pct=Decimal("0.10"),
                 demo_virtual_sleeve=True,
             ),
             equity_attestations={BROKER_OANDA_PRACTICE: Decimal("100000")},
