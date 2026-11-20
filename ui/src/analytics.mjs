@@ -14,6 +14,11 @@ import {
   isSyntheticSyncEntry,
   resolveRealizedPnlProvenance,
 } from './ai-overseer.mjs';
+import {
+  normalizeAggressionDial,
+  renderSectionB5TierDials,
+  resolveCockpitAggressionDial,
+} from './aggression-dial.mjs';
 
 const e = (value) => String(value ?? '')
   .replaceAll('&', '&amp;')
@@ -282,6 +287,12 @@ export function normalizeParallelTiers(doc) {
     bankSweepReservedUsd: numStr(t.bank_sweep_reserved_usd, '0'),
     retainedTradingUsd: numStr(t.retained_trading_usd, '0'),
     lastSkipReason: t.last_skip_reason ? str(t.last_skip_reason, '', 120) : null,
+    riskBps: Number.isSafeInteger(t.risk_bps ?? t.aggression_dial?.risk_bps)
+      ? (t.risk_bps ?? t.aggression_dial.risk_bps)
+      : null,
+    aggressionDial: t.aggression_dial && typeof t.aggression_dial === 'object'
+      ? Object.freeze({ ...t.aggression_dial })
+      : null,
   }));
   const rawSeries = doc.growth_series && typeof doc.growth_series === 'object' ? doc.growth_series : {};
   const series = {};
@@ -294,11 +305,26 @@ export function normalizeParallelTiers(doc) {
       drawdownPct: numStr(pt.drawdown_pct, '0'),
     })));
   }
+  let aggressionDial = null;
+  if (doc.aggression_dial && typeof doc.aggression_dial === 'object') {
+    aggressionDial = normalizeAggressionDial(doc.aggression_dial);
+  } else if (rawTiers.some((t) => (t?.aggression_dial && typeof t.aggression_dial === 'object') || Number.isSafeInteger(t?.risk_bps))) {
+    aggressionDial = normalizeAggressionDial({
+      tiers: rawTiers.map((t) => ({
+        tier_id: t.tier_id,
+        label: t.label,
+        starting_capital_usd: t.starting_capital_usd,
+        ...(t.aggression_dial && typeof t.aggression_dial === 'object' ? t.aggression_dial : {}),
+        risk_bps: t.risk_bps ?? t.aggression_dial?.risk_bps,
+      })),
+    });
+  }
   return Object.freeze({
     connected: true,
     tierCount: tiers.length,
     tiers: Object.freeze(tiers),
     growthSeries: Object.freeze(series),
+    aggressionDial,
   });
 }
 
@@ -385,6 +411,7 @@ export function renderParallelTiersSection(state) {
       <span class="tag"><span class="state-rule" aria-hidden="true"></span>${pt.connected ? 'Live Parallel Engine' : 'Preview (Standby)'}</span>
     </div>
     <p class="panel-copy">All 5 account sizes ($300, $1,000, $3,000, $6,000, and $300,000) subscribe to the single 50ms stream with independent ForexMetaValveGate 1.00% stop-risk verification, ROUND_FLOOR 0.01 lot sizing, real bid/ask + ECN commissions, and 50%/50% Bank Vault sweeps.</p>
+    ${renderSectionB5TierDials(resolveCockpitAggressionDial(state))}
     <div class="tier-race-chart-wrap">
       <canvas class="analytics-canvas" data-tiers-race-canvas="true" width="860" height="220" aria-label="5-Tier normalized percentage ROI growth race chart"></canvas>
     </div>

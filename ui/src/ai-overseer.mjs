@@ -2,6 +2,12 @@
 // Daily Profit Quota ($500-$1,000), and Human-as-Overseer Autonomous AI panel.
 // No DOM, no storage, no inline styles; every dynamic string is normalized and escaped.
 
+import {
+  STATIC_AGGRESSION_DIAL,
+  normalizeAggressionDial,
+  resolveCockpitAggressionDial,
+} from './aggression-dial.mjs';
+
 export const MAX_AI_PAYLOAD_BYTES = 131072;
 
 export const PRIORITY_AI_MODELS = Object.freeze([
@@ -680,6 +686,7 @@ export const STATIC_AI_TRADER = Object.freeze({
   activeSessionLeg: 1,
   canAdvanceRecoverySession: false,
   activeRegionWindow: 'DAILY_NY (17:00 America/New_York)',
+  aggressionDial: STATIC_AGGRESSION_DIAL,
   openPositions: Object.freeze([]),
   recentActions: Object.freeze([]),
 });
@@ -884,6 +891,9 @@ export function normalizeAiTrader(doc) {
     liveTradingStatus,
     lastTrade,
     realizedPnlLedger,
+    aggressionDial: doc.aggression_dial && typeof doc.aggression_dial === 'object'
+      ? normalizeAggressionDial(doc.aggression_dial)
+      : null,
     openPositions: Object.freeze(openPositions),
     recentActions: Object.freeze(recentActions),
   });
@@ -1022,6 +1032,8 @@ export function renderAiOverseerPanel(state) {
     ? `<form class="mobile-unlock-bar prominent-unlock-bar" data-cockpit-unlock-form="true" autocomplete="on"><div class="unlock-bar-row"><label class="sr-only" for="overseer-access-key">Cockpit access key</label><input id="overseer-access-key" class="mobile-unlock-input" type="${unlockInputType}" name="cockpit_access_key" value="${unlockDraftVal}" autocomplete="current-password" spellcheck="false" autocapitalize="off" placeholder="Paste Cockpit access key here (or run D:\\MetaTrader5\\Launch_24x7_Cloud_Cockpit.cmd) to unlock live 24/7 cloud AI"><button type="button" class="button button-small button-secondary unlock-vis-btn" data-toggle-unlock-visibility="true" aria-pressed="${Boolean(state?.unlockKeyVisible)}">${unlockVisLabel}</button><button type="submit" class="button button-small button-primary">Unlock &amp; Connect Live Cloud</button></div><p class="unlock-helper-note">Paste your 43-character key from <code>D:\\MetaTrader5\\.cloud_cockpit.token</code> on your PC — or scan the single-use Pairing QR from an unlocked PC</p>${state?.aiIssue ? `<p class="unlock-inline-error warning-text" role="alert">${esc(state.aiIssue)}</p>` : ''}</form>`
     : '';
   const workingPill = `<span class="working-now-pill" data-working-now="true">WORKING NOW: ${esc(trader.currentFocusStatus ?? (`SCANNING ${trader.marketsEvaluated} MARKETS`))}</span>`;
+  const dialSummary = resolveCockpitAggressionDial(state);
+  const dialSummaryTag = `<span class="tag" data-overseer-aggression-summary="true"><span class="state-rule" aria-hidden="true"></span>Dial: ${esc(dialSummary.masterTargets.riskPctLabel)} ${esc(dialSummary.effectiveLabel)} · ${dialSummary.aiDiscretionEnabled ? 'AI Discretion ON' : 'Manual Lock'}</span>`;
 
   return `<section class="panel ai-overseer-panel" aria-label="AI Autonomous Trader and Human Overseer">
     <div class="section-heading">
@@ -1030,6 +1042,7 @@ export function renderAiOverseerPanel(state) {
         ${connectBtn}
         ${respiteBadge}
         ${workingPill}
+        ${dialSummaryTag}
         <span class="tag${modeWarning ? ' tag-warning' : (profitBankedLocked ? ' tag-profit-locked' : '')}" data-ai-status="${esc(trader.effectiveStatus)}"><span class="state-rule" aria-hidden="true"></span>${esc(trader.connected ? trader.effectiveStatus : 'AI standby (not attached)')}</span>
         <span class="tag"><span class="state-rule" aria-hidden="true"></span>${esc(trader.valveController)} · ${esc(trader.valveParameters)} params</span>
       </div>

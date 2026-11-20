@@ -60,12 +60,14 @@ ACCESS_MODE_OWNER_FULL_CONTROL = "OWNER_FULL_CONTROL"
 ACCESS_MODE_DEVICE_READ_AND_EXPLAINER = "DEVICE_READ_AND_EXPLAINER"
 
 PRESET_SYNC_MASTER = "SYNC_MASTER"
+PRESET_SYNC_ALL_TO_MASTER = "SYNC_ALL_TO_MASTER"
 PRESET_STAGGER_SAFE_TO_HIGH = "STAGGER_SAFE_TO_HIGH"
 PRESET_STAGGER_SAFE_TO_EXTREME = "STAGGER_SAFE_TO_EXTREME"
 PRESET_ALL_BALANCED = "ALL_BALANCED"
 PRESET_ALL_SAFE = "ALL_SAFE"
 VALID_TIER_PRESETS: tuple[str, ...] = (
     PRESET_SYNC_MASTER,
+    PRESET_SYNC_ALL_TO_MASTER,
     PRESET_STAGGER_SAFE_TO_HIGH,
     PRESET_STAGGER_SAFE_TO_EXTREME,
     PRESET_ALL_BALANCED,
@@ -1426,7 +1428,7 @@ class AggressionDialStore:
             raise AggressionDialError(
                 f"Unknown tier preset {preset!r}; expected one of {VALID_TIER_PRESETS}"
             )
-        if norm_preset == PRESET_SYNC_MASTER:
+        if norm_preset in (PRESET_SYNC_MASTER, PRESET_SYNC_ALL_TO_MASTER):
             return self.sync_all_tiers_to_master(
                 live_mode=live_mode,
                 high_risk_confirmed=high_risk_confirmed,
@@ -1721,6 +1723,7 @@ __all__ = [
     "PRESET_ALL_SAFE",
     "PRESET_STAGGER_SAFE_TO_EXTREME",
     "PRESET_STAGGER_SAFE_TO_HIGH",
+    "PRESET_SYNC_ALL_TO_MASTER",
     "PRESET_SYNC_MASTER",
     "REFERENCE_CAPITAL_CENTS",
     "REFERENCE_CAPITAL_USD",

@@ -49,8 +49,17 @@ from cas_forex_revamp.composition.state_store import (
     open_verified_directory_fd,
     verify_and_read_owner_only_file,
 )
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
 from cas_forex_revamp.operator.decisions import OperatorUnavailable
 from cas_forex_revamp.operator.frontier_backends import assert_safe_ai_catalog_payload
+from cas_forex_revamp.valve.aggression_dial import (
+    AggressionDialError,
+    AggressionDialStore,
+    HIGH_RISK_MIN_BPS,
+    HighRiskConfirmationRequiredError,
+    OwnerKeyRequiredError,
+)
 
 
 class _SessionRevokedError(Exception):
@@ -496,6 +505,7 @@ _KNOWN_METRICS_ROUTES: frozenset[str] = frozenset({
     "/api/rotate-token",
     "/api/treasury-prepare",
     "/api/ai-model-select",
+    "/api/aggression-dial",
 })
 
 _CONTENT_TYPES: dict[str, str] = {
@@ -596,6 +606,7 @@ class LoopbackCockpitServer:
         index_stream_reader: Callable[[], dict[str, Any] | None] | None = None,
         profit_vault: Any | None = None,
         parallel_tiers: Any | None = None,
+        aggression_dial: Any | None = None,
         owner_recovery: Any | None = None,
         model_execution_gate: Any | None = None,
         token_file: str | Path | None = None,
@@ -630,6 +641,16 @@ class LoopbackCockpitServer:
         self._index_stream_reader = index_stream_reader
         self._profit_vault = profit_vault
         self._parallel_tiers = parallel_tiers
+        inferred_dial = aggression_dial
+        if inferred_dial is None and autonomous_trader is not None:
+            inferred_dial = getattr(autonomous_trader, "aggression_dial", None) or getattr(
+                autonomous_trader, "_aggression_dial", None
+            )
+        if inferred_dial is None and parallel_tiers is not None:
+            inferred_dial = getattr(parallel_tiers, "aggression_dial", None) or getattr(
+                parallel_tiers, "_aggression_dial", None
+            )
+        self._aggression_dial = inferred_dial
         self._owner_recovery = owner_recovery or (
             getattr(autonomous_trader, "_owner_verifier", None) if autonomous_trader is not None else None
         )
@@ -1162,6 +1183,7 @@ class LoopbackCockpitServer:
                 "autonomous_trader": self._autonomous_trader is not None,
                 "profit_vault": self._profit_vault is not None,
                 "parallel_tiers": self._parallel_tiers is not None,
+                "aggression_dial": self._aggression_dial is not None,
             },
         }
         if self._autonomous_trader is not None:
@@ -1210,6 +1232,64 @@ class LoopbackCockpitServer:
         if type(payload) is not dict:
             raise ContractError("broker routing payload must be a JSON object")
         return safe_broker_routing_payload(payload)
+
+    def _read_aggression_dial_snapshot(self, *, owner_controls_allowed: bool = True) -> dict[str, Any] | None:
+        if self._aggression_dial is None:
+            return None
+        execution_mode = "DEMO"
+        try:
+            routing = self._read_broker_routing()
+            if isinstance(routing, Mapping):
+                raw_em = str(routing.get("execution_mode") or "DEMO").strip().upper()
+                if raw_em == "LIVE":
+                    execution_mode = "LIVE"
+        except Exception as exc_rt:
+            self._last_routing_error = type(exc_rt).__name__
+
+        regime = "NEUTRAL"
+        consec = 0
+        dd_dec = Decimal("0")
+        vs_dec = Decimal("0.60")
+        if self._autonomous_trader is not None:
+            try:
+                tsnap = self._autonomous_trader.status_snapshot()
+                if isinstance(tsnap, Mapping):
+                    raw_reg = str(tsnap.get("last_regime") or "").strip().upper()
+                    if raw_reg:
+                        regime = raw_reg
+                    dq = tsnap.get("daily_quota")
+                    if isinstance(dq, Mapping):
+                        consec = max(0, int(dq.get("consecutive_losses", 0) or 0))
+                    ad_sub = tsnap.get("aggression_dial")
+                    if isinstance(ad_sub, Mapping) and ad_sub.get("drawdown_pct") not in (None, ""):
+                        parsed_dd = Decimal(str(ad_sub["drawdown_pct"]))
+                        if parsed_dd.is_finite() and parsed_dd >= Decimal("0"):
+                            dd_dec = parsed_dd.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+                    raw_vs = tsnap.get("last_valve_score")
+                    if raw_vs not in (None, ""):
+                        parsed_vs = Decimal(str(raw_vs))
+                        if parsed_vs.is_finite():
+                            vs_dec = min(
+                                Decimal("1.00"),
+                                max(Decimal("0.00"), parsed_vs.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)),
+                            )
+            except (InvalidOperation, ValueError, TypeError, Exception) as exc_tr:
+                self._last_routing_error = type(exc_tr).__name__
+
+        doc = dict(
+            self._aggression_dial.snapshot(
+                regime=regime,
+                consecutive_losses=consec,
+                drawdown_pct=dd_dec,
+                valve_score=vs_dec,
+                owner_controls_allowed=bool(owner_controls_allowed),
+            )
+        )
+        doc["live_mode"] = execution_mode == "LIVE"
+        doc["execution_mode"] = execution_mode
+        doc["connected"] = True
+        doc["audit_verified"] = bool(self._aggression_dial.verify_audit_chain())
+        return assert_safe_ai_catalog_payload(doc)
 
     def _resolve_static_path(self, raw_path: str) -> Path | None:
         clean = urllib.parse.unquote(raw_path.split("?", 1)[0].split("#", 1)[0])
@@ -1698,6 +1778,25 @@ class LoopbackCockpitServer:
                             outer._last_routing_error = type(exc).__name__
                             self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Parallel tiers unavailable"})
                         return
+                    if route == "/api/aggression-dial":
+                        if outer._aggression_dial is None:
+                            self._write_json(HTTPStatus.NOT_FOUND, {"error": "Aggression dial store not configured"})
+                            return
+                        try:
+                            adsnap = outer._read_aggression_dial_snapshot(
+                                owner_controls_allowed=(auth_scope == SESSION_SCOPE_OWNER_FULL)
+                            )
+                            if adsnap is None:
+                                self._write_json(HTTPStatus.NOT_FOUND, {"error": "Aggression dial store not configured"})
+                            else:
+                                self._write_json(HTTPStatus.OK, adsnap)
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(
+                                HTTPStatus.INTERNAL_SERVER_ERROR,
+                                {"error": "Aggression dial snapshot unavailable"},
+                            )
+                        return
                     if route == "/api/index-stream":
                         try:
                             idx_snap = outer._index_stream_reader() if outer._index_stream_reader is not None else None
@@ -1745,6 +1844,8 @@ class LoopbackCockpitServer:
                             last_treasury_mono = 0.0
                             last_parallel_tiers_json = ""
                             last_parallel_tiers_mono = 0.0
+                            last_aggression_dial_json = ""
+                            last_aggression_dial_mono = 0.0
                             outer._record_sse_client(1)
                             sse_client_recorded = True
                             try:
@@ -1849,6 +1950,28 @@ class LoopbackCockpitServer:
                                             except Exception as exc:
                                                 outer._last_routing_error = type(exc).__name__
                                                 eframe = f"event: error\ndata: {json.dumps({'source': 'parallel_tiers', 'error': 'Parallel tiers unavailable'})}\n\n".encode("utf-8")
+                                                self.wfile.write(eframe)
+                                                emitted_events += 1
+                                        if outer._aggression_dial is not None:
+                                            try:
+                                                adsnap = outer._read_aggression_dial_snapshot(
+                                                    owner_controls_allowed=(auth_scope == SESSION_SCOPE_OWNER_FULL)
+                                                )
+                                                if adsnap is not None:
+                                                    adjson = json.dumps(adsnap, sort_keys=False)
+                                                    if (
+                                                        not last_aggression_dial_json
+                                                        or adjson != last_aggression_dial_json
+                                                        or (now_mono - last_aggression_dial_mono) >= 1.0
+                                                    ):
+                                                        last_aggression_dial_json = adjson
+                                                        last_aggression_dial_mono = now_mono
+                                                        adframe = f"event: aggression_dial\ndata: {adjson}\n\n".encode("utf-8")
+                                                        self.wfile.write(adframe)
+                                                        emitted_events += 1
+                                            except Exception as exc:
+                                                outer._last_routing_error = type(exc).__name__
+                                                eframe = f"event: error\ndata: {json.dumps({'source': 'aggression_dial', 'error': 'Aggression dial snapshot unavailable'})}\n\n".encode("utf-8")
                                                 self.wfile.write(eframe)
                                                 emitted_events += 1
                                         if emitted_events > 0:
@@ -2051,6 +2174,171 @@ class LoopbackCockpitServer:
                         self._write_json(HTTPStatus.OK, updated)
                     except _SessionRevokedError:
                         self._reject_unauthorized()
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+
+                if route == "/api/aggression-dial":
+                    if outer._aggression_dial is None:
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "Aggression dial store not configured"})
+                        return
+                    try:
+                        body = self._read_json_body(max_bytes=16384)
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        if type(body) is not dict:
+                            raise ContractError("JSON object required")
+                        exec_mode_str = "DEMO"
+                        try:
+                            routing_doc = outer._read_broker_routing()
+                            if isinstance(routing_doc, Mapping):
+                                exec_mode_str = str(routing_doc.get("execution_mode") or "DEMO").strip().upper()
+                        except Exception as exc_rt:
+                            outer._last_routing_error = type(exc_rt).__name__
+                        if "live_mode" in body and type(body["live_mode"]) is not bool:
+                            raise ContractError("live_mode must be a boolean")
+                        live_mode_flag = (exec_mode_str == "LIVE") or bool(body.get("live_mode", False))
+                        raw_hrc = body.get("high_risk_confirmed", False)
+                        if type(raw_hrc) is not bool:
+                            raise ContractError("high_risk_confirmed must be a boolean")
+                        actor_str = str(body.get("actor") or "cockpit-owner").strip() or "cockpit-owner"
+
+                        raw_action = str(body.get("action") or "").strip().upper()
+                        if not raw_action:
+                            if "preset" in body:
+                                raw_action = "APPLY_TIER_PRESET"
+                            elif "tier_id" in body:
+                                raw_action = "SET_TIER_RISK_BPS"
+                            elif "master_risk_bps" in body or "risk_bps" in body:
+                                raw_action = "SET_MASTER_RISK_BPS"
+                            elif (
+                                "ai_discretion_enabled" in body
+                                or "enabled" in body
+                                or "auto_shift_enabled" in body
+                            ):
+                                raw_action = "SET_AI_DISCRETION"
+                            elif "ai_discretion_ceiling_bps" in body or "ceiling_bps" in body:
+                                raw_action = "SET_AI_DISCRETION_CEILING"
+
+                        with outer._commit_lease(supplied_tok, auth_epoch):
+                            if raw_action == "SET_MASTER_RISK_BPS":
+                                bps_val = (
+                                    body["master_risk_bps"]
+                                    if "master_risk_bps" in body
+                                    else body.get("risk_bps")
+                                )
+                                ai_disc = (
+                                    body["ai_discretion_enabled"]
+                                    if "ai_discretion_enabled" in body
+                                    else body.get("auto_shift_enabled")
+                                )
+                                ceil_val = (
+                                    body["ai_discretion_ceiling_bps"]
+                                    if "ai_discretion_ceiling_bps" in body
+                                    else body.get("ceiling_bps")
+                                )
+                                outer._aggression_dial.set_master_risk_bps(
+                                    bps_val,
+                                    ai_discretion_enabled=ai_disc,
+                                    ai_discretion_ceiling_bps=ceil_val,
+                                    live_mode=live_mode_flag,
+                                    high_risk_confirmed=raw_hrc,
+                                    owner_controls_allowed=True,
+                                    actor=actor_str,
+                                )
+                            elif raw_action in ("SET_AI_DISCRETION", "TOGGLE_AI_DISCRETION"):
+                                if "ai_discretion_enabled" in body:
+                                    en_val = body["ai_discretion_enabled"]
+                                elif "enabled" in body:
+                                    en_val = body["enabled"]
+                                elif "auto_shift_enabled" in body:
+                                    en_val = body["auto_shift_enabled"]
+                                else:
+                                    cur_snap = outer._aggression_dial.snapshot()
+                                    en_val = not bool(cur_snap["ai_discretion_enabled"])
+                                ceil_val = (
+                                    body["ai_discretion_ceiling_bps"]
+                                    if "ai_discretion_ceiling_bps" in body
+                                    else body.get("ceiling_bps")
+                                )
+                                outer._aggression_dial.set_ai_discretion(
+                                    en_val,
+                                    ceiling_bps=ceil_val,
+                                    live_mode=live_mode_flag,
+                                    high_risk_confirmed=raw_hrc,
+                                    owner_controls_allowed=True,
+                                    actor=actor_str,
+                                )
+                            elif raw_action == "SET_AI_DISCRETION_CEILING":
+                                ceil_val = (
+                                    body["ai_discretion_ceiling_bps"]
+                                    if "ai_discretion_ceiling_bps" in body
+                                    else body.get("ceiling_bps")
+                                )
+                                if ceil_val is None:
+                                    raise AggressionDialError("ai_discretion_ceiling_bps or ceiling_bps required")
+                                if "ai_discretion_enabled" in body:
+                                    en_cur = body["ai_discretion_enabled"]
+                                elif "enabled" in body:
+                                    en_cur = body["enabled"]
+                                else:
+                                    en_cur = bool(outer._aggression_dial.snapshot()["ai_discretion_enabled"])
+                                outer._aggression_dial.set_ai_discretion(
+                                    en_cur,
+                                    ceiling_bps=ceil_val,
+                                    live_mode=live_mode_flag,
+                                    high_risk_confirmed=raw_hrc,
+                                    owner_controls_allowed=True,
+                                    actor=actor_str,
+                                )
+                            elif raw_action == "SET_TIER_RISK_BPS":
+                                outer._aggression_dial.set_tier_risk_bps(
+                                    body.get("tier_id"),
+                                    body.get("risk_bps"),
+                                    live_mode=live_mode_flag,
+                                    high_risk_confirmed=raw_hrc,
+                                    owner_controls_allowed=True,
+                                    actor=actor_str,
+                                )
+                            elif raw_action in (
+                                "APPLY_TIER_PRESET",
+                                "SYNC_ALL_TO_MASTER",
+                                "SYNC_MASTER",
+                                "APPLY_STAGGER_PRESET",
+                            ):
+                                if raw_action in ("SYNC_ALL_TO_MASTER", "SYNC_MASTER") and "preset" not in body:
+                                    preset_val: Any = "SYNC_MASTER"
+                                elif raw_action == "APPLY_STAGGER_PRESET" and "preset" not in body:
+                                    preset_val = "STAGGER_SAFE_TO_EXTREME"
+                                else:
+                                    preset_val = body.get("preset")
+                                outer._aggression_dial.apply_tier_preset(
+                                    preset_val,
+                                    live_mode=live_mode_flag,
+                                    high_risk_confirmed=raw_hrc,
+                                    owner_controls_allowed=True,
+                                    actor=actor_str,
+                                )
+                            else:
+                                raise AggressionDialError(f"Unsupported aggression-dial action {raw_action!r}")
+                            updated_dial = outer._read_aggression_dial_snapshot(owner_controls_allowed=True)
+                        outer.notify_stream_updated()
+                        self._write_json(HTTPStatus.OK, updated_dial)
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
+                    except HighRiskConfirmationRequiredError as exc:
+                        self._write_json(
+                            HTTPStatus.CONFLICT,
+                            {
+                                "error": str(exc),
+                                "code": "HIGH_RISK_CONFIRMATION_REQUIRED",
+                                "live_mode": True,
+                                "high_risk_min_bps": HIGH_RISK_MIN_BPS,
+                            },
+                        )
+                    except OwnerKeyRequiredError:
+                        self._reject_insufficient_scope()
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
@@ -2922,6 +3210,14 @@ def run_cockpit_cli(
         and runtime_state.profit_vault.configured_initial_capital_usd() is None
     ):
         runtime_state.profit_vault.set_config(initial_capital_usd=cli_init_cap)
+    aggression_dial = AggressionDialStore(
+        runtime_state.state_dir / "aggression_dial.sqlite3",
+        scope_id="dual-shield-barbell",
+    )
+    if runtime_state.parallel_tiers is not None and callable(
+        getattr(runtime_state.parallel_tiers, "bind_aggression_dial", None)
+    ):
+        runtime_state.parallel_tiers.bind_aggression_dial(aggression_dial)
     trader = AutonomousAiTrader(
         router=router,
         model_registry=registry,
@@ -2933,6 +3229,7 @@ def run_cockpit_cli(
         fast_tick_ms=args.fast_tick_ms,
         profit_vault=runtime_state.profit_vault,
         parallel_tiers=runtime_state.parallel_tiers,
+        aggression_dial=aggression_dial,
         risk_gear_mode=merged.get(ENV_RISK_GEAR_MODE),
         risk_gear_path=runtime_state.state_dir / "risk_gear.json",
         initial_capital_usd=cli_init_cap,
@@ -2954,6 +3251,7 @@ def run_cockpit_cli(
         "fast_scout_enabled": cat_snap["fast_scout_enabled"],
         "fast_tick_ms": int(args.fast_tick_ms),
         "autonomous_trader_ready": bool(args.autonomous_ai),
+        "aggression_dial_master_bps": int(aggression_dial.snapshot()["master_risk_bps"]),
         "daily_quota": assert_safe_ai_catalog_payload(quota_store.snapshot()),
     })
     safe_broker_routing_payload(routing_summary)
@@ -3006,6 +3304,7 @@ def run_cockpit_cli(
         index_stream_reader=_read_index_stream,
         profit_vault=runtime_state.profit_vault,
         parallel_tiers=runtime_state.parallel_tiers,
+        aggression_dial=aggression_dial,
         owner_recovery=runtime_state.owner_recovery,
         model_execution_gate=runtime_state.model_gate,
         token_file=str(merged.get("CAS_FOREX_COCKPIT_TOKEN_FILE", "")).strip() or None,

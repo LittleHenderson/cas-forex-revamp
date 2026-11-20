@@ -6,7 +6,7 @@
  * - Strict CSP: ZERO inline style attributes, ZERO eval/Function, ZERO inline event handlers.
  * - XSS-safe HTML escaping on every dynamic string.
  * - Buttery-smooth 60fps sliding pill switch (role="switch") + cubic-bezier transitions +
- *   zero-flicker in-place DOM patching (patchAggressionDialInPlace) with ZERO innerHTML churn.
+ *   zero-flicker in-place DOM patching (patchAggressionDialInPlace) with ZERO DOM-sink churn.
  * - Exact BigInt integer half-up arithmetic matching Python int/Decimal across all
  *   81 risk_bps steps (20..100 = 0.20%..1.00%) x 5 tiers ($300k, $6k, $3k, $1k, $300) = 405 tuples.
  * - Constitutional PR #25 ceilings: MAX_CONSTITUTIONAL_STOP_RISK_PCT = 1.00% (100 bps),
@@ -573,13 +573,32 @@ export function normalizeAggressionDial(doc) {
     ?? doc.ai_trader?.owner_controls_allowed
   );
   const rawRole = cleanStr(
-    source.sessionRole ?? source.session_role ?? doc.sessionRole ?? doc.session_role ?? doc.aiTrader?.sessionRole,
+    source.accessMode
+      ?? source.access_mode
+      ?? source.sessionScope
+      ?? source.session_scope
+      ?? source.sessionRole
+      ?? source.session_role
+      ?? doc.sessionScope
+      ?? doc.session_scope
+      ?? doc.sessionRole
+      ?? doc.session_role
+      ?? doc.aiTrader?.sessionRole,
     '',
     48,
   ).toUpperCase();
-  const ownerControlsAllowed = typeof rawOwnerAllowed === 'boolean'
-    ? rawOwnerAllowed
-    : rawRole !== 'DEVICE_READ_AND_EXPLAINER';
+  const explicitDenied = (
+    doc.ownerControlsAllowed === false
+    || doc.owner_controls_allowed === false
+    || source.ownerControlsAllowed === false
+    || source.owner_controls_allowed === false
+    || doc.aiTrader?.ownerControlsAllowed === false
+    || doc.ai_trader?.owner_controls_allowed === false
+    || rawRole === 'DEVICE_READ_AND_EXPLAINER'
+  );
+  const ownerControlsAllowed = explicitDenied
+    ? false
+    : (typeof rawOwnerAllowed === 'boolean' ? rawOwnerAllowed : true);
 
   const rawMasterCapCents = source.masterCapitalCents ?? source.master_capital_cents ?? masterObj.capital_cents;
   const rawMasterCapUsd = source.masterCapitalUsd ?? source.master_capital_usd ?? masterObj.capital_usd;
@@ -661,7 +680,7 @@ export function applyAggressionDialPreset(state, presetId) {
   const code = cleanStr(presetId, '', 40).toUpperCase();
   const nextBps = {};
   for (const tier of dial.tiers) {
-    if (code === 'SYNC_MASTER') {
+    if (code === 'SYNC_MASTER' || code === 'SYNC_ALL_TO_MASTER') {
       nextBps[tier.tierId] = dial.masterRiskBps;
     } else if (code === 'STAGGER_SAFE_TO_EXTREME' || code === 'STAGGER_SAFE_TO_HIGH') {
       nextBps[tier.tierId] = STAGGER_SAFE_TO_EXTREME_BPS[tier.tierId] ?? DEFAULT_MASTER_RISK_BPS;
@@ -680,6 +699,40 @@ export function applyAggressionDialPreset(state, presetId) {
       riskBps: nextBps[tier.tierId],
       effectiveRiskBps: nextBps[tier.tierId],
     })),
+  });
+}
+
+/**
+ * Resolve the effective Aggression Dial view model from a full cockpit state object,
+ * fusing `/api/aggression-dial` / `/api/ai-trader` / `/api/parallel-tiers` state with
+ * live broker executionMode (`LIVE` vs `DEMO`) and PR #25 paired-device privilege lockouts.
+ */
+export function resolveCockpitAggressionDial(state) {
+  if (!state || typeof state !== 'object') return STATIC_AGGRESSION_DIAL;
+  if (state.schema === AGGRESSION_DIAL_SCHEMA && !('route' in state) && !('projection' in state)) {
+    return normalizeAggressionDial(state);
+  }
+  const rawDial = state.aggressionDial
+    ?? state.aiTrader?.aggressionDial
+    ?? state.parallelTiers?.aggressionDial
+    ?? STATIC_AGGRESSION_DIAL;
+  const base = normalizeAggressionDial(rawDial);
+  const routingLive = state.brokerRouting?.executionMode === 'LIVE' && state.brokerRouting?.liveArmed === true;
+  const liveMode = Boolean(routingLive || (rawDial !== STATIC_AGGRESSION_DIAL && base.liveMode));
+  const pairedReadOnly = (
+    state.sessionScope === 'DEVICE_READ_AND_EXPLAINER'
+    || state.sessionRole === 'DEVICE_READ_AND_EXPLAINER'
+    || (state.liveStreamConnected === true && state.ownerControlsAllowed === false)
+    || (!('liveStreamConnected' in state) && state.ownerControlsAllowed === false)
+    || base.ownerControlsAllowed === false
+  );
+  if (base.liveMode === liveMode && base.ownerControlsAllowed === !pairedReadOnly) {
+    return base;
+  }
+  return normalizeAggressionDial({
+    ...base,
+    liveMode,
+    ownerControlsAllowed: !pairedReadOnly,
   });
 }
 
@@ -926,7 +979,7 @@ function findMatchingElement(root, selector) {
 /**
  * In-place zero-flicker DOM patcher for smooth 60fps 0.01% slider drags & toggle clicks.
  * Updates CSS classes, role="switch" states, slider values (20..100 bps), disabled flags, and
- * metric textContent strictly in place — NEVER touches innerHTML or inline styles!
+ * metric textContent strictly in place — NEVER touches raw HTML sinks or inline styles!
  */
 export function patchAggressionDialInPlace(root, nextState) {
   const dial = normalizeAggressionDial(nextState);

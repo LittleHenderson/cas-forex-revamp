@@ -53,6 +53,12 @@ from cas_forex_revamp.operator.frontier_backends import (
 )
 from cas_forex_revamp.operator.model import ActualModelDecisionAdapter, DurableModelExecutionGate, ModelInvocation
 from cas_forex_revamp.treasury.profit_sweep import ENV_INITIAL_CAPITAL_USD
+from cas_forex_revamp.valve.aggression_dial import (
+    AggressionDialStore,
+    MIN_CONSTITUTIONAL_VALVE_PROB,
+    REFERENCE_CAPITAL_USD,
+    resolve_effective_params as resolve_dial_effective_params,
+)
 from cas_forex_revamp.valve.daily_quota import (
     DailyQuotaGovernanceStore,
     QUOTA_STATUS_LOCKED,
@@ -397,6 +403,7 @@ class AutonomousAiTrader:
         protection_overrides: Mapping[str, Mapping[str, Decimal]] | None = None,
         profit_vault: Any | None = None,
         parallel_tiers: Any | None = None,
+        aggression_dial: AggressionDialStore | None = None,
         risk_gear_mode: str | None = None,
         risk_gear_path: str | Path | None = None,
         initial_capital_usd: Decimal | None = None,
@@ -410,6 +417,8 @@ class AutonomousAiTrader:
             raise ContractError("AutonomousAiTrader requires a ForexMetaValveGate")
         if type(fast_tick_ms) is not int or not (0 <= fast_tick_ms <= 5000):
             raise ContractError("fast_tick_ms must be an integer in 0..5000")
+        if aggression_dial is not None and not isinstance(aggression_dial, AggressionDialStore):
+            raise ContractError("aggression_dial must be an AggressionDialStore or None")
 
         self._router = router
         self._registry = model_registry
@@ -449,6 +458,8 @@ class AutonomousAiTrader:
         self._protection_overrides = {str(k): dict(v) for k, v in (protection_overrides or {}).items()}
         self._profit_vault = profit_vault
         self._parallel_tiers = parallel_tiers
+        self._aggression_dial: AggressionDialStore | None = aggression_dial
+        self._last_dial_skip_reason: str | None = None
         self._risk_gear_path = Path(risk_gear_path) if risk_gear_path is not None else None
         init_gear = RISK_GEAR_AUTO_ADAPTIVE
         if risk_gear_mode is not None and str(risk_gear_mode).strip():
@@ -580,6 +591,99 @@ class AutonomousAiTrader:
     def governance_mode(self) -> str:
         with self._lock:
             return self._governance_mode
+
+    @property
+    def aggression_dial(self) -> AggressionDialStore | None:
+        with self._lock:
+            return self._aggression_dial
+
+    def bind_aggression_dial(self, store: AggressionDialStore | None) -> None:
+        if store is not None and not isinstance(store, AggressionDialStore):
+            raise ContractError("aggression_dial must be an AggressionDialStore or None")
+        with self._lock:
+            self._aggression_dial = store
+
+    def _read_dial_snapshot_outside_lock(self) -> dict[str, Any] | None:
+        with self._lock:
+            dial = self._aggression_dial
+        if dial is None:
+            return None
+        return dial.snapshot()
+
+    def _resolve_master_dial_summary_unlocked(
+        self,
+        *,
+        regime: str,
+        total_eq: Decimal,
+        peak_eq: Decimal,
+        quota_snap: Mapping[str, Any],
+        raw_dial: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if raw_dial is None:
+            return None
+        cap_base = (
+            total_eq
+            if total_eq > Decimal("0")
+            else (self._explicit_initial_capital_usd or REFERENCE_CAPITAL_USD)
+        )
+        raw_dd = (
+            compute_drawdown_pct(total_eq, peak_eq)
+            if (peak_eq > Decimal("0") and total_eq > Decimal("0"))
+            else Decimal("0")
+        )
+        dd_q = max(Decimal("0"), raw_dd.quantize(Decimal("0.000001"), rounding=ROUND_CEILING))
+        consec = max(0, int(quota_snap.get("consecutive_losses", 0) or 0))
+        v_score_dec = Decimal("0.60")
+        if self._last_valve_score not in (None, ""):
+            try:
+                parsed_vs = Decimal(str(self._last_valve_score))
+                if parsed_vs.is_finite():
+                    v_score_dec = min(
+                        Decimal("1.00"),
+                        max(Decimal("0.00"), parsed_vs.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)),
+                    )
+            except (InvalidOperation, ValueError, TypeError):
+                v_score_dec = Decimal("0.60")
+        clean_reg = str(regime or self._last_regime or REGIME_TREND_IGNITION).strip().upper() or REGIME_TREND_IGNITION
+        eff = resolve_dial_effective_params(
+            int(raw_dial["master_risk_bps"]),
+            cap_base,
+            ai_discretion_enabled=bool(raw_dial["ai_discretion_enabled"]),
+            ai_discretion_ceiling_bps=int(raw_dial["ai_discretion_ceiling_bps"]),
+            regime=clean_reg,
+            consecutive_losses=consec,
+            drawdown_pct=dd_q,
+            valve_score=v_score_dec,
+        )
+        return {
+            "schema": "cas-forex.aggression-dial-summary/1",
+            "scope_id": str(raw_dial["scope_id"]),
+            "master_risk_bps": int(eff["requested_risk_bps"]),
+            "master_risk_pct": str(eff["requested_risk_pct"]),
+            "effective_risk_bps": int(eff["effective_risk_bps"]),
+            "effective_risk_pct": str(eff["effective_risk_pct"]),
+            "effective_label": str(eff["effective_label"]),
+            "css_class": str(eff["css_class"]),
+            "ai_discretion_enabled": bool(eff["ai_discretion_enabled"]),
+            "ai_discretion_ceiling_bps": int(eff["ai_discretion_ceiling_bps"]),
+            "ai_discretion_reason": str(eff["ai_discretion_reason"]),
+            "ai_discretion_shifted": bool(eff["ai_discretion_shifted"]),
+            "ai_discretion_direction": str(eff["ai_discretion_direction"]),
+            "capital_usd": str(eff["capital_usd"]),
+            "risk_per_trade_usd": str(eff["risk_per_trade_usd"]),
+            "max_open_trades": int(eff["max_open_trades"]),
+            "min_signal_prob": str(eff["min_signal_prob"]),
+            "session_goal_usd": str(eff["session_goal_usd"]),
+            "soft_goal_usd": str(eff["soft_goal_usd"]),
+            "daily_loss_brake_usd": str(eff["daily_loss_brake_usd"]),
+            "max_drawdown_pct": str(eff["max_drawdown_pct"]),
+            "regime": str(eff["regime"]),
+            "consecutive_losses": int(eff["consecutive_losses"]),
+            "drawdown_pct": str(eff["drawdown_pct"]),
+            "valve_score": str(eff["valve_score"]),
+            "audit_count": int(raw_dial["audit_count"]),
+            "audit_head_sha256": str(raw_dial["audit_head_sha256"]),
+        }
 
     @property
     def risk_gear_mode(self) -> str:
@@ -1328,13 +1432,18 @@ class AutonomousAiTrader:
         risk_mult: Decimal,
         fast_tick: bool,
         allow_cold_open: bool,
+        peak_eq: Decimal | None = None,
+        quota_snap: Mapping[str, Any] | None = None,
+        raw_dial: Mapping[str, Any] | None = None,
     ) -> tuple[str, Side, Decimal, Decimal, str, str, bool, str | None, int] | None:
         """Scan watchlist with TrendRegimeDetector, House-Money ADD pyramiding, and correlation cap."""
+        self._last_dial_skip_reason = None
         ordered_syms = list(INDEX_INSTRUMENTS) + [s for s in markets if s not in INDEX_INSTRUMENTS]
         open_meta_list = list(self._open_position_meta.values())
         best_ratio = Decimal("-1")
         best_sym: str | None = None
         best_reg: str | None = None
+        dial_cap_block: str | None = None
         for sym in ordered_syms:
             info = markets.get(sym)
             if not info:
@@ -1381,6 +1490,26 @@ class AutonomousAiTrader:
 
             if any(m.get("symbol") == sym and m.get("side") != side.value for m in open_meta_list):
                 continue
+
+            cand_dial = (
+                self._resolve_master_dial_summary_unlocked(
+                    regime=regime_name,
+                    total_eq=total_eq,
+                    peak_eq=peak_eq if peak_eq is not None else total_eq,
+                    quota_snap=quota_snap or {},
+                    raw_dial=raw_dial,
+                )
+                if raw_dial is not None
+                else None
+            )
+            if cand_dial is not None:
+                max_open_cap = int(cand_dial["max_open_trades"])
+                if len(open_meta_list) >= max_open_cap:
+                    dial_cap_block = (
+                        f"DIAL_MAX_OPEN_TRADES_REACHED ({len(open_meta_list)}>={max_open_cap} "
+                        f"at {cand_dial['effective_risk_pct']}% {cand_dial['effective_label']})"
+                    )
+                    continue
 
             matching = [
                 m for m in open_meta_list
@@ -1471,6 +1600,14 @@ class AutonomousAiTrader:
             self._top_watch_symbol = best_sym
             self._last_evaluated_symbol = best_sym
             self._last_evaluated_regime = best_reg
+            if best_reg in (
+                REGIME_TREND_IGNITION,
+                REGIME_STRONG_TREND,
+                REGIME_CHOP_RANGE,
+                REGIME_SPREAD_SPIKE,
+            ):
+                self._last_regime = str(best_reg)
+        self._last_dial_skip_reason = dial_cap_block
         return None
 
     def _read_vault_snapshot_outside_lock(self) -> Mapping[str, Any]:
@@ -1852,9 +1989,10 @@ class AutonomousAiTrader:
 
         # Phase 1a: Open-position stop protection ALWAYS executes FIRST with zero vault I/O!
         prot_updates = self.evaluate_fast_protection(quotes=mt5_quotes, now=ts)
-        # Phase 1b (OUTSIDE self._lock): fault-isolated startup vault sync & vault snapshot read
+        # Phase 1b (OUTSIDE self._lock): fault-isolated startup vault sync, vault snapshot & read-only dial read
         self._attempt_startup_vault_sync_post_protection(ts)
         v_snap_cyc = self._read_vault_snapshot_outside_lock()
+        raw_dial_cyc = self._read_dial_snapshot_outside_lock()
         pending_disb_cyc = Decimal(str(v_snap_cyc.get("pending_disbursement_usd", "0") or "0"))
 
         with self._lock:
@@ -1928,9 +2066,36 @@ class AutonomousAiTrader:
 
             strong_runner_eligible = False
 
-            if self._governance_mode != GOVERNANCE_ACTIVE or not allowed:
-                wait_reason = quota_veto if not allowed else f"Overseer governance is {self._governance_mode}"
-                if not allowed:
+            pre_dial = self._resolve_master_dial_summary_unlocked(
+                regime=self._last_regime,
+                total_eq=total_eq,
+                peak_eq=peak_eq,
+                quota_snap=q_snap,
+                raw_dial=raw_dial_cyc,
+            )
+            realized_today_pre = Decimal(str(q_snap.get("realized_net_pnl_usd", "0")))
+            dial_pre_veto: str | None = None
+            if pre_dial is not None:
+                pre_loss_brake = Decimal(str(pre_dial["daily_loss_brake_usd"]))
+                pre_goal_usd = Decimal(str(pre_dial["session_goal_usd"]))
+                if realized_today_pre <= -pre_loss_brake:
+                    dial_pre_veto = (
+                        f"DIAL_DAILY_LOSS_BRAKE (${decimal_text(realized_today_pre)} <= "
+                        f"-${decimal_text(pre_loss_brake)})"
+                    )
+                elif realized_today_pre >= pre_goal_usd and not strong_runner_eligible:
+                    dial_pre_veto = (
+                        f"DIAL_SESSION_GOAL_REACHED (${decimal_text(realized_today_pre)} >= "
+                        f"${decimal_text(pre_goal_usd)})"
+                    )
+
+            if self._governance_mode != GOVERNANCE_ACTIVE or not allowed or dial_pre_veto is not None:
+                wait_reason = (
+                    dial_pre_veto
+                    if dial_pre_veto is not None
+                    else (quota_veto if not allowed else f"Overseer governance is {self._governance_mode}")
+                )
+                if not allowed or dial_pre_veto is not None:
                     self._veto_count += 1
                 self._last_action = "WAIT"
                 self._last_symbol = None
@@ -1961,14 +2126,23 @@ class AutonomousAiTrader:
                 risk_mult=Decimal("0.50") if strong_runner_eligible else risk_mult,
                 fast_tick=fast_tick,
                 allow_cold_open=allowed,
+                peak_eq=peak_eq,
+                quota_snap=q_snap,
+                raw_dial=raw_dial_cyc,
             )
             if setup is None:
+                if self._last_dial_skip_reason is not None:
+                    self._veto_count += 1
                 self._last_action = "WAIT"
                 self._last_symbol = None
                 self._last_reason = (
-                    str(quota_veto)
-                    if strong_runner_eligible
-                    else "No risk-compliant momentum or trend setup clears spread/regime gate."
+                    self._last_dial_skip_reason
+                    if self._last_dial_skip_reason is not None
+                    else (
+                        str(quota_veto)
+                        if strong_runner_eligible
+                        else "No risk-compliant momentum or trend setup clears spread/regime gate."
+                    )
                 )
                 self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
                 if self._parallel_tiers is not None and quotes_map:
@@ -1997,34 +2171,93 @@ class AutonomousAiTrader:
             gear_info = self._resolve_risk_gear(
                 regime=regime_name, total_eq=total_eq, peak_eq=peak_eq, quota_snap=quota_full
             )
+            dial_eff = self._resolve_master_dial_summary_unlocked(
+                regime=regime_name,
+                total_eq=total_eq,
+                peak_eq=peak_eq,
+                quota_snap=quota_full,
+                raw_dial=raw_dial_cyc,
+            )
             realized_today = Decimal(str(quota_full.get("realized_net_pnl_usd", "0")))
-            gear_soft_q = Decimal(gear_info["effective_soft_quota_usd"])
-            gear_hard_q = Decimal(gear_info["effective_hard_quota_usd"])
-            if realized_today >= gear_hard_q and not strong_runner_eligible:
-                self._veto_count += 1
-                self._last_action = "WAIT"
-                self._last_symbol = sym
-                self._last_reason = f"DYNAMIC_GEAR_QUOTA_REACHED ({gear_info['active_gear']}: ${decimal_text(realized_today)} >= ${decimal_text(gear_hard_q)})"
-                self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
-                if self._parallel_tiers is not None and quotes_map:
-                    self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
-                report = {
-                    "schema": "cas-forex.ai-cycle/1",
-                    "cycle_id": cycle_id,
-                    "observed_at": _iso(ts),
-                    "model_id": self._registry.active_model_id,
-                    "cadence": self._last_cadence,
-                    "action": "WAIT",
-                    "symbol": sym,
-                    "reason": self._last_reason,
-                    "valve_score": self._last_valve_score,
-                    "protection_updates": prot_updates,
-                }
-                self._append_journal_cycle(report)
-                return report
-            base_mult = Decimal("0.50") if (strong_runner_eligible or realized_today >= gear_soft_q) else risk_mult
-            gear_scale = Decimal(gear_info["risk_scale_factor"])
-            eff_mult = max(Decimal("0.05"), (base_mult * gear_scale).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR))
+            if dial_eff is not None:
+                dial_soft_q = Decimal(str(dial_eff["soft_goal_usd"]))
+                dial_hard_q = Decimal(str(dial_eff["session_goal_usd"]))
+                dial_loss_b = Decimal(str(dial_eff["daily_loss_brake_usd"]))
+                if realized_today <= -dial_loss_b or (realized_today >= dial_hard_q and not strong_runner_eligible):
+                    self._veto_count += 1
+                    self._last_action = "WAIT"
+                    self._last_symbol = sym
+                    self._last_reason = (
+                        f"DIAL_DAILY_LOSS_BRAKE (${decimal_text(realized_today)} <= -${decimal_text(dial_loss_b)})"
+                        if realized_today <= -dial_loss_b
+                        else f"DIAL_SESSION_GOAL_REACHED (${decimal_text(realized_today)} >= ${decimal_text(dial_hard_q)})"
+                    )
+                    self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                    if self._parallel_tiers is not None and quotes_map:
+                        self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
+                    report = {
+                        "schema": "cas-forex.ai-cycle/1",
+                        "cycle_id": cycle_id,
+                        "observed_at": _iso(ts),
+                        "model_id": self._registry.active_model_id,
+                        "cadence": self._last_cadence,
+                        "action": "WAIT",
+                        "symbol": sym,
+                        "reason": self._last_reason,
+                        "valve_score": self._last_valve_score,
+                        "protection_updates": prot_updates,
+                    }
+                    self._append_journal_cycle(report)
+                    return report
+                base_mult = (
+                    Decimal("0.50")
+                    if (strong_runner_eligible or realized_today >= dial_soft_q)
+                    else Decimal("1.00")
+                )
+                dial_risk_pct = min(
+                    Decimal(str(dial_eff["effective_risk_pct"])),
+                    self._router.barbell.max_stop_loss_equity_risk_pct,
+                    MAX_CONSTITUTIONAL_STOP_RISK_PCT,
+                )
+                with localcontext() as ctx:
+                    ctx.prec = 40
+                    dial_scale = (
+                        dial_risk_pct / self._router.barbell.max_stop_loss_equity_risk_pct
+                    ).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR)
+                if self._risk_gear_mode == RISK_GEAR_CONSERVATIVE:
+                    dial_scale = min(dial_scale, Decimal(gear_info["risk_scale_factor"]))
+                eff_mult = max(
+                    Decimal("0.05"),
+                    (base_mult * dial_scale).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR),
+                )
+            else:
+                gear_soft_q = Decimal(gear_info["effective_soft_quota_usd"])
+                gear_hard_q = Decimal(gear_info["effective_hard_quota_usd"])
+                if realized_today >= gear_hard_q and not strong_runner_eligible:
+                    self._veto_count += 1
+                    self._last_action = "WAIT"
+                    self._last_symbol = sym
+                    self._last_reason = f"DYNAMIC_GEAR_QUOTA_REACHED ({gear_info['active_gear']}: ${decimal_text(realized_today)} >= ${decimal_text(gear_hard_q)})"
+                    self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                    if self._parallel_tiers is not None and quotes_map:
+                        self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
+                    report = {
+                        "schema": "cas-forex.ai-cycle/1",
+                        "cycle_id": cycle_id,
+                        "observed_at": _iso(ts),
+                        "model_id": self._registry.active_model_id,
+                        "cadence": self._last_cadence,
+                        "action": "WAIT",
+                        "symbol": sym,
+                        "reason": self._last_reason,
+                        "valve_score": self._last_valve_score,
+                        "protection_updates": prot_updates,
+                    }
+                    self._append_journal_cycle(report)
+                    return report
+                base_mult = Decimal("0.50") if (strong_runner_eligible or realized_today >= gear_soft_q) else risk_mult
+                gear_scale = Decimal(gear_info["risk_scale_factor"])
+                eff_mult = max(Decimal("0.05"), (base_mult * gear_scale).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR))
             params = self._protection_cfg(sym, eff_mult)
             t_sz = _tick_size(sym)
             spread = max(t_sz, ask - bid)
@@ -2350,6 +2583,51 @@ class AutonomousAiTrader:
                 self._last_symbol = sym
                 self._last_reason = f"ForexMetaValveGate vetoed {active_id} {req_kind.value} proposal on {sym}"
                 raise
+
+            if dial_eff is not None:
+                min_prob_req = max(
+                    MIN_CONSTITUTIONAL_VALVE_PROB,
+                    Decimal(str(dial_eff["min_signal_prob"])),
+                )
+                obs_prob = Decimal(f"{valve_dec.mlp_score:.8f}")
+                if obs_prob < min_prob_req:
+                    self._veto_count += 1
+                    self._last_valve_score = decimal_text(obs_prob)
+                    self._last_action = "WAIT"
+                    self._last_symbol = sym
+                    self._last_reason = (
+                        f"DIAL_MIN_SIGNAL_PROB (mlp_score={valve_dec.mlp_score:.4f} < "
+                        f"{min_prob_req} at {dial_eff['effective_risk_pct']}% {dial_eff['effective_label']})"
+                    )
+                    self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                    if self._parallel_tiers is not None and quotes_map:
+                        self._parallel_tiers.process_tick(
+                            quotes=quotes_map,
+                            signal={
+                                "symbol": sym,
+                                "side": side.value,
+                                "stop_price": decimal_text(sl_price),
+                                "take_profit_price": decimal_text(tp_price),
+                                "regime": regime_name,
+                            },
+                            now=ts,
+                        )
+                    report = {
+                        "schema": "cas-forex.ai-cycle/1",
+                        "cycle_id": cycle_id,
+                        "observed_at": _iso(ts),
+                        "model_id": active_id,
+                        "cadence": self._last_cadence,
+                        "thinking_depth": eff_depth,
+                        "regime": regime_name,
+                        "action": "WAIT",
+                        "symbol": sym,
+                        "reason": self._last_reason,
+                        "valve_score": self._last_valve_score,
+                        "protection_updates": prot_updates,
+                    }
+                    self._append_journal_cycle(report)
+                    return report
 
             # Execute protected broker leg via OrderIntent(OPEN) bound to ADD/OPEN ValveDecision
             broker_order = OrderIntent(
@@ -3167,6 +3445,7 @@ class AutonomousAiTrader:
     def status_snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:
         ts = self._now(now)
         v_snap = self._read_vault_snapshot_outside_lock()
+        raw_dial_snap = self._read_dial_snapshot_outside_lock()
         pending_disb = Decimal(str(v_snap.get("pending_disbursement_usd", "0") or "0"))
         with self._lock:
             equities = self._router.equities()
@@ -3359,4 +3638,12 @@ class AutonomousAiTrader:
                 ts,
                 mt5_tick_fresh=bool(self._cycle_seq > 0 and self._last_cadence.endswith("FAST_TICK")),
             )
+            if raw_dial_snap is not None:
+                payload["aggression_dial"] = self._resolve_master_dial_summary_unlocked(
+                    regime=self._last_regime,
+                    total_eq=total_eq,
+                    peak_eq=self._router.peak_equity() or total_eq,
+                    quota_snap=quota_snap,
+                    raw_dial=raw_dial_snap,
+                )
             return assert_safe_ai_catalog_payload(payload)

@@ -274,6 +274,16 @@
     },
     "realized_pnl_ledger": {
       "$ref": "#/$defs/realizedPnlLedger"
+    },
+    "aggression_dial": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/aggressionDialSummary"
+        }
+      ]
     }
   },
   "$defs": {
@@ -1524,6 +1534,149 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 512
+        }
+      }
+    },
+    "sha256Hex": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "aggressionDialSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "scope_id",
+        "master_risk_bps",
+        "master_risk_pct",
+        "effective_risk_bps",
+        "effective_risk_pct",
+        "effective_label",
+        "css_class",
+        "ai_discretion_enabled",
+        "ai_discretion_ceiling_bps",
+        "ai_discretion_reason",
+        "ai_discretion_shifted",
+        "ai_discretion_direction",
+        "capital_usd",
+        "risk_per_trade_usd",
+        "max_open_trades",
+        "min_signal_prob",
+        "session_goal_usd",
+        "soft_goal_usd",
+        "daily_loss_brake_usd",
+        "max_drawdown_pct",
+        "regime",
+        "consecutive_losses",
+        "drawdown_pct",
+        "valve_score",
+        "audit_count",
+        "audit_head_sha256"
+      ],
+      "properties": {
+        "schema": {
+          "const": "cas-forex.aggression-dial-summary/1"
+        },
+        "scope_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "master_risk_bps": {
+          "type": "integer",
+          "minimum": 20,
+          "maximum": 100
+        },
+        "master_risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "effective_risk_bps": {
+          "type": "integer",
+          "minimum": 20,
+          "maximum": 100
+        },
+        "effective_risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "effective_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "css_class": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 32,
+          "pattern": "^dial-lvl-[0-9]+$"
+        },
+        "ai_discretion_enabled": {
+          "type": "boolean"
+        },
+        "ai_discretion_ceiling_bps": {
+          "type": "integer",
+          "minimum": 20,
+          "maximum": 100
+        },
+        "ai_discretion_reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "ai_discretion_shifted": {
+          "type": "boolean"
+        },
+        "ai_discretion_direction": {
+          "enum": [
+            "UP",
+            "DOWN",
+            "HOLD"
+          ]
+        },
+        "capital_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "risk_per_trade_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "max_open_trades": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "min_signal_prob": {
+          "$ref": "#/$defs/decimal"
+        },
+        "session_goal_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "soft_goal_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "daily_loss_brake_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "max_drawdown_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "regime": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "consecutive_losses": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "drawdown_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "valve_score": {
+          "$ref": "#/$defs/decimal"
+        },
+        "audit_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "audit_head_sha256": {
+          "$ref": "#/$defs/sha256Hex"
         }
       }
     }
