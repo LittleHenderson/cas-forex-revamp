@@ -55,6 +55,7 @@ import {
   HIGH_RISK_MIN_BPS,
   STATIC_AGGRESSION_DIAL,
   applyAggressionDialPreset,
+  applyMarketConditionPreview,
   clampRiskBps,
   normalizeAggressionDial,
   patchAggressionDialInPlace,
@@ -353,7 +354,7 @@ function render(focusMain = false) {
   try { releaseDetachedCanvases(root); } catch { /* Best-effort buffer release. */ }
   replaceSafeHTML(root, renderApp(state));
   if (state.liveStreamConnected && !isOwnerControlSession(state)) {
-    for (const el of root.querySelectorAll('[data-thinking-depth], [data-select-ai-model], [data-treasury-rail], [data-treasury-action], [data-dial-master-slider], [data-dial-master-preset], [data-dial-action], [data-dial-tier-slider], [data-dial-tier-bps], [data-dial-tier-preset], [data-dial-confirm-high-risk], [data-dial-cancel-high-risk], [data-compounding-action]')) {
+    for (const el of root.querySelectorAll('[data-thinking-depth], [data-select-ai-model], [data-treasury-rail], [data-treasury-action], [data-dial-master-slider], [data-dial-master-preset], [data-dial-market-mode], [data-dial-action], [data-dial-tier-slider], [data-dial-tier-bps], [data-dial-tier-preset], [data-dial-confirm-high-risk], [data-dial-cancel-high-risk], [data-compounding-action]')) {
       el.disabled = true;
     }
   }
@@ -1513,6 +1514,16 @@ root.addEventListener('click', (event) => {
       { action: 'acknowledge_principal_withdrawn', amount_usd: pulloutUsd },
       '[data-compounding-field="modeSwitch"]',
     );
+    return;
+  }
+  if (target.dataset.dialMarketMode) {
+    if (state.liveStreamConnected && !requireOwnerControlOrWarn('Market mode preview')) return;
+    const cur = resolveCockpitAggressionDial(state);
+    if (!cur.ownerControlsAllowed) return;
+    const modeId = String(target.dataset.dialMarketMode || '').replace(/[^A-Z_]/gi, '').toUpperCase();
+    if (!modeId) return;
+    state.aggressionDial = applyMarketConditionPreview(cur, modeId);
+    syncAggressionDialDom(`[data-dial-market-mode="${modeId}"]`);
     return;
   }
   if (target.dataset.dialAction === 'TOGGLE_AI_DISCRETION') {

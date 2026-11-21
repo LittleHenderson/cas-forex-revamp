@@ -2,11 +2,11 @@
  * Strict-CSP Trading Aggression Dial (0.20%..1.00% in 0.01% single-unit bps steps 20..100 +
  * AI Discretion) & Section B.5 5-Tier Per-Tier Dial UI Module for CAS Forex Revamp.
  *
- * Pure, zero-dependency ES module:
+ * Pure, zero-dependency ES module (Dark Obsidian Sleek Aesthetic):
  * - Strict CSP: ZERO inline style attributes, ZERO eval/Function, ZERO inline event handlers.
  * - XSS-safe HTML escaping on every dynamic string.
- * - Buttery-smooth 60fps sliding pill switch (role="switch") + cubic-bezier transitions +
- *   zero-flicker in-place DOM patching (patchAggressionDialInPlace) with ZERO DOM-sink churn.
+ * - Buttery-smooth 60fps sliding pill switch (role="switch") + rainbow spectrum slider track +
+ *   glowing white circle thumb + zero-flicker in-place DOM patching with ZERO DOM-sink churn.
  * - Exact BigInt integer half-up arithmetic matching Python int/Decimal across all
  *   81 risk_bps steps (20..100 = 0.20%..1.00%) x 5 tiers ($300k, $6k, $3k, $1k, $300) = 405 tuples.
  * - Constitutional PR #25 ceilings: MAX_CONSTITUTIONAL_STOP_RISK_PCT = 1.00% (100 bps),
@@ -69,23 +69,37 @@ export const AGGRESSION_ANCHOR_KNOTS = Object.freeze([
 ]);
 
 export const MASTER_PRESET_BUTTONS = Object.freeze([
-  Object.freeze({ bps: 20, label: 'Safe 0.20%' }),
-  Object.freeze({ bps: 40, label: 'Steady 0.40%' }),
-  Object.freeze({ bps: 60, label: 'Balanced 0.60%' }),
-  Object.freeze({ bps: 85, label: 'Risky 0.85%' }),
-  Object.freeze({ bps: 95, label: 'High Risk 0.95%' }),
-  Object.freeze({ bps: 100, label: 'Extreme 1.00%' }),
+  Object.freeze({ bps: 20, title: 'Safe', pct: '0.20%', label: 'Safe 0.20%' }),
+  Object.freeze({ bps: 40, title: 'Steady', pct: '0.40%', label: 'Steady 0.40%' }),
+  Object.freeze({ bps: 60, title: 'Balanced', pct: '0.60%', label: 'Balanced 0.60%' }),
+  Object.freeze({ bps: 85, title: 'Risky', pct: '0.85%', label: 'Risky 0.85%' }),
+  Object.freeze({ bps: 95, title: 'High Risk', pct: '0.95%', label: 'High Risk 0.95%' }),
+  Object.freeze({ bps: 100, title: 'Extreme', pct: '1.00%', label: 'Extreme 1.00%' }),
 ]);
+
+export const MARKET_MODE_PILLS = Object.freeze([
+  Object.freeze({ id: 'CHOP', label: 'Chop' }),
+  Object.freeze({ id: 'TREND', label: 'Trend' }),
+  Object.freeze({ id: 'STRONG_TREND', label: 'Strong Trend' }),
+  Object.freeze({ id: 'AFTER_LOSS', label: 'After Loss' }),
+]);
+
+const MARKET_MODE_LABELS = Object.freeze({
+  CHOP: 'Chop',
+  TREND: 'Trend',
+  STRONG_TREND: 'Strong Trend',
+  AFTER_LOSS: 'After Loss',
+});
 
 export const MASTER_SLIDER_TICKS_BPS = Object.freeze([20, 30, 40, 50, 60, 70, 80, 90, 100]);
 
 export const TIER_COMPACT_PRESETS = Object.freeze([
-  Object.freeze({ bps: 20, label: '0.20%' }),
-  Object.freeze({ bps: 40, label: '0.40%' }),
-  Object.freeze({ bps: 60, label: '0.60%' }),
-  Object.freeze({ bps: 85, label: '0.85%' }),
-  Object.freeze({ bps: 95, label: '0.95%' }),
-  Object.freeze({ bps: 100, label: '1.00%' }),
+  Object.freeze({ bps: 20, shortLabel: 'Safe', pctLabel: '0.20%', label: 'Safe' }),
+  Object.freeze({ bps: 40, shortLabel: 'Std', pctLabel: '0.40%', label: 'Std' }),
+  Object.freeze({ bps: 60, shortLabel: 'Bal', pctLabel: '0.60%', label: 'Bal' }),
+  Object.freeze({ bps: 85, shortLabel: 'Rsk', pctLabel: '0.85%', label: 'Rsk' }),
+  Object.freeze({ bps: 95, shortLabel: 'High', pctLabel: '0.95%', label: 'High' }),
+  Object.freeze({ bps: 100, shortLabel: 'Ext', pctLabel: '1.00%', label: 'Ext' }),
 ]);
 
 export const TIER_QUICK_PRESETS = Object.freeze([
@@ -107,39 +121,47 @@ export const STAGGER_SAFE_TO_HIGH_BPS = STAGGER_SAFE_TO_EXTREME_BPS;
 export const DEFAULT_TIER_DEFINITIONS = Object.freeze([
   Object.freeze({
     tierId: 'TIER_1_CURRENT',
-    label: 'Current Barbell ($300,000)',
+    label: '$300,000 Main Barbell',
     colorToken: 'tier-300k',
     startingCapitalCents: 30000000n,
     startingCapitalUsd: '300000.00',
   }),
   Object.freeze({
     tierId: 'TIER_4_6000',
-    label: 'Tier $6,000 Accelerator',
+    label: '$6,000 Accelerator',
     colorToken: 'tier-6000',
     startingCapitalCents: 600000n,
     startingCapitalUsd: '6000.00',
   }),
   Object.freeze({
     tierId: 'TIER_3_3000',
-    label: 'Tier $3,000 Growth',
+    label: '$3,000 Growth',
     colorToken: 'tier-3000',
     startingCapitalCents: 300000n,
     startingCapitalUsd: '3000.00',
   }),
   Object.freeze({
     tierId: 'TIER_2_1000',
-    label: 'Tier $1,000 Starter',
+    label: '$1,000 Starter',
     colorToken: 'tier-1000',
     startingCapitalCents: 100000n,
     startingCapitalUsd: '1000.00',
   }),
   Object.freeze({
     tierId: 'TIER_5_300',
-    label: 'Tier $300 Micro Challenge',
+    label: '$300 Micro Challenge',
     colorToken: 'tier-300',
     startingCapitalCents: 30000n,
     startingCapitalUsd: '300.00',
   }),
+]);
+
+const LEGACY_BACKEND_TIER_LABELS = new Set([
+  'Current Barbell ($300,000)',
+  'Tier $6,000 Accelerator',
+  'Tier $3,000 Growth',
+  'Tier $1,000 Starter',
+  'Tier $300 Micro Challenge',
 ]);
 
 function esc(value) {
@@ -232,6 +254,52 @@ export function zoneForRiskBps(riskBps) {
   if (riskBps <= 89) return Object.freeze({ label: 'Risky', cssClass: 'dial-lvl-8' });
   if (riskBps <= 95) return Object.freeze({ label: 'High Risk', cssClass: 'dial-lvl-10' });
   return Object.freeze({ label: 'Extreme High Risk', cssClass: 'dial-lvl-11' });
+}
+
+export function normalizeMarketCondition(rawCondition, aiDiscretionReason = '', consecutiveLosses = 0) {
+  const token = cleanStr(rawCondition, '', 64).toUpperCase();
+  if (
+    token === 'AFTER_LOSS'
+    || token === 'RECOVERY'
+    || token === 'DEFENSIVE'
+    || token.includes('LOSS')
+    || token.includes('DRAWDOWN')
+  ) {
+    return 'AFTER_LOSS';
+  }
+  if (token === 'CHOP' || token === 'CHOP_RANGE' || token === 'RANGING' || token === 'RANGE') {
+    return 'CHOP';
+  }
+  if (
+    token === 'STRONG_TREND'
+    || token === 'BREAKOUT'
+    || token.startsWith('STRONG_TREND')
+  ) {
+    return 'STRONG_TREND';
+  }
+  if (
+    token === 'TREND'
+    || token === 'TRENDING'
+    || token === 'TREND_IGNITION'
+    || token.startsWith('TREND_IGNITION')
+  ) {
+    return 'TREND';
+  }
+
+  if (Number.isInteger(consecutiveLosses) && consecutiveLosses >= 1) {
+    return 'AFTER_LOSS';
+  }
+  const reason = cleanStr(aiDiscretionReason, '', 80).toUpperCase();
+  if (reason.includes('LOSS') || reason.includes('DRAWDOWN') || reason.includes('RECOVERY')) {
+    return 'AFTER_LOSS';
+  }
+  if (reason.includes('STRONG_TREND') || reason.includes('EXTREME') || reason.includes('BREAKOUT')) {
+    return 'STRONG_TREND';
+  }
+  if (reason.includes('CHOP') || reason.includes('RANGE')) {
+    return 'CHOP';
+  }
+  return 'TREND';
 }
 
 function divRoundHalfUpBigInt(num, den) {
@@ -392,7 +460,8 @@ export function scaleTierTargets(riskBps, startingCapitalCents) {
 }
 
 function buildTierEntry(def, rawTier, fallbackBps) {
-  const label = cleanStr(rawTier?.label, def.label, 120);
+  const rawLabel = cleanStr(rawTier?.label, '', 120);
+  const label = (!rawLabel || LEGACY_BACKEND_TIER_LABELS.has(rawLabel)) ? def.label : rawLabel;
   const colorToken = cleanStr(rawTier?.colorToken ?? rawTier?.color_token, def.colorToken, 40);
   const rawCapCents = rawTier?.startingCapitalCents ?? rawTier?.starting_capital_cents;
   const rawCapUsd = rawTier?.startingCapitalUsd ?? rawTier?.starting_capital_usd ?? rawTier?.capital_usd;
@@ -469,6 +538,7 @@ function buildStaticState() {
     autoShiftEnabled: true,
     aiDiscretionCeilingBps: DEFAULT_AI_DISCRETION_CEILING_BPS,
     aiDiscretionReason: '',
+    marketCondition: 'TREND',
     masterCapitalCents: REF_CAPITAL_CENTS,
     masterCapitalUsd: '300000.00',
     masterTargets,
@@ -553,6 +623,19 @@ export function normalizeAggressionDial(doc) {
     '',
     120,
   );
+
+  const rawLosses = source.consecutiveLosses ?? source.consecutive_losses ?? masterObj.consecutive_losses ?? 0;
+  const consecutiveLosses = Number.isInteger(rawLosses) && rawLosses >= 0 ? rawLosses : 0;
+  const rawCondition = (
+    source.marketCondition
+    ?? source.market_condition
+    ?? source.regime
+    ?? masterObj.regime
+    ?? doc.marketCondition
+    ?? doc.market_condition
+    ?? ''
+  );
+  const marketCondition = normalizeMarketCondition(rawCondition, aiDiscretionReason, consecutiveLosses);
 
   const rawEff = source.effectiveRiskBps ?? source.effective_risk_bps ?? masterObj.effective_risk_bps;
   let effectiveRiskBps = masterRiskBps;
@@ -663,6 +746,7 @@ export function normalizeAggressionDial(doc) {
     autoShiftEnabled: aiDiscretionEnabled,
     aiDiscretionCeilingBps,
     aiDiscretionReason,
+    marketCondition,
     masterCapitalCents,
     masterCapitalUsd: formatCentsPlain(masterCapitalCents),
     masterTargets,
@@ -672,6 +756,41 @@ export function normalizeAggressionDial(doc) {
     tiers,
     guardrails: UNBREAKABLE_GUARDRAILS,
     auditVerified,
+  });
+}
+
+export function applyMarketConditionPreview(state, modeId) {
+  const dial = normalizeAggressionDial(state);
+  const marketCondition = normalizeMarketCondition(modeId);
+  if (!dial.aiDiscretionEnabled) {
+    return normalizeAggressionDial({
+      ...dial,
+      marketCondition,
+      effectiveRiskBps: dial.masterRiskBps,
+      aiDiscretionReason: 'MANUAL_LOCK',
+    });
+  }
+  let effectiveRiskBps = dial.masterRiskBps;
+  let aiDiscretionReason = dial.aiDiscretionReason;
+  if (marketCondition === 'CHOP') {
+    effectiveRiskBps = Math.min(dial.masterRiskBps, 40);
+    aiDiscretionReason = 'CHOP_RANGE';
+  } else if (marketCondition === 'AFTER_LOSS') {
+    effectiveRiskBps = Math.min(dial.masterRiskBps, 30);
+    aiDiscretionReason = 'CONSECUTIVE_LOSS_1';
+  } else if (marketCondition === 'TREND') {
+    effectiveRiskBps = Math.min(dial.aiDiscretionCeilingBps, Math.max(dial.masterRiskBps, 85));
+    aiDiscretionReason = effectiveRiskBps > dial.masterRiskBps ? 'TREND_IGNITION_BOOST' : 'TREND_IGNITION_HOLD';
+  } else if (marketCondition === 'STRONG_TREND') {
+    effectiveRiskBps = Math.min(dial.aiDiscretionCeilingBps, MAX_RISK_BPS);
+    aiDiscretionReason = 'STRONG_TREND';
+  }
+  effectiveRiskBps = clampRiskBps(effectiveRiskBps, dial.masterRiskBps);
+  return normalizeAggressionDial({
+    ...dial,
+    marketCondition,
+    effectiveRiskBps,
+    aiDiscretionReason,
   });
 }
 
@@ -747,6 +866,24 @@ function buildAiShiftText(dial, targets) {
   return `AI Discretion Active → ${targets.riskPctLabel} ${targets.label}${reasonSuffix}`;
 }
 
+function buildBaseToAiPillText(chosenProfile, targets) {
+  return `Base ${chosenProfile.riskPctLabel} → AI ${targets.riskPctLabel}`;
+}
+
+function buildMarketModeStatusText(dial, targets) {
+  const modeLabel = MARKET_MODE_LABELS[dial.marketCondition] ?? 'Trend';
+  if (!dial.aiDiscretionEnabled) {
+    return `Manual Lock active — pinned at ${targets.riskPctLabel} (${targets.label})`;
+  }
+  if (dial.effectiveRiskBps > dial.masterRiskBps) {
+    return `AI boosted UP for ${modeLabel} → ${targets.riskPctLabel} (${targets.label})`;
+  }
+  if (dial.effectiveRiskBps < dial.masterRiskBps) {
+    return `AI stepped DOWN for ${modeLabel} → ${targets.riskPctLabel} (${targets.label})`;
+  }
+  return `AI Discretion holding ${modeLabel} → ${targets.riskPctLabel} (${targets.label})`;
+}
+
 function renderHighRiskConfirmBanner(pendingBps, targetLabel, tierId = null, disabledAttr = '', kind = 'bps') {
   const profile = RISK_BPS_PROFILES[pendingBps];
   if (!profile || !profile.highRisk) return '';
@@ -780,9 +917,19 @@ export function renderMasterAggressionDial(state) {
     : '<span class="dial-pill-tag dial-owner-lock-badge" data-dial-owner-key-required="false" hidden></span>';
 
   const isShifted = dial.aiDiscretionEnabled && dial.effectiveRiskBps !== dial.masterRiskBps;
+  const baseAiPill = isShifted
+    ? `<span class="dial-pill-tag dial-base-ai-pill ${esc(targets.cssClass)}" data-dial-base-ai-pill="true">${esc(buildBaseToAiPillText(chosenProfile, targets))}</span>`
+    : `<span class="dial-pill-tag dial-base-ai-pill ${esc(targets.cssClass)}" data-dial-base-ai-pill="false" hidden></span>`;
   const shiftedNote = isShifted
-    ? `<span class="dial-pill-tag dial-shift-pill ${esc(targets.cssClass)}" data-dial-ai-shifted="true" data-dial-auto-shifted="true">${esc(buildAiShiftText(dial, targets))}</span>`
-    : `<span class="dial-pill-tag dial-shift-pill ${esc(targets.cssClass)}" data-dial-ai-shifted="false" data-dial-auto-shifted="false" hidden></span>`;
+    ? `<span class="dial-pill-tag dial-shift-pill sr-only ${esc(targets.cssClass)}" data-dial-ai-shifted="true" data-dial-auto-shifted="true">${esc(buildAiShiftText(dial, targets))}</span>`
+    : `<span class="dial-pill-tag dial-shift-pill sr-only ${esc(targets.cssClass)}" data-dial-ai-shifted="false" data-dial-auto-shifted="false" hidden></span>`;
+
+  const marketPillsHtml = MARKET_MODE_PILLS.map((pill) => {
+    const active = dial.marketCondition === pill.id;
+    const activeCls = active ? ` is-active ${esc(targets.cssClass)}` : '';
+    return `<button type="button" class="dial-market-pill${activeCls}" data-dial-market-mode="${esc(pill.id)}" aria-pressed="${active ? 'true' : 'false'}"${disabledAttr}>${esc(pill.label)}</button>`;
+  }).join('');
+  const marketStatusText = buildMarketModeStatusText(dial, targets);
 
   const ticksHtml = MASTER_SLIDER_TICKS_BPS.map((tickBps) => {
     const activeCls = tickBps === dial.masterRiskBps ? ' is-current' : '';
@@ -793,7 +940,7 @@ export function renderMasterAggressionDial(state) {
   const presetsHtml = MASTER_PRESET_BUTTONS.map((preset) => {
     const p = RISK_BPS_PROFILES[preset.bps];
     const activeCls = dial.masterRiskBps === preset.bps ? ' is-active' : '';
-    return `<button type="button" class="dial-preset-btn ${esc(p.cssClass)}${activeCls}" data-dial-master-preset="${preset.bps}" aria-pressed="${dial.masterRiskBps === preset.bps ? 'true' : 'false'}"${disabledAttr}>${esc(preset.label)}</button>`;
+    return `<button type="button" class="dial-preset-btn ${esc(p.cssClass)}${activeCls}" data-dial-master-preset="${preset.bps}" aria-label="${esc(preset.label)}" aria-pressed="${dial.masterRiskBps === preset.bps ? 'true' : 'false'}"${disabledAttr}><span class="dial-preset-title">${esc(preset.title)}</span><span class="dial-preset-pct">${esc(preset.pct)}</span></button>`;
   }).join('');
 
   let confirmBannerHtml = '';
@@ -822,21 +969,36 @@ export function renderMasterAggressionDial(state) {
   const toggleLabel = dial.aiDiscretionEnabled ? 'AI Discretion: ON' : 'Manual Lock';
   const sublineText = buildMasterSublineText(dial, chosenProfile, targets);
 
-  return `<section class="panel aggression-dial-panel ${esc(targets.cssClass)}${readonlyCls}" data-aggression-dial="master" data-dial-bps="${targets.riskBps}" data-dial-master-bps="${dial.masterRiskBps}" data-ai-discretion="${dial.aiDiscretionEnabled ? 'true' : 'false'}" data-live-mode="${dial.liveMode ? 'true' : 'false'}" data-owner-controls-allowed="${dial.ownerControlsAllowed ? 'true' : 'false'}" aria-label="Master Trading Aggression Dial">
+  return `<section class="panel aggression-dial-panel ${esc(targets.cssClass)}${readonlyCls}" data-aggression-dial="master" data-dial-bps="${targets.riskBps}" data-dial-master-bps="${dial.masterRiskBps}" data-ai-discretion="${dial.aiDiscretionEnabled ? 'true' : 'false'}" data-market-mode="${esc(dial.marketCondition)}" data-live-mode="${dial.liveMode ? 'true' : 'false'}" data-owner-controls-allowed="${dial.ownerControlsAllowed ? 'true' : 'false'}" aria-label="Master Trading Aggression Dial">
     <div class="dial-header">
       <div class="dial-title-group">
         <span class="dial-badge dial-level-badge ${esc(targets.cssClass)}" data-dial-bps-badge="${targets.riskBps}">${esc(targets.riskPctLabel)}</span>
-        <div>
-          <h2 class="dial-heading" data-dial-heading="true">${esc(targets.label)}</h2>
+        <div class="dial-header-copy">
+          <span class="dial-eyebrow">MASTER TRADING AGGRESSION DIAL (0.01% STEPS)</span>
+          <div class="dial-heading-row">
+            <h2 class="dial-heading" data-dial-heading="true">${esc(targets.label)}</h2>
+            ${baseAiPill}
+            ${shiftedNote}
+            ${ownerLockBadge}
+          </div>
           <span class="dial-subline" data-dial-subline="true">${esc(sublineText)}</span>
         </div>
-        ${shiftedNote}
-        ${ownerLockBadge}
       </div>
+    </div>
+
+    <div class="dial-discretion-row">
       <button type="button" role="switch" aria-checked="${dial.aiDiscretionEnabled ? 'true' : 'false'}" class="dial-switch ${switchCls}" data-dial-action="TOGGLE_AI_DISCRETION"${disabledAttr}>
         <span class="dial-switch-track" aria-hidden="true"><span class="dial-switch-thumb"></span></span>
         <span class="dial-switch-label" data-dial-switch-label="true">${esc(toggleLabel)}</span>
       </button>
+    </div>
+
+    <div class="dial-market-box ${esc(targets.cssClass)}" data-dial-market-box="true" data-active-market-mode="${esc(dial.marketCondition)}">
+      <div class="dial-market-row" role="group" aria-label="Market Mode">
+        <span class="dial-market-label">Market Mode:</span>
+        <div class="dial-market-pills">${marketPillsHtml}</div>
+      </div>
+      <p class="dial-market-status ${esc(targets.cssClass)}" data-dial-market-status="true">${esc(marketStatusText)}</p>
     </div>
 
     <div class="dial-slider-wrap">
@@ -849,19 +1011,20 @@ export function renderMasterAggressionDial(state) {
     <div class="dial-metrics-grid" role="list" aria-label="Active risk and target metrics">
       <div class="dial-metric-tile" role="listitem" data-dial-metric="risk-per-trade">
         <span class="dial-metric-label">Risk / Trade</span>
-        <strong class="dial-metric-value" data-dial-metric-value="risk-per-trade">${esc(targets.riskPctLabel)}</strong>
+        <strong class="dial-metric-value dial-val-zone" data-dial-metric-value="risk-per-trade">${esc(targets.riskPctLabel)}</strong>
       </div>
       <div class="dial-metric-tile" role="listitem" data-dial-metric="max-open-trades">
-        <span class="dial-metric-label">Max Open Trades</span>
+        <span class="dial-metric-label">Max Trades</span>
         <strong class="dial-metric-value" data-dial-metric-value="max-open-trades">${targets.maxOpenTrades}</strong>
+      </div>
+      <div class="dial-metric-tile" role="listitem" data-dial-metric="signal-bar">
+        <span class="dial-metric-label">Signal Bar</span>
+        <strong class="dial-metric-value" data-dial-metric-value="signal-bar">${esc(targets.minSignalProb)}</strong>
       </div>
       <div class="dial-metric-tile" role="listitem" data-dial-metric="session-goal">
         <span class="dial-metric-label">Session Goal</span>
         <strong class="dial-metric-value dial-val-positive" data-dial-metric-value="session-goal">${esc(targets.sessionGoalFormatted)}</strong>
-      </div>
-      <div class="dial-metric-tile" role="listitem" data-dial-metric="daily-loss-brake">
-        <span class="dial-metric-label">Daily Loss Brake</span>
-        <strong class="dial-metric-value dial-val-negative" data-dial-metric-value="daily-loss-brake">${esc(targets.dailyLossBrakeFormatted)}</strong>
+        <span class="dial-metric-subbrake" data-dial-metric="daily-loss-brake">Daily Loss Brake <strong class="dial-val-negative" data-dial-metric-value="daily-loss-brake">${esc(targets.dailyLossBrakeFormatted)}</strong></span>
       </div>
     </div>
 
@@ -889,7 +1052,7 @@ export function renderSectionB5TierDials(state) {
     const compactButtonsHtml = TIER_COMPACT_PRESETS.map((preset) => {
       const p = RISK_BPS_PROFILES[preset.bps];
       const activeCls = tier.riskBps === preset.bps ? ' is-active' : '';
-      return `<button type="button" class="dial-tier-btn b5-tier-btn ${esc(p.cssClass)}${activeCls}" data-dial-tier-id="${esc(tier.tierId)}" data-dial-tier-bps="${preset.bps}" aria-pressed="${tier.riskBps === preset.bps ? 'true' : 'false'}"${disabledAttr}>${esc(preset.label)}</button>`;
+      return `<button type="button" class="dial-tier-btn b5-tier-btn ${esc(p.cssClass)}${activeCls}" data-dial-tier-id="${esc(tier.tierId)}" data-dial-tier-bps="${preset.bps}" aria-label="${esc(tier.label)} ${esc(preset.shortLabel)} ${esc(preset.pctLabel)}" aria-pressed="${tier.riskBps === preset.bps ? 'true' : 'false'}"${disabledAttr}>${esc(preset.shortLabel)}</button>`;
     }).join('');
 
     const tierConfirmHtml = (
@@ -904,14 +1067,15 @@ export function renderSectionB5TierDials(state) {
 
     return `<div class="b5-tier-row ${esc(tier.cssClass)}" data-tier-id="${esc(tier.tierId)}" data-tier-bps="${tier.riskBps}">
       <div class="b5-tier-head">
-        <span class="dial-badge dial-level-badge ${esc(tier.cssClass)}" data-tier-bps-badge="${tier.riskBps}">${esc(tier.riskPctLabel)}</span>
-        <div class="b5-tier-identity">
+        <div class="b5-tier-identity-row">
+          <span class="dial-badge dial-level-badge b5-bps-box ${esc(tier.cssClass)}" data-tier-bps-badge="${tier.riskBps}">${esc(tier.riskPctLabel)}</span>
           <strong class="b5-tier-label">${esc(tier.label)}</strong>
-          <span class="b5-tier-level-name" data-tier-level-name="true">${esc(tier.zoneLabel)} · ${esc(tier.startingCapitalFormatted)} · Min Signal ${esc(tier.minSignalProb)}</span>
+          <span class="dial-pill-tag b5-zone-pill ${esc(tier.cssClass)}" data-tier-zone-pill="true" data-tier-level-name="true">${esc(tier.zoneLabel)}</span>
         </div>
         <div class="b5-tier-metrics">
-          <span class="b5-tier-metric"><em>Risk</em> <strong class="dial-metric-value-sm" data-tier-metric="risk">${esc(tier.riskPctLabel)}</strong></span>
+          <span class="b5-tier-metric sr-only"><em>Risk</em> <strong class="dial-metric-value-sm" data-tier-metric="risk">${esc(tier.riskPctLabel)}</strong></span>
           <span class="b5-tier-metric"><em>Max</em> <strong class="dial-metric-value-sm" data-tier-metric="max">${tier.maxOpenTrades}</strong></span>
+          <span class="b5-tier-metric"><em>Bar</em> <strong class="dial-metric-value-sm" data-tier-metric="signal-bar">${esc(tier.minSignalProb)}</strong></span>
           <span class="b5-tier-metric b5-metric-goal"><em>Goal</em> <strong class="dial-metric-value-sm" data-tier-metric="goal">${esc(tier.sessionGoalFormatted)}</strong></span>
           <span class="b5-tier-metric b5-metric-brake"><em>Brake</em> <strong class="dial-metric-value-sm" data-tier-metric="brake">${esc(tier.dailyLossBrakeFormatted)}</strong></span>
         </div>
@@ -924,18 +1088,22 @@ export function renderSectionB5TierDials(state) {
     </div>`;
   }).join('');
 
-  return `<div class="b5-tier-dials${readonlyCls}" data-section="b5-tier-dials" data-live-mode="${dial.liveMode ? 'true' : 'false'}" data-owner-controls-allowed="${dial.ownerControlsAllowed ? 'true' : 'false'}" aria-label="Section B.5 5-Tier Per-Account Aggression Dials">
+  return `<div class="b5-tier-dials${readonlyCls}" data-section="b5-tier-dials" data-live-mode="${dial.liveMode ? 'true' : 'false'}" data-owner-controls-allowed="${dial.ownerControlsAllowed ? 'true' : 'false'}" aria-label="Section B.5 5-Tier Account Aggression Dials">
     <div class="b5-tier-dials-header">
-      <div>
-        <p class="eyebrow">SECTION B.5 · SHARED 50MS STREAM · ZERO EXTRA AI API COST</p>
+      <div class="b5-tier-header-stack">
+        <p class="eyebrow b5-eyebrow">SECTION B.5 · SHARED 50MS STREAM · ZERO EXTRA AI API COST</p>
         <div class="b5-tier-title-row">
-          <h3 class="b5-tier-dials-title">5-Tier Per-Account Aggression Controls</h3>
+          <h3 class="b5-tier-dials-title">5-Tier Account Aggression Dials (0.20%–1.00% by 0.01%)</h3>
           ${ownerLockBadge}
         </div>
+        <div class="b5-tier-quickbar" role="group" aria-label="All-tier quick presets">${quickButtonsHtml}</div>
       </div>
-      <div class="b5-tier-quickbar" role="group" aria-label="All-tier quick presets">${quickButtonsHtml}</div>
     </div>
     <div class="b5-tier-rows">${tierRowsHtml}</div>
+    <div class="b5-safety-footer" data-b5-safety-footer="true">
+      <p class="b5-safety-walls-line">Hard Safety Walls ON at every 0.01% step: Stop Risk ≤ 1.00%  Max DD ≤ 10.00%  Valve ≥ 0.55  1,000% Margin</p>
+      <span class="b5-safety-steps-subline">Exact 0.01% Steps</span>
+    </div>
   </div>`;
 }
 
@@ -976,6 +1144,231 @@ function findMatchingElement(root, selector) {
   return null;
 }
 
+export function patchMasterAggressionDialInPlace(root, nextState) {
+  const dial = normalizeAggressionDial(nextState);
+  const masterEl = findMatchingElement(root, '[data-aggression-dial="master"]');
+  if (!masterEl) {
+    return false;
+  }
+  const readOnly = dial.ownerControlsAllowed === false;
+  const chosenProfile = RISK_BPS_PROFILES[dial.masterRiskBps];
+  const targets = dial.masterTargets;
+  const isShifted = dial.aiDiscretionEnabled && dial.effectiveRiskBps !== dial.masterRiskBps;
+
+  swapDialLevelClass(masterEl, targets.cssClass);
+  masterEl.classList?.toggle('is-readonly', readOnly);
+  masterEl.setAttribute?.('data-dial-bps', String(targets.riskBps));
+  masterEl.setAttribute?.('data-dial-master-bps', String(dial.masterRiskBps));
+  masterEl.setAttribute?.('data-ai-discretion', dial.aiDiscretionEnabled ? 'true' : 'false');
+  masterEl.setAttribute?.('data-market-mode', dial.marketCondition);
+  masterEl.setAttribute?.('data-live-mode', dial.liveMode ? 'true' : 'false');
+  masterEl.setAttribute?.('data-owner-controls-allowed', dial.ownerControlsAllowed ? 'true' : 'false');
+
+  const badgeEl = masterEl.querySelector?.('[data-dial-bps-badge]');
+  if (badgeEl) {
+    swapDialLevelClass(badgeEl, targets.cssClass);
+    badgeEl.setAttribute?.('data-dial-bps-badge', String(targets.riskBps));
+    badgeEl.textContent = targets.riskPctLabel;
+  }
+
+  const headingEl = masterEl.querySelector?.('[data-dial-heading]');
+  if (headingEl) {
+    headingEl.textContent = targets.label;
+  }
+
+  const sublineEl = masterEl.querySelector?.('[data-dial-subline]');
+  if (sublineEl) {
+    sublineEl.textContent = buildMasterSublineText(dial, chosenProfile, targets);
+  }
+
+  const baseAiEl = masterEl.querySelector?.('[data-dial-base-ai-pill]');
+  if (baseAiEl) {
+    swapDialLevelClass(baseAiEl, targets.cssClass);
+    baseAiEl.setAttribute?.('data-dial-base-ai-pill', isShifted ? 'true' : 'false');
+    baseAiEl.textContent = isShifted ? buildBaseToAiPillText(chosenProfile, targets) : '';
+    setHiddenFlag(baseAiEl, !isShifted);
+  }
+
+  const shiftEl = masterEl.querySelector?.('[data-dial-ai-shifted]');
+  if (shiftEl) {
+    swapDialLevelClass(shiftEl, targets.cssClass);
+    shiftEl.setAttribute?.('data-dial-ai-shifted', isShifted ? 'true' : 'false');
+    shiftEl.setAttribute?.('data-dial-auto-shifted', isShifted ? 'true' : 'false');
+    shiftEl.textContent = isShifted ? buildAiShiftText(dial, targets) : '';
+    setHiddenFlag(shiftEl, !isShifted);
+  }
+
+  const lockEl = masterEl.querySelector?.('[data-dial-owner-key-required]');
+  if (lockEl) {
+    lockEl.setAttribute?.('data-dial-owner-key-required', readOnly ? 'true' : 'false');
+    lockEl.textContent = readOnly ? 'Owner Key Required' : '';
+    setHiddenFlag(lockEl, !readOnly);
+  }
+
+  const switchBtn = masterEl.querySelector?.('[data-dial-action="TOGGLE_AI_DISCRETION"]');
+  if (switchBtn) {
+    switchBtn.classList?.toggle('is-on', dial.aiDiscretionEnabled);
+    switchBtn.classList?.toggle('is-off', !dial.aiDiscretionEnabled);
+    switchBtn.setAttribute?.('aria-checked', dial.aiDiscretionEnabled ? 'true' : 'false');
+    switchBtn.disabled = readOnly;
+    const switchLabel = switchBtn.querySelector?.('[data-dial-switch-label]');
+    if (switchLabel) {
+      switchLabel.textContent = dial.aiDiscretionEnabled ? 'AI Discretion: ON' : 'Manual Lock';
+    }
+  }
+
+  const marketBoxEl = masterEl.querySelector?.('[data-dial-market-box]');
+  if (marketBoxEl) {
+    swapDialLevelClass(marketBoxEl, targets.cssClass);
+    marketBoxEl.setAttribute?.('data-active-market-mode', dial.marketCondition);
+  }
+
+  const marketPillEls = masterEl.querySelectorAll?.('[data-dial-market-mode]') ?? [];
+  for (const pillBtn of marketPillEls) {
+    const modeId = pillBtn.getAttribute?.('data-dial-market-mode');
+    const active = modeId === dial.marketCondition;
+    pillBtn.classList?.toggle('is-active', active);
+    swapDialLevelClass(pillBtn, active ? targets.cssClass : null);
+    pillBtn.setAttribute?.('aria-pressed', active ? 'true' : 'false');
+    pillBtn.disabled = readOnly;
+  }
+
+  const marketStatusEl = masterEl.querySelector?.('[data-dial-market-status]');
+  if (marketStatusEl) {
+    swapDialLevelClass(marketStatusEl, targets.cssClass);
+    marketStatusEl.textContent = buildMarketModeStatusText(dial, targets);
+  }
+
+  const sliderEl = masterEl.querySelector?.('[data-dial-master-slider="true"]');
+  if (sliderEl) {
+    swapDialLevelClass(sliderEl, chosenProfile.cssClass);
+    const nextVal = String(dial.masterRiskBps);
+    if (String(sliderEl.value ?? '') !== nextVal) {
+      sliderEl.value = nextVal;
+    }
+    sliderEl.disabled = readOnly;
+  }
+
+  const tickEls = masterEl.querySelectorAll?.('[data-dial-tick-bps]') ?? [];
+  for (const tickEl of tickEls) {
+    const tickBps = Number(tickEl.getAttribute?.('data-dial-tick-bps'));
+    tickEl.classList?.toggle('is-current', tickBps === dial.masterRiskBps);
+    tickEl.classList?.toggle('is-ai-active', isShifted && tickBps === dial.effectiveRiskBps);
+  }
+
+  const presetBtns = masterEl.querySelectorAll?.('[data-dial-master-preset]') ?? [];
+  for (const btn of presetBtns) {
+    const presetBps = Number(btn.getAttribute?.('data-dial-master-preset'));
+    const active = presetBps === dial.masterRiskBps;
+    btn.classList?.toggle('is-active', active);
+    btn.setAttribute?.('aria-pressed', active ? 'true' : 'false');
+    btn.disabled = readOnly;
+  }
+
+  const metricMap = {
+    'risk-per-trade': targets.riskPctLabel,
+    'max-open-trades': String(targets.maxOpenTrades),
+    'signal-bar': targets.minSignalProb,
+    'session-goal': targets.sessionGoalFormatted,
+    'daily-loss-brake': targets.dailyLossBrakeFormatted,
+  };
+  for (const [key, val] of Object.entries(metricMap)) {
+    const valEl = masterEl.querySelector?.(`[data-dial-metric-value="${key}"]`);
+    if (valEl) {
+      valEl.textContent = val;
+    }
+  }
+
+  return true;
+}
+
+export function patchSectionB5TierDialsInPlace(root, nextState) {
+  const dial = normalizeAggressionDial(nextState);
+  const b5El = findMatchingElement(root, '[data-section="b5-tier-dials"]');
+  if (!b5El) {
+    return 0;
+  }
+  const readOnly = dial.ownerControlsAllowed === false;
+  let patchedTiers = 0;
+
+  b5El.classList?.toggle('is-readonly', readOnly);
+  b5El.setAttribute?.('data-live-mode', dial.liveMode ? 'true' : 'false');
+  b5El.setAttribute?.('data-owner-controls-allowed', dial.ownerControlsAllowed ? 'true' : 'false');
+
+  const b5LockEl = b5El.querySelector?.('[data-dial-owner-key-required]');
+  if (b5LockEl) {
+    b5LockEl.setAttribute?.('data-dial-owner-key-required', readOnly ? 'true' : 'false');
+    b5LockEl.textContent = readOnly ? 'Owner Key Required' : '';
+    setHiddenFlag(b5LockEl, !readOnly);
+  }
+
+  const quickBtns = b5El.querySelectorAll?.('[data-dial-tier-preset]') ?? [];
+  for (const qBtn of quickBtns) {
+    qBtn.disabled = readOnly;
+  }
+
+  const tierById = new Map(dial.tiers.map((t) => [t.tierId, t]));
+  const rowEls = b5El.querySelectorAll?.('[data-tier-id]') ?? [];
+  for (const rowEl of rowEls) {
+    const tierId = rowEl.getAttribute?.('data-tier-id');
+    const tier = tierById.get(tierId);
+    if (!tier) continue;
+
+    swapDialLevelClass(rowEl, tier.cssClass);
+    rowEl.setAttribute?.('data-tier-bps', String(tier.riskBps));
+
+    const badgeEl = rowEl.querySelector?.('[data-tier-bps-badge]');
+    if (badgeEl) {
+      swapDialLevelClass(badgeEl, tier.cssClass);
+      badgeEl.setAttribute?.('data-tier-bps-badge', String(tier.riskBps));
+      badgeEl.textContent = tier.riskPctLabel;
+    }
+
+    const zoneEl = rowEl.querySelector?.('[data-tier-zone-pill]') ?? rowEl.querySelector?.('[data-tier-level-name]');
+    if (zoneEl) {
+      swapDialLevelClass(zoneEl, tier.cssClass);
+      zoneEl.textContent = tier.zoneLabel;
+    }
+
+    const tierMetrics = {
+      risk: tier.riskPctLabel,
+      max: String(tier.maxOpenTrades),
+      'signal-bar': tier.minSignalProb,
+      goal: tier.sessionGoalFormatted,
+      brake: tier.dailyLossBrakeFormatted,
+    };
+    for (const [key, val] of Object.entries(tierMetrics)) {
+      const mEl = rowEl.querySelector?.(`[data-tier-metric="${key}"]`);
+      if (mEl) {
+        mEl.textContent = val;
+      }
+    }
+
+    const sliderEl = rowEl.querySelector?.('[data-dial-tier-slider]');
+    if (sliderEl) {
+      swapDialLevelClass(sliderEl, tier.cssClass);
+      const nextVal = String(tier.riskBps);
+      if (String(sliderEl.value ?? '') !== nextVal) {
+        sliderEl.value = nextVal;
+      }
+      sliderEl.disabled = readOnly;
+    }
+
+    const tierBtns = rowEl.querySelectorAll?.('[data-dial-tier-bps]') ?? [];
+    for (const tBtn of tierBtns) {
+      const btnBps = Number(tBtn.getAttribute?.('data-dial-tier-bps'));
+      const active = btnBps === tier.riskBps;
+      tBtn.classList?.toggle('is-active', active);
+      tBtn.setAttribute?.('aria-pressed', active ? 'true' : 'false');
+      tBtn.disabled = readOnly;
+    }
+
+    patchedTiers += 1;
+  }
+
+  return patchedTiers;
+}
+
 /**
  * In-place zero-flicker DOM patcher for smooth 60fps 0.01% slider drags & toggle clicks.
  * Updates CSS classes, role="switch" states, slider values (20..100 bps), disabled flags, and
@@ -986,234 +1379,48 @@ export function patchAggressionDialInPlace(root, nextState) {
   if (!root) {
     return Object.freeze({ patchedMaster: false, patchedTiers: 0, state: dial });
   }
-
-  const readOnly = dial.ownerControlsAllowed === false;
-  let patchedMaster = false;
-  let patchedTiers = 0;
-
-  const masterEl = findMatchingElement(root, '[data-aggression-dial="master"]');
-  if (masterEl) {
-    const chosenProfile = RISK_BPS_PROFILES[dial.masterRiskBps];
-    const targets = dial.masterTargets;
-    const isShifted = dial.aiDiscretionEnabled && dial.effectiveRiskBps !== dial.masterRiskBps;
-
-    swapDialLevelClass(masterEl, targets.cssClass);
-    masterEl.classList?.toggle('is-readonly', readOnly);
-    masterEl.setAttribute?.('data-dial-bps', String(targets.riskBps));
-    masterEl.setAttribute?.('data-dial-master-bps', String(dial.masterRiskBps));
-    masterEl.setAttribute?.('data-ai-discretion', dial.aiDiscretionEnabled ? 'true' : 'false');
-    masterEl.setAttribute?.('data-live-mode', dial.liveMode ? 'true' : 'false');
-    masterEl.setAttribute?.('data-owner-controls-allowed', dial.ownerControlsAllowed ? 'true' : 'false');
-
-    const badgeEl = masterEl.querySelector?.('[data-dial-bps-badge]');
-    if (badgeEl) {
-      swapDialLevelClass(badgeEl, targets.cssClass);
-      badgeEl.setAttribute?.('data-dial-bps-badge', String(targets.riskBps));
-      badgeEl.textContent = targets.riskPctLabel;
-    }
-
-    const headingEl = masterEl.querySelector?.('[data-dial-heading]');
-    if (headingEl) {
-      headingEl.textContent = targets.label;
-    }
-
-    const sublineEl = masterEl.querySelector?.('[data-dial-subline]');
-    if (sublineEl) {
-      sublineEl.textContent = buildMasterSublineText(dial, chosenProfile, targets);
-    }
-
-    const shiftEl = masterEl.querySelector?.('[data-dial-ai-shifted]');
-    if (shiftEl) {
-      swapDialLevelClass(shiftEl, targets.cssClass);
-      shiftEl.setAttribute?.('data-dial-ai-shifted', isShifted ? 'true' : 'false');
-      shiftEl.setAttribute?.('data-dial-auto-shifted', isShifted ? 'true' : 'false');
-      shiftEl.textContent = isShifted ? buildAiShiftText(dial, targets) : '';
-      setHiddenFlag(shiftEl, !isShifted);
-    }
-
-    const lockEl = masterEl.querySelector?.('[data-dial-owner-key-required]');
-    if (lockEl) {
-      lockEl.setAttribute?.('data-dial-owner-key-required', readOnly ? 'true' : 'false');
-      lockEl.textContent = readOnly ? 'Owner Key Required' : '';
-      setHiddenFlag(lockEl, !readOnly);
-    }
-
-    const switchBtn = masterEl.querySelector?.('[data-dial-action="TOGGLE_AI_DISCRETION"]');
-    if (switchBtn) {
-      switchBtn.classList?.toggle('is-on', dial.aiDiscretionEnabled);
-      switchBtn.classList?.toggle('is-off', !dial.aiDiscretionEnabled);
-      switchBtn.setAttribute?.('aria-checked', dial.aiDiscretionEnabled ? 'true' : 'false');
-      switchBtn.disabled = readOnly;
-      const switchLabel = switchBtn.querySelector?.('[data-dial-switch-label]');
-      if (switchLabel) {
-        switchLabel.textContent = dial.aiDiscretionEnabled ? 'AI Discretion: ON' : 'Manual Lock';
-      }
-    }
-
-    const sliderEl = masterEl.querySelector?.('[data-dial-master-slider="true"]');
-    if (sliderEl) {
-      swapDialLevelClass(sliderEl, chosenProfile.cssClass);
-      const nextVal = String(dial.masterRiskBps);
-      if (String(sliderEl.value ?? '') !== nextVal) {
-        sliderEl.value = nextVal;
-      }
-      sliderEl.disabled = readOnly;
-    }
-
-    const tickEls = masterEl.querySelectorAll?.('[data-dial-tick-bps]') ?? [];
-    for (const tickEl of tickEls) {
-      const tickBps = Number(tickEl.getAttribute?.('data-dial-tick-bps'));
-      tickEl.classList?.toggle('is-current', tickBps === dial.masterRiskBps);
-      tickEl.classList?.toggle('is-ai-active', isShifted && tickBps === dial.effectiveRiskBps);
-    }
-
-    const presetBtns = masterEl.querySelectorAll?.('[data-dial-master-preset]') ?? [];
-    for (const btn of presetBtns) {
-      const presetBps = Number(btn.getAttribute?.('data-dial-master-preset'));
-      const active = presetBps === dial.masterRiskBps;
-      btn.classList?.toggle('is-active', active);
-      btn.setAttribute?.('aria-pressed', active ? 'true' : 'false');
-      btn.disabled = readOnly;
-    }
-
-    const metricMap = {
-      'risk-per-trade': targets.riskPctLabel,
-      'max-open-trades': String(targets.maxOpenTrades),
-      'session-goal': targets.sessionGoalFormatted,
-      'daily-loss-brake': targets.dailyLossBrakeFormatted,
-    };
-    for (const [key, val] of Object.entries(metricMap)) {
-      const valEl = masterEl.querySelector?.(`[data-dial-metric-value="${key}"]`);
-      if (valEl) {
-        valEl.textContent = val;
-      }
-    }
-
-    patchedMaster = true;
-  }
-
-  const b5El = findMatchingElement(root, '[data-section="b5-tier-dials"]');
-  if (b5El) {
-    b5El.classList?.toggle('is-readonly', readOnly);
-    b5El.setAttribute?.('data-live-mode', dial.liveMode ? 'true' : 'false');
-    b5El.setAttribute?.('data-owner-controls-allowed', dial.ownerControlsAllowed ? 'true' : 'false');
-
-    const b5LockEl = b5El.querySelector?.('[data-dial-owner-key-required]');
-    if (b5LockEl) {
-      b5LockEl.setAttribute?.('data-dial-owner-key-required', readOnly ? 'true' : 'false');
-      b5LockEl.textContent = readOnly ? 'Owner Key Required' : '';
-      setHiddenFlag(b5LockEl, !readOnly);
-    }
-
-    const quickBtns = b5El.querySelectorAll?.('[data-dial-tier-preset]') ?? [];
-    for (const qBtn of quickBtns) {
-      qBtn.disabled = readOnly;
-    }
-
-    const tierById = new Map(dial.tiers.map((t) => [t.tierId, t]));
-    const rowEls = b5El.querySelectorAll?.('[data-tier-id]') ?? [];
-    for (const rowEl of rowEls) {
-      const tierId = rowEl.getAttribute?.('data-tier-id');
-      const tier = tierById.get(tierId);
-      if (!tier) continue;
-
-      swapDialLevelClass(rowEl, tier.cssClass);
-      rowEl.setAttribute?.('data-tier-bps', String(tier.riskBps));
-
-      const badgeEl = rowEl.querySelector?.('[data-tier-bps-badge]');
-      if (badgeEl) {
-        swapDialLevelClass(badgeEl, tier.cssClass);
-        badgeEl.setAttribute?.('data-tier-bps-badge', String(tier.riskBps));
-        badgeEl.textContent = tier.riskPctLabel;
-      }
-
-      const nameEl = rowEl.querySelector?.('[data-tier-level-name]');
-      if (nameEl) {
-        nameEl.textContent = `${tier.zoneLabel} · ${tier.startingCapitalFormatted} · Min Signal ${tier.minSignalProb}`;
-      }
-
-      const tierMetrics = {
-        risk: tier.riskPctLabel,
-        max: String(tier.maxOpenTrades),
-        goal: tier.sessionGoalFormatted,
-        brake: tier.dailyLossBrakeFormatted,
-      };
-      for (const [key, val] of Object.entries(tierMetrics)) {
-        const mEl = rowEl.querySelector?.(`[data-tier-metric="${key}"]`);
-        if (mEl) {
-          mEl.textContent = val;
-        }
-      }
-
-      const sliderEl = rowEl.querySelector?.('[data-dial-tier-slider]');
-      if (sliderEl) {
-        swapDialLevelClass(sliderEl, tier.cssClass);
-        const nextVal = String(tier.riskBps);
-        if (String(sliderEl.value ?? '') !== nextVal) {
-          sliderEl.value = nextVal;
-        }
-        sliderEl.disabled = readOnly;
-      }
-
-      const tierBtns = rowEl.querySelectorAll?.('[data-dial-tier-bps]') ?? [];
-      for (const tBtn of tierBtns) {
-        const btnBps = Number(tBtn.getAttribute?.('data-dial-tier-bps'));
-        const active = btnBps === tier.riskBps;
-        tBtn.classList?.toggle('is-active', active);
-        tBtn.setAttribute?.('aria-pressed', active ? 'true' : 'false');
-        tBtn.disabled = readOnly;
-      }
-
-      patchedTiers += 1;
-    }
-  }
-
+  const patchedMaster = patchMasterAggressionDialInPlace(root, dial);
+  const patchedTiers = patchSectionB5TierDialsInPlace(root, dial);
   return Object.freeze({ patchedMaster, patchedTiers, state: dial });
 }
 
 export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dial (0.20%..1.00% in 0.01% bps steps + AI Discretion) & Section B.5 5-Tier Controls */
 .aggression-dial-panel {
-  --dial-accent: #2563EB;
+  --dial-accent: #eab308;
+  --dial-badge-bg: rgba(234, 179, 8, 0.15);
+  --dial-badge-ink: #facc15;
+  --dial-glow: rgba(234, 179, 8, 0.45);
   --dial-ease: cubic-bezier(0.22, 1, 0.36, 1);
-  --dial-surface: var(--panel, #FFFFFF);
-  --dial-soft: var(--panel-soft, #F7F9FC);
-  --dial-border: var(--line, #DCE2EA);
-  --dial-ink: var(--ink, #122238);
-  --dial-muted: var(--muted, #596779);
-  background: var(--dial-surface);
-  border: 1px solid var(--dial-border);
-  border-left: 4px solid var(--dial-accent);
-  border-radius: 10px;
-  padding: 18px 20px;
+  --dial-surface: #0b0d11;
+  --dial-card: #12151b;
+  --dial-soft: #11141a;
+  --dial-inset: #090b0f;
+  --dial-border: #232730;
+  --dial-ink: #f3f5f8;
+  --dial-muted: #94a3b8;
+  background: linear-gradient(180deg, #12151b 0%, #0b0d11 100%);
+  border: 1px solid #232730;
+  border-radius: 14px;
+  padding: 20px 22px;
+  color: #f3f5f8;
   display: grid;
   gap: 14px;
   contain: layout style;
+  box-shadow: 0 10px 28px rgb(0 0 0 / 42%), inset 0 1px 0 rgb(255 255 255 / 4%);
   transition: border-color 220ms cubic-bezier(0.22, 1, 0.36, 1), background-color 220ms ease;
 }
 
-.dial-lvl-1 { --dial-accent: #0F766E; --dial-badge-bg: #CCFBF1; --dial-badge-ink: #115E59; }
-.dial-lvl-2 { --dial-accent: #0D9488; --dial-badge-bg: #D1FAE5; --dial-badge-ink: #065F46; }
-.dial-lvl-3 { --dial-accent: #0284C7; --dial-badge-bg: #E0F2FE; --dial-badge-ink: #075985; }
-.dial-lvl-4 { --dial-accent: #2563EB; --dial-badge-bg: #DBEAFE; --dial-badge-ink: #1E40AF; }
-.dial-lvl-5 { --dial-accent: #4F46E5; --dial-badge-bg: #E0E7FF; --dial-badge-ink: #3730A3; }
-.dial-lvl-6 { --dial-accent: #CA8A04; --dial-badge-bg: #FEF3C7; --dial-badge-ink: #92400E; }
-.dial-lvl-7 { --dial-accent: #D97706; --dial-badge-bg: #FFEDD5; --dial-badge-ink: #9A3412; }
-.dial-lvl-8 { --dial-accent: #EA580C; --dial-badge-bg: #FED7AA; --dial-badge-ink: #9A3412; }
-.dial-lvl-9 { --dial-accent: #DC2626; --dial-badge-bg: #FEE2E2; --dial-badge-ink: #991B1B; }
-.dial-lvl-10 { --dial-accent: #B91C1C; --dial-badge-bg: #FECACA; --dial-badge-ink: #7F1D1D; }
-.dial-lvl-11 { --dial-accent: #9D174D; --dial-badge-bg: #FCE7F3; --dial-badge-ink: #831843; }
-
-:root[data-theme="dark"] .dial-lvl-1 { --dial-badge-bg: #134E4A; --dial-badge-ink: #99F6E4; }
-:root[data-theme="dark"] .dial-lvl-2 { --dial-badge-bg: #064E3B; --dial-badge-ink: #A7F3D0; }
-:root[data-theme="dark"] .dial-lvl-3 { --dial-badge-bg: #0C4A6E; --dial-badge-ink: #BAE6FD; }
-:root[data-theme="dark"] .dial-lvl-4 { --dial-badge-bg: #1E3A8A; --dial-badge-ink: #BFDBFE; }
-:root[data-theme="dark"] .dial-lvl-5 { --dial-badge-bg: #312E81; --dial-badge-ink: #C7D2FE; }
-:root[data-theme="dark"] .dial-lvl-6 { --dial-badge-bg: #713F12; --dial-badge-ink: #FDE68A; }
-:root[data-theme="dark"] .dial-lvl-7 { --dial-badge-bg: #7C2D12; --dial-badge-ink: #FED7AA; }
-:root[data-theme="dark"] .dial-lvl-8 { --dial-badge-bg: #9A3412; --dial-badge-ink: #FFEDD5; }
-:root[data-theme="dark"] .dial-lvl-9 { --dial-badge-bg: #7F1D1D; --dial-badge-ink: #FECACA; }
-:root[data-theme="dark"] .dial-lvl-10 { --dial-badge-bg: #991B1B; --dial-badge-ink: #FEE2E2; }
-:root[data-theme="dark"] .dial-lvl-11 { --dial-badge-bg: #831843; --dial-badge-ink: #FBCFE8; }
+.dial-lvl-1 { --dial-accent: #10b981; --dial-badge-bg: rgba(16, 185, 129, 0.15); --dial-badge-ink: #34d399; --dial-glow: rgba(16, 185, 129, 0.48); }
+.dial-lvl-2 { --dial-accent: #14b8a6; --dial-badge-bg: rgba(20, 184, 166, 0.15); --dial-badge-ink: #2dd4bf; --dial-glow: rgba(20, 184, 166, 0.46); }
+.dial-lvl-3 { --dial-accent: #22c55e; --dial-badge-bg: rgba(34, 197, 94, 0.15); --dial-badge-ink: #4ade80; --dial-glow: rgba(34, 197, 94, 0.46); }
+.dial-lvl-4 { --dial-accent: #84cc16; --dial-badge-bg: rgba(132, 204, 22, 0.15); --dial-badge-ink: #a3e635; --dial-glow: rgba(132, 204, 22, 0.45); }
+.dial-lvl-5 { --dial-accent: #eab308; --dial-badge-bg: rgba(234, 179, 8, 0.16); --dial-badge-ink: #facc15; --dial-glow: rgba(234, 179, 8, 0.48); }
+.dial-lvl-6 { --dial-accent: #f59e0b; --dial-badge-bg: rgba(245, 158, 11, 0.16); --dial-badge-ink: #fbbf24; --dial-glow: rgba(245, 158, 11, 0.48); }
+.dial-lvl-7 { --dial-accent: #f97316; --dial-badge-bg: rgba(249, 115, 22, 0.17); --dial-badge-ink: #fb923c; --dial-glow: rgba(249, 115, 22, 0.50); }
+.dial-lvl-8 { --dial-accent: #f97316; --dial-badge-bg: rgba(249, 115, 22, 0.19); --dial-badge-ink: #fb923c; --dial-glow: rgba(249, 115, 22, 0.52); }
+.dial-lvl-9 { --dial-accent: #ef4444; --dial-badge-bg: rgba(239, 68, 68, 0.17); --dial-badge-ink: #f87171; --dial-glow: rgba(239, 68, 68, 0.52); }
+.dial-lvl-10 { --dial-accent: #f43f5e; --dial-badge-bg: rgba(244, 63, 94, 0.18); --dial-badge-ink: #fb7185; --dial-glow: rgba(244, 63, 94, 0.54); }
+.dial-lvl-11 { --dial-accent: #ef4444; --dial-badge-bg: rgba(239, 68, 68, 0.20); --dial-badge-ink: #f87171; --dial-glow: rgba(239, 68, 68, 0.58); }
 
 .dial-header {
   display: flex;
@@ -1227,51 +1434,75 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
-  min-height: 44px;
+  gap: 14px;
+  min-height: 48px;
+}
+
+.dial-header-copy {
+  display: grid;
+  gap: 3px;
+}
+
+.dial-eyebrow {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #8b96a8;
+}
+
+.dial-heading-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
 }
 
 .dial-badge,
 .dial-level-badge {
   display: inline-grid;
   place-items: center;
-  min-width: 64px;
-  height: 38px;
-  padding: 0 12px;
-  border-radius: 999px;
+  min-width: 76px;
+  height: 48px;
+  padding: 0 14px;
+  border-radius: 10px;
   font-weight: 800;
-  font-size: 15px;
+  font-size: 18px;
   font-variant-numeric: tabular-nums;
-  background: var(--dial-badge-bg, #E0E7FF);
-  color: var(--dial-badge-ink, #3730A3);
-  border: 1px solid var(--dial-accent, #4F46E5);
+  background: var(--dial-badge-bg, rgba(234, 179, 8, 0.16));
+  color: var(--dial-badge-ink, #facc15);
+  border: 1.5px solid var(--dial-accent, #eab308);
+  box-shadow: 0 0 16px rgb(0 0 0 / 28%);
   transition: background-color 220ms cubic-bezier(0.22, 1, 0.36, 1), color 200ms ease, border-color 220ms cubic-bezier(0.22, 1, 0.36, 1), transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .dial-heading {
   margin: 0;
-  font-size: 20px;
+  font-size: 21px;
+  font-weight: 800;
   line-height: 1.2;
-  color: var(--dial-ink);
+  color: var(--dial-badge-ink, #f3f5f8);
   transition: color 180ms ease;
 }
 
 .dial-subline {
   display: block;
-  font-size: 12px;
-  color: var(--dial-muted);
+  font-size: 11.5px;
+  color: #7e8a9c;
   font-variant-numeric: tabular-nums;
 }
 
 .dial-pill-tag,
+.dial-base-ai-pill,
 .dial-shift-pill,
 .dial-owner-lock-badge {
   display: inline-flex;
   align-items: center;
-  padding: 4px 10px;
+  padding: 4px 11px;
   border-radius: 999px;
-  font-size: 11px;
+  font-size: 11.5px;
   font-weight: 700;
+  font-variant-numeric: tabular-nums;
   transition: background-color 200ms cubic-bezier(0.22, 1, 0.36, 1), border-color 200ms cubic-bezier(0.22, 1, 0.36, 1), color 200ms ease, opacity 180ms ease;
 }
 
@@ -1279,46 +1510,54 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   display: none;
 }
 
+.dial-base-ai-pill,
 .dial-shift-pill {
-  background: var(--dial-badge-bg, var(--dial-soft));
-  border: 1px solid var(--dial-accent);
-  color: var(--dial-badge-ink, var(--dial-ink));
+  background: var(--dial-badge-bg, #161b24);
+  border: 1px solid var(--dial-accent, #eab308);
+  color: var(--dial-badge-ink, #facc15);
 }
 
 .dial-owner-lock-badge {
-  background: var(--warning-surface, #FFF0E4);
-  border: 1px solid var(--orange, #C2510B);
-  color: var(--warning-text, #773408);
+  background: rgba(245, 158, 11, 0.16);
+  border: 1px solid #f59e0b;
+  color: #fde68a;
+}
+
+.dial-discretion-row {
+  display: flex;
+  align-items: center;
 }
 
 /* Buttery-smooth 60fps sliding pill switch (role="switch") */
 .dial-switch {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
+  gap: 11px;
   min-height: 44px;
-  padding: 6px 14px 6px 8px;
+  padding: 6px 16px 6px 8px;
   border-radius: 999px;
-  border: 1px solid var(--dial-border);
-  background: var(--dial-soft);
-  color: var(--dial-ink);
+  border: 1px solid #252b36;
+  background: #11151d;
+  color: #ffffff;
   font-weight: 700;
-  font-size: 13px;
+  font-size: 13.5px;
   cursor: pointer;
   user-select: none;
   transition: border-color 220ms cubic-bezier(0.22, 1, 0.36, 1), background-color 220ms ease, box-shadow 200ms ease;
 }
 
 .dial-switch.is-on {
-  border-color: #0F766E;
+  border-color: rgba(16, 185, 129, 0.55);
+  background: #0e1815;
 }
 
 .dial-switch.is-off {
-  border-color: #D97706;
+  border-color: rgba(245, 158, 11, 0.55);
+  background: #171410;
 }
 
 .dial-switch:focus-visible {
-  outline: 2px solid var(--focus, #1B65B2);
+  outline: 2px solid var(--focus, #83BAF0);
   outline-offset: 2px;
 }
 
@@ -1330,25 +1569,25 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   height: 26px;
   padding: 3px;
   border-radius: 999px;
-  background-color: #94A3B8;
+  background-color: #475569;
   transition: background-color 220ms ease;
   flex-shrink: 0;
 }
 
 .dial-switch.is-on .dial-switch-track {
-  background-color: #0F766E;
+  background-color: #10b981;
 }
 
 .dial-switch.is-off .dial-switch-track {
-  background-color: #B45309;
+  background-color: #b45309;
 }
 
 .dial-switch-thumb {
   width: 20px;
   height: 20px;
   border-radius: 999px;
-  background-color: #FFFFFF;
-  box-shadow: 0 1px 3px rgb(0 0 0 / 28%);
+  background-color: #ffffff;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 40%);
   transform: translateX(0);
   will-change: transform;
   transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1), background-color 220ms ease;
@@ -1361,12 +1600,73 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
 .dial-switch-label {
   min-width: 11.5ch;
   text-align: left;
+  color: #f8fafc;
   font-variant-numeric: tabular-nums;
 }
 
+/* Market Mode Inset Box */
+.dial-market-box {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #090b0f;
+  border: 1px solid #1f242d;
+}
+
+.dial-market-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.dial-market-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #8b96a8;
+  margin-right: 4px;
+}
+
+.dial-market-pills {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.dial-market-pill {
+  min-height: 44px;
+  padding: 6px 13px;
+  border-radius: 999px;
+  border: 1px solid #242a35;
+  background: #12161f;
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 200ms cubic-bezier(0.22, 1, 0.36, 1), background-color 200ms ease, color 180ms ease;
+}
+
+.dial-market-pill.is-active {
+  background: var(--dial-badge-bg, rgba(234, 179, 8, 0.16));
+  border-color: var(--dial-accent, #eab308);
+  color: var(--dial-badge-ink, #facc15);
+}
+
+.dial-market-status {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--dial-badge-ink, #facc15);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Rainbow Spectrum Slider Track + Glowing Crisp White Circle Thumb */
 .dial-slider-wrap {
   display: grid;
-  gap: 6px;
+  gap: 8px;
+  padding-top: 2px;
 }
 
 .dial-slider {
@@ -1375,60 +1675,60 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   width: 100%;
   min-height: 44px;
   background: transparent;
-  accent-color: var(--dial-accent, #4F46E5);
+  accent-color: var(--dial-accent, #eab308);
   cursor: pointer;
   margin: 0;
 }
 
 .dial-slider::-webkit-slider-runnable-track {
-  height: 8px;
+  height: 10px;
   border-radius: 999px;
-  background: var(--dial-border, #DCE2EA);
-  transition: background-color 200ms cubic-bezier(0.22, 1, 0.36, 1);
+  background: linear-gradient(90deg, #10b981 0%, #22c55e 24%, #eab308 50%, #f97316 76%, #ef4444 100%);
+  box-shadow: inset 0 1px 2px rgb(0 0 0 / 45%);
 }
 
 .dial-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 24px;
-  height: 24px;
-  margin-top: -8px;
+  width: 22px;
+  height: 22px;
+  margin-top: -6px;
   border-radius: 999px;
-  background: var(--dial-accent, #4F46E5);
-  border: 3px solid var(--dial-surface, #FFFFFF);
-  box-shadow: 0 2px 6px rgb(15 23 42 / 24%);
+  background: #ffffff;
+  border: 3px solid var(--dial-accent, #eab308);
+  box-shadow: 0 0 12px var(--dial-glow, rgba(255, 255, 255, 0.45)), 0 2px 6px rgb(0 0 0 / 50%);
   will-change: transform;
-  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), background-color 200ms ease, box-shadow 200ms ease;
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), border-color 200ms ease, box-shadow 200ms ease;
 }
 
 .dial-slider:hover::-webkit-slider-thumb,
 .dial-slider:active::-webkit-slider-thumb {
   transform: scale(1.12);
-  box-shadow: 0 3px 10px rgb(15 23 42 / 32%);
+  box-shadow: 0 0 16px var(--dial-glow, rgba(255, 255, 255, 0.65)), 0 3px 10px rgb(0 0 0 / 55%);
 }
 
 .dial-slider::-moz-range-track {
-  height: 8px;
+  height: 10px;
   border-radius: 999px;
-  background: var(--dial-border, #DCE2EA);
-  transition: background-color 200ms cubic-bezier(0.22, 1, 0.36, 1);
+  background: linear-gradient(90deg, #10b981 0%, #22c55e 24%, #eab308 50%, #f97316 76%, #ef4444 100%);
+  box-shadow: inset 0 1px 2px rgb(0 0 0 / 45%);
 }
 
 .dial-slider::-moz-range-thumb {
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
   border-radius: 999px;
-  background: var(--dial-accent, #4F46E5);
-  border: 3px solid var(--dial-surface, #FFFFFF);
-  box-shadow: 0 2px 6px rgb(15 23 42 / 24%);
+  background: #ffffff;
+  border: 3px solid var(--dial-accent, #eab308);
+  box-shadow: 0 0 12px var(--dial-glow, rgba(255, 255, 255, 0.45)), 0 2px 6px rgb(0 0 0 / 50%);
   will-change: transform;
-  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), background-color 200ms ease, box-shadow 200ms ease;
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), border-color 200ms ease, box-shadow 200ms ease;
 }
 
 .dial-slider:hover::-moz-range-thumb,
 .dial-slider:active::-moz-range-thumb {
   transform: scale(1.12);
-  box-shadow: 0 3px 10px rgb(15 23 42 / 32%);
+  box-shadow: 0 0 16px var(--dial-glow, rgba(255, 255, 255, 0.65)), 0 3px 10px rgb(0 0 0 / 55%);
 }
 
 .dial-ticks {
@@ -1437,7 +1737,7 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   text-align: center;
   font-size: 11px;
   font-weight: 600;
-  color: var(--dial-muted);
+  color: #7e8a9c;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1447,29 +1747,50 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
 
 .dial-tick.is-current,
 .dial-tick.is-ai-active {
-  color: var(--dial-accent);
+  color: var(--dial-badge-ink, #facc15);
   font-weight: 800;
 }
 
+/* 3x2 Grid of 2-Line Preset Cards */
 .dial-presets {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
 }
 
 .dial-preset-btn {
-  min-height: 44px;
+  min-height: 56px;
   min-width: 44px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  border: 1px solid var(--dial-border);
-  background: var(--dial-soft);
-  color: var(--dial-ink);
-  font-size: 12px;
+  padding: 12px 10px;
+  border-radius: 10px;
+  border: 1px solid #222731;
+  background: #11141a;
+  color: #f3f5f8;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  font-size: 13px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   cursor: pointer;
   transition: background-color 200ms cubic-bezier(0.22, 1, 0.36, 1), border-color 200ms cubic-bezier(0.22, 1, 0.36, 1), color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 200ms ease;
+}
+
+.dial-preset-title {
+  font-size: 13.5px;
+  font-weight: 800;
+  line-height: 1.2;
+  color: #f8fafc;
+}
+
+.dial-preset-pct {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: #8b96a8;
+  font-variant-numeric: tabular-nums;
 }
 
 .dial-preset-btn:active:not(:disabled) {
@@ -1480,21 +1801,27 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   background: var(--dial-badge-bg);
   color: var(--dial-badge-ink);
   border-color: var(--dial-accent);
-  box-shadow: inset 0 0 0 1px var(--dial-accent);
+  box-shadow: 0 0 14px var(--dial-glow, rgba(255, 255, 255, 0.16)), inset 0 0 0 1px var(--dial-accent);
 }
 
+.dial-preset-btn.is-active .dial-preset-title,
+.dial-preset-btn.is-active .dial-preset-pct {
+  color: var(--dial-badge-ink);
+}
+
+/* 2x2 Live Metric Cards */
 .dial-metrics-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
 
 .dial-metric-tile {
-  min-height: 74px;
-  padding: 12px 14px;
-  border-radius: 8px;
-  border: 1px solid var(--dial-border);
-  background: var(--dial-soft);
+  min-height: 76px;
+  padding: 12px 15px;
+  border-radius: 10px;
+  border: 1px solid #222731;
+  background: #11141a;
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -1505,42 +1832,54 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
 .dial-metric-label {
   font-size: 11px;
   font-weight: 600;
-  color: var(--dial-muted);
+  color: #8b96a8;
   text-transform: uppercase;
-  letter-spacing: 0.4px;
+  letter-spacing: 0.05em;
 }
 
 .dial-metric-value {
   display: inline-block;
   min-width: 8ch;
-  font-size: 20px;
+  font-size: 21px;
   font-weight: 800;
   font-variant-numeric: tabular-nums;
-  color: var(--dial-ink);
+  color: #f8fafc;
   transition: color 180ms ease;
+}
+
+.dial-metric-value.dial-val-zone {
+  color: var(--dial-badge-ink, #facc15);
+}
+
+.dial-metric-subbrake {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #8b96a8;
+  font-variant-numeric: tabular-nums;
 }
 
 .dial-metric-value-sm {
   display: inline-block;
-  min-width: 6ch;
+  min-width: 3ch;
   font-variant-numeric: tabular-nums;
+  color: #f8fafc;
   transition: color 180ms ease;
 }
 
 .dial-val-positive {
-  color: #0F766E;
+  color: #34d399;
 }
 
 .dial-val-negative {
-  color: #B91C1C;
+  color: #f87171;
 }
 
 .dial-guardrails-line {
   margin: 0;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 600;
-  color: var(--dial-muted);
-  letter-spacing: 0.2px;
+  color: #7e8a9c;
+  letter-spacing: 0.02em;
 }
 
 .dial-confirm-banner {
@@ -1550,7 +1889,7 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   justify-content: space-between;
   gap: 12px;
   padding: 12px 14px;
-  border-radius: 8px;
+  border-radius: 10px;
   border: 1px solid var(--dial-accent);
   background: var(--dial-badge-bg);
   color: var(--dial-badge-ink);
@@ -1581,9 +1920,9 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
 }
 
 .dial-confirm-btn {
-  background: #B91C1C;
-  color: #FFFFFF;
-  border: 1px solid #7F1D1D;
+  background: #dc2626;
+  color: #ffffff;
+  border: 1px solid #991b1b;
 }
 
 .dial-cancel-btn {
@@ -1592,21 +1931,37 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   border: 1px solid currentColor;
 }
 
+/* Section B.5 · 5-Tier Account Aggression Dials (Dark Obsidian Cards) */
 .b5-tier-dials {
   display: grid;
-  gap: 12px;
-  margin-top: 14px;
-  padding-top: 14px;
-  border-top: 1px solid var(--line, #DCE2EA);
+  gap: 14px;
+  margin-top: 16px;
+  padding: 20px 22px;
+  border-radius: 14px;
+  background: linear-gradient(180deg, #12151b 0%, #0b0d11 100%);
+  border: 1px solid #232730;
+  color: #f3f5f8;
   contain: layout style;
+  box-shadow: 0 10px 28px rgb(0 0 0 / 40%);
 }
 
 .b5-tier-dials-header {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
-  gap: 10px;
+  gap: 12px;
+}
+
+.b5-tier-header-stack {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+}
+
+.b5-eyebrow {
+  margin: 0;
+  color: #8b96a8;
 }
 
 .b5-tier-title-row {
@@ -1618,27 +1973,34 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
 
 .b5-tier-dials-title {
   margin: 0;
-  font-size: 16px;
-  color: var(--ink, #122238);
+  font-size: 18px;
+  font-weight: 800;
+  color: #f8fafc;
 }
 
 .b5-tier-quickbar {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  padding-top: 2px;
 }
 
 .b5-tier-preset-btn {
   min-height: 44px;
-  padding: 0 14px;
-  border-radius: 8px;
-  border: 1px solid var(--line, #DCE2EA);
-  background: var(--panel-soft, #F7F9FC);
-  color: var(--ink, #122238);
+  padding: 0 15px;
+  border-radius: 999px;
+  border: 1px solid #252b37;
+  background: #141820;
+  color: #e2e8f0;
   font-size: 12px;
   font-weight: 700;
   cursor: pointer;
   transition: background-color 200ms cubic-bezier(0.22, 1, 0.36, 1), border-color 200ms cubic-bezier(0.22, 1, 0.36, 1), transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.b5-tier-preset-btn:hover:not(:disabled) {
+  border-color: #3b4456;
+  background: #1a202c;
 }
 
 .b5-tier-preset-btn:active:not(:disabled) {
@@ -1651,11 +2013,10 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
 }
 
 .b5-tier-row {
-  padding: 12px 14px;
-  border-radius: 8px;
-  border: 1px solid var(--line, #DCE2EA);
-  border-left: 4px solid var(--dial-accent, #4F46E5);
-  background: var(--panel-soft, #F7F9FC);
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: 1px solid #222731;
+  background: #11141b;
   display: grid;
   gap: 10px;
   transition: border-color 220ms cubic-bezier(0.22, 1, 0.36, 1), background-color 200ms ease;
@@ -1669,50 +2030,70 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   gap: 10px;
 }
 
-.b5-tier-identity {
-  display: grid;
-  gap: 2px;
+.b5-tier-identity-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
   margin-right: auto;
 }
 
-.b5-tier-label {
+.b5-bps-box {
+  min-width: 64px;
+  height: 36px;
+  padding: 0 10px;
+  border-radius: 8px;
   font-size: 14px;
-  color: var(--ink, #122238);
 }
 
-.b5-tier-level-name {
-  font-size: 12px;
-  color: var(--muted, #596779);
-  font-variant-numeric: tabular-nums;
+.b5-tier-label {
+  font-size: 14.5px;
+  font-weight: 800;
+  color: #f8fafc;
+}
+
+.b5-zone-pill {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--dial-badge-bg);
+  border: 1px solid var(--dial-accent);
+  color: var(--dial-badge-ink);
 }
 
 .b5-tier-metrics {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
+  align-items: center;
+  gap: 14px;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
 
 .b5-tier-metric em {
   font-style: normal;
-  color: var(--muted, #596779);
+  color: #8b96a8;
   margin-right: 4px;
 }
 
 .b5-metric-goal strong {
-  color: #0F766E;
+  color: #34d399;
 }
 
 .b5-metric-brake strong {
-  color: #B91C1C;
+  color: #f87171;
 }
 
 .b5-tier-controls {
-  display: grid;
-  grid-template-columns: minmax(140px, 1fr) auto;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
+}
+
+.b5-tier-slider {
+  flex: 1 1 200px;
 }
 
 .b5-tier-btn-group {
@@ -1726,11 +2107,11 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   min-height: 44px;
   min-width: 44px;
   padding: 0 10px;
-  border-radius: 7px;
-  border: 1px solid var(--line, #DCE2EA);
-  background: var(--panel, #FFFFFF);
-  color: var(--ink, #122238);
-  font-size: 12px;
+  border-radius: 8px;
+  border: 1px solid #242a35;
+  background: #141820;
+  color: #cbd5e1;
+  font-size: 11.5px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   cursor: pointer;
@@ -1749,6 +2130,32 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   border-color: var(--dial-accent);
 }
 
+.b5-safety-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid #1f242d;
+}
+
+.b5-safety-walls-line {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: #94a3b8;
+  font-variant-numeric: tabular-nums;
+}
+
+.b5-safety-steps-subline {
+  font-size: 11px;
+  font-weight: 700;
+  color: #64748b;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .aggression-dial-panel.is-readonly button:disabled,
 .aggression-dial-panel.is-readonly input:disabled,
 .b5-tier-dials.is-readonly button:disabled,
@@ -1762,10 +2169,11 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .dial-metrics-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: 1fr;
   }
   .b5-tier-controls {
-    grid-template-columns: 1fr;
+    flex-direction: column;
+    align-items: stretch;
   }
 }
 
@@ -1774,11 +2182,13 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   .dial-badge,
   .dial-level-badge,
   .dial-pill-tag,
+  .dial-base-ai-pill,
   .dial-shift-pill,
   .dial-owner-lock-badge,
   .dial-switch,
   .dial-switch-track,
   .dial-switch-thumb,
+  .dial-market-pill,
   .dial-slider::-webkit-slider-thumb,
   .dial-slider::-moz-range-thumb,
   .dial-tick,
