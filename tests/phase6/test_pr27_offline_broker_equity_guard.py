@@ -62,11 +62,13 @@ from cas_forex_revamp.venue.external_paper_broker import (
     OandaPracticePaperClient,
     PaperBrokerTransportError,
 )
+from cas_forex_revamp.venue.live_auth_ticket import LiveAuthorizationError
 from cas_forex_revamp.venue.mt5_broker_bridge import (
     BROKER_HUGOSWAY_MT5,
     BROKER_LHFX_MT5,
     BROKER_OANDA_LIVE,
     BROKER_OANDA_PRACTICE,
+    LiveBrokerEndpointForbiddenError,
     Mt5Credentials,
     Mt5MutationJournal,
     Mt5PaperBrokerVenue,
@@ -144,6 +146,8 @@ class _FakeOandaTransport:
         self.nav = nav
         self.quotes = dict(quotes)
         self.fail_http_520 = fail_http_520
+        self.summary_attempts = 0
+        self.custom_error: Exception | None = None
         self._next_trade_id = 9001
         self._trades: list[dict[str, object]] = []
 
@@ -163,6 +167,10 @@ class _FakeOandaTransport:
         max_wire_bytes: int = 32768,
     ) -> bytes:
         _ = (headers, timeout, max_wire_bytes)
+        if method == "GET" and url.endswith("/summary"):
+            self.summary_attempts += 1
+        if self.custom_error is not None:
+            raise self.custom_error
         if self.fail_http_520:
             raise PaperBrokerTransportError("OANDA HTTP 520: Cloudflare origin weekend maintenance")
         if method == "GET" and url.endswith("/summary"):
@@ -1099,6 +1107,236 @@ class Pr27OfflineBrokerEquityGuardTests(unittest.TestCase):
             self.assertEqual(router.online_total_equity(), D("287173.93"))
             fresh_eq = router.equities(require_fresh_oanda=True)
             self.assertEqual(fresh_eq[BROKER_OANDA_PRACTICE], D("100000.00"))
+
+
+    def test_cold_start_oanda_http_520_throttled_60s_auto_reconnect_restores_active_and_nav(self) -> None:
+        stream_doc = json.loads((CONTRACTS_DIR / "initial-market-stream.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            spool_root = root / "spool"
+            emu_hugo = SimMt5SpoolEa(
+                spool_root / "hugosway_mt5",
+                server="Hugosway-Demo",
+                login=7001111,
+                quotes=QUOTES_FX,
+                balance=D("89695.34"),
+                connected=True,
+                clock=lambda: T0,
+            )
+            emu_lhfx = SimMt5SpoolEa(
+                spool_root / "lhfx_mt5",
+                server="LHFXSA-Trade",
+                login=8002222,
+                quotes=QUOTES_FX,
+                balance=D("97478.59"),
+                connected=True,
+                clock=lambda: T0,
+            )
+            emu_hugo.publish_market()
+            emu_lhfx.publish_market()
+            emus = {
+                BROKER_HUGOSWAY_MT5: emu_hugo,
+                BROKER_LHFX_MT5: emu_lhfx,
+            }
+
+            now_box = [T0]
+            oanda_http = _FakeOandaTransport(
+                nav=D("100000.00"),
+                quotes=QUOTES_FX,
+                fail_http_520=True,
+            )
+            env = {
+                "CAS_FOREX_OANDA_PRACTICE_ACCOUNT_ID": "101-001-7777777-001",
+                "CAS_FOREX_OANDA_PRACTICE_TOKEN": _dummy_cred("oanda"),
+                "CAS_FOREX_OANDA_ACCOUNT_ID": "101-001-7777777-001",
+                "CAS_FOREX_OANDA_API_TOKEN": _dummy_cred("oanda"),
+                "CAS_FOREX_HUGOSWAY_MT5_LOGIN": "7001111",
+                "CAS_FOREX_HUGOSWAY_MT5_PASSWORD": _dummy_cred("hugo"),
+                "CAS_FOREX_HUGOSWAY_MT5_SERVER": "Hugosway-Demo",
+                "CAS_FOREX_LHFX_MT5_LOGIN": "8002222",
+                "CAS_FOREX_LHFX_MT5_PASSWORD": _dummy_cred("lhfx"),
+                "CAS_FOREX_LHFX_MT5_SERVER": "LHFXSA-Trade",
+                "CAS_FOREX_MT5_SPOOL_DIR": str(spool_root),
+                "CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE": "1",
+            }
+            router = DualShieldBrokerRouter(
+                environ=env,
+                valve_gate=VALVE_GATE,
+                oracle=OandaQuoteTruthOracle.from_static_quotes(QUOTES_FX, reference_name="OANDA_PRACTICE_ORACLE"),
+                barbell=BarbellCapitalPolicy(demo_virtual_sleeve=True),
+                peak_equity_store=PeakEquityStore(root / "peak.sqlite3"),
+                mt5_mutation_journal=Mt5MutationJournal(root / "mt5_mutations.sqlite3"),
+                oanda_reconnect_interval_seconds=60.0,
+                transport_factory=lambda bid, _mode, sp_dir: Mt5SpoolBridgeTransport(
+                    Path(str(sp_dir)) / bid.lower(),
+                    sleep=emus[bid].sleep_hook,
+                    poll_interval_seconds=0.005,
+                    receipt_timeout_seconds=1.0,
+                    clock=lambda: now_box[0],
+                ),
+                oanda_client_factory=lambda e: OandaPracticePaperClient(
+                    environ=e,
+                    transport=oanda_http,
+                    clock=lambda: now_box[0],
+                ),
+                clock=lambda: now_box[0],
+            )
+            statuses = router.activate_all()
+            self.assertEqual(statuses[BROKER_OANDA_PRACTICE], "FAILED")
+            self.assertEqual(router.offline_brokers(), [BROKER_OANDA_PRACTICE])
+            self.assertEqual(router.online_total_equity(), D("187173.93"))
+            self.assertEqual(oanda_http.summary_attempts, 1)
+
+            trader = AutonomousAiTrader(
+                router=router,
+                valve_gate=VALVE_GATE,
+                model_registry=FrontierModelRegistry(
+                    environ={},
+                    resolve_dns=lambda _h: ("127.0.0.1",),
+                    clock=lambda: now_box[0],
+                ),
+                execution_gate=lambda _inv: None,
+                quota_store=DailyQuotaGovernanceStore(root / "quota.sqlite3"),
+                profit_vault=ProfitSweepVault(root / "vault.sqlite3", initial_capital_usd=D("287173.93")),
+                aggression_dial=AggressionDialStore(root / "dial.sqlite3"),
+                initial_capital_usd=D("287173.93"),
+                journal_path=root / "ai_cycles.sqlite3",
+                clock=lambda: now_box[0],
+            )
+
+            # Even if OANDA origin recovers at +15s, retry is strictly throttled before 60.0s (0 network calls!)
+            oanda_http.set_fail_http_520(False)
+            now_box[0] = T0 + timedelta(seconds=15)
+            self.assertFalse(router.try_reconnect_oanda())
+            self.assertEqual(oanda_http.summary_attempts, 1)
+
+            now_box[0] = T0 + timedelta(seconds=59)
+            self.assertFalse(router._maybe_reconnect_oanda())
+            _ = router.routing_snapshot()
+            _ = trader.status_snapshot(now=now_box[0])
+            self.assertEqual(oanda_http.summary_attempts, 1)
+            self.assertEqual(router.offline_brokers(), [BROKER_OANDA_PRACTICE])
+
+            # At +60s, simulate another transient HTTP 520 -> records 1 attempt, stays FAILED, throttles next 60s
+            oanda_http.set_fail_http_520(True)
+            now_box[0] = T0 + timedelta(seconds=60)
+            self.assertFalse(router.try_reconnect_oanda())
+            self.assertEqual(oanda_http.summary_attempts, 2)
+            self.assertEqual(router.offline_brokers(), [BROKER_OANDA_PRACTICE])
+
+            oanda_http.set_fail_http_520(False)
+            now_box[0] = T0 + timedelta(seconds=90)
+            self.assertFalse(router.try_reconnect_oanda())
+            self.assertEqual(oanda_http.summary_attempts, 2)
+
+            # At +120s (>= 60s after last attempt), background trader.run_cycle triggers self-heal -> ACTIVE + $100k NAV!
+            now_box[0] = T0 + timedelta(seconds=120)
+            trader.run_cycle(stream_doc, now=now_box[0])
+            self.assertEqual(oanda_http.summary_attempts, 3)
+            self.assertFalse(router.is_broker_offline(BROKER_OANDA_PRACTICE))
+            self.assertEqual(router.offline_brokers(), [])
+            oanda_v = router.venues[BROKER_OANDA_PRACTICE]
+            self.assertIsInstance(oanda_v, OandaPracticeFallbackVenue)
+            self.assertEqual(oanda_v.nav, D("100000.00"))  # type: ignore[union-attr]
+            self.assertEqual(router.online_total_equity(), D("287173.93"))
+
+            rsnap = router.routing_snapshot()
+            chain_map = {c["broker_id"]: c for c in rsnap["chain"]}
+            self.assertEqual(chain_map[BROKER_OANDA_PRACTICE]["status"], "ACTIVE")
+            self.assertIsNone(chain_map[BROKER_OANDA_PRACTICE]["failure"])
+            self.assertEqual(rsnap["dual_shield"]["allocation"]["offline_brokers"], [])
+            self.assertEqual(rsnap["dual_shield"]["allocation"]["online_equity"], "287173.93")
+            self.assertIs(rsnap["dual_shield"]["allocation"]["equity_incomplete"], False)
+
+            tsnap = trader.status_snapshot(now=now_box[0])
+            self.assertEqual(tsnap["deployable_equity_usd"], "287173.93")
+            self.assertEqual(tsnap["banked_session"]["offline_brokers"], [])
+            self.assertIsNone(tsnap["banked_session"]["offline_broker_notice"])
+            self.assertIs(tsnap["banked_session"]["equity_incomplete_brokers_offline"], False)
+
+    def test_oanda_live_endpoint_forbidden_and_live_auth_errors_never_swallowed_or_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            spool_root = root / "spool"
+            emu_hugo = SimMt5SpoolEa(
+                spool_root / "hugosway_mt5",
+                server="Hugosway-Demo",
+                login=7001111,
+                quotes=QUOTES_FX,
+                balance=D("89695.34"),
+                connected=True,
+                clock=lambda: T0,
+            )
+            emu_hugo.publish_market()
+
+            oanda_http = _FakeOandaTransport(nav=D("100000.00"), quotes=QUOTES_FX)
+            env = {
+                "CAS_FOREX_OANDA_PRACTICE_ACCOUNT_ID": "101-001-7777777-001",
+                "CAS_FOREX_OANDA_PRACTICE_TOKEN": _dummy_cred("oanda"),
+                "CAS_FOREX_OANDA_ACCOUNT_ID": "101-001-7777777-001",
+                "CAS_FOREX_OANDA_API_TOKEN": _dummy_cred("oanda"),
+                "CAS_FOREX_HUGOSWAY_MT5_LOGIN": "7001111",
+                "CAS_FOREX_HUGOSWAY_MT5_PASSWORD": _dummy_cred("hugo"),
+                "CAS_FOREX_HUGOSWAY_MT5_SERVER": "Hugosway-Demo",
+                "CAS_FOREX_MT5_SPOOL_DIR": str(spool_root),
+                "CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE": "1",
+            }
+
+            factory_error: list[Exception | None] = [None]
+
+            def _make_router() -> DualShieldBrokerRouter:
+                def _client_factory(e: dict[str, str]) -> OandaPracticePaperClient:
+                    if factory_error[0] is not None:
+                        raise factory_error[0]
+                    return OandaPracticePaperClient(
+                        environ=e,
+                        transport=oanda_http,
+                        clock=lambda: T0,
+                    )
+
+                return DualShieldBrokerRouter(
+                    environ=env,
+                    valve_gate=VALVE_GATE,
+                    oracle=OandaQuoteTruthOracle.from_static_quotes(QUOTES_FX, reference_name="OANDA_PRACTICE_ORACLE"),
+                    barbell=BarbellCapitalPolicy(demo_virtual_sleeve=True),
+                    peak_equity_store=PeakEquityStore(root / "peak.sqlite3"),
+                    transport_factory=lambda bid, _mode, sp_dir: Mt5SpoolBridgeTransport(
+                        Path(str(sp_dir)) / bid.lower(),
+                        sleep=emu_hugo.sleep_hook,
+                        poll_interval_seconds=0.005,
+                        receipt_timeout_seconds=1.0,
+                        clock=lambda: T0,
+                    ),
+                    oanda_client_factory=_client_factory,
+                    clock=lambda: T0,
+                )
+
+            # 1. LiveAuthorizationError on activate_all AND try_reconnect_oanda is NEVER swallowed as FAILED
+            factory_error[0] = LiveAuthorizationError("forged or expired live authorization ticket")
+            r_auth = _make_router()
+            with self.assertRaises(LiveAuthorizationError):
+                r_auth.activate_all()
+            self.assertFalse(r_auth.try_reconnect_oanda(force=True))
+
+            factory_error[0] = PaperBrokerTransportError("cold-start HTTP 520 before client init")
+            r_auth_retry = _make_router()
+            self.assertEqual(r_auth_retry.activate_all()[BROKER_OANDA_PRACTICE], "FAILED")
+            factory_error[0] = LiveAuthorizationError("forged or expired live authorization ticket on reconnect")
+            with self.assertRaises(LiveAuthorizationError):
+                r_auth_retry.try_reconnect_oanda(now=T0 + timedelta(seconds=61))
+            self.assertFalse(r_auth_retry.try_reconnect_oanda(now=T0 + timedelta(seconds=180), force=True))
+
+            # 2. LiveBrokerEndpointForbiddenError during try_reconnect_oanda is NEVER swallowed or retried
+            factory_error[0] = None
+            oanda_http.custom_error = None
+            oanda_http.set_fail_http_520(True)
+            r_forb = _make_router()
+            self.assertEqual(r_forb.activate_all()[BROKER_OANDA_PRACTICE], "FAILED")
+            oanda_http.set_fail_http_520(False)
+            oanda_http.custom_error = LiveBrokerEndpointForbiddenError("live endpoint forbidden in DEMO mode")
+            with self.assertRaises(LiveBrokerEndpointForbiddenError):
+                r_forb.try_reconnect_oanda(now=T0 + timedelta(seconds=61))
+            self.assertFalse(r_forb.try_reconnect_oanda(now=T0 + timedelta(seconds=180), force=True))
 
 
 if __name__ == "__main__":

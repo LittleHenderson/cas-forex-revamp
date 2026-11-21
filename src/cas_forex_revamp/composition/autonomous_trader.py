@@ -113,6 +113,7 @@ from cas_forex_revamp.composition.trend_regime import (
     evaluate_house_money_pyramid_leg,
 )
 from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
+from cas_forex_revamp.venue.live_auth_ticket import LiveAuthorizationError
 from cas_forex_revamp.venue.live_market_stream import EXPANDED_MARKETS, INDEX_INSTRUMENTS
 from cas_forex_revamp.venue.mt5_broker_bridge import (
     MT5_CONTRACT_SIZE,
@@ -123,6 +124,7 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
     MT5_VOLUME_STEP,
     Mt5BridgeError,
     Mt5PaperBrokerVenue,
+    LiveBrokerEndpointForbiddenError,
     OandaPracticeFallbackVenue,
     OrderIntent,
 )
@@ -2649,7 +2651,14 @@ class AutonomousAiTrader:
 
         # Phase 1a: Open-position stop protection ALWAYS executes FIRST with zero vault I/O!
         prot_updates = self.evaluate_fast_protection(quotes=mt5_quotes, now=ts)
-        # Phase 1b (OUTSIDE self._lock): fault-isolated startup vault sync, vault snapshot & read-only dial read
+        # Phase 1b (OUTSIDE self._lock): throttled 60s OANDA self-heal, startup vault sync, vault & dial reads
+        if not fast_tick and callable(getattr(self._router, "try_reconnect_oanda", None)):
+            try:
+                self._router.try_reconnect_oanda(now=ts)
+            except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
+                raise
+            except Exception as exc_oa:
+                logger.warning("background OANDA reconnect skipped: %s", type(exc_oa).__name__)
         self._attempt_startup_vault_sync_post_protection(ts)
         v_snap_cyc = self._read_vault_snapshot_outside_lock()
         raw_dial_cyc = self._read_dial_snapshot_outside_lock()

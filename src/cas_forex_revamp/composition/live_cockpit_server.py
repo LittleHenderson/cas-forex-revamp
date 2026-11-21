@@ -3468,6 +3468,8 @@ def run_cockpit_cli(
     from cas_forex_revamp.composition.state_store import initialize_shared_runtime_state
     from cas_forex_revamp.operator.frontier_backends import FrontierModelRegistry
     from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
+    from cas_forex_revamp.venue.live_auth_ticket import LiveAuthorizationError
+    from cas_forex_revamp.venue.mt5_broker_bridge import LiveBrokerEndpointForbiddenError
     from cas_forex_revamp.venue.live_market_stream import (
         EXPANDED_MARKETS,
         ExpandedPublicLiveFxFeedClient,
@@ -3680,6 +3682,14 @@ def run_cockpit_cli(
 
     def _poll_loop() -> None:
         while not stop_flag.wait(float(args.poll_seconds)):
+            if callable(getattr(router, "try_reconnect_oanda", None)):
+                try:
+                    if router.try_reconnect_oanda():
+                        srv.notify_stream_updated()
+                except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
+                    raise
+                except Exception as exc_or:
+                    print(f"[broker] OANDA reconnect check skipped ({type(exc_or).__name__}).")
             if feed_client is None:
                 break
             try:
