@@ -42,9 +42,10 @@ from cas_forex_revamp.operator.frontier_backends import (
     _SENSITIVE_KEY_WORDS,
     FrontierModelRegistry,
 )
+from cas_forex_revamp.treasury.compounding_controller import CompoundingAndMilestoneController
 from cas_forex_revamp.treasury.profit_sweep import ProfitSweepVault
 from cas_forex_revamp.valve.aggression_dial import AggressionDialStore
-from cas_forex_revamp.valve.daily_quota import DailyQuotaGovernanceStore
+from cas_forex_revamp.valve.daily_quota import DailyQuotaGovernanceStore, friendly_broker_label
 from cas_forex_revamp.valve.tks_meta_valve_controller import (
     PeakEquityStore,
     ValveDecision,
@@ -57,10 +58,14 @@ from cas_forex_revamp.venue.dual_shield_router import (
     OandaQuoteTruthOracle,
     STATUS_BROKER_OFFLINE,
 )
-from cas_forex_revamp.venue.external_paper_broker import OandaPracticePaperClient
+from cas_forex_revamp.venue.external_paper_broker import (
+    OandaPracticePaperClient,
+    PaperBrokerTransportError,
+)
 from cas_forex_revamp.venue.mt5_broker_bridge import (
     BROKER_HUGOSWAY_MT5,
     BROKER_LHFX_MT5,
+    BROKER_OANDA_LIVE,
     BROKER_OANDA_PRACTICE,
     Mt5Credentials,
     Mt5MutationJournal,
@@ -129,14 +134,24 @@ def _make_open_order(
 
 
 class _FakeOandaTransport:
-    def __init__(self, *, nav: Decimal, quotes: dict[str, tuple[Decimal, Decimal]]) -> None:
+    def __init__(
+        self,
+        *,
+        nav: Decimal,
+        quotes: dict[str, tuple[Decimal, Decimal]],
+        fail_http_520: bool = False,
+    ) -> None:
         self.nav = nav
         self.quotes = dict(quotes)
+        self.fail_http_520 = fail_http_520
         self._next_trade_id = 9001
         self._trades: list[dict[str, object]] = []
 
     def set_nav(self, nav: Decimal) -> None:
         self.nav = nav
+
+    def set_fail_http_520(self, fail: bool) -> None:
+        self.fail_http_520 = fail
 
     def __call__(
         self,
@@ -148,6 +163,8 @@ class _FakeOandaTransport:
         max_wire_bytes: int = 32768,
     ) -> bytes:
         _ = (headers, timeout, max_wire_bytes)
+        if self.fail_http_520:
+            raise PaperBrokerTransportError("OANDA HTTP 520: Cloudflare origin weekend maintenance")
         if method == "GET" and url.endswith("/summary"):
             used = D("0.00")
             doc = {
@@ -853,6 +870,235 @@ class Pr27OfflineBrokerEquityGuardTests(unittest.TestCase):
                 self.assertIs(bs_3["equity_incomplete_brokers_offline"], False)  # type: ignore[index]
             finally:
                 srv.stop()
+
+
+    def test_cold_start_oanda_http_520_weekend_maintenance_prevents_fake_deficit_and_false_drawdown(self) -> None:
+        br_schema = json.loads((CONTRACTS_DIR / "broker-routing.schema.json").read_text(encoding="utf-8"))
+        ai_schema = json.loads((CONTRACTS_DIR / "ai-trader.schema.json").read_text(encoding="utf-8"))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pk_store = PeakEquityStore(root / "peak.sqlite3")
+            pk_store.observe_equity(
+                "dual-shield-barbell",
+                current_equity=D("300000.00"),
+                opening_balance=D("300000.00"),
+                now=T0 - timedelta(hours=6),
+            )
+
+            spool_root = root / "spool"
+            emu_hugo = SimMt5SpoolEa(
+                spool_root / "hugosway_mt5",
+                server="Hugosway-Demo",
+                login=7001111,
+                quotes=QUOTES_FX,
+                balance=D("89695.34"),
+                connected=True,
+                clock=lambda: T0,
+            )
+            emu_lhfx = SimMt5SpoolEa(
+                spool_root / "lhfx_mt5",
+                server="LHFXSA-Trade",
+                login=8002222,
+                quotes=QUOTES_FX,
+                balance=D("97478.59"),
+                connected=True,
+                clock=lambda: T0,
+            )
+            emu_hugo.publish_market()
+            emu_lhfx.publish_market()
+            emus = {
+                BROKER_HUGOSWAY_MT5: emu_hugo,
+                BROKER_LHFX_MT5: emu_lhfx,
+            }
+
+            oanda_http = _FakeOandaTransport(
+                nav=D("100000.00"),
+                quotes=QUOTES_FX,
+                fail_http_520=True,
+            )
+            env = {
+                "CAS_FOREX_OANDA_PRACTICE_ACCOUNT_ID": "101-001-7777777-001",
+                "CAS_FOREX_OANDA_PRACTICE_TOKEN": _dummy_cred("oanda"),
+                "CAS_FOREX_OANDA_ACCOUNT_ID": "101-001-7777777-001",
+                "CAS_FOREX_OANDA_API_TOKEN": _dummy_cred("oanda"),
+                "CAS_FOREX_HUGOSWAY_MT5_LOGIN": "7001111",
+                "CAS_FOREX_HUGOSWAY_MT5_PASSWORD": _dummy_cred("hugo"),
+                "CAS_FOREX_HUGOSWAY_MT5_SERVER": "Hugosway-Demo",
+                "CAS_FOREX_LHFX_MT5_LOGIN": "8002222",
+                "CAS_FOREX_LHFX_MT5_PASSWORD": _dummy_cred("lhfx"),
+                "CAS_FOREX_LHFX_MT5_SERVER": "LHFXSA-Trade",
+                "CAS_FOREX_MT5_SPOOL_DIR": str(spool_root),
+                "CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE": "1",
+            }
+            mt5_journal = Mt5MutationJournal(root / "mt5_mutations.sqlite3")
+            router = DualShieldBrokerRouter(
+                environ=env,
+                valve_gate=VALVE_GATE,
+                oracle=OandaQuoteTruthOracle.from_static_quotes(QUOTES_FX, reference_name="OANDA_PRACTICE_ORACLE"),
+                barbell=BarbellCapitalPolicy(demo_virtual_sleeve=True),
+                peak_equity_store=pk_store,
+                mt5_mutation_journal=mt5_journal,
+                transport_factory=lambda bid, _mode, sp_dir: Mt5SpoolBridgeTransport(
+                    Path(str(sp_dir)) / bid.lower(),
+                    sleep=emus[bid].sleep_hook,
+                    poll_interval_seconds=0.005,
+                    receipt_timeout_seconds=1.0,
+                    clock=lambda: T0,
+                ),
+                oanda_client_factory=lambda e: OandaPracticePaperClient(
+                    environ=e,
+                    transport=oanda_http,
+                    clock=lambda: T0,
+                ),
+                clock=lambda: T0,
+            )
+            statuses = router.activate_all()
+            self.assertEqual(statuses[BROKER_HUGOSWAY_MT5], "ACTIVE")
+            self.assertEqual(statuses[BROKER_LHFX_MT5], "ACTIVE")
+            self.assertEqual(statuses[BROKER_OANDA_PRACTICE], "FAILED")
+            self.assertTrue(router.is_broker_offline(BROKER_OANDA_PRACTICE))
+            self.assertEqual(router.offline_brokers(), [BROKER_OANDA_PRACTICE])
+            self.assertEqual(
+                router.online_equities(),
+                {
+                    BROKER_HUGOSWAY_MT5: D("89695.34"),
+                    BROKER_LHFX_MT5: D("97478.59"),
+                },
+            )
+            self.assertEqual(router.online_total_equity(), D("187173.93"))
+            self.assertEqual(router.peak_equity(), D("300000.00"))
+
+            # PR #25 Finding [3] invariant: require_fresh_oanda=True still fails closed!
+            with self.assertRaises(Mt5TransportError):
+                router.equities(require_fresh_oanda=True)
+
+            rsnap = router.routing_snapshot()
+            validate_contract_schema(rsnap, br_schema)
+            _assert_no_floats_or_sensitive_keys(self, rsnap)
+            chain_map = {c["broker_id"]: c["status"] for c in rsnap["chain"]}
+            self.assertEqual(chain_map[BROKER_OANDA_PRACTICE], "FAILED")
+            self.assertEqual(rsnap["dual_shield"]["allocation"]["offline_brokers"], [BROKER_OANDA_PRACTICE])
+            self.assertEqual(rsnap["dual_shield"]["allocation"]["online_equity"], "187173.93")
+            self.assertIs(rsnap["dual_shield"]["allocation"]["equity_incomplete"], True)
+            self.assertEqual(rsnap["dual_shield"]["allocation"]["drawdown_pct"], "0")
+
+            comp_ctrl = CompoundingAndMilestoneController(
+                root / "compounding.sqlite3",
+                starting_principal_usd=D("300000.00"),
+            )
+            trader = AutonomousAiTrader(
+                router=router,
+                valve_gate=VALVE_GATE,
+                model_registry=FrontierModelRegistry(
+                    environ={},
+                    resolve_dns=lambda _h: ("127.0.0.1",),
+                    clock=lambda: T0,
+                ),
+                execution_gate=lambda _inv: None,
+                quota_store=DailyQuotaGovernanceStore(root / "quota.sqlite3"),
+                profit_vault=ProfitSweepVault(root / "vault.sqlite3", initial_capital_usd=D("300000.00")),
+                aggression_dial=AggressionDialStore(root / "dial.sqlite3"),
+                compounding_controller=comp_ctrl,
+                initial_capital_usd=D("300000.00"),
+                journal_path=root / "ai_cycles.sqlite3",
+                clock=lambda: T0,
+            )
+            tsnap = trader.status_snapshot(now=T0)
+            validate_contract_schema(tsnap, ai_schema)
+            _assert_no_floats_or_sensitive_keys(self, tsnap)
+            self.assertEqual(tsnap["deployable_equity_usd"], "187173.93")
+            bs = tsnap["banked_session"]
+            self.assertEqual(bs["offline_brokers"], [BROKER_OANDA_PRACTICE])
+            self.assertEqual(bs["online_equity_usd"], "187173.93")
+            self.assertIs(bs["equity_incomplete_brokers_offline"], True)
+            self.assertEqual(bs["capital_status"], CAPITAL_STATUS_AT_PRINCIPAL)
+            self.assertEqual(bs["deficit_to_principal_usd"], "0")
+            notice_txt = str(bs["offline_broker_notice"])
+            self.assertIn("OANDA is temporarily offline", notice_txt)
+            self.assertIn("not a trading loss", notice_txt)
+
+            csnap = trader.compounding_snapshot(now=T0)
+            self.assertIsNotNone(csnap)
+            self.assertEqual(csnap["current_equity_usd"], "300000.00")  # type: ignore[index]
+            self.assertIs(csnap["underwater"], False)  # type: ignore[index]
+
+            # Real >=10% online cohort drawdown STILL trips while OANDA is cold-start offline
+            emu_lhfx.balance = D("77478.59")
+            emu_lhfx.publish_market()
+            eff_curr, eff_pk, eff_dd = router.effective_drawdown_state()
+            self.assertGreater(eff_dd, D("0.10"))
+            with self.assertRaises(BarbellPolicyRefusalError) as ctx_dd:
+                router.barbell.require_drawdown(current_equity=eff_curr, peak_equity=eff_pk)
+            self.assertEqual(ctx_dd.exception.reason, "MAX_DRAWDOWN_EXCEEDED")
+            tsnap_loss = trader.status_snapshot(now=T0 + timedelta(seconds=5))
+            self.assertEqual(tsnap_loss["banked_session"]["capital_status"], CAPITAL_STATUS_RECOVERY_MODE)
+            self.assertEqual(tsnap_loss["banked_session"]["deficit_to_principal_usd"], "20000")
+
+    def test_mid_session_oanda_drop_preserves_continuity_excludes_online_and_keeps_finding3_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rig = _build_three_broker_rig(
+                root,
+                oanda_nav=D("100000.00"),
+                hugo_balance=D("89695.34"),
+                lhfx_balance=D("97478.59"),
+                demo_virtual_sleeve=True,
+                initial_capital_usd=D("287173.93"),
+            )
+            router: DualShieldBrokerRouter = rig["router"]  # type: ignore[assignment]
+            trader: AutonomousAiTrader = rig["trader"]  # type: ignore[assignment]
+            oanda_http: _FakeOandaTransport = rig["oanda_http"]  # type: ignore[assignment]
+            oanda_venue: OandaPracticeFallbackVenue = rig["oanda_venue"]  # type: ignore[assignment]
+
+            self.assertEqual(router.offline_brokers(), [])
+            self.assertEqual(router.online_total_equity(), D("287173.93"))
+
+            # Mid-session OANDA HTTP 520 failure: new-risk refresh MUST fail closed (Finding [3])
+            oanda_http.set_fail_http_520(True)
+            ord_new = _make_open_order("oanda-mid-drop", units=D("10000"))
+            with self.assertRaises(Mt5TransportError):
+                router.execute_open(ord_new, valve_decision=_admit_order(ord_new))
+            with self.assertRaises(Mt5TransportError):
+                router.equities(require_fresh_oanda=True)
+
+            # Read/snapshot path preserves $100,000 continuity in equities() while excluding OANDA from online_equities()
+            self.assertTrue(router.is_broker_offline(BROKER_OANDA_PRACTICE))
+            self.assertEqual(router.offline_brokers(), [BROKER_OANDA_PRACTICE])
+            eq_map = router.equities()
+            self.assertEqual(eq_map[BROKER_OANDA_PRACTICE], D("100000.00"))
+            self.assertEqual(router.barbell.total_equity(eq_map), D("287173.93"))
+            self.assertEqual(
+                router.online_equities(),
+                {
+                    BROKER_HUGOSWAY_MT5: D("89695.34"),
+                    BROKER_LHFX_MT5: D("97478.59"),
+                },
+            )
+            self.assertEqual(router.online_total_equity(), D("187173.93"))
+
+            snap_drop = trader.status_snapshot(now=T0)
+            self.assertEqual(snap_drop["deployable_equity_usd"], "187173.93")
+            bs_drop = snap_drop["banked_session"]
+            self.assertEqual(bs_drop["current_total_equity_usd"], "287173.93")
+            self.assertEqual(bs_drop["capital_status"], CAPITAL_STATUS_AT_PRINCIPAL)
+            self.assertEqual(bs_drop["deficit_to_principal_usd"], "0")
+            self.assertEqual(bs_drop["offline_brokers"], [BROKER_OANDA_PRACTICE])
+            self.assertEqual(bs_drop["online_equity_usd"], "187173.93")
+            self.assertIs(bs_drop["equity_incomplete_brokers_offline"], True)
+            self.assertIn("OANDA is temporarily offline", str(bs_drop["offline_broker_notice"]))
+            self.assertEqual(friendly_broker_label(BROKER_OANDA_LIVE), "OANDA")
+            live_notice = str(trader._build_offline_broker_notice([BROKER_OANDA_LIVE], D("187173.93")))
+            self.assertIn("OANDA is temporarily offline", live_notice)
+
+            # Recovery: OANDA returns 200 OK -> offline_brokers clears and online_total_equity restores $287,173.93
+            oanda_http.set_fail_http_520(False)
+            oanda_venue.probe_account_summary(now=T0 + timedelta(seconds=5))
+            self.assertFalse(router.is_broker_offline(BROKER_OANDA_PRACTICE))
+            self.assertEqual(router.offline_brokers(), [])
+            self.assertEqual(router.online_total_equity(), D("287173.93"))
+            fresh_eq = router.equities(require_fresh_oanda=True)
+            self.assertEqual(fresh_eq[BROKER_OANDA_PRACTICE], D("100000.00"))
 
 
 if __name__ == "__main__":

@@ -772,7 +772,11 @@ class AutonomousAiTrader:
                 if venue.account is not None and not getattr(venue, "is_offline", False):
                     return True
             elif isinstance(venue, OandaPracticeFallbackVenue):
-                if venue.summary is not None or venue.nav is not None:
+                oanda_off = (
+                    callable(getattr(self._router, "is_broker_offline", None))
+                    and self._router.is_broker_offline(venue.broker_id)
+                )
+                if not oanda_off and (venue.summary is not None or venue.nav is not None):
                     return True
         return False
 
@@ -815,6 +819,13 @@ class AutonomousAiTrader:
             has_live = self._has_connected_broker_equity_unlocked() or total_eq > Decimal("0")
             ps = self._principal_surplus_metrics(total_eq, v_snap=v_snap, equities=eq_bundle["equities"])
             econ_eq = ps["economic_equity_usd"]
+            if ps.get("cold_offline_unknown") and econ_eq < ps["principal_usd"]:
+                econ_eq = max(
+                    Decimal("0.00"),
+                    (ps["principal_usd"] + ps["net_surplus_usd"]).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    ),
+                )
             exec_mode = "LIVE" if str(self._router.execution_mode).upper() == "LIVE" else "DEMO"
         return (econ_eq if has_live else None), econ_eq, exec_mode
 
@@ -1048,14 +1059,20 @@ class AutonomousAiTrader:
     def _format_offline_broker_notice(offline_ids: list[str], online_eq_q: Decimal) -> str | None:
         if not offline_ids:
             return None
-        labels = [friendly_broker_label(b) for b in offline_ids]
+        labels: list[str] = []
+        for b in offline_ids:
+            lbl = friendly_broker_label(b)
+            if lbl not in labels:
+                labels.append(lbl)
         names_text = ", ".join(labels)
         verb = "is" if len(labels) == 1 else "are"
         return (
-            f"{names_text} ({', '.join(offline_ids)}) {verb} currently offline. "
-            f"Trading size uses verified online funds only (${decimal_text(online_eq_q)}); "
-            f"unreachable offline funds are not a trading loss."
+            f"{names_text} {verb} temporarily offline — disconnected account equity is excluded from "
+            f"trading loss and drawdown checks (verified online funds: ${decimal_text(online_eq_q)}; "
+            f"not a trading loss)."
         )
+
+    _build_offline_broker_notice = _format_offline_broker_notice
 
     def _resolve_master_dial_summary_unlocked(
         self,
@@ -1324,6 +1341,8 @@ class AutonomousAiTrader:
                         "volume_lots": decimal_text(pos.volume_lots),
                     })
             elif isinstance(venue, OandaPracticeFallbackVenue):
+                if callable(getattr(self._router, "is_broker_offline", None)) and self._router.is_broker_offline(broker_id):
+                    continue
                 has_venue_acct = True
                 bal_sum += venue.nav or Decimal("0")
                 free_sum += venue.margin_available or Decimal("0")
@@ -2352,6 +2371,7 @@ class AutonomousAiTrader:
             "capital_status": capital_status,
             "in_recovery_mode": capital_status == CAPITAL_STATUS_RECOVERY_MODE,
             "vault_sweeps_paused_for_recovery": capital_status != CAPITAL_STATUS_IN_SURPLUS,
+            "cold_offline_unknown": bool(cold_unknown),
         }
 
     def sync_session_profit_to_vault(self, *, now: datetime | None = None) -> dict[str, Any] | None:
