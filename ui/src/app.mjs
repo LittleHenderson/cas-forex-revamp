@@ -2,7 +2,7 @@ import { createExplainer } from './explainer.mjs';
 import { decodeCockpit, parseUniqueJSON, MAX_SNAPSHOT_BYTES } from './wire.mjs';
 import { resetInspection, reviewRecords, inspectRecord } from './model.mjs';
 import { displayFreshness } from './freshness.mjs';
-import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose, replaceSafeHTML } from './render.mjs';
+import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose, replaceSafeHTML, resolveCockpitCompounding } from './render.mjs';
 import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decision-read.mjs';
 import { ScopedBridge, createAuthenticatedLoopbackBridge } from './bridge.mjs';
 import { ALL_WATCHLIST_MARKETS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts, releaseDetachedCanvases } from './chart.mjs';
@@ -62,6 +62,14 @@ import {
   renderSectionB5TierDials,
   resolveCockpitAggressionDial,
 } from './aggression-dial.mjs';
+import {
+  COMPOUNDING_PANEL_SCHEMA,
+  STATIC_COMPOUNDING_PANEL,
+  compareDecimalStrings,
+  normalizeCompoundingPanel,
+  normalizeDecimalString,
+  patchCompoundingPanelInPlace,
+} from './compounding-panel.mjs';
 
 // Fixed same-origin assets. Only explicit trusted bootstrap may inject a scoped bridge.
 const schemaURL = new URL('../docs/contracts/cockpit.schema.json', document.baseURI);
@@ -183,6 +191,7 @@ let state = {
   moneyFlow: createDefaultMoneyFlowState(),
   liveFunding: createDefaultLiveFundingState(),
   aggressionDial: STATIC_AGGRESSION_DIAL,
+  compounding: STATIC_COMPOUNDING_PANEL,
   unlockDraft: '',
   unlockKeyVisible: false,
   sessionScope: initialSessionScope,
@@ -344,7 +353,7 @@ function render(focusMain = false) {
   try { releaseDetachedCanvases(root); } catch { /* Best-effort buffer release. */ }
   replaceSafeHTML(root, renderApp(state));
   if (state.liveStreamConnected && !isOwnerControlSession(state)) {
-    for (const el of root.querySelectorAll('[data-thinking-depth], [data-select-ai-model], [data-treasury-rail], [data-treasury-action], [data-dial-master-slider], [data-dial-master-preset], [data-dial-action], [data-dial-tier-slider], [data-dial-tier-bps], [data-dial-tier-preset], [data-dial-confirm-high-risk], [data-dial-cancel-high-risk]')) {
+    for (const el of root.querySelectorAll('[data-thinking-depth], [data-select-ai-model], [data-treasury-rail], [data-treasury-action], [data-dial-master-slider], [data-dial-master-preset], [data-dial-action], [data-dial-tier-slider], [data-dial-tier-bps], [data-dial-tier-preset], [data-dial-confirm-high-risk], [data-dial-cancel-high-risk], [data-compounding-action]')) {
       el.disabled = true;
     }
   }
@@ -494,6 +503,7 @@ function recordMicroTick(envelope) {
 
 function stopLoopbackStream() {
   if (liveSseAbort) { liveSseAbort.abort(); liveSseAbort = null; }
+  stopLiveCockpitPollLoop();
   state.liveStreamConnected = false;
   closeQrPairingDrawer(false);
 }
@@ -517,6 +527,7 @@ function handleSseEvent(eventName, dataText) {
   } else if (eventName === 'ai_trader') {
     try {
       state.aiTrader = normalizeAiTrader(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
+      refreshCompoundingFromTick();
       scheduleStreamRender();
     } catch { /* Ignore malformed ai_trader frame. */ }
   } else if (eventName === 'ai_models') {
@@ -527,6 +538,7 @@ function handleSseEvent(eventName, dataText) {
   } else if (eventName === 'treasury') {
     try {
       state.treasury = normalizeTreasury(parseUniqueJSON(dataText, MAX_TREASURY_BYTES));
+      refreshCompoundingFromTick();
       scheduleStreamRender();
     } catch { /* Ignore malformed treasury frame. */ }
   } else if (eventName === 'parallel_tiers') {
@@ -542,6 +554,11 @@ function handleSseEvent(eventName, dataText) {
         syncAggressionDialDom();
       }
     } catch { /* Ignore malformed aggression_dial frame. */ }
+  } else if (eventName === 'compounding') {
+    try {
+      state.compounding = normalizeCompoundingPanel(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
+      syncCompoundingDom();
+    } catch { /* Ignore malformed compounding frame. */ }
   }
 }
 
@@ -670,6 +687,7 @@ async function connectLoopbackLiveFeed() {
   }
   await readBrokerRouting();
   await readAiCockpitFeeds();
+  startLiveCockpitPollLoop();
   render();
   announce('Connected to verified loopback market stream and autonomous AI overseer.');
 }
@@ -707,6 +725,124 @@ async function readAiCockpitFeeds() {
     state.parallelTiers = normalizeParallelTiers(parseUniqueJSON(rawTiers, MAX_TREASURY_BYTES));
   } catch { state.parallelTiers = null; }
   await readAggressionDial();
+  await readCompounding();
+}
+
+const LIVE_COCKPIT_POLL_MS = 4000;
+let liveCockpitPollTimer = null;
+let liveCockpitPollInFlight = false;
+let compoundingTickRefreshInFlight = false;
+
+function isStrictOwnerCompoundingSession() {
+  if (state.liveStreamConnected !== true) return false;
+  if (!loopbackAuthToken) return false;
+  if (state.sessionScope !== SESSION_SCOPES.OWNER_FULL_CONTROL) return false;
+  if (state.ownerControlsAllowed !== true) return false;
+  return isOwnerControlSession(state);
+}
+
+async function readCompounding() {
+  try {
+    const rawComp = await readStatic(new URL('/api/compounding', window.location.origin), MAX_AI_PAYLOAD_BYTES);
+    state.compounding = normalizeCompoundingPanel(parseUniqueJSON(rawComp, MAX_AI_PAYLOAD_BYTES));
+  } catch {
+    if (state.aiTrader?.compounding) {
+      state.compounding = normalizeCompoundingPanel(state.aiTrader.compounding);
+    }
+  }
+}
+
+function syncCompoundingDom(focusSelector = null) {
+  const sx = window.scrollX || 0;
+  const sy = window.scrollY || 0;
+  const resolved = resolveCockpitCompounding(state);
+  const panelEl = root.querySelector('[data-compounding-panel="true"]');
+  if (panelEl) {
+    patchCompoundingPanelInPlace(panelEl, resolved);
+    if (focusSelector) {
+      panelEl.querySelector(focusSelector)?.focus({ preventScroll: true });
+    }
+  }
+  if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
+}
+
+function refreshCompoundingFromTick() {
+  if (!state.liveStreamConnected || compoundingTickRefreshInFlight) return;
+  compoundingTickRefreshInFlight = true;
+  void readCompounding()
+    .then(() => { syncCompoundingDom(); })
+    .finally(() => { compoundingTickRefreshInFlight = false; });
+}
+
+async function pollLiveCockpitState() {
+  if (!state.liveStreamConnected || document.hidden || liveCockpitPollInFlight) return;
+  liveCockpitPollInFlight = true;
+  try {
+    try {
+      const rawTrader = await readStatic(new URL('/api/ai-trader', window.location.origin), MAX_AI_PAYLOAD_BYTES);
+      state.aiTrader = normalizeAiTrader(parseUniqueJSON(rawTrader, MAX_AI_PAYLOAD_BYTES));
+    } catch { /* Keep prior verified trader snapshot. */ }
+    await readAggressionDial();
+    await readCompounding();
+    if (!isDialSliderDragging()) {
+      syncAggressionDialDom();
+    }
+    syncCompoundingDom();
+  } finally {
+    liveCockpitPollInFlight = false;
+  }
+}
+
+function startLiveCockpitPollLoop() {
+  stopLiveCockpitPollLoop();
+  if (!state.liveStreamConnected) return;
+  liveCockpitPollTimer = window.setInterval(() => {
+    void pollLiveCockpitState();
+  }, LIVE_COCKPIT_POLL_MS);
+}
+
+function stopLiveCockpitPollLoop() {
+  if (liveCockpitPollTimer !== null) {
+    window.clearInterval(liveCockpitPollTimer);
+    liveCockpitPollTimer = null;
+  }
+}
+
+async function submitCompoundingMutation(payload, focusSelector = null) {
+  if (!state.liveStreamConnected) return;
+  if (!isStrictOwnerCompoundingSession()) {
+    requireOwnerControlOrWarn('Compounding control update');
+    syncCompoundingDom();
+    return;
+  }
+  try {
+    const res = await postLoopbackJson('/api/compounding', payload);
+    if (res && typeof res === 'object' && (res.schema === COMPOUNDING_PANEL_SCHEMA || res.mode !== undefined || res.compounding_mode !== undefined)) {
+      state.compounding = normalizeCompoundingPanel(res);
+    } else {
+      await readCompounding();
+    }
+    state.aiIssue = null;
+    syncCompoundingDom(focusSelector);
+    announce(
+      payload.action === 'acknowledge_principal_withdrawn'
+        ? `Original principal withdrawal ($${payload.amount_usd}) acknowledged. Trading on 100% house money.`
+        : `Compounding mode updated to ${state.compounding.mode}.`,
+    );
+  } catch (error) {
+    if (error?.status === 403) {
+      state.ownerControlsAllowed = false;
+      state.canPairDevice = false;
+    }
+    state.aiIssue = error instanceof Error ? error.message : 'Compounding update failed.';
+    announce(state.aiIssue);
+    await readCompounding();
+    if (error?.status === 403) {
+      render();
+    } else {
+      syncCompoundingDom(focusSelector);
+    }
+  }
 }
 
 let dialDebounceTimer = null;
@@ -1332,6 +1468,53 @@ root.addEventListener('click', (event) => {
     })();
     return;
   }
+  if (target.dataset.compoundingAction === 'TOGGLE_FULL_100') {
+    if (state.liveStreamConnected && !isStrictOwnerCompoundingSession()) {
+      requireOwnerControlOrWarn('Compounding mode toggle');
+      syncCompoundingDom();
+      return;
+    }
+    const cur = resolveCockpitCompounding(state);
+    if (!cur.ownerControlsAllowed) return;
+    const nextMode = cur.isFullCompound ? 'BALANCED_SPLIT_50_50' : 'FULL_COMPOUND_100';
+    state.compounding = normalizeCompoundingPanel({
+      ...cur,
+      mode: nextMode,
+      effectiveVaultSweepRatio: null,
+    });
+    syncCompoundingDom('[data-compounding-action="TOGGLE_FULL_100"]');
+    void submitCompoundingMutation(
+      { action: 'set_mode', mode: nextMode },
+      '[data-compounding-action="TOGGLE_FULL_100"]',
+    );
+    return;
+  }
+  if (target.dataset.compoundingAction === 'ACK_PRINCIPAL_WITHDRAWN') {
+    if (state.liveStreamConnected && !isStrictOwnerCompoundingSession()) {
+      requireOwnerControlOrWarn('Acknowledge principal withdrawn');
+      syncCompoundingDom();
+      return;
+    }
+    const cur = resolveCockpitCompounding(state);
+    if (!cur.houseMoneyReady || !cur.ownerControlsAllowed) return;
+    const pulloutUsd = compareDecimalStrings(cur.suggestedPrincipalPulloutUsd, '0.00') > 0
+      ? normalizeDecimalString(cur.suggestedPrincipalPulloutUsd, cur.startingPrincipalUsd, 2)
+      : normalizeDecimalString(cur.startingPrincipalUsd, '5000.00', 2);
+    state.compounding = normalizeCompoundingPanel({
+      ...cur,
+      houseMoneyStatus: 'PLAYING_ON_HOUSE_MONEY',
+      houseMoneyReady: false,
+      principalWithdrawnAcknowledged: true,
+      principalWithdrawnUsd: pulloutUsd,
+      suggestedPrincipalPulloutUsd: '0.00',
+    });
+    syncCompoundingDom('[data-compounding-field="modeSwitch"]');
+    void submitCompoundingMutation(
+      { action: 'acknowledge_principal_withdrawn', amount_usd: pulloutUsd },
+      '[data-compounding-field="modeSwitch"]',
+    );
+    return;
+  }
   if (target.dataset.dialAction === 'TOGGLE_AI_DISCRETION') {
     if (state.liveStreamConnected && !requireOwnerControlOrWarn('AI Discretion toggle')) return;
     const cur = resolveCockpitAggressionDial(state);
@@ -1838,5 +2021,5 @@ function updateObservationAge() {
 }
 let ageTimer = window.setInterval(updateObservationAge, 1000);
 document.addEventListener('visibilitychange', () => { if (document.hidden) controller?.invalidateReadAge(); updateObservationAge(); });
-window.addEventListener('pagehide', () => { controller?.invalidateReadAge(); window.clearInterval(ageTimer); ageTimer = null; });
-window.addEventListener('pageshow', () => { updateObservationAge(); if (ageTimer === null) ageTimer = window.setInterval(updateObservationAge, 1000); });
+window.addEventListener('pagehide', () => { controller?.invalidateReadAge(); stopLiveCockpitPollLoop(); window.clearInterval(ageTimer); ageTimer = null; });
+window.addEventListener('pageshow', () => { updateObservationAge(); if (ageTimer === null) ageTimer = window.setInterval(updateObservationAge, 1000); if (state.liveStreamConnected) startLiveCockpitPollLoop(); });

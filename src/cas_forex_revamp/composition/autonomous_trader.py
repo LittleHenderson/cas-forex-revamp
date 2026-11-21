@@ -52,7 +52,29 @@ from cas_forex_revamp.operator.frontier_backends import (
     assert_safe_ai_catalog_payload,
 )
 from cas_forex_revamp.operator.model import ActualModelDecisionAdapter, DurableModelExecutionGate, ModelInvocation
+from cas_forex_revamp.composition.phase8_live_bridge import Phase8LiveTradingBridge
+from cas_forex_revamp.execution.smart_execution import (
+    QuoteSnapshot,
+    RefusalReason as SmartRefusalReason,
+    SmartExecutionPlanner,
+    SmartSliceExecutor,
+)
+from cas_forex_revamp.ledger.unified_ledger import UnifiedRealTimeLedger
+from cas_forex_revamp.risk.news_shock_shield import (
+    NewsShockShield,
+    TradeActionType,
+)
+from cas_forex_revamp.treasury.compounding_controller import (
+    CompoundingAndMilestoneController,
+    CompoundingControllerError,
+    CompoundingMode,
+    OwnerKeyRequiredError as CompoundingOwnerKeyRequiredError,
+)
 from cas_forex_revamp.treasury.profit_sweep import ENV_INITIAL_CAPITAL_USD
+from cas_forex_revamp.venue.execution_event_bus import (
+    ExecutionEventBus,
+    ExecutionEventType,
+)
 from cas_forex_revamp.valve.aggression_dial import (
     AggressionDialStore,
     MIN_CONSTITUTIONAL_VALVE_PROB,
@@ -142,6 +164,128 @@ ACTIVE_GEAR_STRONG_TREND_RUNNER = "STRONG_TREND_RUNNER"
 MAX_CONSTITUTIONAL_STOP_RISK_PCT = Decimal("1.00")
 MAX_CONSTITUTIONAL_DRAWDOWN_PCT = Decimal("0.10")
 SOFT_DRAWDOWN_DOWNSHIFT_PCT = Decimal("0.05")
+
+COMPOUNDING_MONITORED_SYMBOLS: tuple[str, ...] = ("NAS100", "US30", "XAUUSD", "EUR_USD")
+COMPOUNDING_BROKER_LABELS: tuple[str, ...] = ("Hugo's Way", "LHFX", "OANDA")
+_PHASE8_SUPPORTED_BROKERS: frozenset[str] = frozenset(
+    {"HUGOSWAY_MT5", "LHFX_MT5", "OANDA", "OANDA_PRACTICE", "OANDA_LIVE"}
+)
+
+
+def _enrich_milestone_dict(item: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(item)
+    raw_mult = out.get("multiplier", "2")
+    try:
+        mult_int = int(Decimal(str(raw_mult)))
+    except (InvalidOperation, ValueError, TypeError):
+        mult_int = 2
+    out["multiple"] = max(1, mult_int)
+    return out
+
+
+def build_enriched_compounding_payload(
+    *,
+    compounding_controller: CompoundingAndMilestoneController,
+    phase8_bridge: Phase8LiveTradingBridge | None = None,
+    fallback_news_shield: NewsShockShield | None = None,
+    current_equity_usd: Decimal | None = None,
+    owner_controls_allowed: bool = True,
+    session_scope: str = "OWNER_FULL_CONTROL",
+    execution_mode: str = "DEMO",
+    now_utc: datetime | None = None,
+) -> dict[str, Any]:
+    """Build strictly 0-write enriched compounding + milestone + Phase 8 bridge snapshot."""
+    ts = utc_time(now_utc, "now_utc") if now_utc is not None else datetime.now(timezone.utc)
+    eff_scope = (
+        "DEVICE_READ_AND_EXPLAINER"
+        if str(session_scope or "").strip().upper() == "DEVICE_READ_AND_EXPLAINER"
+        else "OWNER_FULL_CONTROL"
+    )
+    eff_owner = bool(owner_controls_allowed) and (eff_scope == "OWNER_FULL_CONTROL")
+    eff_exec = "LIVE" if str(execution_mode or "DEMO").strip().upper() == "LIVE" else "DEMO"
+
+    safe_eq_override = (
+        max(Decimal("0.00"), current_equity_usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        if current_equity_usd is not None
+        else None
+    )
+    doc = dict(compounding_controller.snapshot(current_equity_usd=safe_eq_override))
+    doc["milestones"] = [
+        _enrich_milestone_dict(m) for m in (doc.get("milestones") or []) if isinstance(m, Mapping)
+    ]
+    raw_next = doc.get("next_milestone")
+    doc["next_milestone"] = _enrich_milestone_dict(raw_next) if isinstance(raw_next, Mapping) else None
+
+    shield = phase8_bridge.news_shield if phase8_bridge is not None else (fallback_news_shield or NewsShockShield())
+    news_doc = shield.shield_status_snapshot(COMPOUNDING_MONITORED_SYMBOLS, now_utc=ts)
+
+    p8_summary: dict[str, Any] | None = None
+    if phase8_bridge is not None:
+        eval_eq_dec = Decimal(str(doc["current_equity_usd"]))
+        raw_b = phase8_bridge.bridge_snapshot(
+            symbols=COMPOUNDING_MONITORED_SYMBOLS,
+            current_equity_usd=eval_eq_dec,
+            now_utc=ts,
+        )
+        bus_raw = raw_b.get("event_bus") if isinstance(raw_b.get("event_bus"), Mapping) else {}
+        workers_map = bus_raw.get("async_workers") if isinstance(bus_raw.get("async_workers"), Mapping) else {}
+        lanes_raw = (
+            bus_raw.get("subscriber_errors_by_lane")
+            if isinstance(bus_raw.get("subscriber_errors_by_lane"), Mapping)
+            else {}
+        )
+        clean_bus = {
+            "published_count": int(bus_raw.get("published_count", 0)),
+            "deduped_count": int(bus_raw.get("deduped_count", 0)),
+            "dropped_events": int(bus_raw.get("dropped_events", 0)),
+            "subscriber_errors": int(bus_raw.get("subscriber_errors", 0)),
+            "last_seq_id": int(bus_raw.get("last_seq_id", 0)),
+            "replay_buffer_len": int(bus_raw.get("replay_buffer_len", 0)),
+            "replay_buffer_maxlen": int(bus_raw.get("replay_buffer_maxlen", 10000)),
+            "active_subscribers": int(bus_raw.get("active_subscribers", 0)),
+            "subscriber_errors_by_lane": {
+                "CRITICAL_PROTECTION": int(lanes_raw.get("CRITICAL_PROTECTION", 0)),
+                "LEDGER_ASYNC": int(lanes_raw.get("LEDGER_ASYNC", 0)),
+                "UI_SSE_ASYNC": int(lanes_raw.get("UI_SSE_ASYNC", 0)),
+            },
+            "async_workers": [
+                {
+                    "subscriber_id": str(w.get("subscriber_id", "")),
+                    "name": str(w.get("name", "")),
+                    "lane": str(w.get("lane", "LEDGER_ASYNC")),
+                    "queue_depth": int(w.get("queue_depth", 0)),
+                    "queue_maxsize": int(w.get("queue_maxsize", 1024)),
+                    "in_flight": int(w.get("in_flight", 0)),
+                    "delivered_count": int(w.get("delivered_count", 0)),
+                    "dropped_count": int(w.get("dropped_count", 0)),
+                    "error_count": int(w.get("error_count", 0)),
+                    "last_error": None if w.get("last_error") is None else str(w.get("last_error")),
+                    "alive": bool(w.get("alive", False)),
+                }
+                for w in workers_map.values()
+                if isinstance(w, Mapping)
+            ],
+            "closed": bool(bus_raw.get("closed", False)),
+        }
+        p8_summary = {
+            "schema": str(raw_b["schema"]),
+            "as_of_utc": str(raw_b["as_of_utc"]),
+            "supported_brokers": [str(b) for b in (raw_b.get("supported_brokers") or [])],
+            "valve_weights_sha256": str(raw_b["valve_weights_sha256"]),
+            "event_bus": clean_bus,
+            "ledger": dict(raw_b["ledger"]),
+        }
+
+    doc["owner_controls_allowed"] = eff_owner
+    doc["session_scope"] = eff_scope
+    doc["access_mode"] = eff_scope
+    doc["execution_mode"] = eff_exec
+    doc["live_mode"] = eff_exec == "LIVE"
+    doc["connected"] = True
+    doc["brokers"] = list(COMPOUNDING_BROKER_LABELS)
+    doc["news_shield"] = news_doc
+    doc["phase8_bridge"] = p8_summary
+    return assert_safe_ai_catalog_payload(doc)
 
 
 def resolve_adaptive_risk_and_quota(
@@ -408,6 +552,9 @@ class AutonomousAiTrader:
         risk_gear_path: str | Path | None = None,
         initial_capital_usd: Decimal | None = None,
         startup_vault_retry_cooldown_seconds: float = DEFAULT_STARTUP_VAULT_RETRY_COOLDOWN_SECONDS,
+        compounding_controller: CompoundingAndMilestoneController | None = None,
+        phase8_bridge: Phase8LiveTradingBridge | None = None,
+        state_dir: str | Path | None = None,
     ) -> None:
         if not isinstance(router, DualShieldBrokerRouter):
             raise ContractError("AutonomousAiTrader requires a DualShieldBrokerRouter")
@@ -419,6 +566,12 @@ class AutonomousAiTrader:
             raise ContractError("fast_tick_ms must be an integer in 0..5000")
         if aggression_dial is not None and not isinstance(aggression_dial, AggressionDialStore):
             raise ContractError("aggression_dial must be an AggressionDialStore or None")
+        if compounding_controller is not None and not isinstance(
+            compounding_controller, CompoundingAndMilestoneController
+        ):
+            raise ContractError("compounding_controller must be a CompoundingAndMilestoneController or None")
+        if phase8_bridge is not None and not isinstance(phase8_bridge, Phase8LiveTradingBridge):
+            raise ContractError("phase8_bridge must be a Phase8LiveTradingBridge or None")
 
         self._router = router
         self._registry = model_registry
@@ -521,6 +674,257 @@ class AutonomousAiTrader:
             if initial_capital_usd is not None
             else None
         )
+        self._state_dir: Path | None = Path(state_dir).resolve() if state_dir is not None else None
+        resolved_comp = compounding_controller
+        resolved_bridge = phase8_bridge
+        if self._state_dir is not None:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            boot_ts = self._now()
+            boot_principal = self._resolve_initial_capital_usd(allow_vault_io=True) or Decimal("5000.00")
+            if resolved_comp is None:
+                resolved_comp = CompoundingAndMilestoneController(
+                    self._state_dir / "compounding.sqlite3",
+                    starting_principal_usd=boot_principal,
+                    mode=CompoundingMode.BALANCED_SPLIT_50_50,
+                    scope_id=self._scope.account_id,
+                    now_utc=boot_ts,
+                )
+            if resolved_bridge is None:
+                p8_ledger = UnifiedRealTimeLedger(
+                    self._state_dir / "phase8_unified_ledger.sqlite3",
+                    scope_id=self._scope.account_id,
+                    principal_usd=boot_principal,
+                    sweep_ratio=Decimal("0.50"),
+                    clock=self._clock,
+                )
+                resolved_bridge = Phase8LiveTradingBridge(
+                    self._valve_gate,
+                    ledger=p8_ledger,
+                    event_bus=ExecutionEventBus(),
+                    news_shield=NewsShockShield(),
+                    smart_planner=SmartExecutionPlanner(),
+                    smart_executor=SmartSliceExecutor(valve_gate=self._valve_gate, clock=self._clock),
+                    compounding_controller=resolved_comp,
+                )
+        if (
+            resolved_bridge is not None
+            and resolved_comp is not None
+            and resolved_bridge.compounding_controller is None
+        ):
+            resolved_bridge._compounding_controller = resolved_comp
+        self._compounding_controller: CompoundingAndMilestoneController | None = resolved_comp
+        self._phase8_bridge: Phase8LiveTradingBridge | None = resolved_bridge
+        self._fallback_news_shield = NewsShockShield()
+
+    @property
+    def compounding_controller(self) -> CompoundingAndMilestoneController | None:
+        return self._compounding_controller
+
+    @property
+    def phase8_bridge(self) -> Phase8LiveTradingBridge | None:
+        return self._phase8_bridge
+
+    @property
+    def aggression_dial(self) -> AggressionDialStore | None:
+        return self._aggression_dial
+
+    def bind_compounding_controller(self, controller: CompoundingAndMilestoneController | None) -> None:
+        if controller is not None and not isinstance(controller, CompoundingAndMilestoneController):
+            raise ContractError("controller must be a CompoundingAndMilestoneController or None")
+        with self._lock:
+            self._compounding_controller = controller
+            if self._phase8_bridge is not None:
+                self._phase8_bridge._compounding_controller = controller
+
+    def bind_phase8_bridge(self, bridge: Phase8LiveTradingBridge | None) -> None:
+        if bridge is not None and not isinstance(bridge, Phase8LiveTradingBridge):
+            raise ContractError("bridge must be a Phase8LiveTradingBridge or None")
+        with self._lock:
+            self._phase8_bridge = bridge
+            if bridge is not None and self._compounding_controller is not None and bridge.compounding_controller is None:
+                bridge._compounding_controller = self._compounding_controller
+
+    def close(self, timeout: float = 2.0, *, drain: bool = True) -> bool:
+        """Cleanly shut down Phase8LiveTradingBridge / ExecutionEventBus worker threads (0 leaked threads)."""
+        bridge = self._phase8_bridge
+        if bridge is None:
+            return True
+        return bridge.close(timeout=timeout, drain=drain)
+
+    shutdown = close
+
+    def _resolve_phase8_broker_id(self, candidate: str | None = None) -> str:
+        raw = str(candidate or "").strip().upper()
+        if raw in _PHASE8_SUPPORTED_BROKERS:
+            return raw
+        active_brk = str(getattr(self._router, "active_broker_id", "") or "").strip().upper()
+        if active_brk in _PHASE8_SUPPORTED_BROKERS:
+            return active_brk
+        for b_id in self._router.priority_order:
+            cand = str(b_id or "").strip().upper()
+            if cand in _PHASE8_SUPPORTED_BROKERS:
+                return cand
+        return "HUGOSWAY_MT5"
+
+    def _has_connected_broker_equity_unlocked(self) -> bool:
+        for venue in self._router.venues.values():
+            if isinstance(venue, Mt5PaperBrokerVenue):
+                if venue.account is not None and not getattr(venue, "is_offline", False):
+                    return True
+            elif isinstance(venue, OandaPracticeFallbackVenue):
+                if venue.summary is not None or venue.nav is not None:
+                    return True
+        return False
+
+    def _compounding_starting_principal_ro(self) -> Decimal | None:
+        ctrl = self._compounding_controller
+        if ctrl is None:
+            return None
+        try:
+            snap = ctrl.snapshot()
+            return Decimal(str(snap["starting_principal_usd"])).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        except Exception as exc_cp:
+            logger.debug("compounding principal read skipped: %s", type(exc_cp).__name__)
+            return None
+
+    def _sync_vault_sweep_ratio_for_write(self, economic_equity_usd: Decimal) -> Decimal | None:
+        """Synchronize ProfitSweepVault sweep_ratio from CompoundingAndMilestoneController strictly on write paths."""
+        ctrl = self._compounding_controller
+        vault = self._profit_vault
+        if ctrl is None or vault is None or not hasattr(vault, "set_config"):
+            return None
+        safe_eq = max(Decimal("0.00"), economic_equity_usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        eff_ratio = ctrl.effective_vault_sweep_ratio(safe_eq)
+        try:
+            v_cur = vault.snapshot() if hasattr(vault, "snapshot") else {}
+            cur_ratio = Decimal(str(v_cur.get("sweep_ratio", "0.50"))).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            cur_auto = bool(v_cur.get("auto_sweep_enabled", True))
+            if cur_ratio != eff_ratio or not cur_auto:
+                vault.set_config(sweep_ratio=eff_ratio, auto_sweep_enabled=True)
+        except Exception as exc_vs:
+            logger.warning("compounding->vault sweep_ratio sync skipped: %s", type(exc_vs).__name__)
+        return eff_ratio
+
+    def _live_economic_equity_for_compounding(self) -> tuple[Decimal | None, Decimal, str]:
+        v_snap = self._read_vault_snapshot_outside_lock()
+        with self._lock:
+            eq_bundle = self._router_equity_bundle_unlocked()
+            total_eq = eq_bundle["total_eq"]
+            has_live = self._has_connected_broker_equity_unlocked() or total_eq > Decimal("0")
+            ps = self._principal_surplus_metrics(total_eq, v_snap=v_snap, equities=eq_bundle["equities"])
+            econ_eq = ps["economic_equity_usd"]
+            exec_mode = "LIVE" if str(self._router.execution_mode).upper() == "LIVE" else "DEMO"
+        return (econ_eq if has_live else None), econ_eq, exec_mode
+
+    def compounding_snapshot(
+        self,
+        *,
+        owner_controls_allowed: bool = True,
+        session_scope: str = "OWNER_FULL_CONTROL",
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Return strictly 0-write compounding, House-Money, and Phase 8 bridge snapshot."""
+        ctrl = self._compounding_controller
+        if ctrl is None:
+            return None
+        ts = self._now(now)
+        live_eq_opt, _, exec_mode = self._live_economic_equity_for_compounding()
+        return build_enriched_compounding_payload(
+            compounding_controller=ctrl,
+            phase8_bridge=self._phase8_bridge,
+            fallback_news_shield=self._fallback_news_shield,
+            current_equity_usd=live_eq_opt,
+            owner_controls_allowed=owner_controls_allowed,
+            session_scope=session_scope,
+            execution_mode=exec_mode,
+            now_utc=ts,
+        )
+
+    def set_compounding_mode(
+        self,
+        mode: CompoundingMode | str,
+        *,
+        compounding_target_usd: Decimal | None = None,
+        house_money_target_usd: Decimal | None = None,
+        custom_vault_ratio: Decimal | None = None,
+        post_target_vault_ratio: Decimal | None = None,
+        auto_enable_vault_at_target: bool | None = None,
+        owner_controls_allowed: bool = True,
+        actor: str = "cockpit-owner",
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Owner-gated compounding mode mutation; syncs ProfitSweepVault sweep_ratio immediately."""
+        ctrl = self._compounding_controller
+        if ctrl is None:
+            raise ContractError("CompoundingAndMilestoneController is not attached")
+        ts = self._now(now)
+        ctrl.set_compounding_mode(
+            mode,
+            compounding_target_usd=compounding_target_usd,
+            house_money_target_usd=house_money_target_usd,
+            custom_vault_ratio=custom_vault_ratio,
+            post_target_vault_ratio=post_target_vault_ratio,
+            auto_enable_vault_at_target=auto_enable_vault_at_target,
+            owner_controls_allowed=owner_controls_allowed,
+            actor=actor,
+            now_utc=ts,
+        )
+        live_eq_opt, econ_eq, _ = self._live_economic_equity_for_compounding()
+        eval_eq = live_eq_opt if live_eq_opt is not None else Decimal(str(ctrl.snapshot()["current_equity_usd"]))
+        self._sync_vault_sweep_ratio_for_write(eval_eq if eval_eq >= Decimal("0") else econ_eq)
+        snap = self.compounding_snapshot(
+            owner_controls_allowed=owner_controls_allowed,
+            session_scope="OWNER_FULL_CONTROL" if owner_controls_allowed else "DEVICE_READ_AND_EXPLAINER",
+            now=ts,
+        )
+        if snap is None:
+            raise ContractError("Compounding snapshot unavailable")
+        return snap
+
+    def acknowledge_principal_withdrawn(
+        self,
+        amount_usd: Decimal | None = None,
+        *,
+        owner_controls_allowed: bool = True,
+        actor: str = "cockpit-owner",
+        post_withdrawal_equity_usd: Decimal | None = None,
+        note: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Owner-gated House-Money original principal pull-out acknowledgment."""
+        ctrl = self._compounding_controller
+        if ctrl is None:
+            raise ContractError("CompoundingAndMilestoneController is not attached")
+        if not owner_controls_allowed:
+            raise CompoundingOwnerKeyRequiredError(
+                "Owner key required: acknowledge_principal_withdrawn is forbidden for read-only devices"
+            )
+        if note is not None:
+            if not isinstance(note, str) or len(note) > 240 or any(ch in note for ch in ("\x00", "\r", "\n")):
+                raise CompoundingControllerError("note must be a clean string of at most 240 characters")
+        ts = self._now(now)
+        resolved_amt = amount_usd
+        if resolved_amt is None:
+            cur_snap = self.compounding_snapshot(owner_controls_allowed=True, now=ts) or ctrl.snapshot()
+            sugg = Decimal(str(cur_snap["suggested_principal_pullout_usd"]))
+            resolved_amt = sugg if sugg > Decimal("0.00") else Decimal(str(cur_snap["starting_principal_usd"]))
+        ctrl.acknowledge_principal_withdrawn(
+            resolved_amt,
+            owner_controls_allowed=owner_controls_allowed,
+            actor=actor,
+            post_withdrawal_equity_usd=post_withdrawal_equity_usd,
+            now_utc=ts,
+        )
+        snap = self.compounding_snapshot(
+            owner_controls_allowed=owner_controls_allowed,
+            session_scope="OWNER_FULL_CONTROL",
+            now=ts,
+        )
+        if snap is None:
+            raise ContractError("Compounding snapshot unavailable")
+        return snap
 
     def _connect_journal(self) -> sqlite3.Connection | None:
         if self._journal_path is None:
@@ -1074,6 +1478,12 @@ class AutonomousAiTrader:
         ts = self._now(now)
         actions: list[dict[str, Any]] = []
         deferred_vault_closes: list[tuple[str, str, str, Decimal, str, Decimal, Decimal | None]] = []
+        deferred_p8_protections: list[
+            tuple[str, str, TradeActionType, str, str, Side, Decimal, Decimal, Decimal, Decimal | None, str]
+        ] = []
+        deferred_p8_closes: list[
+            tuple[str, str, ExecutionEventType, str, Side, Decimal, Decimal, Decimal, Decimal]
+        ] = []
         had_stale_close = False
         with self._lock:
             if self._governance_mode == GOVERNANCE_STOPPED:
@@ -1219,6 +1629,25 @@ class AutonomousAiTrader:
                         self._protection_stage[pos.ticket] = new_stage
                         self._open_position_meta[pos.ticket]["stop_loss"] = decimal_text(candidate_sl)
                         self._open_position_meta[pos.ticket]["protection_stage"] = new_stage
+                        if self._phase8_bridge is not None:
+                            p8_act = (
+                                TradeActionType.MOVE_BREAKEVEN
+                                if new_stage == "BREAKEVEN_LOCKED"
+                                else TradeActionType.TRAIL_STOP
+                            )
+                            deferred_p8_protections.append((
+                                broker_id,
+                                sym,
+                                p8_act,
+                                str(intent.intent_id),
+                                str(pos.ticket),
+                                pos.side,
+                                pos.volume_lots,
+                                current_price,
+                                candidate_sl,
+                                pos.take_profit,
+                                f"Instant {new_stage} SL->{decimal_text(candidate_sl)}",
+                            ))
                         actions.append({
                             "ticket": pos.ticket,
                             "broker_id": broker_id,
@@ -1265,6 +1694,29 @@ class AutonomousAiTrader:
                                     in_recovery_mode=in_rec_post,
                                 )
                                 had_stale_close = True
+                                if self._phase8_bridge is not None:
+                                    raw_side_c = str(meta.get("side") or "BUY").strip().upper()
+                                    side_c = Side.SELL if raw_side_c == Side.SELL.value else Side.BUY
+                                    try:
+                                        lots_c = max(Decimal("0.01"), Decimal(str(meta.get("volume_lots", "0.01"))))
+                                    except (InvalidOperation, ValueError, TypeError):
+                                        lots_c = Decimal("0.01")
+                                    try:
+                                        px_c = max(Decimal("0.00"), Decimal(str(meta.get("entry_price", "1"))))
+                                    except (InvalidOperation, ValueError, TypeError):
+                                        px_c = Decimal("1.00")
+                                    ev_t_c = ExecutionEventType.TP_HIT if pnl_dec > Decimal("0") else ExecutionEventType.SL_HIT
+                                    deferred_p8_closes.append((
+                                        broker_id,
+                                        sym_closed,
+                                        ev_t_c,
+                                        safe_ticket,
+                                        side_c,
+                                        lots_c,
+                                        px_c,
+                                        pnl_dec,
+                                        eq_post,
+                                    ))
                                 if pnl_dec > Decimal("0"):
                                     deferred_vault_closes.append((
                                         safe_ticket,
@@ -1291,10 +1743,63 @@ class AutonomousAiTrader:
                     self._peak_favorable.pop(stale_tkt, None)
                     self._protection_stage.pop(stale_tkt, None)
 
-        # 3. OUTSIDE self._lock: flush any closed-trade vault sweeps without ever blocking 50ms stop protection
+        # 3. OUTSIDE self._lock: dispatch Phase 8 protective/close events & flush closed-trade vault sweeps
+        if self._phase8_bridge is not None and (deferred_p8_protections or deferred_p8_closes):
+            for (
+                brk_p,
+                sym_p,
+                act_p,
+                oid_p,
+                tkt_p,
+                side_p,
+                lots_p,
+                px_p,
+                sl_p,
+                tp_p,
+                rsn_p,
+            ) in deferred_p8_protections:
+                try:
+                    self._phase8_bridge.dispatch_protective_action(
+                        broker_id=self._resolve_phase8_broker_id(brk_p),
+                        symbol=sym_p,
+                        action=act_p,
+                        order_id=oid_p,
+                        position_ticket=tkt_p,
+                        side=side_p,
+                        quantity_lots=lots_p,
+                        price=px_p,
+                        stop_loss=sl_p,
+                        take_profit=tp_p,
+                        reason=rsn_p,
+                        now_utc=ts,
+                    )
+                except Exception as exc_p8p:
+                    logger.warning("phase8 protective dispatch skipped for %s: %s", tkt_p, type(exc_p8p).__name__)
+            for brk_c, sym_c, evt_c, tkt_c, side_c, lots_c, px_c, pnl_c, eq_c in deferred_p8_closes:
+                try:
+                    self._phase8_bridge.record_broker_fill_or_close(
+                        broker_id=self._resolve_phase8_broker_id(brk_c),
+                        symbol=sym_c,
+                        event_type=evt_c,
+                        event_id=f"close-{tkt_c}-{int(ts.timestamp() * 1000)}",
+                        order_id=f"ord-{tkt_c}",
+                        position_ticket=tkt_c,
+                        side=side_c,
+                        quantity_lots=lots_c,
+                        price=px_c,
+                        realized_pnl_usd=pnl_c,
+                        current_equity_usd=eq_c if eq_c > Decimal("0") else None,
+                        now_utc=ts,
+                    )
+                except Exception as exc_p8c:
+                    logger.warning("phase8 close publish skipped for %s: %s", tkt_c, type(exc_p8c).__name__)
         if had_stale_close and self._profit_vault is not None:
             try:
+                comp_cap = self._compounding_starting_principal_ro()
                 for t_id, sym_c, brk_c, pnl_c, sdate_c, eq_c, cap_c in deferred_vault_closes:
+                    eff_cap_c = cap_c if cap_c is not None else comp_cap
+                    econ_eq_c = eq_c + self._cached_settled_disbursed_usd
+                    self._sync_vault_sweep_ratio_for_write(econ_eq_c)
                     self._profit_vault.record_realized_close(
                         trade_id=t_id,
                         symbol=sym_c,
@@ -1303,7 +1808,7 @@ class AutonomousAiTrader:
                         occurred_at=ts,
                         session_date=sdate_c,
                         total_equity_usd=eq_c,
-                        initial_capital_usd=cap_c,
+                        initial_capital_usd=eff_cap_c,
                     )
                 self.sync_session_profit_to_vault(now=ts)
             except Exception as exc_vsync:
@@ -1869,8 +2374,12 @@ class AutonomousAiTrader:
             sdate = str(dq_snap.get("session_date", "")).strip()
             sess_net = Decimal(str(dq_snap.get("realized_net_pnl_usd", "0")))
             init_cap_arg = ps["configured_initial_capital_usd"]
+            econ_eq_sync = ps["economic_equity_usd"]
         if not sdate:
             return None
+        if init_cap_arg is None:
+            init_cap_arg = self._compounding_starting_principal_ro()
+        self._sync_vault_sweep_ratio_for_write(econ_eq_sync)
         res = self._profit_vault.reconcile_session_realized_profit(
             session_date=sdate,
             session_realized_net_usd=sess_net,
@@ -1965,8 +2474,39 @@ class AutonomousAiTrader:
             if not snap["new_risk_allowed"]:
                 self._governance_reason = str(snap["lock_reason"] or snap["status"])
             init_cap_arg = ps["configured_initial_capital_usd"]
+            econ_eq_closed = ps["economic_equity_usd"]
+            has_live_eq_closed = self._has_connected_broker_equity_unlocked() or total_eq > Decimal("0")
+        if self._phase8_bridge is not None:
+            try:
+                raw_side_rc = (
+                    str(popped_meta.get("side") or "BUY").strip().upper()
+                    if isinstance(popped_meta, Mapping)
+                    else "BUY"
+                )
+                side_rc = Side.SELL if raw_side_rc == Side.SELL.value else Side.BUY
+                raw_lots_rc = popped_meta.get("volume_lots", "0.01") if isinstance(popped_meta, Mapping) else "0.01"
+                raw_px_rc = popped_meta.get("entry_price", "1.00") if isinstance(popped_meta, Mapping) else "1.00"
+                self._phase8_bridge.record_broker_fill_or_close(
+                    broker_id=self._resolve_phase8_broker_id(eff_broker),
+                    symbol=symbol,
+                    event_type=ExecutionEventType.CLOSE_MANUAL,
+                    event_id=f"rcpnl-{ticket}-{int(ts.timestamp() * 1000)}",
+                    order_id=f"ord-{ticket}",
+                    position_ticket=str(ticket),
+                    side=side_rc,
+                    quantity_lots=max(Decimal("0.01"), Decimal(str(raw_lots_rc))),
+                    price=max(Decimal("0.00"), Decimal(str(raw_px_rc))),
+                    realized_pnl_usd=pnl_usd,
+                    current_equity_usd=econ_eq_closed if has_live_eq_closed else None,
+                    now_utc=ts,
+                )
+            except Exception as exc_p8rc:
+                logger.warning("record_closed_pnl phase8 publish skipped for %s: %s", ticket, type(exc_p8rc).__name__)
         if self._profit_vault is not None:
             try:
+                if init_cap_arg is None:
+                    init_cap_arg = self._compounding_starting_principal_ro()
+                self._sync_vault_sweep_ratio_for_write(econ_eq_closed)
                 self._profit_vault.record_realized_close(
                     trade_id=ticket,
                     symbol=symbol,
@@ -2440,6 +2980,41 @@ class AutonomousAiTrader:
             self._last_effective_effort = eff_depth
             self._last_pyramid_leg = is_pyramid_add
 
+            if self._phase8_bridge is not None:
+                p8_news_act = TradeActionType.ADD_POSITION if is_pyramid_add else TradeActionType.OPEN_NEW
+                p8_news_pre = self._phase8_bridge.news_shield.evaluate(sym, p8_news_act, now_utc=ts)
+                p8_prof_pre = self._phase8_bridge.smart_planner.profile_for(sym)
+                q_pre = QuoteSnapshot(symbol=sym, bid=bid, ask=ask, timestamp_utc=ts)
+                p8_pre_block: str | None = None
+                if not p8_news_pre.allowed:
+                    p8_pre_block = p8_news_pre.reason_code
+                elif q_pre.spread_points(p8_prof_pre.point_size) > p8_prof_pre.max_spread_points:
+                    p8_pre_block = SmartRefusalReason.SPREAD_GUARD_EXCEEDED.value
+                if p8_pre_block is not None:
+                    self._veto_count += 1
+                    self._last_action = "WAIT"
+                    self._last_symbol = sym
+                    self._last_reason = f"PHASE8_PRE_ENTRY_BLOCKED:{p8_pre_block}"
+                    self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                    if self._parallel_tiers is not None and quotes_map:
+                        self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
+                    report = {
+                        "schema": "cas-forex.ai-cycle/1",
+                        "cycle_id": cycle_id,
+                        "observed_at": _iso(ts),
+                        "model_id": active_id,
+                        "cadence": self._last_cadence,
+                        "thinking_depth": eff_depth,
+                        "regime": regime_name,
+                        "action": "WAIT",
+                        "symbol": sym,
+                        "reason": self._last_reason,
+                        "valve_score": self._last_valve_score,
+                        "protection_updates": prot_updates,
+                    }
+                    self._append_journal_cycle(report)
+                    return report
+
             if hasattr(self._router, "check_open_eligibility"):
                 elig_ok, elig_reason = self._router.check_open_eligibility(
                     sym, equities=equities, peak_equity=peak_eq
@@ -2682,9 +3257,97 @@ class AutonomousAiTrader:
                 new_risk_permission="ALLOWED",
                 management_permission="ALLOWED",
             )
+            proposal_box = _ModelProposal(req, dec_result, intent)
+            if self._phase8_bridge is not None:
+                p8_prof_post = self._phase8_bridge.smart_planner.profile_for(sym)
+                q_post = QuoteSnapshot(symbol=sym, bid=bid, ask=ask, timestamp_utc=ts)
+                stop_dist_pts_post = max(
+                    Decimal("0.01"),
+                    abs(limit_ref - sl_price) / p8_prof_post.point_size,
+                )
+                eff_risk_pct_post = min(
+                    MAX_CONSTITUTIONAL_STOP_RISK_PCT,
+                    max(
+                        Decimal("0.01"),
+                        (self._router.barbell.max_stop_loss_equity_risk_pct * eff_mult).quantize(
+                            Decimal("0.0001"), rounding=ROUND_FLOOR
+                        ),
+                    ),
+                )
+                open_pyr_post = sum(
+                    1
+                    for m in self._open_position_meta.values()
+                    if m.get("symbol") == sym and m.get("side") == side.value
+                )
+                max_open_post = min(
+                    8,
+                    max(
+                        1,
+                        int(dial_eff["max_open_trades"])
+                        if (dial_eff is not None and "max_open_trades" in dial_eff)
+                        else MAX_PYRAMID_LEGS,
+                    ),
+                )
+                max_loss_cap_post = (
+                    Decimal(str(dial_eff["daily_loss_brake_usd"]))
+                    if dial_eff is not None
+                    else Decimal(str(quota_full.get("max_daily_loss_usd", "1000.00") or "1000.00"))
+                )
+                daily_rem_post = max_loss_cap_post + realized_today
+                curr_dd_post = (
+                    compute_drawdown_pct(eq_bundle_post["eff_dd_eq"], eq_bundle_post["eff_dd_peak"])
+                    if (eq_bundle_post["eff_dd_peak"] > Decimal("0") and eq_bundle_post["eff_dd_eq"] > Decimal("0"))
+                    else Decimal("0.00")
+                )
+                p8_view_post = {k: v for k, v in current_view.items() if k != "policy"}
+                p8_view_post["policy"] = {
+                    "new_risk_permission": "ALLOWED",
+                    "management_permission": "ALLOWED",
+                    "max_drawdown_pct": current_view["policy"]["max_drawdown_pct"],
+                }
+                p8_dec = self._phase8_bridge.evaluate_pre_entry(
+                    broker_id=self._resolve_phase8_broker_id(getattr(self._router, "active_broker_id", None)),
+                    symbol=sym,
+                    side=side,
+                    equity_usd=deployable_eq,
+                    stop_distance_points=stop_dist_pts_post,
+                    risk_pct=eff_risk_pct_post,
+                    quote=q_post,
+                    account_state=p8_view_post,
+                    proposal=proposal_box,
+                    open_pyramid_count=open_pyr_post,
+                    max_open_trades=max_open_post,
+                    daily_loss_remaining_usd=daily_rem_post,
+                    drawdown_pct=curr_dd_post,
+                    now_utc=ts,
+                )
+                if not p8_dec.allowed and p8_dec.reason_code != SmartRefusalReason.VALVE_REFUSAL.value:
+                    self._veto_count += 1
+                    self._last_action = "WAIT"
+                    self._last_symbol = sym
+                    self._last_reason = f"PHASE8_PRE_ENTRY_BLOCKED:{p8_dec.reason_code}"
+                    self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                    if self._parallel_tiers is not None and quotes_map:
+                        self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
+                    report = {
+                        "schema": "cas-forex.ai-cycle/1",
+                        "cycle_id": cycle_id,
+                        "observed_at": _iso(ts),
+                        "model_id": active_id,
+                        "cadence": self._last_cadence,
+                        "thinking_depth": eff_depth,
+                        "regime": regime_name,
+                        "action": "WAIT",
+                        "symbol": sym,
+                        "reason": self._last_reason,
+                        "valve_score": self._last_valve_score,
+                        "protection_updates": prot_updates,
+                    }
+                    self._append_journal_cycle(report)
+                    return report
             try:
                 valve_dec = self._valve_gate.require_admissible(
-                    _ModelProposal(req, dec_result, intent), current_view=current_view, now=ts
+                    proposal_box, current_view=current_view, now=ts
                 )
             except ValveRefusalError:
                 self._veto_count += 1
@@ -2784,6 +3447,29 @@ class AutonomousAiTrader:
             }
             self._peak_favorable[str(ticket)] = fill_px
             self._protection_stage[str(ticket)] = "INITIAL_SL"
+            if self._phase8_bridge is not None:
+                try:
+                    filled_lots_p8 = (
+                        exec_res.result.receipt.volume_lots
+                        if (exec_res.result.receipt is not None and exec_res.result.receipt.volume_lots)
+                        else Decimal("0.01")
+                    )
+                    self._phase8_bridge.record_broker_fill_or_close(
+                        broker_id=self._resolve_phase8_broker_id(exec_res.executed_on),
+                        symbol=sym,
+                        event_type=ExecutionEventType.FILL,
+                        event_id=f"fill-{cycle_id}-{ticket}",
+                        order_id=str(intent.intent_id),
+                        position_ticket=str(ticket),
+                        side=side,
+                        quantity_lots=filled_lots_p8,
+                        price=fill_px,
+                        realized_pnl_usd=Decimal("0.00"),
+                        current_equity_usd=total_eq if total_eq > Decimal("0") else None,
+                        now_utc=ts,
+                    )
+                except Exception as exc_p8f:
+                    logger.warning("phase8 open fill publish skipped for %s: %s", ticket, type(exc_p8f).__name__)
 
             v_score_str = decimal_text(Decimal(f"{valve_dec.mlp_score:.8f}"))
             self._last_valve_score = v_score_str
@@ -2872,6 +3558,7 @@ class AutonomousAiTrader:
         closed_tickets: list[str] = []
         close_errors: list[Exception] = []
         deferred_em_vault: list[tuple[str, str, str, Decimal, str, Decimal, Decimal | None]] = []
+        deferred_em_p8: list[tuple[str, str, str, Side, Decimal, Decimal, Decimal, Decimal]] = []
         v_snap_em = self._read_vault_snapshot_outside_lock()
         with self._lock:
             self._governance_mode = GOVERNANCE_PAUSED_NEW_RISK
@@ -2949,6 +3636,18 @@ class AutonomousAiTrader:
                                     str(q_em.get("session_date", "")),
                                     eq_em_after,
                                     ps_em["configured_initial_capital_usd"],
+                                ))
+                            if self._phase8_bridge is not None:
+                                em_px = tick.bid if pos.side is Side.BUY else tick.ask
+                                deferred_em_p8.append((
+                                    broker_id,
+                                    pos.symbol,
+                                    str(pos.ticket),
+                                    pos.side,
+                                    pos.volume_lots,
+                                    em_px,
+                                    pos.profit,
+                                    eq_em_after,
                                 ))
                             self._open_position_meta.pop(pos.ticket, None)
                             closed_tickets.append(pos.ticket)
@@ -3047,13 +3746,60 @@ class AutonomousAiTrader:
                                     eq_em_after,
                                     ps_em["configured_initial_capital_usd"],
                                 ))
+                            if self._phase8_bridge is not None:
+                                em_opx = o_bid if pos.side is Side.BUY else o_ask
+                                deferred_em_p8.append((
+                                    broker_id,
+                                    pos.symbol,
+                                    str(pos.ticket),
+                                    pos.side,
+                                    pos.volume_lots,
+                                    em_opx,
+                                    realized_pnl,
+                                    eq_em_after,
+                                ))
                             self._open_position_meta.pop(pos.ticket, None)
                             closed_tickets.append(pos.ticket)
                         except Exception as exc_oclose:
                             close_errors.append(exc_oclose)
+        if deferred_em_p8 and self._phase8_bridge is not None:
+            for brk_e, sym_e, tkt_e, side_e, lots_e, px_e, pnl_e, eq_e in deferred_em_p8:
+                try:
+                    norm_b = self._resolve_phase8_broker_id(brk_e)
+                    self._phase8_bridge.dispatch_protective_action(
+                        broker_id=norm_b,
+                        symbol=sym_e,
+                        action=TradeActionType.EMERGENCY_CLOSE_ALL,
+                        order_id=f"em-ord-{tkt_e}",
+                        position_ticket=tkt_e,
+                        side=side_e,
+                        quantity_lots=lots_e,
+                        price=px_e,
+                        reason=str(reason)[:200],
+                        now_utc=ts,
+                    )
+                    self._phase8_bridge.record_broker_fill_or_close(
+                        broker_id=norm_b,
+                        symbol=sym_e,
+                        event_type=ExecutionEventType.CLOSE_MANUAL,
+                        event_id=f"em-close-{tkt_e}-{int(ts.timestamp() * 1000)}",
+                        order_id=f"em-ord-{tkt_e}",
+                        position_ticket=tkt_e,
+                        side=side_e,
+                        quantity_lots=lots_e,
+                        price=px_e,
+                        realized_pnl_usd=pnl_e,
+                        current_equity_usd=eq_e if eq_e > Decimal("0") else None,
+                        now_utc=ts,
+                    )
+                except Exception as exc_emp8:
+                    logger.warning("emergency_close_all phase8 publish skipped for %s: %s", tkt_e, type(exc_emp8).__name__)
         if closed_tickets and self._profit_vault is not None:
             try:
+                comp_cap_em = self._compounding_starting_principal_ro()
                 for t_id, sym_e, brk_e, pnl_e, sdate_e, eq_e, cap_e in deferred_em_vault:
+                    eff_cap_e = cap_e if cap_e is not None else comp_cap_em
+                    self._sync_vault_sweep_ratio_for_write(eq_e + self._cached_settled_disbursed_usd)
                     self._profit_vault.record_realized_close(
                         trade_id=t_id,
                         symbol=sym_e,
@@ -3062,7 +3808,7 @@ class AutonomousAiTrader:
                         occurred_at=ts,
                         session_date=sdate_e,
                         total_equity_usd=eq_e,
-                        initial_capital_usd=cap_e,
+                        initial_capital_usd=eff_cap_e,
                     )
                 self.sync_session_profit_to_vault(now=ts)
             except Exception as exc_vsync:

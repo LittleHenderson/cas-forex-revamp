@@ -21,6 +21,84 @@ import {
   renderMasterAggressionDial,
   resolveCockpitAggressionDial,
 } from './aggression-dial.mjs';
+import {
+  COMPOUNDING_PANEL_SCHEMA,
+  STATIC_COMPOUNDING_PANEL,
+  normalizeCompoundingPanel,
+  renderCompoundingAndHouseMoneyPanel,
+} from './compounding-panel.mjs';
+
+export function resolveCockpitCompounding(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) {
+    return STATIC_COMPOUNDING_PANEL;
+  }
+  if (
+    state.schema === COMPOUNDING_PANEL_SCHEMA
+    && !('route' in state)
+    && !('projection' in state)
+  ) {
+    return normalizeCompoundingPanel(state);
+  }
+  const rawCompounding = state.compounding
+    ?? state.compoundingPanel
+    ?? state.compoundingController
+    ?? state.compounding_controller
+    ?? state.aiTrader?.compounding
+    ?? state.aiTrader?.compounding_controller
+    ?? STATIC_COMPOUNDING_PANEL;
+  const base = normalizeCompoundingPanel(rawCompounding);
+
+  const roleCandidates = [
+    state.sessionScope,
+    state.session_scope,
+    state.sessionRole,
+    state.session_role,
+    state.deviceRole,
+    state.device_role,
+    state.aiTrader?.sessionScope,
+    state.aiTrader?.sessionRole,
+    state.aiTrader?.deviceRole,
+  ];
+  const roleDenied = roleCandidates.some(
+    (r) => typeof r === 'string' && r.trim().toUpperCase() === 'DEVICE_READ_AND_EXPLAINER',
+  );
+
+  let flagDenied = !base.ownerControlsAllowed;
+  if (state.liveStreamConnected === true) {
+    if (!isOwnerControlSession(state)) {
+      flagDenied = true;
+    }
+    if (state.ownerControlsAllowed !== undefined && state.ownerControlsAllowed !== true) {
+      flagDenied = true;
+    }
+  } else if (!('liveStreamConnected' in state) && state.ownerControlsAllowed !== undefined) {
+    if (state.ownerControlsAllowed !== true) {
+      flagDenied = true;
+    }
+  }
+  if (state.owner_controls_allowed !== undefined && state.owner_controls_allowed !== true) {
+    flagDenied = true;
+  }
+
+  const fallbackShield = rawCompounding?.newsShield
+    ?? rawCompounding?.news_shield
+    ?? state.newsShield
+    ?? state.news_shield
+    ?? state.phase8Bridge?.news_shield
+    ?? state.aiTrader?.newsShield
+    ?? state.aiTrader?.news_shield
+    ?? null;
+
+  const effectiveAllowed = !roleDenied && !flagDenied;
+  if (base.ownerControlsAllowed === effectiveAllowed && !fallbackShield) {
+    return base;
+  }
+  return normalizeCompoundingPanel({
+    ...base,
+    ...(fallbackShield ? { newsShield: fallbackShield } : {}),
+    ownerControlsAllowed: effectiveAllowed,
+  });
+}
 
 export function escapeHTML(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
@@ -166,7 +244,7 @@ function effects(projection) {
 }
 
 function operate(projection, state) {
-  return `<section class="workspace-intro" aria-label="Workspace introduction"><div><p class="eyebrow">PERSONAL FOREX / OBSERVATION FIRST</p><h2>Every decision, with its evidence.</h2></div><p>Inspect the account snapshot, oversee autonomous AI execution, monitor 5 parallel account tiers &amp; 50%/50% Bank Vault sweeps, and keep unobserved outcomes visible.</p></section>${renderAiTopSwitcherBar(state)}${renderMasterAggressionDial(resolveCockpitAggressionDial(state))}<div class="route-index">${sectionNumber('01')}<h2>Permissions &amp; control</h2></div><div class="context-grid">${permissions(projection, state.transport)}${controls(state.transport)}</div><div class="route-index">${sectionNumber('02')}<h2>Account snapshot</h2></div>${metrics(projection, state)}<p class="account-coverage">P/L period, fees and cashflow coverage are unavailable in this projection.</p>${renderLiveFundingPanel(state)}${renderAiOverseerPanel(state)}<div class="route-index">${sectionNumber('03')}<h2>Live market &amp; candlestick chart</h2></div>${renderMarketChartSection(projection, state)}${renderEquityAndAnalyticsSection(state)}${renderParallelTiersSection(state)}${renderMoneyFlowSection(state)}<div class="route-index">${sectionNumber('04')}<h2>Positions, proposals &amp; effects</h2></div><div class="operate-grid">${positions(projection)}${decision(projection)}${effects(projection)}</div>`;
+  return `<section class="workspace-intro" aria-label="Workspace introduction"><div><p class="eyebrow">PERSONAL FOREX / OBSERVATION FIRST</p><h2>Every decision, with its evidence.</h2></div><p>Inspect the account snapshot, oversee autonomous AI execution, monitor 5 parallel account tiers &amp; 50%/50% Bank Vault sweeps, and keep unobserved outcomes visible.</p></section>${renderAiTopSwitcherBar(state)}${renderMasterAggressionDial(resolveCockpitAggressionDial(state))}${renderCompoundingAndHouseMoneyPanel(resolveCockpitCompounding(state))}<div class="route-index">${sectionNumber('01')}<h2>Permissions &amp; control</h2></div><div class="context-grid">${permissions(projection, state.transport)}${controls(state.transport)}</div><div class="route-index">${sectionNumber('02')}<h2>Account snapshot</h2></div>${metrics(projection, state)}<p class="account-coverage">P/L period, fees and cashflow coverage are unavailable in this projection.</p>${renderLiveFundingPanel(state)}${renderAiOverseerPanel(state)}<div class="route-index">${sectionNumber('03')}<h2>Live market &amp; candlestick chart</h2></div>${renderMarketChartSection(projection, state)}${renderEquityAndAnalyticsSection(state)}${renderParallelTiersSection(state)}${renderMoneyFlowSection(state)}<div class="route-index">${sectionNumber('04')}<h2>Positions, proposals &amp; effects</h2></div><div class="operate-grid">${positions(projection)}${decision(projection)}${effects(projection)}</div>`;
 }
 
 function catalogInspection(read, source = null) {
@@ -372,4 +450,4 @@ export function renderPreparedClose(transport) {
   const canRead = transport?.attached && close?.submitted && preview && !['PREPARING', 'REVIEW_REQUIRED', 'PREPARATION_FAILED', 'CHECKING', 'REQUESTING', 'READING'].includes(close.status);
   return `<div class="dialog-heading"><p class="eyebrow">EXACT TARGET / OWNER REVIEW</p><h2 id="dialog-title">Reviewed Close</h2></div><div role="status"><strong>${e(close?.status ?? 'Unavailable')}</strong><p>${e(close?.reason ?? 'No target prepared.')}</p></div>${preview ? `<dl class="metadata">${meta('Account / run', `${preview.scope.account_id} / ${preview.scope.run_id}`)}${meta('Source state', intent.source_state.state_id)}${meta('Position / version', `${intent.target_id} / ${intent.target_version}`)}${meta('Instrument', intent.instrument_id)}${meta('Exact quantity', `${intent.quantity} BASE_UNITS`)}${meta('Owner request', preview.owner_request_id)}${meta('Command ID', preview.command_id)}${meta('Intent SHA-256', preview.intent_sha256)}${meta('Expires at (simulator)', preview.expires_at)}</dl><details><summary>Full exact intent</summary><pre>${e(JSON.stringify(intent, null, 2))}</pre></details>` : ''}${q ? `<h3>Independent receipt / cumulative base units</h3><dl class="metadata">${Object.entries(q).map(([key, value]) => meta(key, value)).join('')}${meta('Receipt ID', close.observation.receipt.receipt_id)}${meta('Observed at', close.observation.receipt.observed_at)}</dl>` : '<p class="quiet-note">No independent filled quantity established for this request.</p>'}<p class="quiet-note">Close does not resume automation. Partial fills and cancelled remainders stay separate.</p><div class="dialog-actions">${button('Back', 'data-dialog-close="true"')}${button('Request reviewed Close', `data-submit-close="${e(preview?.preview_id ?? '')}" ${transport?.attached && close?.status === 'REVIEW_REQUIRED' ? '' : 'disabled'}`, 'button-primary')}${canRead ? button('Read venue receipt', 'data-read-close="true"') : ''}</div>${modalInterruption(transport)}`;
 }
-export { renderAiOverseerPanel, renderAiModelCatalogPanel, renderBankedProfitsHeroBanner, renderAiTopSwitcherBar, renderEquityAndAnalyticsSection, renderParallelTiersSection, renderLiveFundingPanel, renderMasterAggressionDial };
+export { renderAiOverseerPanel, renderAiModelCatalogPanel, renderBankedProfitsHeroBanner, renderAiTopSwitcherBar, renderEquityAndAnalyticsSection, renderParallelTiersSection, renderLiveFundingPanel, renderMasterAggressionDial, renderCompoundingAndHouseMoneyPanel };

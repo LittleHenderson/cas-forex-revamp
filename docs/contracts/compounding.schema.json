@@ -1,0 +1,1110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:compounding-controller:1.0",
+  "title": "CompoundingAndHouseMoneySnapshot",
+  "description": "100% Compounding Mode, House-Money Milestone Ladder, NewsShockShield & Phase 8 Live Bridge snapshot for GET/POST /api/compounding.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "scope_id",
+    "mode",
+    "starting_principal_usd",
+    "current_equity_usd",
+    "compounding_target_usd",
+    "house_money_target_usd",
+    "auto_enable_vault_at_target",
+    "post_target_vault_ratio",
+    "custom_vault_ratio",
+    "effective_vault_sweep_ratio",
+    "retained_compounding_ratio",
+    "underwater",
+    "at_or_below_principal",
+    "recovery_invariant_active",
+    "house_money_ready",
+    "house_money_status",
+    "suggested_principal_pullout_usd",
+    "progress_to_house_money_pct",
+    "remaining_to_house_money_usd",
+    "principal_withdrawn",
+    "principal_withdrawn_usd",
+    "principal_withdrawn_at_utc",
+    "milestones",
+    "next_milestone",
+    "constitutional_ceilings",
+    "audit_chain_valid",
+    "audit_entry_count",
+    "updated_at_utc",
+    "owner_controls_allowed",
+    "session_scope",
+    "access_mode",
+    "execution_mode",
+    "live_mode",
+    "connected",
+    "brokers",
+    "news_shield",
+    "phase8_bridge"
+  ],
+  "properties": {
+    "schema": {
+      "const": "cas-forex.compounding-controller/1"
+    },
+    "scope_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "mode": {
+      "enum": [
+        "FULL_COMPOUND_100",
+        "BALANCED_SPLIT_50_50",
+        "CUSTOM_SPLIT"
+      ]
+    },
+    "starting_principal_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "current_equity_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "compounding_target_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "house_money_target_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "auto_enable_vault_at_target": {
+      "type": "boolean"
+    },
+    "post_target_vault_ratio": {
+      "$ref": "#/$defs/decimal"
+    },
+    "custom_vault_ratio": {
+      "$ref": "#/$defs/decimal"
+    },
+    "effective_vault_sweep_ratio": {
+      "$ref": "#/$defs/decimal"
+    },
+    "retained_compounding_ratio": {
+      "$ref": "#/$defs/decimal"
+    },
+    "underwater": {
+      "type": "boolean"
+    },
+    "at_or_below_principal": {
+      "type": "boolean"
+    },
+    "recovery_invariant_active": {
+      "type": "boolean"
+    },
+    "house_money_ready": {
+      "type": "boolean"
+    },
+    "house_money_status": {
+      "enum": [
+        "BUILDING_TOWARD_PRINCIPAL",
+        "COMPOUNDING_TO_DOUBLE",
+        "HOUSE_MONEY_READY_TO_PULL_PRINCIPAL",
+        "PLAYING_ON_HOUSE_MONEY"
+      ]
+    },
+    "suggested_principal_pullout_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "progress_to_house_money_pct": {
+      "$ref": "#/$defs/decimal"
+    },
+    "remaining_to_house_money_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "principal_withdrawn": {
+      "type": "boolean"
+    },
+    "principal_withdrawn_usd": {
+      "$ref": "#/$defs/decimal"
+    },
+    "principal_withdrawn_at_utc": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/timestamp"
+        }
+      ]
+    },
+    "milestones": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/milestoneItem"
+      }
+    },
+    "next_milestone": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/milestoneItem"
+        }
+      ]
+    },
+    "constitutional_ceilings": {
+      "$ref": "#/$defs/constitutionalCeilings"
+    },
+    "audit_chain_valid": {
+      "type": "boolean"
+    },
+    "audit_entry_count": {
+      "$ref": "#/$defs/nonNegativeInt"
+    },
+    "updated_at_utc": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "owner_controls_allowed": {
+      "type": "boolean"
+    },
+    "session_scope": {
+      "enum": [
+        "OWNER_FULL_CONTROL",
+        "DEVICE_READ_AND_EXPLAINER"
+      ]
+    },
+    "access_mode": {
+      "enum": [
+        "OWNER_FULL_CONTROL",
+        "DEVICE_READ_AND_EXPLAINER"
+      ]
+    },
+    "execution_mode": {
+      "enum": [
+        "DEMO",
+        "LIVE"
+      ]
+    },
+    "live_mode": {
+      "type": "boolean"
+    },
+    "connected": {
+      "type": "boolean"
+    },
+    "brokers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 48
+      }
+    },
+    "news_shield": {
+      "$ref": "#/$defs/newsShieldSnapshot"
+    },
+    "phase8_bridge": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/phase8BridgeSummary"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+    },
+    "decimal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 31,
+      "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+    },
+    "nonNegativeInt": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 32,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$"
+    },
+    "sha256Hex": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "milestoneItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "label",
+        "multiplier",
+        "multiple",
+        "target_usd",
+        "reached",
+        "remaining_usd",
+        "progress_pct"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/identifier"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "multiplier": {
+          "$ref": "#/$defs/decimal"
+        },
+        "multiple": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "target_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "reached": {
+          "type": "boolean"
+        },
+        "remaining_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "progress_pct": {
+          "$ref": "#/$defs/decimal"
+        }
+      }
+    },
+    "constitutionalCeilings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_stop_risk_pct",
+        "max_drawdown_pct",
+        "min_margin_level_pct",
+        "min_open_trades",
+        "max_open_trades"
+      ],
+      "properties": {
+        "max_stop_risk_pct": {
+          "const": "1.00"
+        },
+        "max_drawdown_pct": {
+          "const": "0.10"
+        },
+        "min_margin_level_pct": {
+          "const": "1000.0"
+        },
+        "min_open_trades": {
+          "const": 1
+        },
+        "max_open_trades": {
+          "const": 8
+        }
+      }
+    },
+    "blockingNewsEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "title",
+        "currency",
+        "impact",
+        "scheduled_utc",
+        "category",
+        "source"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "currency": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 12
+        },
+        "impact": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "scheduled_utc": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        }
+      }
+    },
+    "upcomingNewsEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "title",
+        "currency",
+        "impact",
+        "category",
+        "source",
+        "scheduled_utc",
+        "blackout_starts_at_utc",
+        "blackout_ends_at_utc",
+        "seconds_until_blackout_start",
+        "seconds_until_event"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "currency": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 12
+        },
+        "impact": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "scheduled_utc": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "blackout_starts_at_utc": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "blackout_ends_at_utc": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "seconds_until_blackout_start": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "seconds_until_event": {
+          "$ref": "#/$defs/nonNegativeInt"
+        }
+      }
+    },
+    "upcomingBlackoutItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "title",
+        "currency",
+        "impact",
+        "category",
+        "source",
+        "scheduled_utc",
+        "blackout_starts_at_utc",
+        "blackout_ends_at_utc",
+        "seconds_until_blackout_start",
+        "seconds_until_event",
+        "affected_symbols"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "currency": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 12
+        },
+        "impact": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "scheduled_utc": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "blackout_starts_at_utc": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "blackout_ends_at_utc": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "seconds_until_blackout_start": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "seconds_until_event": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "affected_symbols": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 24
+          }
+        }
+      }
+    },
+    "newsSymbolReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "normalized_symbol",
+        "currencies",
+        "new_entries_allowed",
+        "protective_actions_allowed",
+        "reason_code",
+        "plain_english_status",
+        "active_blocking_events",
+        "resume_at_utc",
+        "seconds_until_resume",
+        "next_upcoming_event"
+      ],
+      "properties": {
+        "normalized_symbol": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "currencies": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 12
+          }
+        },
+        "new_entries_allowed": {
+          "type": "boolean"
+        },
+        "protective_actions_allowed": {
+          "const": true
+        },
+        "reason_code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "plain_english_status": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400
+        },
+        "active_blocking_events": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/blockingNewsEvent"
+          }
+        },
+        "resume_at_utc": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/timestamp"
+            }
+          ]
+        },
+        "seconds_until_resume": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/nonNegativeInt"
+            }
+          ]
+        },
+        "next_upcoming_event": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/upcomingNewsEvent"
+            }
+          ]
+        }
+      }
+    },
+    "newsShieldSymbols": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "NAS100",
+        "US30",
+        "XAUUSD",
+        "EUR_USD"
+      ],
+      "properties": {
+        "NAS100": {
+          "$ref": "#/$defs/newsSymbolReport"
+        },
+        "US30": {
+          "$ref": "#/$defs/newsSymbolReport"
+        },
+        "XAUUSD": {
+          "$ref": "#/$defs/newsSymbolReport"
+        },
+        "EUR_USD": {
+          "$ref": "#/$defs/newsSymbolReport"
+        }
+      }
+    },
+    "newsShieldSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evaluated_at_utc",
+        "pre_minutes",
+        "post_minutes",
+        "min_impact",
+        "calendar_updated_at_utc",
+        "calendar_stale",
+        "fail_closed_on_stale_calendar",
+        "protective_actions_always_allowed",
+        "overall_status",
+        "plain_english_summary",
+        "symbols",
+        "upcoming_blackouts"
+      ],
+      "properties": {
+        "evaluated_at_utc": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "pre_minutes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 120
+        },
+        "post_minutes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 120
+        },
+        "min_impact": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "calendar_updated_at_utc": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/timestamp"
+            }
+          ]
+        },
+        "calendar_stale": {
+          "type": "boolean"
+        },
+        "fail_closed_on_stale_calendar": {
+          "type": "boolean"
+        },
+        "protective_actions_always_allowed": {
+          "const": true
+        },
+        "overall_status": {
+          "enum": [
+            "CLEAR",
+            "PAUSED_NEWS_WINDOW",
+            "PAUSED_STALE_CALENDAR"
+          ]
+        },
+        "plain_english_summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "symbols": {
+          "$ref": "#/$defs/newsShieldSymbols"
+        },
+        "upcoming_blackouts": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/upcomingBlackoutItem"
+          }
+        }
+      }
+    },
+    "laneErrorCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "CRITICAL_PROTECTION",
+        "LEDGER_ASYNC",
+        "UI_SSE_ASYNC"
+      ],
+      "properties": {
+        "CRITICAL_PROTECTION": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "LEDGER_ASYNC": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "UI_SSE_ASYNC": {
+          "$ref": "#/$defs/nonNegativeInt"
+        }
+      }
+    },
+    "asyncWorkerSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "subscriber_id",
+        "name",
+        "lane",
+        "queue_depth",
+        "queue_maxsize",
+        "in_flight",
+        "delivered_count",
+        "dropped_count",
+        "error_count",
+        "last_error",
+        "alive"
+      ],
+      "properties": {
+        "subscriber_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "lane": {
+          "enum": [
+            "LEDGER_ASYNC",
+            "UI_SSE_ASYNC"
+          ]
+        },
+        "queue_depth": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "queue_maxsize": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "in_flight": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "delivered_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "dropped_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "error_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "last_error": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "maxLength": 300
+            }
+          ]
+        },
+        "alive": {
+          "type": "boolean"
+        }
+      }
+    },
+    "eventBusSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "published_count",
+        "deduped_count",
+        "dropped_events",
+        "subscriber_errors",
+        "last_seq_id",
+        "replay_buffer_len",
+        "replay_buffer_maxlen",
+        "active_subscribers",
+        "subscriber_errors_by_lane",
+        "async_workers",
+        "closed"
+      ],
+      "properties": {
+        "published_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "deduped_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "dropped_events": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "subscriber_errors": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "last_seq_id": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "replay_buffer_len": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "replay_buffer_maxlen": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "active_subscribers": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "subscriber_errors_by_lane": {
+          "$ref": "#/$defs/laneErrorCounts"
+        },
+        "async_workers": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/asyncWorkerSummary"
+          }
+        },
+        "closed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "regionalPnlMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ASIA",
+        "LONDON",
+        "NEW_YORK"
+      ],
+      "properties": {
+        "ASIA": {
+          "$ref": "#/$defs/decimal"
+        },
+        "LONDON": {
+          "$ref": "#/$defs/decimal"
+        },
+        "NEW_YORK": {
+          "$ref": "#/$defs/decimal"
+        }
+      }
+    },
+    "unifiedLedgerSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "scope_id",
+        "as_of_utc",
+        "session_date",
+        "regional_session",
+        "mode",
+        "session_status",
+        "new_risk_allowed",
+        "principal_usd",
+        "initial_equity_usd",
+        "broker_equity_usd",
+        "confirmed_settled_disbursed_usd",
+        "pending_transfers_usd",
+        "failed_cancelled_transfers_usd",
+        "settled_equity_usd",
+        "effective_equity_usd",
+        "net_surplus_above_principal_usd",
+        "principal_shortfall_usd",
+        "sweep_ratio",
+        "vault_sweep_target_usd",
+        "bank_vault_reserved_usd",
+        "retained_trading_surplus_usd",
+        "deployable_trading_equity_usd",
+        "accounting_label",
+        "lifetime_realized_pnl_usd",
+        "daily_realized_pnl_usd",
+        "daily_peak_pnl_usd",
+        "daily_profit_floor_armed",
+        "daily_profit_floor_usd",
+        "research_respite_active",
+        "daily_loss_locked",
+        "loss_lock_reason",
+        "loss_lock_origin_mode",
+        "loss_lock_carried_over",
+        "daily_closed_trades",
+        "daily_win_count",
+        "daily_loss_count",
+        "daily_consecutive_losses",
+        "daily_regional_pnl_usd",
+        "lifetime_regional_pnl_usd",
+        "peak_equity_usd",
+        "drawdown_usd",
+        "drawdown_pct",
+        "audit_event_count",
+        "last_audit_sha256"
+      ],
+      "properties": {
+        "schema": {
+          "const": "cas-forex.unified-ledger/1"
+        },
+        "scope_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "as_of_utc": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "session_date": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 24
+        },
+        "regional_session": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "mode": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 48
+        },
+        "session_status": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 48
+        },
+        "new_risk_allowed": {
+          "type": "boolean"
+        },
+        "principal_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "initial_equity_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "broker_equity_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "confirmed_settled_disbursed_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "pending_transfers_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "failed_cancelled_transfers_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "settled_equity_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "effective_equity_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "net_surplus_above_principal_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "principal_shortfall_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "sweep_ratio": {
+          "$ref": "#/$defs/decimal"
+        },
+        "vault_sweep_target_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "bank_vault_reserved_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "retained_trading_surplus_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "deployable_trading_equity_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "accounting_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "lifetime_realized_pnl_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "daily_realized_pnl_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "daily_peak_pnl_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "daily_profit_floor_armed": {
+          "type": "boolean"
+        },
+        "daily_profit_floor_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "research_respite_active": {
+          "type": "boolean"
+        },
+        "daily_loss_locked": {
+          "type": "boolean"
+        },
+        "loss_lock_reason": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "maxLength": 240
+            }
+          ]
+        },
+        "loss_lock_origin_mode": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "maxLength": 64
+            }
+          ]
+        },
+        "loss_lock_carried_over": {
+          "type": "boolean"
+        },
+        "daily_closed_trades": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "daily_win_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "daily_loss_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "daily_consecutive_losses": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "daily_regional_pnl_usd": {
+          "$ref": "#/$defs/regionalPnlMap"
+        },
+        "lifetime_regional_pnl_usd": {
+          "$ref": "#/$defs/regionalPnlMap"
+        },
+        "peak_equity_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "drawdown_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "drawdown_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "audit_event_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "last_audit_sha256": {
+          "$ref": "#/$defs/sha256Hex"
+        }
+      }
+    },
+    "phase8BridgeSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "as_of_utc",
+        "supported_brokers",
+        "valve_weights_sha256",
+        "event_bus",
+        "ledger"
+      ],
+      "properties": {
+        "schema": {
+          "const": "cas-forex.phase8-live-bridge/1"
+        },
+        "as_of_utc": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "supported_brokers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 48
+          }
+        },
+        "valve_weights_sha256": {
+          "$ref": "#/$defs/sha256Hex"
+        },
+        "event_bus": {
+          "$ref": "#/$defs/eventBusSummary"
+        },
+        "ledger": {
+          "$ref": "#/$defs/unifiedLedgerSnapshot"
+        }
+      }
+    }
+  }
+}
