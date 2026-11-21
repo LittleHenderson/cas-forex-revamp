@@ -45,7 +45,7 @@
   }
 }
 * { box-sizing: border-box; }
-body { position: relative; isolation: isolate; margin: 0; background: var(--canvas); color: var(--ink); font-size: 14px; line-height: 1.55; }
+body { position: relative; isolation: isolate; margin: 0; background: var(--canvas); color: var(--ink); font-size: 14px; line-height: 1.55; overflow-anchor: none; }
 /* A quiet, noninteractive tile across the page canvas; panel interiors stay solid. */
 body::before { content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none; background: url("./assets/diamond-grid.svg") repeat 0 0 / 66px 66px; opacity: var(--pattern-opacity); }
 button, input { font: inherit; }
