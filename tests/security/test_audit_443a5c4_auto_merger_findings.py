@@ -4,8 +4,10 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+import errno
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -526,18 +528,48 @@ class Audit443a5c4AutoMergerFindingsTests(unittest.TestCase):
                 merge_cmds.append(list(cmd))
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        with patch.object(agent_pr_merger.subprocess, "run", side_effect=fake_subp_run):
-            with patch.object(agent_pr_merger, "gh_json", side_effect=fake_gh_json):
-                with patch.object(agent_pr_merger, "verify_worktree_lightweight", return_value=(True, ["secret_scan=CLEAN"])):
-                    buf: list[str] = []
-                    with patch("builtins.print", side_effect=lambda s: buf.append(s)):
-                        rc = agent_pr_merger.main()
+        orig_mkdtemp = tempfile.mkdtemp
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(agent_pr_merger.tempfile, "mkdtemp", side_effect=lambda prefix="tmp", **_kw: orig_mkdtemp(prefix=prefix, dir=td)):
+                with patch.object(agent_pr_merger.subprocess, "run", side_effect=fake_subp_run):
+                    with patch.object(agent_pr_merger, "gh_json", side_effect=fake_gh_json):
+                        with patch.object(agent_pr_merger, "verify_worktree_lightweight", return_value=(True, ["secret_scan=CLEAN"])):
+                            buf: list[str] = []
+                            with patch("builtins.print", side_effect=lambda s: buf.append(s)):
+                                rc = agent_pr_merger.main()
         self.assertEqual(rc, 0)
         rep = json.loads("".join(buf))
         self.assertEqual(rep["actions"][0]["action"], "MERGED")
         self.assertEqual(len(merge_cmds), 1)
         self.assertIn("--match-head-commit", merge_cmds[0])
         self.assertIn(SHA_A, merge_cmds[0])
+
+    def test_f14_temp_worktree_dir_falls_back_on_readonly_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            ro_parent = Path(td) / "readonly_parent"
+            ro_parent.mkdir()
+            fallback_root = Path(td) / "tmpdir"
+            fallback_root.mkdir()
+            orig_mkdtemp = tempfile.mkdtemp
+
+            def fake_mkdtemp(prefix="tmp", dir=None):
+                if dir == str(ro_parent):
+                    raise OSError(errno.EROFS, "Read-only file system")
+                return orig_mkdtemp(prefix=prefix, dir=str(fallback_root))
+
+            with patch.object(agent_pr_merger.os, "access", return_value=False):
+                with patch.object(agent_pr_merger.tempfile, "mkdtemp", side_effect=fake_mkdtemp) as mkd:
+                    out = agent_pr_merger._create_temp_worktree_dir("cas_pr_1_", ro_parent)
+                    self.assertTrue(out.is_dir())
+                    self.assertEqual(out.parent, fallback_root)
+                    mkd.assert_called_once_with(prefix="cas_pr_1_")
+
+            with patch.object(agent_pr_merger.os, "access", return_value=True):
+                with patch.object(agent_pr_merger.tempfile, "mkdtemp", side_effect=fake_mkdtemp) as mkd:
+                    out2 = agent_pr_merger._create_temp_worktree_dir("cas_pr_2_", ro_parent)
+                    self.assertTrue(out2.is_dir())
+                    self.assertEqual(out2.parent, fallback_root)
+                    self.assertEqual(mkd.call_count, 2)
 
     def test_docs_workflow_and_readme_parity_and_no_active_github_workflow(self) -> None:
         self.assertFalse((REPO_ROOT / ".github" / "workflows").exists())

@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -873,6 +874,16 @@ def verify_worktree_lightweight(wt_dir: Path) -> tuple[bool, list[str]]:
     return True, notes
 
 
+def _create_temp_worktree_dir(prefix: str, preferred_parent: Path) -> Path:
+    """Create a temporary worktree directory, falling back to TMPDIR when preferred_parent is read-only."""
+    if os.access(preferred_parent, os.W_OK):
+        try:
+            return Path(tempfile.mkdtemp(prefix=prefix, dir=str(preferred_parent)))
+        except OSError:
+            return Path(tempfile.mkdtemp(prefix=prefix))
+    return Path(tempfile.mkdtemp(prefix=prefix))
+
+
 def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     subprocess.run(["git", "fetch", "origin", "--prune"], cwd=str(repo_root), check=True, timeout=60)
@@ -944,7 +955,7 @@ def main() -> int:
             continue
 
         # Verify PR head in temporary worktree
-        tmp_wt = Path(tempfile.mkdtemp(prefix=f"cas_pr_{num}_", dir=str(repo_root.parent)))
+        tmp_wt = _create_temp_worktree_dir(f"cas_pr_{num}_", repo_root.parent)
         try:
             subprocess.run(["git", "worktree", "add", "--detach", str(tmp_wt), sha], cwd=str(repo_root), check=True, capture_output=True, timeout=60)
             ok, notes = verify_worktree_lightweight(tmp_wt)
