@@ -412,19 +412,14 @@ class Audit0b16e88CockpitAndOperatorFindingsTests(unittest.TestCase):
                         CompoundingAndMilestoneController(planted_link)
                 self.assertEqual(outside_target.read_bytes(), b"")
 
-            # Deterministic cross-platform check: simulated child symlink/reparse on compounding.sqlite3 & sidecar
+            # Cross-platform check: real child/sidecar symlinks on POSIX; simulated reparse on Windows
             clean_dir = root / "clean_state"
             ensure_secure_state_directory(clean_dir)
             db_path = clean_dir / "compounding.sqlite3"
             wal_path = clean_dir / "compounding.sqlite3-wal"
-            db_path.write_bytes(b"")
-            if os.name == "posix":
-                os.chmod(db_path, 0o600)
 
-            with mock.patch(
-                "cas_forex_revamp.composition.state_store._is_symlink_or_reparse",
-                side_effect=lambda p, *_a, **_kw: Path(p).name.startswith("compounding.sqlite3"),
-            ):
+            if os.name == "posix":
+                os.symlink(outside_target, db_path)
                 with self.assertRaises(ContractError):
                     verify_non_symlink_sqlite_target(db_path)
                 with self.assertRaises(ContractError):
@@ -433,25 +428,51 @@ class Audit0b16e88CockpitAndOperatorFindingsTests(unittest.TestCase):
                     CompoundingAndMilestoneController(db_path)
                 with self.assertRaises(ContractError):
                     ensure_secure_state_directory(clean_dir)
+                db_path.unlink()
 
-            # Sidecar symlink (-wal) is also rejected fail-closed before SQLite touches it
-            wal_path.write_bytes(b"")
-            if os.name == "posix":
-                os.chmod(wal_path, 0o600)
-            with mock.patch(
-                "cas_forex_revamp.composition.state_store._is_symlink_or_reparse",
-                side_effect=lambda p, *_a, **_kw: Path(p).name == "compounding.sqlite3-wal",
-            ):
+                # Sidecar symlink (-wal) on POSIX is also rejected fail-closed before SQLite touches it
+                db_path.write_bytes(b"")
+                os.chmod(db_path, 0o600)
+                os.symlink(outside_target, wal_path)
                 with self.assertRaises(ContractError):
                     verify_non_symlink_sqlite_target(db_path)
-            wal_path.unlink()
-            db_path.unlink()
+                with self.assertRaises(ContractError):
+                    open_verified_sqlite_connection(db_path)
+                with self.assertRaises(CompoundingControllerError):
+                    CompoundingAndMilestoneController(db_path)
+                wal_path.unlink()
+                db_path.unlink()
+            else:
+                db_path.write_bytes(b"")
+                with mock.patch(
+                    "cas_forex_revamp.composition.state_store._is_symlink_or_reparse",
+                    side_effect=lambda p, *_a, **_kw: Path(p).name.startswith("compounding.sqlite3"),
+                ):
+                    with self.assertRaises(ContractError):
+                        verify_non_symlink_sqlite_target(db_path)
+                    with self.assertRaises(ContractError):
+                        open_verified_sqlite_connection(db_path)
+                    with self.assertRaises(CompoundingControllerError):
+                        CompoundingAndMilestoneController(db_path)
+                    with self.assertRaises(ContractError):
+                        ensure_secure_state_directory(clean_dir)
+
+                # Sidecar symlink (-wal) is also rejected fail-closed before SQLite touches it
+                wal_path.write_bytes(b"")
+                with mock.patch(
+                    "cas_forex_revamp.composition.state_store._is_symlink_or_reparse",
+                    side_effect=lambda p, *_a, **_kw: Path(p).name == "compounding.sqlite3-wal",
+                ):
+                    with self.assertRaises(ContractError):
+                        verify_non_symlink_sqlite_target(db_path)
+                wal_path.unlink()
+                db_path.unlink()
 
             # On POSIX, initially group/world-writable state directory (0o777) MUST be rejected before fchmod
             if os.name == "posix":
                 unsafe_dir = root / "world_writable_state"
-                unsafe_dir.mkdir(mode=0o777)
-                os.chmod(unsafe_dir, 0o777)
+                unsafe_dir.mkdir(mode=0o700)
+                os.chmod(unsafe_dir, 0o777)  # nosec B103: intentional world-writable state directory fixture to verify fail-closed rejection
                 with self.assertRaises(ContractError):
                     open_verified_directory_fd(unsafe_dir, create=False, label="state directory")
 
