@@ -317,6 +317,7 @@ class DrawdownGateRemediationTests(unittest.TestCase):
                 equity_attestations={BROKER_OANDA_PRACTICE: D("80000")},
                 initial_peak_equity=D("100000"),  # Current total = 88,000 vs initial peak 100,000 -> 12% drawdown
                 transport_factory=lambda b, m, r: Mt5SpoolBridgeTransport(Path(r) / b.lower(), sleep=emu.sleep_hook, poll_interval_seconds=0.01),
+                clock=lambda: T0 + timedelta(seconds=1),
             )
             router.activate_all()
             order = OrderIntent(

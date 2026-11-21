@@ -20,20 +20,24 @@ Pure Python standard library only (zero external runtime dependencies inside air
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from hashlib import sha256
+import hmac
 import json
 import math
 from pathlib import Path
+import secrets
 import sqlite3
 from threading import RLock
+from types import MappingProxyType
 from typing import Any
 
 from cas_forex_revamp.contracts import ActionKind, ContractError, ControlKind, canonical_bytes, decimal_text
+from cas_forex_revamp.contracts.primitives import utc_time
 
 
 MAX_CONSTITUTIONAL_DRAWDOWN_PCT = Decimal("0.10")
@@ -98,12 +102,220 @@ INJECTION_MARKERS: tuple[str, ...] = (
 )
 
 
+DEFAULT_VALVE_GRANT_TTL_SECONDS = 30.0
+MAX_VALVE_GRANT_TTL_SECONDS = 300.0
+DEFAULT_VALVE_DECISION_TTL_SECONDS = 300.0
+
+RISK_REDUCING_ACTION_KINDS: frozenset[str] = frozenset({"CLOSE", "REDUCE", "AMEND_STOP"})
+RISK_INCREASING_ACTION_KINDS: frozenset[str] = frozenset({"OPEN", "ADD"})
+ALLOWED_VALVE_GRANT_ACTIONS: frozenset[str] = RISK_REDUCING_ACTION_KINDS | RISK_INCREASING_ACTION_KINDS
+
+
 class ValveRefusalError(ContractError):
     """Raised when ForexMetaValveGate blocks an unsafe or hallucinated trade proposal."""
 
     def __init__(self, message: str, decision: "ValveDecision | None" = None) -> None:
         super().__init__(message)
         self.decision = decision
+
+
+class ValveGrantError(ValveRefusalError):
+    """Raised when a ValveOrderGrant is missing, forged, tampered, expired, replayed, or mismatched."""
+
+
+_VALVE_DECISION_SENTINEL = object()
+_VALVE_GRANT_SENTINEL = object()
+
+
+def _build_valve_hmac_sealer() -> tuple[Callable[[str], str], Callable[[str, str], bool]]:
+    """Create process-private HMAC-SHA256 sign/verify closures for Valve decisions & order grants."""
+    seal_material = secrets.token_bytes(32)
+
+    def _sign(payload: str) -> str:
+        return hmac.new(seal_material, payload.encode("utf-8"), sha256).hexdigest()
+
+    def _verify(payload: str, mac_hex: str) -> bool:
+        if not isinstance(mac_hex, str) or len(mac_hex) != 64:
+            return False
+        return hmac.compare_digest(_sign(payload), mac_hex.lower())
+
+    return _sign, _verify
+
+
+_sign_valve_payload, _verify_valve_payload = _build_valve_hmac_sealer()
+
+_GRANT_LEDGER_LOCK = RLock()
+_ISSUED_UNCONSUMED_GRANTS: dict[str, tuple[str, datetime]] = {}
+_CONSUMED_GRANT_NONCES: set[str] = set()
+_CONSUMED_DECISION_TARGETS: set[tuple[str, str, str]] = set()
+
+
+def _norm_grant_symbol(raw: Any) -> str:
+    txt = str(raw or "").strip().upper()
+    if not txt:
+        return ""
+    if txt.startswith("TRADE_"):
+        return txt
+    if "/" in txt or "_" in txt:
+        compact = txt.replace("/", "").replace("_", "")
+        if len(compact) == 6 and compact.isalpha():
+            return compact
+    return txt
+
+
+def _norm_grant_decimal(raw: Any) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return ""
+        if s.upper() == "ALL":
+            return "ALL"
+    d = _safe_decimal(raw)
+    if d is None:
+        raise ValveGrantError(f"invalid decimal valve grant field: {raw!r}")
+    txt = format(d, "f")
+    if "." in txt:
+        txt = txt.rstrip("0").rstrip(".")
+    return "0" if txt in ("", "-0") else txt
+
+
+def _norm_grant_side(raw: Any) -> str:
+    if raw is None:
+        return ""
+    val = raw.value if hasattr(raw, "value") else str(raw)
+    norm = val.strip().upper()
+    if not norm:
+        return ""
+    if norm not in ("BUY", "SELL"):
+        raise ValveGrantError(f"invalid side in valve grant: {norm!r}")
+    return norm
+
+
+def _norm_grant_action(raw: Any) -> str:
+    val = raw.value if hasattr(raw, "value") else str(raw)
+    norm = val.strip().upper()
+    if norm not in ALLOWED_VALVE_GRANT_ACTIONS:
+        raise ValveGrantError(f"unsupported valve grant action_kind: {norm!r}")
+    return norm
+
+
+def _norm_grant_execution_mode(raw: Any) -> str:
+    norm = str(raw or "").strip().upper()
+    if norm not in ("DEMO", "LIVE"):
+        raise ValveGrantError(f"invalid execution_mode in valve grant: {norm!r}")
+    return norm
+
+
+def _canonical_grant_order_digest(
+    *,
+    broker_id: str,
+    account_id: str,
+    server: str,
+    execution_mode: str,
+    action_kind: str,
+    symbol: str,
+    side: str,
+    volume: str,
+    stop_loss: str,
+    take_profit: str,
+    position_ticket: str,
+    grant_nonce: str,
+    issued_at: datetime,
+    expires_at: datetime,
+) -> str:
+    payload = {
+        "protocol": "cas-forex-valve-order-grant/1",
+        "broker_id": broker_id.strip().upper(),
+        "account_id": str(account_id).strip(),
+        "server": server.strip().casefold(),
+        "execution_mode": _norm_grant_execution_mode(execution_mode),
+        "action_kind": _norm_grant_action(action_kind),
+        "symbol": _norm_grant_symbol(symbol),
+        "side": _norm_grant_side(side),
+        "volume": _norm_grant_decimal(volume),
+        "stop_loss": _norm_grant_decimal(stop_loss),
+        "take_profit": _norm_grant_decimal(take_profit),
+        "position_ticket": str(position_ticket or "").strip(),
+        "grant_nonce": grant_nonce.strip(),
+        "issued_at": _iso_utc(issued_at),
+        "expires_at": _iso_utc(expires_at),
+    }
+    return sha256(canonical_bytes(payload)).hexdigest()
+
+
+def _canonical_grant_sig_input(
+    *,
+    order_digest_sha256: str,
+    weights_sha256: str,
+    decision_sha256: str,
+    risk_reducing: bool,
+    gate_id: str,
+) -> str:
+    return "|".join((
+        "cas-forex-valve-grant-sig/1",
+        order_digest_sha256.lower(),
+        weights_sha256.lower(),
+        decision_sha256.lower(),
+        "RR" if risk_reducing else "RI",
+        gate_id,
+    ))
+
+
+def _canonical_decision_seal_input(
+    *,
+    admitted: bool,
+    valve_mode: str,
+    mlp_score: float,
+    threshold: float,
+    mlp_admitted: bool,
+    hard_veto: bool,
+    hard_veto_reasons: tuple[str, ...],
+    weights_sha256: str,
+    request_id: str,
+    selected_action_ref: str | None,
+    gate_id: str,
+    decision_nonce: str,
+    issued_at: datetime | None,
+    expires_at: datetime | None,
+    bound_intent_digest: str,
+    bound_action_kind: str,
+    bound_symbol: str,
+    bound_side: str,
+    bound_quantity: str,
+    bound_stop_price: str,
+    bound_take_profit_price: str,
+    bound_limit_price: str,
+    bound_target_id: str,
+) -> str:
+    payload = {
+        "protocol": "cas-forex-valve-decision-seal/1",
+        "admitted": bool(admitted),
+        "valve_mode": str(valve_mode),
+        "mlp_score": _fmt8(mlp_score),
+        "threshold": _fmt8(threshold),
+        "mlp_admitted": bool(mlp_admitted),
+        "hard_veto": bool(hard_veto),
+        "hard_veto_reasons": list(hard_veto_reasons),
+        "weights_sha256": str(weights_sha256).lower(),
+        "request_id": str(request_id),
+        "selected_action_ref": selected_action_ref,
+        "gate_id": gate_id,
+        "decision_nonce": decision_nonce,
+        "issued_at": None if issued_at is None else _iso_utc(issued_at),
+        "expires_at": None if expires_at is None else _iso_utc(expires_at),
+        "bound_intent_digest": bound_intent_digest,
+        "bound_action_kind": bound_action_kind,
+        "bound_symbol": bound_symbol,
+        "bound_side": bound_side,
+        "bound_quantity": bound_quantity,
+        "bound_stop_price": bound_stop_price,
+        "bound_take_profit_price": bound_take_profit_price,
+        "bound_limit_price": bound_limit_price,
+        "bound_target_id": bound_target_id,
+    }
+    return sha256(canonical_bytes(payload)).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,10 +327,212 @@ class ValveDecision:
     mlp_admitted: bool
     hard_veto: bool
     hard_veto_reasons: tuple[str, ...]
-    features: dict[str, float]
+    features: Mapping[str, float]
     weights_sha256: str
     request_id: str
     selected_action_ref: str | None
+    _mint_token: object = field(default=None, repr=False, compare=False)
+    _decision_seal: str = field(default="", repr=False, compare=False)
+    _gate_id: str = field(default="", repr=False, compare=False)
+    _decision_nonce: str = field(default="", repr=False, compare=False)
+    _issued_at: datetime | None = field(default=None, repr=False, compare=False)
+    _expires_at: datetime | None = field(default=None, repr=False, compare=False)
+    _bound_intent_digest: str = field(default="", repr=False, compare=False)
+    _bound_action_kind: str = field(default="", repr=False, compare=False)
+    _bound_symbol: str = field(default="", repr=False, compare=False)
+    _bound_side: str = field(default="", repr=False, compare=False)
+    _bound_quantity: str = field(default="", repr=False, compare=False)
+    _bound_stop_price: str = field(default="", repr=False, compare=False)
+    _bound_take_profit_price: str = field(default="", repr=False, compare=False)
+    _bound_limit_price: str = field(default="", repr=False, compare=False)
+    _bound_target_id: str = field(default="", repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if type(self.admitted) is not bool:
+            raise ContractError("ValveDecision.admitted must be a bool")
+        if type(self.mlp_admitted) is not bool or type(self.hard_veto) is not bool:
+            raise ContractError("ValveDecision boolean flags must be bool")
+        if not isinstance(self.features, Mapping):
+            raise ContractError("ValveDecision.features must be a Mapping")
+        frozen_features = MappingProxyType({str(k): float(v) for k, v in self.features.items()})
+        object.__setattr__(self, "features", frozen_features)
+        frozen_reasons = tuple(str(r) for r in self.hard_veto_reasons)
+        object.__setattr__(self, "hard_veto_reasons", frozen_reasons)
+
+    @property
+    def is_gate_minted(self) -> bool:
+        if self._mint_token is not _VALVE_DECISION_SENTINEL:
+            return False
+        return _verify_valve_payload(self._seal_payload(), self._decision_seal)
+
+    @property
+    def bound_intent_digest(self) -> str:
+        return self._bound_intent_digest
+
+    @property
+    def decision_nonce(self) -> str:
+        return self._decision_nonce
+
+    @property
+    def issued_at(self) -> datetime | None:
+        return self._issued_at
+
+    @property
+    def expires_at(self) -> datetime | None:
+        return self._expires_at
+
+    def _seal_payload(self) -> str:
+        return _canonical_decision_seal_input(
+            admitted=self.admitted,
+            valve_mode=self.valve_mode,
+            mlp_score=self.mlp_score,
+            threshold=self.threshold,
+            mlp_admitted=self.mlp_admitted,
+            hard_veto=self.hard_veto,
+            hard_veto_reasons=self.hard_veto_reasons,
+            weights_sha256=self.weights_sha256,
+            request_id=self.request_id,
+            selected_action_ref=self.selected_action_ref,
+            gate_id=self._gate_id,
+            decision_nonce=self._decision_nonce,
+            issued_at=self._issued_at,
+            expires_at=self._expires_at,
+            bound_intent_digest=self._bound_intent_digest,
+            bound_action_kind=self._bound_action_kind,
+            bound_symbol=self._bound_symbol,
+            bound_side=self._bound_side,
+            bound_quantity=self._bound_quantity,
+            bound_stop_price=self._bound_stop_price,
+            bound_take_profit_price=self._bound_take_profit_price,
+            bound_limit_price=self._bound_limit_price,
+            bound_target_id=self._bound_target_id,
+        )
+
+    def verify_provenance(
+        self,
+        *,
+        expected_weights_sha256: str | None = None,
+        expected_gate_id: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Fail closed unless this ValveDecision was cryptographically minted by ForexMetaValveGate."""
+        if self._mint_token is not _VALVE_DECISION_SENTINEL or not _verify_valve_payload(
+            self._seal_payload(), self._decision_seal
+        ):
+            raise ValveGrantError(
+                "ValveDecision lacks valid ForexMetaValveGate cryptographic provenance seal; forged/manual decision refused",
+                decision=self,
+            )
+        if expected_weights_sha256 is not None and not hmac.compare_digest(
+            self.weights_sha256.lower(), expected_weights_sha256.lower()
+        ):
+            raise ValveGrantError("ValveDecision was produced by different Valve weights", decision=self)
+        if expected_gate_id is not None and self._gate_id != expected_gate_id:
+            raise ValveGrantError("ValveDecision was produced by a different ForexMetaValveGate", decision=self)
+        if now is not None and self._issued_at is not None and self._expires_at is not None:
+            check_now = utc_time(now, "now")
+            if check_now < self._issued_at - timedelta(seconds=30) or check_now > self._expires_at:
+                raise ValveGrantError(
+                    f"ValveDecision expired or not yet valid (expires_at={_iso_utc(self._expires_at)})",
+                    decision=self,
+                )
+
+    def assert_binds_order(
+        self,
+        *,
+        action_ref: str,
+        action_kind: ActionKind | str,
+        symbol: str,
+        side: Any = None,
+        quantity_units: Decimal | str | None = None,
+        stop_price: Decimal | str | None = None,
+        take_profit_price: Decimal | str | None = None,
+        limit_price: Decimal | str | None = None,
+        position_ticket: str | None = None,
+    ) -> None:
+        """Verify that every order-relevant field matches the exact proposal evaluated by the Valve."""
+        if self.selected_action_ref != action_ref:
+            raise ValveGrantError("ValveDecision does not bind this order's action_ref", decision=self)
+        ord_kind = _norm_grant_action(action_kind)
+        bound_kind = self._bound_action_kind.strip().upper()
+        if not bound_kind:
+            raise ValveGrantError("ValveDecision carries no bound action_kind (WAIT or unminted decision)", decision=self)
+        kind_ok = (ord_kind == bound_kind) or (bound_kind == "ADD" and ord_kind == "OPEN")
+        if not kind_ok:
+            raise ValveGrantError(
+                f"ValveDecision bound action_kind {bound_kind!r} cannot authorize {ord_kind!r}",
+                decision=self,
+            )
+        ord_sym = _norm_grant_symbol(symbol)
+        if not self._bound_symbol or ord_sym != self._bound_symbol:
+            raise ValveGrantError(
+                f"ValveDecision bound symbol {self._bound_symbol!r} does not match order symbol {ord_sym!r}",
+                decision=self,
+            )
+        ord_side = _norm_grant_side(side)
+        if ord_kind in RISK_INCREASING_ACTION_KINDS:
+            if not self._bound_side or ord_side != self._bound_side:
+                raise ValveGrantError(
+                    f"ValveDecision bound side {self._bound_side!r} does not match order side {ord_side!r}",
+                    decision=self,
+                )
+        elif ord_side and self._bound_side and ord_side != self._bound_side:
+            raise ValveGrantError(
+                f"ValveDecision bound side {self._bound_side!r} does not match management side {ord_side!r}",
+                decision=self,
+            )
+        ord_qty = _norm_grant_decimal(quantity_units)
+        if ord_kind in ("OPEN", "ADD", "REDUCE"):
+            if not self._bound_quantity or ord_qty != self._bound_quantity:
+                raise ValveGrantError(
+                    f"ValveDecision bound quantity {self._bound_quantity!r} does not match order quantity {ord_qty!r}",
+                    decision=self,
+                )
+        elif ord_kind == "CLOSE":
+            if ord_qty and self._bound_quantity and ord_qty != "ALL" and ord_qty != self._bound_quantity:
+                raise ValveGrantError(
+                    f"ValveDecision bound CLOSE quantity {self._bound_quantity!r} does not match {ord_qty!r}",
+                    decision=self,
+                )
+        ord_stop = _norm_grant_decimal(stop_price)
+        if ord_kind in RISK_INCREASING_ACTION_KINDS:
+            if ord_stop != self._bound_stop_price:
+                raise ValveGrantError(
+                    f"ValveDecision bound stop_price {self._bound_stop_price!r} does not match {ord_stop!r}",
+                    decision=self,
+                )
+        elif ord_kind == "AMEND_STOP":
+            if self._bound_stop_price and ord_stop != self._bound_stop_price:
+                raise ValveGrantError(
+                    f"ValveDecision bound AMEND_STOP stop_price {self._bound_stop_price!r} does not match {ord_stop!r}",
+                    decision=self,
+                )
+        ord_tp = _norm_grant_decimal(take_profit_price)
+        if ord_kind in RISK_INCREASING_ACTION_KINDS:
+            if ord_tp != self._bound_take_profit_price:
+                raise ValveGrantError(
+                    f"ValveDecision bound take_profit_price {self._bound_take_profit_price!r} does not match {ord_tp!r}",
+                    decision=self,
+                )
+        elif ord_kind == "AMEND_STOP":
+            if self._bound_take_profit_price and ord_tp != self._bound_take_profit_price:
+                raise ValveGrantError(
+                    f"ValveDecision bound AMEND_STOP take_profit_price {self._bound_take_profit_price!r} does not match {ord_tp!r}",
+                    decision=self,
+                )
+        ord_limit = _norm_grant_decimal(limit_price)
+        if ord_kind in RISK_INCREASING_ACTION_KINDS and ord_limit != self._bound_limit_price:
+            raise ValveGrantError(
+                f"ValveDecision bound limit_price {self._bound_limit_price!r} does not match {ord_limit!r}",
+                decision=self,
+            )
+        ord_ticket = str(position_ticket or "").strip()
+        if ord_kind in RISK_REDUCING_ACTION_KINDS:
+            if self._bound_target_id and ord_ticket and self._bound_target_id != ord_ticket:
+                raise ValveGrantError(
+                    f"ValveDecision bound target_id {self._bound_target_id!r} does not match position_ticket {ord_ticket!r}",
+                    decision=self,
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +548,187 @@ class ValveDecision:
             "request_id": self.request_id,
             "selected_action_ref": self.selected_action_ref,
         }
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ValveOrderGrant:
+    """Opaque, frozen, short-lived, single-use order-bound capability minted exclusively by ForexMetaValveGate."""
+
+    broker_id: str
+    account_id: str
+    server: str
+    execution_mode: str
+    action_kind: str
+    symbol: str
+    side: str
+    volume: str
+    stop_loss: str
+    take_profit: str
+    position_ticket: str
+    grant_nonce: str
+    issued_at: datetime
+    expires_at: datetime
+    weights_sha256: str
+    decision_sha256: str
+    risk_reducing: bool
+    order_digest_sha256: str
+    signature_hmac_sha256: str
+    _mint_token: object = field(default=None, repr=False, compare=False)
+    _gate_id: str = field(default="", repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._mint_token is not _VALVE_GRANT_SENTINEL:
+            raise ValveGrantError(
+                "ValveOrderGrant cannot be constructed directly; must be minted by ForexMetaValveGate"
+            )
+        if not isinstance(self.broker_id, str) or not self.broker_id.strip():
+            raise ValveGrantError("ValveOrderGrant requires a non-empty broker_id")
+        if not isinstance(self.account_id, str) or not self.account_id.strip():
+            raise ValveGrantError("ValveOrderGrant requires a non-empty account_id")
+        if not isinstance(self.server, str) or not self.server.strip():
+            raise ValveGrantError("ValveOrderGrant requires a non-empty server")
+        _norm_grant_execution_mode(self.execution_mode)
+        act = _norm_grant_action(self.action_kind)
+        if type(self.risk_reducing) is not bool or self.risk_reducing != (act in RISK_REDUCING_ACTION_KINDS):
+            raise ValveGrantError("ValveOrderGrant risk_reducing flag does not match action_kind")
+        if not isinstance(self.symbol, str) or not self.symbol.strip():
+            raise ValveGrantError("ValveOrderGrant requires a non-empty symbol")
+        if not isinstance(self.grant_nonce, str) or len(self.grant_nonce.strip()) < 16:
+            raise ValveGrantError("ValveOrderGrant requires a high-entropy grant_nonce")
+        issued = utc_time(self.issued_at, "issued_at")
+        expires = utc_time(self.expires_at, "expires_at")
+        ttl = (expires - issued).total_seconds()
+        if ttl <= 0 or ttl > MAX_VALVE_GRANT_TTL_SECONDS:
+            raise ValveGrantError("ValveOrderGrant TTL must be in (0, 300] seconds")
+        expected_digest = _canonical_grant_order_digest(
+            broker_id=self.broker_id,
+            account_id=self.account_id,
+            server=self.server,
+            execution_mode=self.execution_mode,
+            action_kind=self.action_kind,
+            symbol=self.symbol,
+            side=self.side,
+            volume=self.volume,
+            stop_loss=self.stop_loss,
+            take_profit=self.take_profit,
+            position_ticket=self.position_ticket,
+            grant_nonce=self.grant_nonce,
+            issued_at=issued,
+            expires_at=expires,
+        )
+        if not hmac.compare_digest(expected_digest, self.order_digest_sha256.lower()):
+            raise ValveGrantError("ValveOrderGrant order_digest_sha256 verification failed")
+        sig_input = _canonical_grant_sig_input(
+            order_digest_sha256=self.order_digest_sha256,
+            weights_sha256=self.weights_sha256,
+            decision_sha256=self.decision_sha256,
+            risk_reducing=self.risk_reducing,
+            gate_id=self._gate_id,
+        )
+        if not _verify_valve_payload(sig_input, self.signature_hmac_sha256):
+            raise ValveGrantError("ValveOrderGrant HMAC-SHA256 signature verification failed")
+
+    def __repr__(self) -> str:
+        return (
+            f"ValveOrderGrant(broker_id={self.broker_id!r}, action_kind={self.action_kind!r}, "
+            f"symbol={self.symbol!r}, execution_mode={self.execution_mode!r}, "
+            f"risk_reducing={self.risk_reducing!r}, expires_at={_iso_utc(self.expires_at)!r})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+def verify_and_consume_valve_order_grant(
+    grant: Any,
+    *,
+    broker_id: str,
+    account_id: str | int,
+    server: str,
+    execution_mode: str,
+    action_kind: ActionKind | str,
+    symbol: str,
+    side: Any = None,
+    volume: Decimal | str | None = None,
+    stop_loss: Decimal | str | None = None,
+    take_profit: Decimal | str | None = None,
+    position_ticket: str | None = None,
+    now: datetime | None = None,
+    require_risk_reducing: bool = False,
+    expected_weights_sha256: str | None = None,
+) -> ValveOrderGrant:
+    """Verify cryptographic signature, exact order binding, TTL, and atomically consume a single-use ValveOrderGrant."""
+    if not isinstance(grant, ValveOrderGrant):
+        raise ValveGrantError("Broker mutation refused: valid ForexMetaValveGate ValveOrderGrant is mandatory")
+    if grant._mint_token is not _VALVE_GRANT_SENTINEL:
+        raise ValveGrantError("Broker mutation refused: ValveOrderGrant provenance sentinel invalid")
+    norm_broker = str(broker_id or "").strip().upper()
+    norm_acct = str(account_id or "").strip()
+    norm_srv = str(server or "").strip()
+    norm_mode = _norm_grant_execution_mode(execution_mode)
+    norm_act = _norm_grant_action(action_kind)
+    norm_sym = _norm_grant_symbol(symbol)
+    norm_side = _norm_grant_side(side)
+    norm_vol = _norm_grant_decimal(volume)
+    norm_sl = _norm_grant_decimal(stop_loss)
+    norm_tp = _norm_grant_decimal(take_profit)
+    norm_ticket = str(position_ticket or "").strip()
+    if require_risk_reducing and (norm_act not in RISK_REDUCING_ACTION_KINDS or not grant.risk_reducing):
+        raise ValveGrantError(
+            f"Management/protective broker sink refuses non-risk-reducing action {norm_act!r}"
+        )
+    if grant.risk_reducing != (grant.action_kind in RISK_REDUCING_ACTION_KINDS):
+        raise ValveGrantError("ValveOrderGrant risk_reducing invariant violated")
+    if expected_weights_sha256 is not None and not hmac.compare_digest(
+        grant.weights_sha256.lower(), expected_weights_sha256.lower()
+    ):
+        raise ValveGrantError("ValveOrderGrant weights_sha256 mismatch")
+    sig_input = _canonical_grant_sig_input(
+        order_digest_sha256=grant.order_digest_sha256,
+        weights_sha256=grant.weights_sha256,
+        decision_sha256=grant.decision_sha256,
+        risk_reducing=grant.risk_reducing,
+        gate_id=grant._gate_id,
+    )
+    if not _verify_valve_payload(sig_input, grant.signature_hmac_sha256):
+        raise ValveGrantError("ValveOrderGrant HMAC-SHA256 verification failed")
+    expected_digest = _canonical_grant_order_digest(
+        broker_id=norm_broker,
+        account_id=norm_acct,
+        server=norm_srv,
+        execution_mode=norm_mode,
+        action_kind=norm_act,
+        symbol=norm_sym,
+        side=norm_side,
+        volume=norm_vol,
+        stop_loss=norm_sl,
+        take_profit=norm_tp,
+        position_ticket=norm_ticket,
+        grant_nonce=grant.grant_nonce,
+        issued_at=grant.issued_at,
+        expires_at=grant.expires_at,
+    )
+    if not hmac.compare_digest(expected_digest, grant.order_digest_sha256.lower()):
+        raise ValveGrantError(
+            f"ValveOrderGrant field-binding mismatch for {norm_broker}/{norm_act}/{norm_sym}; "
+            "order parameters differ from signed grant"
+        )
+    check_now = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+    if check_now < grant.issued_at - timedelta(seconds=30) or check_now > grant.expires_at:
+        raise ValveGrantError(
+            f"ValveOrderGrant expired or not yet valid (expires_at={_iso_utc(grant.expires_at)}, "
+            f"checked_at={_iso_utc(check_now)})"
+        )
+    with _GRANT_LEDGER_LOCK:
+        nonce = grant.grant_nonce
+        if nonce in _CONSUMED_GRANT_NONCES:
+            raise ValveGrantError("ValveOrderGrant replay refused: single-use grant_nonce already consumed")
+        reg = _ISSUED_UNCONSUMED_GRANTS.get(nonce)
+        if reg is None or not hmac.compare_digest(reg[0], expected_digest):
+            raise ValveGrantError("ValveOrderGrant unknown or already consumed; failing closed")
+        _ISSUED_UNCONSUMED_GRANTS.pop(nonce, None)
+        _CONSUMED_GRANT_NONCES.add(nonce)
+    return grant
 
 
 def _fmt8(value: float) -> str:
@@ -1446,10 +2041,108 @@ class ForexMetaValveGate:
         )
         self.peak_equity_store = peak_equity_store if peak_equity_store is not None else PeakEquityStore()
         self._weights_sha256 = controller.weights_sha256()
+        self._gate_id = secrets.token_hex(16)
 
     @property
     def weights_sha256(self) -> str:
         return self._weights_sha256
+
+    @property
+    def gate_id(self) -> str:
+        return self._gate_id
+
+    def _mint_decision(
+        self,
+        *,
+        admitted: bool,
+        valve_mode: str,
+        mlp_score: float,
+        threshold: float,
+        mlp_admitted: bool,
+        hard_veto: bool,
+        hard_veto_reasons: tuple[str, ...],
+        features: Mapping[str, float],
+        request_id: str,
+        selected_action_ref: str | None,
+        issued_at: datetime,
+        expires_at: datetime,
+        bound_action_kind: str = "",
+        bound_symbol: str = "",
+        bound_side: str = "",
+        bound_quantity: str = "",
+        bound_stop_price: str = "",
+        bound_take_profit_price: str = "",
+        bound_limit_price: str = "",
+        bound_target_id: str = "",
+    ) -> ValveDecision:
+        nonce = secrets.token_hex(16)
+        bound_payload = {
+            "request_id": request_id,
+            "selected_action_ref": selected_action_ref,
+            "action_kind": bound_action_kind,
+            "symbol": bound_symbol,
+            "side": bound_side,
+            "quantity": bound_quantity,
+            "stop_price": bound_stop_price,
+            "take_profit_price": bound_take_profit_price,
+            "limit_price": bound_limit_price,
+            "target_id": bound_target_id,
+        }
+        bound_digest = sha256(canonical_bytes(bound_payload)).hexdigest()
+        seal_in = _canonical_decision_seal_input(
+            admitted=admitted,
+            valve_mode=valve_mode,
+            mlp_score=mlp_score,
+            threshold=threshold,
+            mlp_admitted=mlp_admitted,
+            hard_veto=hard_veto,
+            hard_veto_reasons=hard_veto_reasons,
+            weights_sha256=self._weights_sha256,
+            request_id=request_id,
+            selected_action_ref=selected_action_ref,
+            gate_id=self._gate_id,
+            decision_nonce=nonce,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            bound_intent_digest=bound_digest,
+            bound_action_kind=bound_action_kind,
+            bound_symbol=bound_symbol,
+            bound_side=bound_side,
+            bound_quantity=bound_quantity,
+            bound_stop_price=bound_stop_price,
+            bound_take_profit_price=bound_take_profit_price,
+            bound_limit_price=bound_limit_price,
+            bound_target_id=bound_target_id,
+        )
+        seal = _sign_valve_payload(seal_in)
+        return ValveDecision(
+            admitted=admitted,
+            valve_mode=valve_mode,
+            mlp_score=mlp_score,
+            threshold=threshold,
+            mlp_admitted=mlp_admitted,
+            hard_veto=hard_veto,
+            hard_veto_reasons=hard_veto_reasons,
+            features=features,
+            weights_sha256=self._weights_sha256,
+            request_id=request_id,
+            selected_action_ref=selected_action_ref,
+            _mint_token=_VALVE_DECISION_SENTINEL,
+            _decision_seal=seal,
+            _gate_id=self._gate_id,
+            _decision_nonce=nonce,
+            _issued_at=issued_at,
+            _expires_at=expires_at,
+            _bound_intent_digest=bound_digest,
+            _bound_action_kind=bound_action_kind,
+            _bound_symbol=bound_symbol,
+            _bound_side=bound_side,
+            _bound_quantity=bound_quantity,
+            _bound_stop_price=bound_stop_price,
+            _bound_take_profit_price=bound_take_profit_price,
+            _bound_limit_price=bound_limit_price,
+            _bound_target_id=bound_target_id,
+        )
 
     def evaluate(
         self,
@@ -1478,8 +2171,23 @@ class ForexMetaValveGate:
         feature_map = {name: val for name, val in zip(FOREX_FEATURE_NAMES, vec)}
         score = self.controller.forward(vec)
         mlp_ok = score >= self.controller.threshold
+        req_state = getattr(proposal.request, "state", None)
+        obs_at = getattr(req_state, "observed_at", None)
+        valid_until = getattr(req_state, "valid_until", None)
+        if now is not None:
+            issued_dt = utc_time(now, "now")
+        elif obs_at is not None:
+            issued_dt = utc_time(obs_at, "observed_at")
+        else:
+            issued_dt = datetime.now(timezone.utc)
+        default_exp = issued_dt + timedelta(seconds=DEFAULT_VALVE_DECISION_TTL_SECONDS)
+        if valid_until is not None:
+            vu_dt = utc_time(valid_until, "valid_until")
+            expires_dt = min(vu_dt, default_exp) if vu_dt > issued_dt else (issued_dt + timedelta(seconds=1))
+        else:
+            expires_dt = default_exp
         if proposal.intent is None:
-            return ValveDecision(
+            return self._mint_decision(
                 admitted=True,
                 valve_mode="WAIT_BYPASS",
                 mlp_score=score,
@@ -1488,10 +2196,39 @@ class ForexMetaValveGate:
                 hard_veto=False,
                 hard_veto_reasons=(),
                 features=feature_map,
-                weights_sha256=self._weights_sha256,
                 request_id=proposal.request.request_id,
                 selected_action_ref=None,
+                issued_at=issued_dt,
+                expires_at=expires_dt,
             )
+        intent = proposal.intent
+        b_kind = intent.kind.value if hasattr(intent.kind, "value") else str(intent.kind)
+        b_sym = _norm_grant_symbol(getattr(intent, "instrument_id", None) or getattr(intent, "symbol", None) or "")
+        raw_side = getattr(intent, "side", None)
+        try:
+            b_side = _norm_grant_side(raw_side)
+        except ValveGrantError:
+            b_side = ""
+        raw_qty = getattr(intent, "quantity", None)
+        if raw_qty is None:
+            raw_qty = getattr(intent, "quantity_units", None)
+        try:
+            b_qty = _norm_grant_decimal(raw_qty)
+        except ValveGrantError:
+            b_qty = ""
+        try:
+            b_stop = _norm_grant_decimal(getattr(intent, "stop_price", None))
+        except ValveGrantError:
+            b_stop = ""
+        try:
+            b_tp = _norm_grant_decimal(getattr(intent, "take_profit_price", None))
+        except ValveGrantError:
+            b_tp = ""
+        try:
+            b_limit = _norm_grant_decimal(getattr(intent, "limit_price", None))
+        except ValveGrantError:
+            b_limit = ""
+        b_target = str(getattr(intent, "target_id", None) or getattr(intent, "position_ticket", None) or "").strip()
         hard_veto = len(vetoes) > 0
         admitted = bool(mlp_ok and not hard_veto)
         mode = (
@@ -1499,7 +2236,7 @@ class ForexMetaValveGate:
             if admitted
             else ("HARD_FLOOR_AND_MLP_VETO" if (hard_veto and not mlp_ok) else ("HARD_FLOOR_VETO" if hard_veto else "MLP_SCORE_VETO"))
         )
-        return ValveDecision(
+        return self._mint_decision(
             admitted=admitted,
             valve_mode=mode,
             mlp_score=score,
@@ -1508,9 +2245,18 @@ class ForexMetaValveGate:
             hard_veto=hard_veto,
             hard_veto_reasons=tuple(vetoes),
             features=feature_map,
-            weights_sha256=self._weights_sha256,
             request_id=proposal.request.request_id,
             selected_action_ref=proposal.result.selection.selected_action_ref,
+            issued_at=issued_dt,
+            expires_at=expires_dt,
+            bound_action_kind=b_kind,
+            bound_symbol=b_sym,
+            bound_side=b_side,
+            bound_quantity=b_qty,
+            bound_stop_price=b_stop,
+            bound_take_profit_price=b_tp,
+            bound_limit_price=b_limit,
+            bound_target_id=b_target,
         )
 
     def require_admissible(
@@ -1526,6 +2272,247 @@ class ForexMetaValveGate:
             reasons = ",".join(dec.hard_veto_reasons) if dec.hard_veto_reasons else f"mlp_score={dec.mlp_score:.6f}<{dec.threshold:.6f}"
             raise ValveRefusalError(f"ForexMetaValveGate blocked unsafe proposal ({dec.valve_mode}): {reasons}", decision=dec)
         return dec
+
+    def _mint_and_register_grant(
+        self,
+        *,
+        broker_id: str,
+        account_id: str | int,
+        server: str,
+        execution_mode: str,
+        action_kind: ActionKind | str,
+        symbol: str,
+        side: Any,
+        volume: Decimal | str | None,
+        stop_loss: Decimal | str | None,
+        take_profit: Decimal | str | None,
+        position_ticket: str | None,
+        decision_sha256: str,
+        now: datetime | None,
+        ttl_seconds: float,
+    ) -> ValveOrderGrant:
+        if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float)):
+            raise ValveGrantError("ttl_seconds must be a finite number in (0, 300]")
+        ttl_f = float(ttl_seconds)
+        if not math.isfinite(ttl_f) or ttl_f <= 0.0 or ttl_f > MAX_VALVE_GRANT_TTL_SECONDS:
+            raise ValveGrantError(f"ttl_seconds must be in (0, {MAX_VALVE_GRANT_TTL_SECONDS}]")
+        norm_broker = str(broker_id or "").strip().upper()
+        norm_acct = str(account_id or "").strip()
+        norm_srv = str(server or "").strip()
+        if not norm_broker or not norm_acct or not norm_srv:
+            raise ValveGrantError("ValveOrderGrant requires non-empty broker_id, account_id, and server")
+        norm_mode = _norm_grant_execution_mode(execution_mode)
+        norm_act = _norm_grant_action(action_kind)
+        norm_sym = _norm_grant_symbol(symbol)
+        if not norm_sym:
+            raise ValveGrantError("ValveOrderGrant requires a non-empty symbol")
+        norm_side = _norm_grant_side(side)
+        norm_vol = _norm_grant_decimal(volume)
+        norm_sl = _norm_grant_decimal(stop_loss)
+        norm_tp = _norm_grant_decimal(take_profit)
+        norm_ticket = str(position_ticket or "").strip()
+        issued_dt = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        expires_dt = issued_dt + timedelta(seconds=ttl_f)
+        grant_nonce = secrets.token_hex(16)
+        risk_reducing = norm_act in RISK_REDUCING_ACTION_KINDS
+        order_digest = _canonical_grant_order_digest(
+            broker_id=norm_broker,
+            account_id=norm_acct,
+            server=norm_srv,
+            execution_mode=norm_mode,
+            action_kind=norm_act,
+            symbol=norm_sym,
+            side=norm_side,
+            volume=norm_vol,
+            stop_loss=norm_sl,
+            take_profit=norm_tp,
+            position_ticket=norm_ticket,
+            grant_nonce=grant_nonce,
+            issued_at=issued_dt,
+            expires_at=expires_dt,
+        )
+        sig_input = _canonical_grant_sig_input(
+            order_digest_sha256=order_digest,
+            weights_sha256=self._weights_sha256,
+            decision_sha256=decision_sha256,
+            risk_reducing=risk_reducing,
+            gate_id=self._gate_id,
+        )
+        sig_hex = _sign_valve_payload(sig_input)
+        grant = ValveOrderGrant(
+            broker_id=norm_broker,
+            account_id=norm_acct,
+            server=norm_srv,
+            execution_mode=norm_mode,
+            action_kind=norm_act,
+            symbol=norm_sym,
+            side=norm_side,
+            volume=norm_vol,
+            stop_loss=norm_sl,
+            take_profit=norm_tp,
+            position_ticket=norm_ticket,
+            grant_nonce=grant_nonce,
+            issued_at=issued_dt,
+            expires_at=expires_dt,
+            weights_sha256=self._weights_sha256,
+            decision_sha256=decision_sha256,
+            risk_reducing=risk_reducing,
+            order_digest_sha256=order_digest,
+            signature_hmac_sha256=sig_hex,
+            _mint_token=_VALVE_GRANT_SENTINEL,
+            _gate_id=self._gate_id,
+        )
+        with _GRANT_LEDGER_LOCK:
+            _ISSUED_UNCONSUMED_GRANTS[grant_nonce] = (order_digest, expires_dt)
+            if len(_ISSUED_UNCONSUMED_GRANTS) > 8192:
+                cutoff = issued_dt - timedelta(hours=1)
+                stale_keys = [k for k, (_, exp) in _ISSUED_UNCONSUMED_GRANTS.items() if exp < cutoff]
+                for k in stale_keys:
+                    _ISSUED_UNCONSUMED_GRANTS.pop(k, None)
+        return grant
+
+    def issue_order_grant(
+        self,
+        decision: ValveDecision,
+        *,
+        broker_id: str,
+        account_id: str | int,
+        server: str,
+        execution_mode: str,
+        action_kind: ActionKind | str,
+        symbol: str,
+        side: Any = None,
+        volume: Decimal | str | None = None,
+        stop_loss: Decimal | str | None = None,
+        take_profit: Decimal | str | None = None,
+        position_ticket: str | None = None,
+        order_action_ref: str | None = None,
+        order_quantity_units: Decimal | str | None = None,
+        order_side: Any = None,
+        order_stop_price: Decimal | str | None = None,
+        order_take_profit_price: Decimal | str | None = None,
+        order_limit_price: Decimal | str | None = None,
+        require_risk_reducing: bool = False,
+        now: datetime | None = None,
+        ttl_seconds: float = DEFAULT_VALVE_GRANT_TTL_SECONDS,
+    ) -> ValveOrderGrant:
+        """Issue an opaque, single-use, exact-order-bound ValveOrderGrant from an admitted ValveDecision."""
+        if not isinstance(decision, ValveDecision):
+            raise ValveGrantError("issue_order_grant requires a gate-minted ValveDecision")
+        check_now = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        decision.verify_provenance(expected_weights_sha256=self._weights_sha256, now=check_now)
+        if not decision.admitted or decision.valve_mode != "ADMIT" or decision.hard_veto or not decision.mlp_admitted:
+            raise ValveGrantError(
+                f"ForexMetaValveGate did not admit this decision ({decision.valve_mode})", decision=decision
+            )
+        if decision.mlp_score < decision.threshold:
+            raise ValveGrantError("ForexMetaValveGate score below threshold", decision=decision)
+        norm_act = _norm_grant_action(action_kind)
+        if require_risk_reducing and norm_act not in RISK_REDUCING_ACTION_KINDS:
+            raise ValveGrantError(
+                f"Risk-reducing grant requested, refusing {norm_act!r}", decision=decision
+            )
+        eff_action_ref = decision.selected_action_ref if order_action_ref is None else order_action_ref
+        if not isinstance(eff_action_ref, str) or not eff_action_ref.strip():
+            raise ValveGrantError("ValveDecision missing selected_action_ref", decision=decision)
+        decision.assert_binds_order(
+            action_ref=eff_action_ref,
+            action_kind=norm_act,
+            symbol=symbol,
+            side=(side if order_side is None else order_side),
+            quantity_units=(volume if order_quantity_units is None else order_quantity_units),
+            stop_price=(stop_loss if order_stop_price is None else order_stop_price),
+            take_profit_price=(take_profit if order_take_profit_price is None else order_take_profit_price),
+            limit_price=order_limit_price,
+            position_ticket=position_ticket,
+        )
+        norm_broker = str(broker_id or "").strip().upper()
+        norm_acct = str(account_id or "").strip()
+        target_key = (decision.decision_nonce, norm_broker, norm_acct)
+        with _GRANT_LEDGER_LOCK:
+            if target_key in _CONSUMED_DECISION_TARGETS:
+                raise ValveGrantError(
+                    f"ValveDecision replay refused for {norm_broker}/{norm_acct}", decision=decision
+                )
+            _CONSUMED_DECISION_TARGETS.add(target_key)
+        decision_sha = sha256(canonical_bytes(decision.to_dict())).hexdigest()
+        return self._mint_and_register_grant(
+            broker_id=norm_broker,
+            account_id=norm_acct,
+            server=server,
+            execution_mode=execution_mode,
+            action_kind=norm_act,
+            symbol=symbol,
+            side=side,
+            volume=volume,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            position_ticket=position_ticket,
+            decision_sha256=decision_sha,
+            now=check_now,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def issue_protective_order_grant(
+        self,
+        *,
+        broker_id: str,
+        account_id: str | int,
+        server: str,
+        execution_mode: str,
+        action_kind: ActionKind | str,
+        symbol: str,
+        position_ticket: str,
+        side: Any = None,
+        volume: Decimal | str | None = None,
+        stop_loss: Decimal | str | None = None,
+        take_profit: Decimal | str | None = None,
+        reason: str = "PROTECTIVE_RISK_REDUCTION",
+        now: datetime | None = None,
+        ttl_seconds: float = DEFAULT_VALVE_GRANT_TTL_SECONDS,
+    ) -> ValveOrderGrant:
+        """Always-available risk-reducing grant for protective/emergency CLOSE, REDUCE, or AMEND_STOP."""
+        norm_act = _norm_grant_action(action_kind)
+        if norm_act not in RISK_REDUCING_ACTION_KINDS:
+            raise ValveGrantError(
+                f"issue_protective_order_grant permits only CLOSE/REDUCE/AMEND_STOP; refused {norm_act!r}"
+            )
+        norm_ticket = str(position_ticket or "").strip()
+        if not norm_ticket:
+            raise ValveGrantError("issue_protective_order_grant requires a non-empty position_ticket")
+        if norm_act in ("CLOSE", "REDUCE") and not _norm_grant_decimal(volume):
+            raise ValveGrantError(f"issue_protective_order_grant({norm_act}) requires volume")
+        if norm_act == "AMEND_STOP" and not (_norm_grant_decimal(stop_loss) or _norm_grant_decimal(take_profit)):
+            raise ValveGrantError("issue_protective_order_grant(AMEND_STOP) requires stop_loss or take_profit")
+        check_now = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        prot_sha = sha256(
+            canonical_bytes({
+                "mode": "PROTECTIVE_RISK_REDUCTION",
+                "action_kind": norm_act,
+                "broker_id": str(broker_id).strip().upper(),
+                "account_id": str(account_id).strip(),
+                "position_ticket": norm_ticket,
+                "symbol": _norm_grant_symbol(symbol),
+                "reason": str(reason or "PROTECTIVE_RISK_REDUCTION")[:128],
+                "issued_at": _iso_utc(check_now),
+            })
+        ).hexdigest()
+        return self._mint_and_register_grant(
+            broker_id=broker_id,
+            account_id=account_id,
+            server=server,
+            execution_mode=execution_mode,
+            action_kind=norm_act,
+            symbol=symbol,
+            side=side,
+            volume=volume,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            position_ticket=norm_ticket,
+            decision_sha256=prot_sha,
+            now=check_now,
+            ttl_seconds=ttl_seconds,
+        )
 
 
 def load_default_forex_valve_gate(

@@ -127,20 +127,47 @@ class _MutableClock:
         return self.current
 
 
-def _valve_decision(gate: ForexMetaValveGate, order: OrderIntent) -> ValveDecision:
-    return ValveDecision(
-        admitted=True,
-        valve_mode="ADMIT",
-        mlp_score=0.92,
-        threshold=gate.controller.threshold,
-        mlp_admitted=True,
-        hard_veto=False,
-        hard_veto_reasons=(),
-        features={f"f{i}": 0.0 for i in range(16)},
-        weights_sha256=gate.controller.weights_sha256(),
-        request_id=f"req-{order.order_id}",
-        selected_action_ref=order.action_ref,
+def _valve_decision(gate: ForexMetaValveGate, order: OrderIntent, *, now: datetime | None = None) -> ValveDecision:
+    eff_now = T0 if now is None else now
+    bid_q, ask_q = QUOTES.get(order.symbol, (D("1.10000"), D("1.10010")))
+    inv: list[dict[str, Any]] = []
+    if order.position_ticket is not None:
+        prev_sl = (order.stop_price - D("0.00100")) if order.stop_price is not None else (bid_q - D("0.01000"))
+        inv.append({"ticket": order.position_ticket, "symbol": order.symbol, "side": "BUY", "stop_loss": str(prev_sl)})
+    intent = SimpleNamespace(
+        intent_id=order.order_id,
+        action_ref=order.action_ref,
+        kind=order.kind,
+        instrument_id=order.symbol,
+        quantity=order.quantity_units,
+        side=order.side,
+        stop_price=order.stop_price,
+        limit_price=order.limit_price,
+        take_profit_price=order.take_profit_price,
+        target_id=order.position_ticket,
     )
+    req = SimpleNamespace(
+        request_id=f"req-{order.order_id}",
+        facts=(),
+        evidence=(SimpleNamespace(evidence_id="ev-1"),),
+        state=SimpleNamespace(observed_at=eff_now, valid_until=eff_now + timedelta(minutes=5)),
+    )
+    sel = SimpleNamespace(evidence_ids=("ev-1",), reason="ID=02 audit test", selected_action_ref=order.action_ref)
+    prop = SimpleNamespace(request=req, result=SimpleNamespace(selection=sel), intent=intent)
+    view = {
+        "balance": "100000",
+        "equity": "100000",
+        "available_margin": "90000",
+        "position_inventory": inv,
+        "bid": str(bid_q),
+        "ask": str(ask_q),
+        "policy": {
+            "new_risk_permission": "ALLOWED",
+            "management_permission": "ALLOWED",
+            "max_entry_quantity": "5000000",
+        },
+    }
+    return gate.require_admissible(prop, current_view=view, now=eff_now)
 
 
 def _open_order(order_id: str, *, symbol: str = "EURUSD", units: Decimal = D("50000"), stop: Decimal = D("1.09500")) -> OrderIntent:
@@ -407,8 +434,8 @@ class _RefreshFaultTransport:
             expires_at=prepared.expires_at,
         )
 
-    def send_order(self, request: Mt5OrderRequest) -> Mt5OrderReceipt:
-        rcpt = self.inner.send_order(request)
+    def send_order(self, request: Mt5OrderRequest, **kwargs: Any) -> Mt5OrderReceipt:
+        rcpt = self.inner.send_order(request, **kwargs)
         self._sent = True
         return rcpt
 
@@ -559,10 +586,18 @@ class AuditEfb2bf4VenueSecurityTests(unittest.TestCase):
             with self.assertRaises(OandaOutcomeUnknownError):
                 router.execute_open(_open_order("blocked-by-oanda", symbol="GBPUSD", units=D("10000"), stop=D("1.26500")), valve_decision=_valve_decision(gate, _open_order("blocked-by-oanda", symbol="GBPUSD", units=D("10000"), stop=D("1.26500"))))
             oanda_client = router.venues[BROKER_OANDA_PRACTICE].client  # type: ignore[union-attr]
+            _blk_o = _open_order("oanda-gbp-blocked", symbol="GBPUSD", units=D("1000"), stop=D("1.26500"))
+            _blk_g = gate.issue_order_grant(
+                _valve_decision(gate, _blk_o, now=clock()),
+                broker_id=oanda_client.broker_id, account_id=str(oanda_client.account_id),
+                server=oanda_client.server_host, execution_mode=oanda_client.execution_mode,
+                action_kind="OPEN", symbol="GBPUSD", side=Side.BUY, volume=D("1000"),
+                stop_loss=D("1.26500"), order_action_ref=_blk_o.action_ref, order_quantity_units=_blk_o.quantity_units, now=clock(),
+            )
             with self.assertRaises(OandaOutcomeUnknownError):
                 oanda_client.submit_paper_market_order(
                     symbol="GBPUSD", side=Side.BUY, units=D("1000"), client_order_id="oanda-gbp-blocked",
-                    stop_loss_price=D("1.26500"), now=clock(),
+                    stop_loss_price=D("1.26500"), valve_grant=_blk_g, now=clock(),
                 )
 
     # ------------------------------------------------------------------
@@ -852,7 +887,16 @@ class AuditEfb2bf4VenueSecurityTests(unittest.TestCase):
                 volume_lots=D("0.10"), price=D("1.10010"), stop_loss=D("1.09500"),
                 position_ticket=None, deviation_points=20, magic=20261120, comment="live-ok", created_at=clock(),
             )
-            rcpt_ok = native.send_order(req_valid)
+            _f6_gate = load_default_forex_valve_gate()
+            _f6_ord = _open_order("live-native-ok", symbol="EURUSD", units=D("10000"), stop=D("1.09500"))
+            _f6_grant = _f6_gate.issue_order_grant(
+                _valve_decision(_f6_gate, _f6_ord, now=clock()),
+                broker_id=BROKER_HUGOSWAY_MT5, account_id="9001122", server="Hugo PRO5",
+                execution_mode=EXECUTION_MODE_LIVE, action_kind="OPEN", symbol="EURUSD",
+                side=Side.BUY, volume=D("0.10"), stop_loss=D("1.09500"),
+                order_action_ref=_f6_ord.action_ref, order_quantity_units=_f6_ord.quantity_units, now=clock(),
+            )
+            rcpt_ok = native.send_order(req_valid, valve_grant=_f6_grant)
             self.assertTrue(rcpt_ok.accepted)
             self.assertEqual(sdk.order_send_calls, 1)
 
@@ -860,9 +904,17 @@ class AuditEfb2bf4VenueSecurityTests(unittest.TestCase):
             oanda_stub = _StatefulOandaTransport(host="api-fxtrade.oanda.com", account_id="001-001-live-01")
             oanda_client = OandaPracticePaperClient.from_runtime_env(live_env, transport=oanda_stub, clock=clock)
             assert oanda_client.live_auth_context is not None
+            _f6_oord = _open_order("live-oanda-ok", symbol="EURUSD", units=D("1000"), stop=D("1.09500"))
+            _f6_ogrant = _f6_gate.issue_order_grant(
+                _valve_decision(_f6_gate, _f6_oord, now=clock()),
+                broker_id=BROKER_OANDA_LIVE, account_id="001-001-live-01", server="api-fxtrade.oanda.com",
+                execution_mode=EXECUTION_MODE_LIVE, action_kind="OPEN", symbol="EURUSD",
+                side=Side.BUY, volume=D("1000"), stop_loss=D("1.09500"),
+                order_action_ref=_f6_oord.action_ref, order_quantity_units=_f6_oord.quantity_units, now=clock(),
+            )
             r_open = oanda_client.submit_paper_market_order(
                 symbol="EURUSD", side=Side.BUY, units=D("1000"), client_order_id="live-oanda-ok",
-                stop_loss_price=D("1.09500"), now=clock(),
+                stop_loss_price=D("1.09500"), valve_grant=_f6_ogrant, now=clock(),
             )
             self.assertEqual(r_open["status"], "FILLED")
             open_tid = next(iter(oanda_stub.open_trades.keys()))
@@ -924,7 +976,12 @@ class AuditEfb2bf4VenueSecurityTests(unittest.TestCase):
             )
             ticket_path.write_text(json.dumps(bundle2), encoding="utf-8")
             oanda_client.refresh_live_authorization(live_env, now=clock())
-            r_cls = oanda_client.close_trade(trade_id=open_tid, units="ALL", now=clock())
+            _f6_cls_grant = _f6_gate.issue_protective_order_grant(
+                broker_id=BROKER_OANDA_LIVE, account_id="001-001-live-01", server="api-fxtrade.oanda.com",
+                execution_mode=EXECUTION_MODE_LIVE, action_kind="CLOSE", symbol=f"TRADE_{open_tid}",
+                position_ticket=open_tid, volume="ALL", now=clock(),
+            )
+            r_cls = oanda_client.close_trade(trade_id=open_tid, units="ALL", valve_grant=_f6_cls_grant, now=clock())
             self.assertEqual(r_cls["status"], "CLOSED")
 
     # ------------------------------------------------------------------

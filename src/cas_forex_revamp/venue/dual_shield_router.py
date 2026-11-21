@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 import logging
 import math
@@ -84,8 +84,12 @@ from .mt5_broker_bridge import (
     Mt5SpoolBridgeTransport,
     Mt5Tick,
     Mt5TransportError,
+    MANAGEMENT_ACTION_KINDS,
     OandaPracticeFallbackVenue,
     OrderIntent,
+    RISK_INCREASING_ACTION_KINDS,
+    RiskIncreasingOrderIntent,
+    RiskReducingOrderIntent,
     STATUS_BROKER_OFFLINE,
     require_valve_clearance,
 )
@@ -105,8 +109,12 @@ __all__ = [
     "OffMarketBrokerQuoteError",
     "OffsetOrder",
     "OffsetPlan",
+    "DEFAULT_INDEX_REFERENCE_MAX_AGE_SECONDS",
     "QuoteReferenceUnavailableError",
     "QuoteTruthVerdict",
+    "ReferenceQuote",
+    "RiskIncreasingOrderIntent",
+    "RiskReducingOrderIntent",
     "STATUS_BROKER_OFFLINE",
 ]
 
@@ -248,6 +256,157 @@ class QuoteTruthVerdict:
         return out
 
 
+DEFAULT_INDEX_REFERENCE_MAX_AGE_SECONDS = 60.0
+_MT5_BROKER_IDS: frozenset[str] = frozenset({BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5})
+
+
+def _parse_reference_observed_at(raw: Any) -> datetime:
+    if isinstance(raw, datetime):
+        return utc_time(raw, "observed_at")
+    if isinstance(raw, str) and raw.strip():
+        txt = raw.strip()
+        if txt.endswith("Z"):
+            txt = txt[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(txt)
+        except ValueError as exc:
+            raise QuoteReferenceUnavailableError(f"invalid reference quote observed_at {raw!r}") from exc
+        return utc_time(dt, "observed_at")
+    raise QuoteReferenceUnavailableError("index reference quote missing observed_at timestamp")
+
+
+def _looks_like_mt5_provider(provider: str) -> bool:
+    up = provider.strip().upper()
+    return (
+        up in _MT5_BROKER_IDS
+        or "MT5" in up
+        or "HUGOSWAY" in up
+        or "LHFX" in up
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceQuote:
+    """Validated reference quote carrying explicit source provenance for anti-self-corroboration (Finding [5])."""
+
+    symbol: str
+    bid: Decimal
+    ask: Decimal
+    source_provider: str
+    source_broker_id: str | None = None
+    is_independent_public: bool = False
+    observed_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        bid, ask = _validated_quote(self.symbol, self.bid, self.ask, "reference_quote")
+        object.__setattr__(self, "bid", bid)
+        object.__setattr__(self, "ask", ask)
+        if not isinstance(self.source_provider, str) or not self.source_provider.strip():
+            raise QuoteReferenceUnavailableError("ReferenceQuote requires a non-empty source_provider")
+        if type(self.is_independent_public) is not bool:
+            raise QuoteReferenceUnavailableError("ReferenceQuote.is_independent_public must be a bool")
+        if self.source_broker_id is not None:
+            if not isinstance(self.source_broker_id, str) or not self.source_broker_id.strip():
+                raise QuoteReferenceUnavailableError("ReferenceQuote.source_broker_id must be None or non-empty string")
+            object.__setattr__(self, "source_broker_id", self.source_broker_id.strip().upper())
+        if self.observed_at is not None:
+            object.__setattr__(self, "observed_at", _parse_reference_observed_at(self.observed_at))
+        if self.is_independent_public:
+            if self.source_broker_id in _MT5_BROKER_IDS or _looks_like_mt5_provider(self.source_provider):
+                raise QuoteReferenceUnavailableError(
+                    f"MT5 broker-derived feed ({self.source_provider}/{self.source_broker_id}) cannot claim is_independent_public=True"
+                )
+
+    @classmethod
+    def from_entry(cls, symbol: str, entry: Any) -> "ReferenceQuote":
+        if isinstance(entry, cls):
+            if entry.symbol != symbol:
+                raise QuoteReferenceUnavailableError(f"ReferenceQuote symbol {entry.symbol} does not match {symbol}")
+            return entry
+        if not isinstance(entry, Mapping):
+            raise QuoteReferenceUnavailableError(
+                f"index reference for {symbol} lacks required provenance metadata (unlabeled quote refused)"
+            )
+        required = ("bid", "ask", "source_provider", "source_broker_id", "is_independent_public", "observed_at")
+        missing = [k for k in required if k not in entry]
+        if missing:
+            raise QuoteReferenceUnavailableError(
+                f"index reference for {symbol} missing required provenance keys {missing}"
+            )
+        raw_bid = entry["bid"]
+        raw_ask = entry["ask"]
+        try:
+            bid_d = raw_bid if isinstance(raw_bid, Decimal) else parse_decimal(str(raw_bid), "bid")
+            ask_d = raw_ask if isinstance(raw_ask, Decimal) else parse_decimal(str(raw_ask), "ask")
+        except ContractError as exc:
+            raise QuoteReferenceUnavailableError(f"invalid index reference quote price for {symbol}: {exc}") from None
+        obs_dt = _parse_reference_observed_at(entry["observed_at"])
+        raw_broker = entry["source_broker_id"]
+        if raw_broker is not None and not isinstance(raw_broker, str):
+            raise QuoteReferenceUnavailableError(f"invalid source_broker_id for {symbol}")
+        return cls(
+            symbol=symbol,
+            bid=bid_d,
+            ask=ask_d,
+            source_provider=str(entry["source_provider"]),
+            source_broker_id=(None if raw_broker is None else raw_broker),
+            is_independent_public=entry["is_independent_public"],
+            observed_at=obs_dt,
+        )
+
+    def assert_fresh(
+        self,
+        *,
+        now: datetime | None,
+        max_age_seconds: float = DEFAULT_INDEX_REFERENCE_MAX_AGE_SECONDS,
+    ) -> None:
+        if self.observed_at is None:
+            raise QuoteReferenceUnavailableError(f"index reference for {self.symbol} missing observed_at timestamp")
+        if now is None or max_age_seconds <= 0:
+            return
+        check_now = utc_time(now, "now")
+        age = (check_now - self.observed_at).total_seconds()
+        if age > max_age_seconds or age < -30.0:
+            raise QuoteReferenceUnavailableError(
+                f"index reference for {self.symbol} ({self.source_provider}) is stale or future-skewed "
+                f"(age={age:.2f}s > max={max_age_seconds:.2f}s)"
+            )
+
+    def assert_corroborates_target(
+        self,
+        target_broker_id: str,
+        *,
+        now: datetime | None = None,
+        max_age_seconds: float = DEFAULT_INDEX_REFERENCE_MAX_AGE_SECONDS,
+    ) -> None:
+        target = str(target_broker_id or "").strip().upper()
+        self.assert_fresh(now=now, max_age_seconds=max_age_seconds)
+        prov = self.source_provider.strip().upper()
+        src_broker = (self.source_broker_id or "").strip().upper()
+        if src_broker and src_broker == target:
+            raise QuoteReferenceUnavailableError(
+                f"same-venue self-corroboration refused: {self.symbol} reference came from target broker {target}"
+            )
+        if prov == target or (target in _MT5_BROKER_IDS and target in prov):
+            raise QuoteReferenceUnavailableError(
+                f"same-venue self-corroboration refused: {self.symbol} provider {self.source_provider!r} matches target {target}"
+            )
+        if not self.is_independent_public:
+            if not src_broker:
+                raise QuoteReferenceUnavailableError(
+                    f"unlabeled non-public index reference ({self.source_provider}) refused for {target} ({self.symbol})"
+                )
+            if src_broker == target:
+                raise QuoteReferenceUnavailableError(
+                    f"same-venue self-corroboration refused: {self.symbol} reference came from {src_broker}"
+                )
+        else:
+            if src_broker in _MT5_BROKER_IDS or _looks_like_mt5_provider(prov):
+                raise QuoteReferenceUnavailableError(
+                    f"MT5 broker-derived feed cannot corroborate as independent public source for {target} ({self.symbol})"
+                )
+
+
 ReferenceSource = Callable[[tuple[str, ...]], Mapping[str, tuple[Decimal, Decimal]]]
 
 
@@ -268,6 +427,9 @@ class OandaQuoteTruthOracle:
         max_divergence_bps_index: Decimal = Decimal("25"),
         max_spread_bps: Decimal = Decimal("30"),
         max_oanda_spread_multiple: Decimal = Decimal("3.0"),
+        reference_provenance: Mapping[str, ReferenceQuote] | None = None,
+        clock: Callable[[], datetime] | None = None,
+        max_reference_age_seconds: float = DEFAULT_INDEX_REFERENCE_MAX_AGE_SECONDS,
     ) -> None:
         if not callable(reference_source):
             raise ContractError("reference_source must be callable")
@@ -280,6 +442,11 @@ class OandaQuoteTruthOracle:
         self.max_divergence_bps_index = decimal_value(max_divergence_bps_index, "max_divergence_bps_index", positive=True)
         self.max_spread_bps = decimal_value(max_spread_bps, "max_spread_bps", positive=True)
         self.max_oanda_spread_multiple = decimal_value(max_oanda_spread_multiple, "max_oanda_spread_multiple", positive=True)
+        self._reference_provenance: dict[str, ReferenceQuote] = (
+            dict(reference_provenance) if reference_provenance is not None else {}
+        )
+        self._clock: Callable[[], datetime] | None = clock
+        self._max_reference_age_seconds: float = float(max_reference_age_seconds)
 
     def __repr__(self) -> str:
         return f"OandaQuoteTruthOracle(reference={self.reference_name!r})"
@@ -313,6 +480,34 @@ class OandaQuoteTruthOracle:
         frozen = dict(quotes)
         return cls(reference_source=lambda symbols: {s: frozen[s] for s in symbols if s in frozen},
                    reference_name=reference_name, **kwargs)
+
+    @classmethod
+    def from_reference_quotes(
+        cls,
+        quotes: Mapping[str, ReferenceQuote],
+        *,
+        reference_name: str | None = None,
+        clock: Callable[[], datetime] | None = None,
+        max_reference_age_seconds: float = DEFAULT_INDEX_REFERENCE_MAX_AGE_SECONDS,
+        **kwargs: Any,
+    ) -> "OandaQuoteTruthOracle":
+        prov_map: dict[str, ReferenceQuote] = {}
+        pair_map: dict[str, tuple[Decimal, Decimal]] = {}
+        first_provider = "INDEX_REFERENCE"
+        for sym, raw_q in quotes.items():
+            rq = ReferenceQuote.from_entry(sym, raw_q)
+            prov_map[sym] = rq
+            pair_map[sym] = (rq.bid, rq.ask)
+            first_provider = rq.source_provider
+        eff_name = reference_name if reference_name else first_provider
+        return cls(
+            reference_source=lambda symbols: {s: pair_map[s] for s in symbols if s in pair_map},
+            reference_name=eff_name,
+            reference_provenance=prov_map,
+            clock=clock,
+            max_reference_age_seconds=max_reference_age_seconds,
+            **kwargs,
+        )
 
     def max_divergence_for(self, symbol: str) -> Decimal:
         if symbol in INDEX_INSTRUMENTS:
@@ -372,11 +567,33 @@ class OandaQuoteTruthOracle:
         bid: Decimal,
         ask: Decimal,
         *,
-        reference: Mapping[str, tuple[Decimal, Decimal]] | None = None,
+        reference: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
     ) -> QuoteTruthVerdict:
         bid, ask = _validated_quote(symbol, bid, ask, broker_id)
-        ref = reference if reference is not None and symbol in reference else self.reference_quotes((symbol,))
-        rbid, rask = _validated_quote(symbol, ref[symbol][0], ref[symbol][1], "reference")
+        check_now = now if now is not None else (self._clock() if self._clock is not None else None)
+        prov = self._reference_provenance.get(symbol)
+        if prov is not None:
+            prov.assert_corroborates_target(
+                broker_id,
+                now=check_now,
+                max_age_seconds=self._max_reference_age_seconds,
+            )
+        if reference is not None and symbol in reference:
+            raw_entry = reference[symbol]
+            if isinstance(raw_entry, (ReferenceQuote, Mapping)):
+                entry_rq = ReferenceQuote.from_entry(symbol, raw_entry)
+                entry_rq.assert_corroborates_target(
+                    broker_id,
+                    now=check_now,
+                    max_age_seconds=self._max_reference_age_seconds,
+                )
+                rbid, rask = entry_rq.bid, entry_rq.ask
+            else:
+                rbid, rask = _validated_quote(symbol, raw_entry[0], raw_entry[1], "reference")
+        else:
+            ref = self.reference_quotes((symbol,))
+            rbid, rask = _validated_quote(symbol, ref[symbol][0], ref[symbol][1], "reference")
         with localcontext() as ctx:
             ctx.prec = 40
             mid = (bid + ask) / 2
@@ -952,7 +1169,8 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         peak_equity_store: PeakEquityStore | None = None,
         initial_peak_equity: Decimal | None = None,
         drawdown_scope_id: str = "dual-shield-barbell",
-        index_reference_source: Callable[[Iterable[str]], Mapping[str, tuple[Decimal, Decimal]]] | None = None,
+        index_reference_source: Callable[[Iterable[str]], Mapping[str, Any]] | None = None,
+        index_reference_max_age_seconds: float = DEFAULT_INDEX_REFERENCE_MAX_AGE_SECONDS,
         oanda_reconnect_interval_seconds: float = DEFAULT_OANDA_RECONNECT_INTERVAL_SECONDS,
         monotonic: Callable[[], float] | None = None,
         **kwargs: Any,
@@ -968,6 +1186,14 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         self._oracle_override = oracle
         self._oracle_cache: OandaQuoteTruthOracle | None = None
         self._index_reference_source = index_reference_source
+        if (
+            isinstance(index_reference_max_age_seconds, bool)
+            or not isinstance(index_reference_max_age_seconds, (int, float))
+            or not math.isfinite(float(index_reference_max_age_seconds))
+            or float(index_reference_max_age_seconds) <= 0.0
+        ):
+            raise ContractError("index_reference_max_age_seconds must be a positive finite number")
+        self._index_reference_max_age_seconds = float(index_reference_max_age_seconds)
         self.barbell = barbell or BarbellCapitalPolicy.from_environ(self._env)
         if self.barbell.max_stop_loss_equity_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
             raise ContractError("CONSTITUTIONAL_STOP_RISK_CEILING_EXCEEDED: router refuses stop-risk above 1.00%")
@@ -1215,26 +1441,56 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             raise BrokerFailoverExhaustedError("no venue in the dual-shield barbell could be activated")
         return self._active.broker_id
 
-    def _index_reference_quotes(self, symbol: str) -> tuple[OandaQuoteTruthOracle, dict[str, tuple[Decimal, Decimal]]]:
-        """Resolve verified reference quotes for US index CFDs (which US OANDA does not quote)."""
+    def _index_reference_quotes(
+        self,
+        symbol: str,
+        *,
+        target_broker_id: str | None = None,
+    ) -> tuple[OandaQuoteTruthOracle, dict[str, tuple[Decimal, Decimal]]]:
+        """Resolve provenance-verified reference quotes for US index CFDs (Finding [5]).
+
+        Strictly rejects unlabeled quotes, stale quotes, MT5 feeds claiming to be public, and
+        same-venue self-corroboration where reference provenance matches ``target_broker_id``.
+        """
+        now_ts = self._clock()
         if self._oracle_override is not None:
             try:
                 ref = self._oracle_override.reference_quotes((symbol,))
+                if target_broker_id is not None and symbol in self._oracle_override._reference_provenance:
+                    self._oracle_override._reference_provenance[symbol].assert_corroborates_target(
+                        target_broker_id,
+                        now=now_ts,
+                        max_age_seconds=self._index_reference_max_age_seconds,
+                    )
                 return self._oracle_override, ref
             except QuoteReferenceUnavailableError:
                 logging.getLogger(__name__).debug("oracle override lacks index quote for %s; falling back", symbol)
         if self._index_reference_source is not None:
             raw = self._index_reference_source((symbol,))
             if isinstance(raw, Mapping) and symbol in raw:
-                bid, ask = _validated_quote(symbol, raw[symbol][0], raw[symbol][1], "index_reference")
-                ref = {symbol: (bid, ask)}
-                oracle = OandaQuoteTruthOracle.from_static_quotes(ref, reference_name="INDEX_REFERENCE")
-                return oracle, ref
+                ref_quote = ReferenceQuote.from_entry(symbol, raw[symbol])
+                ref_quote.assert_fresh(
+                    now=now_ts,
+                    max_age_seconds=self._index_reference_max_age_seconds,
+                )
+                if target_broker_id is not None:
+                    ref_quote.assert_corroborates_target(
+                        target_broker_id,
+                        now=now_ts,
+                        max_age_seconds=self._index_reference_max_age_seconds,
+                    )
+                oracle = OandaQuoteTruthOracle.from_reference_quotes(
+                    {symbol: ref_quote},
+                    reference_name=ref_quote.source_provider,
+                    clock=self._clock,
+                    max_reference_age_seconds=self._index_reference_max_age_seconds,
+                )
+                return oracle, {symbol: (ref_quote.bid, ref_quote.ask)}
         hugo = self._venues.get(BROKER_HUGOSWAY_MT5)
         lhfx = self._venues.get(BROKER_LHFX_MT5)
         if not isinstance(hugo, Mt5PaperBrokerVenue) or not isinstance(lhfx, Mt5PaperBrokerVenue):
             raise QuoteReferenceUnavailableError(
-                f"{symbol} requires either an independent index_reference_source or dual connected MT5 venues for cross-venue corroboration"
+                f"{symbol} requires either a provenance-verified independent index_reference_source or dual connected MT5 venues for cross-venue corroboration"
             )
         if hugo.is_offline or lhfx.is_offline:
             raise QuoteReferenceUnavailableError(
@@ -1252,15 +1508,59 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         cons_ask = ((ht.ask + lt.ask) / Decimal("2")).quantize(tick_sz)
         if cons_ask <= cons_bid:
             cons_ask = (cons_bid + tick_sz).quantize(tick_sz)
-        ref_q = _validated_quote(symbol, cons_bid, cons_ask, "dual_mt5_consensus")
-        oracle = OandaQuoteTruthOracle.from_static_quotes({symbol: ref_q}, reference_name="DUAL_MT5_INDEX_CONSENSUS")
-        oracle.verify_cross_venue_index_quotes(
+        cons_q = _validated_quote(symbol, cons_bid, cons_ask, "dual_mt5_consensus")
+        check_oracle = OandaQuoteTruthOracle.from_static_quotes({symbol: cons_q}, reference_name="DUAL_MT5_INDEX_CONSENSUS")
+        check_oracle.verify_cross_venue_index_quotes(
             symbol=symbol,
             hugo_quote=(ht.bid, ht.ask),
             lhfx_quote=(lt.bid, lt.ask),
-            reference_quote=ref_q,
+            reference_quote=cons_q,
         )
-        return oracle, {symbol: ref_q}
+        if target_broker_id == BROKER_HUGOSWAY_MT5:
+            peer_rq = ReferenceQuote(
+                symbol=symbol,
+                bid=lt.bid,
+                ask=lt.ask,
+                source_provider="CROSS_VENUE_MT5_PEER",
+                source_broker_id=BROKER_LHFX_MT5,
+                is_independent_public=False,
+                observed_at=now_ts,
+            )
+            peer_rq.assert_corroborates_target(
+                BROKER_HUGOSWAY_MT5,
+                now=now_ts,
+                max_age_seconds=self._index_reference_max_age_seconds,
+            )
+            peer_oracle = OandaQuoteTruthOracle.from_reference_quotes(
+                {symbol: peer_rq},
+                reference_name="CROSS_VENUE_MT5_LHFX",
+                clock=self._clock,
+                max_reference_age_seconds=self._index_reference_max_age_seconds,
+            )
+            return peer_oracle, {symbol: (peer_rq.bid, peer_rq.ask)}
+        if target_broker_id == BROKER_LHFX_MT5:
+            peer_rq = ReferenceQuote(
+                symbol=symbol,
+                bid=ht.bid,
+                ask=ht.ask,
+                source_provider="CROSS_VENUE_MT5_PEER",
+                source_broker_id=BROKER_HUGOSWAY_MT5,
+                is_independent_public=False,
+                observed_at=now_ts,
+            )
+            peer_rq.assert_corroborates_target(
+                BROKER_LHFX_MT5,
+                now=now_ts,
+                max_age_seconds=self._index_reference_max_age_seconds,
+            )
+            peer_oracle = OandaQuoteTruthOracle.from_reference_quotes(
+                {symbol: peer_rq},
+                reference_name="CROSS_VENUE_MT5_HUGOSWAY",
+                clock=self._clock,
+                max_reference_age_seconds=self._index_reference_max_age_seconds,
+            )
+            return peer_oracle, {symbol: (peer_rq.bid, peer_rq.ask)}
+        return check_oracle, {symbol: cons_q}
 
     def oracle(self) -> OandaQuoteTruthOracle:
         if self._oracle_override is not None:
@@ -1592,10 +1892,23 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             reasons.append(f"{self._oanda_broker_id}={exc.reason}")
             return False, "; ".join(reasons)
 
-    def execute_open(self, order: OrderIntent, *, valve_decision: ValveDecision) -> DualShieldExecution:
+    def execute_open(
+        self,
+        order: OrderIntent | RiskIncreasingOrderIntent,
+        *,
+        valve_decision: ValveDecision,
+    ) -> DualShieldExecution:
+        if isinstance(order, RiskIncreasingOrderIntent):
+            order = order.order
         if not isinstance(order, OrderIntent) or order.kind is not ActionKind.OPEN:
             raise ContractError("execute_open requires an OPEN OrderIntent; use execute_management otherwise")
-        require_valve_clearance(order, valve_decision, expected_weights_sha256=self._valve_gate.weights_sha256)
+        require_valve_clearance(
+            order,
+            valve_decision,
+            expected_weights_sha256=self._valve_gate.weights_sha256,
+            now=self._clock(),
+            require_risk_reducing=False,
+        )
         # Finding [1]: Barbell-wide unresolved-mutation latch checked before ANY new risk across every venue & symbol.
         self.assert_no_unresolved_mutations(context="OPEN")
         # Finding [3]: Refresh OANDA NAV & margin immediately before every new-risk admission; fail closed if stale/failed.
@@ -1651,12 +1964,19 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             def margin_guard(check: Mt5MarginCheck, _account: Mt5AccountSnapshot, _b: str = broker_id) -> None:
                 self.barbell.require_sleeve(_b, equities=equities, used_margin_after=check.used_margin_after)
 
+            if order.symbol in INDEX_INSTRUMENTS:
+                broker_oracle, broker_ref = self._index_reference_quotes(order.symbol, target_broker_id=broker_id)
+                eff_quote_guard = broker_oracle.guard(broker_ref, verdicts)
+            else:
+                eff_quote_guard = oracle.guard(reference, verdicts)
             try:
                 result = venue.execute(
                     order,
                     valve_decision=valve_decision,
-                    quote_guard=oracle.guard(reference, verdicts),
+                    quote_guard=eff_quote_guard,
                     margin_guard=margin_guard,
+                    allowed_actions=frozenset({ActionKind.OPEN}),
+                    require_risk_reducing=False,
                 )
             except (
                 Mt5OutcomeUnknownError,
@@ -1730,29 +2050,71 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         self.barbell.require_sleeve(
             self._oanda_broker_id, equities=fresh_equities, used_margin_after=(nav - available) + required
         )
-        result = oanda.execute(order, valve_decision=valve_decision)
+        result = oanda.execute(
+            order,
+            valve_decision=valve_decision,
+            allowed_actions=frozenset({ActionKind.OPEN}),
+            require_risk_reducing=False,
+        )
         self._record(trail, self._oanda_broker_id, "EXECUTED", "SAFE_HARBOR")
         return DualShieldExecution(
             result=result, executed_on=self._oanda_broker_id, safe_harbor=True, trail=tuple(trail),
             quote_verdicts=tuple(verdicts), stop_loss_risk=risk, stop_loss_risk_cap=cap,
         )
 
-    def execute_management(self, broker_id: str, order: OrderIntent, *, valve_decision: ValveDecision) -> Mt5ExecutionResult:
-        """AMEND_STOP is quote-truth checked (anti-stop-hunt); REDUCE/CLOSE always reach the venue."""
+    def execute_management(
+        self,
+        broker_id: str,
+        order: OrderIntent | RiskReducingOrderIntent,
+        *,
+        valve_decision: ValveDecision,
+    ) -> Mt5ExecutionResult:
+        """AMEND_STOP is quote-truth checked (anti-stop-hunt); REDUCE/CLOSE always reach the venue.
+
+        Strictly refuses risk-increasing actions (OPEN/ADD) at router, valve clearance, and venue sink (Finding [10]).
+        """
+        if isinstance(order, RiskIncreasingOrderIntent):
+            raise ContractError("execute_management refuses RiskIncreasingOrderIntent (OPEN/ADD); use execute_open")
+        if isinstance(order, RiskReducingOrderIntent):
+            order = order.order
+        if not isinstance(order, OrderIntent):
+            raise ContractError("execute_management requires a management OrderIntent (AMEND_STOP, REDUCE, or CLOSE)")
+        if order.kind in RISK_INCREASING_ACTION_KINDS or order.kind not in MANAGEMENT_ACTION_KINDS:
+            raise ContractError(
+                f"execute_management refuses risk-increasing/non-management action {order.kind.value!r}; use execute_open"
+            )
+        require_valve_clearance(
+            order,
+            valve_decision,
+            expected_weights_sha256=self._valve_gate.weights_sha256,
+            now=self._clock(),
+            require_risk_reducing=True,
+        )
         venue = self._venues.get(broker_id)
         if venue is None:
             raise Mt5TransportError(f"{broker_id} is not connected")
         if not isinstance(venue, Mt5PaperBrokerVenue):
-            return venue.execute(order, valve_decision=valve_decision)
+            return venue.execute(
+                order,
+                valve_decision=valve_decision,
+                allowed_actions=MANAGEMENT_ACTION_KINDS,
+                require_risk_reducing=True,
+            )
         if order.kind is ActionKind.AMEND_STOP:
             if order.symbol in INDEX_INSTRUMENTS:
-                idx_oracle, idx_ref = self._index_reference_quotes(order.symbol)
+                idx_oracle, idx_ref = self._index_reference_quotes(order.symbol, target_broker_id=broker_id)
                 guard = idx_oracle.guard(reference=idx_ref)
             else:
                 guard = self.oracle().guard()
         else:
             guard = None
-        return venue.execute(order, valve_decision=valve_decision, quote_guard=guard)
+        return venue.execute(
+            order,
+            valve_decision=valve_decision,
+            quote_guard=guard,
+            allowed_actions=MANAGEMENT_ACTION_KINDS,
+            require_risk_reducing=True,
+        )
 
     def detect_frozen_positions(self, broker_id: str) -> tuple[Mt5Position, ...] | None:
         """Return the last known positions if ``broker_id``'s terminal is unreachable, else ``None``."""

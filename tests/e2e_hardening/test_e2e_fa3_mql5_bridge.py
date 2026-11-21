@@ -219,7 +219,22 @@ class Mql5BridgeE2ETests(unittest.TestCase):
                 valve_decision_sha256="c" * 64,
             )
             signed_req = sign_spool_valve_admission(transport.prepare_request(req), spool_dir=spool_dir)
-            rcpt = transport.send_order(signed_req)
+            _g_rt = load_default_forex_valve_gate()
+            from datetime import datetime as _dt, timezone as _tz
+            _now_rt = _dt.now(_tz.utc)
+            _prop_rt = build_valve_proposal(
+                order_id="req-rt-01", action_ref="act-req-rt-01", quantity=D("10000"),
+                limit_price=None, stop_price=D("1.09500"), take_profit_price=D("1.11000"),
+                observed_at=_now_rt,
+            )
+            _dec_rt = _g_rt.require_admissible(_prop_rt, current_view=default_view(), policy=default_policy(), now=_now_rt)
+            _grant_rt = _g_rt.issue_order_grant(
+                _dec_rt, broker_id=BROKER_HUGOSWAY_MT5, account_id="7001234", server="Hugosway-Demo",
+                execution_mode="DEMO", action_kind="OPEN", symbol="EURUSD", side=Side.BUY,
+                volume=D("0.10"), stop_loss=D("1.09500"), take_profit=D("1.11000"),
+                order_action_ref="act-req-rt-01", order_quantity_units=D("10000"), now=_now_rt,
+            )
+            rcpt = transport.send_order(signed_req, valve_grant=_grant_rt)
             self.assertTrue(rcpt.accepted)
             self.assertEqual(rcpt.status, "FILLED")
             self.assertEqual(rcpt.retcode, 10009)
@@ -271,7 +286,7 @@ class Mql5BridgeE2ETests(unittest.TestCase):
                 order_id=order.order_id,
                 action_ref=order.action_ref,
                 quantity=order.quantity_units,
-                limit_price=D("1.10010"),
+                limit_price=None,
                 stop_price=order.stop_price,
                 take_profit_price=order.take_profit_price,
             )
@@ -320,7 +335,22 @@ class Mql5BridgeE2ETests(unittest.TestCase):
                 valve_decision_sha256="d" * 64,
             )
             signed_req1 = sign_spool_valve_admission(transport.prepare_request(req1), spool_dir=spool_dir)
-            rcpt1 = transport.send_order(signed_req1)
+            _g_n1 = load_default_forex_valve_gate()
+            from datetime import datetime as _dt, timezone as _tz
+            _now_n1 = _dt.now(_tz.utc)
+            _prop_n1 = build_valve_proposal(
+                order_id="req-nonce-01", action_ref="act-req-nonce-01", quantity=D("10000"),
+                limit_price=None, stop_price=D("1.09500"), take_profit_price=None,
+                observed_at=_now_n1,
+            )
+            _dec_n1 = _g_n1.require_admissible(_prop_n1, current_view=default_view(), policy=default_policy(), now=_now_n1)
+            _grant_n1 = _g_n1.issue_order_grant(
+                _dec_n1, broker_id=BROKER_HUGOSWAY_MT5, account_id="7001234", server="Hugosway-Demo",
+                execution_mode="DEMO", action_kind="OPEN", symbol="EURUSD", side=Side.BUY,
+                volume=D("0.10"), stop_loss=D("1.09500"), take_profit=None,
+                order_action_ref="act-req-nonce-01", order_quantity_units=D("10000"), now=_now_n1,
+            )
+            rcpt1 = transport.send_order(signed_req1, valve_grant=_grant_n1)
             self.assertTrue(rcpt1.accepted)
 
             key_hex = (Path(td) / ".spool_hmac.key").read_text(encoding="ascii").strip()

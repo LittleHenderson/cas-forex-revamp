@@ -72,6 +72,11 @@ from cas_forex_revamp.operator.decisions import OperatorSession
 from .faults import FaultSchedule
 from .fixtures import VenueScenario
 from .sqlite_venue import JournalCheckpoint, PRICE_QUANTUM, SQLiteVenue, VenueStorageError
+from cas_forex_revamp.valve.tks_meta_valve_controller import (
+    ValveGrantError,
+    ValveOrderGrant,
+    verify_and_consume_valve_order_grant,
+)
 from .live_auth_ticket import (
     ENV_LIVE_AUTH_KEY_FILE,
     ENV_LIVE_AUTH_TICKET_FILE,
@@ -80,6 +85,7 @@ from .live_auth_ticket import (
     LiveAuthorizationError,
     build_live_authorization_context,
     verify_live_environ_authorization,
+    verify_live_environ_authorization_context,
 )
 from .live_market_stream import (
     ALLOWED_PUBLIC_FEED_HOSTS,
@@ -1950,14 +1956,16 @@ class OandaPracticePaperClient:
                 identifier(raw_acct, "oanda_account_id")
                 if self.execution_mode == EXECUTION_MODE_LIVE:
                     try:
-                        verified_ticket = verify_live_environ_authorization(
+                        _, ctx = verify_live_environ_authorization_context(
                             environ,
                             expected_broker_id="OANDA_LIVE",
                             expected_account_login=raw_acct,
                             expected_server=ALLOWED_OANDA_LIVE_HOST,
+                            live_arm_phrase=live_arm_phrase,
+                            require_arm_phrase=True,
                             now=self._clock(),
                         )
-                        self._live_auth_context = build_live_authorization_context(verified_ticket)
+                        self._live_auth_context = ctx
                     except LiveAuthTicketError as exc:
                         raise LiveBrokerEndpointForbiddenError(f"OANDA_LIVE_TICKET_MISMATCH: {exc}") from None
                 self._secret = _RedactedSecret(raw_tok)
@@ -1989,29 +1997,41 @@ class OandaPracticePaperClient:
     def live_auth_context(self) -> LiveAuthorizationContext | None:
         return self._live_auth_context
 
+    @property
+    def broker_id(self) -> str:
+        return "OANDA_LIVE" if self.execution_mode == EXECUTION_MODE_LIVE else "OANDA_PRACTICE"
+
+    @property
+    def server_host(self) -> str:
+        return (urllib.parse.urlsplit(self.base_url).hostname or "").strip().lower()
+
     def refresh_live_authorization(
         self,
         environ: Mapping[str, str],
         *,
+        live_arm_phrase: str | None = None,
         now: datetime | None = None,
     ) -> LiveAuthorizationContext:
         """Re-verify a freshly issued LIVE authorization ticket for an active OANDA LIVE client."""
         if self.execution_mode != EXECUTION_MODE_LIVE or self._account_id is None:
             raise LiveAuthorizationError("refresh_live_authorization requires an active OANDA LIVE client")
         check_now = self._clock() if now is None else utc_time(now, "now")
-        verified_ticket = verify_live_environ_authorization(
+        _, ctx = verify_live_environ_authorization_context(
             environ,
             expected_broker_id="OANDA_LIVE",
             expected_account_login=self._account_id,
             expected_server=ALLOWED_OANDA_LIVE_HOST,
+            live_arm_phrase=live_arm_phrase,
+            require_arm_phrase=True,
             now=check_now,
         )
-        ctx = build_live_authorization_context(verified_ticket)
         ctx.assert_valid_at(
             check_now,
             expected_broker_id="OANDA_LIVE",
             expected_account_id=self._account_id,
             expected_server=ALLOWED_OANDA_LIVE_HOST,
+            require_arm_phrase=True,
+            reverify_ticket=True,
         )
         self._live_auth_context = ctx
         return ctx
@@ -2022,11 +2042,18 @@ class OandaPracticePaperClient:
         if self._live_auth_context is None:
             raise LiveAuthorizationError("OANDA LIVE mutation refused: missing verified LiveAuthorizationContext")
         check_now = self._clock() if now is None else utc_time(now, "now")
+        self._live_auth_context.verify_provenance(
+            now=check_now,
+            reverify_ticket=True,
+            require_arm_phrase=True,
+        )
         self._live_auth_context.assert_valid_at(
             check_now,
             expected_broker_id="OANDA_LIVE",
             expected_account_id=self._account_id,
             expected_server=ALLOWED_OANDA_LIVE_HOST,
+            require_arm_phrase=True,
+            reverify_ticket=True,
         )
 
     def bind_mutation_journal(self, journal: OandaMutationJournal) -> None:
@@ -2126,9 +2153,12 @@ class OandaPracticePaperClient:
         *,
         body_obj: dict[str, Any] | None = None,
         now: datetime | None = None,
+        _valve_grant_verified: bool = False,
     ) -> tuple[str, bytes]:
         secret, _ = self._require_active()
         if str(method).strip().upper() in ("POST", "PUT", "PATCH", "DELETE"):
+            if not _valve_grant_verified:
+                raise ValveGrantError("OANDA raw mutation HTTP request refused without verified ValveOrderGrant")
             self._assert_live_mutation_authorized(now=now)
         full_url = self.validate_mode_url(
             f"{self.base_url}/{relative_path.lstrip('/')}", execution_mode=self.execution_mode
@@ -2249,6 +2279,7 @@ class OandaPracticePaperClient:
         stop_loss_price: Decimal | None = None,
         take_profit_price: Decimal | None = None,
         price_bound: Decimal | None = None,
+        valve_grant: ValveOrderGrant | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         _, acct_id = self._require_active()
@@ -2283,6 +2314,22 @@ class OandaPracticePaperClient:
             order_spec["takeProfitOnFill"] = {"price": decimal_text(tp_dec)}
         ts_now = self._clock() if now is None else utc_time(now, "now")
         self._assert_live_mutation_authorized(now=ts_now)
+        verify_and_consume_valve_order_grant(
+            valve_grant,
+            broker_id=self.broker_id,
+            account_id=acct_id,
+            server=self.server_host,
+            execution_mode=self.execution_mode,
+            action_kind="OPEN",
+            symbol=norm,
+            side=side.value,
+            volume=units,
+            stop_loss=sl_dec,
+            take_profit=tp_dec,
+            position_ticket=None,
+            now=ts_now,
+            require_risk_reducing=False,
+        )
         now_utc_str = _format_utc_micros(ts_now, "observed_at")
         rel_path = f"accounts/{acct_id}/orders"
         pre_cursor = self._last_transaction_id
@@ -2298,7 +2345,13 @@ class OandaPracticePaperClient:
             pre_dispatch_last_tx_id=pre_cursor,
         )
         try:
-            _, raw = self._request("POST", rel_path, body_obj={"order": order_spec}, now=ts_now)
+            _, raw = self._request(
+                "POST",
+                rel_path,
+                body_obj={"order": order_spec},
+                now=ts_now,
+                _valve_grant_verified=True,
+            )
             doc = _parse_external_wire_json(raw, label="oanda_practice_order")
             if type(doc) is not dict:
                 raise PaperBrokerTransportError("malformed OANDA practice order response")
@@ -2360,6 +2413,8 @@ class OandaPracticePaperClient:
         trade_id: str,
         stop_loss_price: Decimal | None = None,
         take_profit_price: Decimal | None = None,
+        symbol: str | None = None,
+        valve_grant: ValveOrderGrant | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Update resting trade-level SL/TP via OANDA v20 ``PUT accounts/{id}/trades/{trade}/orders``."""
@@ -2376,6 +2431,23 @@ class OandaPracticePaperClient:
             body["takeProfit"] = {"price": decimal_text(tp_dec), "timeInForce": "GTC"}
         ts_now = self._clock() if now is None else utc_time(now, "now")
         self._assert_live_mutation_authorized(now=ts_now)
+        norm_sym = symbol.strip().upper() if isinstance(symbol, str) and symbol.strip() else f"TRADE_{tid}"
+        verify_and_consume_valve_order_grant(
+            valve_grant,
+            broker_id=self.broker_id,
+            account_id=acct_id,
+            server=self.server_host,
+            execution_mode=self.execution_mode,
+            action_kind="AMEND_STOP",
+            symbol=norm_sym,
+            side=None,
+            volume=None,
+            stop_loss=sl_dec,
+            take_profit=tp_dec,
+            position_ticket=tid,
+            now=ts_now,
+            require_risk_reducing=True,
+        )
         now_utc_str = _format_utc_micros(ts_now, "observed_at")
         ext_id = "casfx-" + sha256(f"AMEND|{acct_id}|{tid}|{sl_dec}|{tp_dec}|{now_utc_str}".encode("utf-8")).hexdigest()[:24]
         if "stopLoss" in body:
@@ -2387,7 +2459,7 @@ class OandaPracticePaperClient:
         self._mutation_journal.record_pending(
             client_ext_id=ext_id,
             account_id=acct_id,
-            symbol=f"TRADE_{tid}",
+            symbol=norm_sym,
             action_kind="AMEND_STOP",
             method="PUT",
             relative_path=rel_path,
@@ -2397,7 +2469,13 @@ class OandaPracticePaperClient:
             trade_id=tid,
         )
         try:
-            _, raw = self._request("PUT", rel_path, body_obj=body, now=ts_now)
+            _, raw = self._request(
+                "PUT",
+                rel_path,
+                body_obj=body,
+                now=ts_now,
+                _valve_grant_verified=True,
+            )
             doc = _parse_external_wire_json(raw, label="oanda_trade_amend")
             if type(doc) is not dict:
                 raise PaperBrokerTransportError("malformed OANDA trade protection amend response")
@@ -2512,6 +2590,7 @@ class OandaPracticePaperClient:
         client_order_id: str | None = None,
         symbol: str | None = None,
         action_kind: str | None = None,
+        valve_grant: ValveOrderGrant | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Durable, journaled OANDA v20 trade full CLOSE or partial REDUCE via ``PUT accounts/{id}/trades/{tid}/close``."""
@@ -2529,6 +2608,23 @@ class OandaPracticePaperClient:
             raise ContractError(f"close_trade action_kind must be CLOSE or REDUCE, got {eff_action!r}")
         ts_now = self._clock() if now is None else utc_time(now, "now")
         self._assert_live_mutation_authorized(now=ts_now)
+        norm_sym = symbol.strip().upper() if isinstance(symbol, str) and symbol.strip() else f"TRADE_{tid}"
+        verify_and_consume_valve_order_grant(
+            valve_grant,
+            broker_id=self.broker_id,
+            account_id=acct_id,
+            server=self.server_host,
+            execution_mode=self.execution_mode,
+            action_kind=eff_action,
+            symbol=norm_sym,
+            side=None,
+            volume=units_field,
+            stop_loss=None,
+            take_profit=None,
+            position_ticket=tid,
+            now=ts_now,
+            require_risk_reducing=True,
+        )
         now_utc_str = _format_utc_micros(ts_now, "observed_at")
         if client_order_id is not None:
             ext_id = identifier(client_order_id, "client_order_id")
@@ -2536,7 +2632,6 @@ class OandaPracticePaperClient:
             ext_id = "casfx-" + sha256(
                 f"{eff_action}|{acct_id}|{tid}|{units_field}|{now_utc_str}".encode("utf-8")
             ).hexdigest()[:24]
-        norm_sym = symbol.strip().upper() if isinstance(symbol, str) and symbol.strip() else f"TRADE_{tid}"
         rel_path = f"accounts/{acct_id}/trades/{tid}/close"
         pre_cursor = self._last_transaction_id
         self._mutation_journal.record_pending(
@@ -2552,7 +2647,13 @@ class OandaPracticePaperClient:
             trade_id=tid,
         )
         try:
-            _, raw = self._request("PUT", rel_path, body_obj={"units": units_field}, now=ts_now)
+            _, raw = self._request(
+                "PUT",
+                rel_path,
+                body_obj={"units": units_field},
+                now=ts_now,
+                _valve_grant_verified=True,
+            )
             doc = _parse_external_wire_json(raw, label="oanda_trade_close")
             if type(doc) is not dict:
                 raise PaperBrokerTransportError("malformed OANDA trade close response")

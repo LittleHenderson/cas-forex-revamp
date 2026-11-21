@@ -397,7 +397,21 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
         gate = load_default_forex_valve_gate()
         with tempfile.TemporaryDirectory() as tmp:
             rig = _Rig(tmp)
-            router = rig.dual_router(gate=gate, index_reference_source=lambda syms: {s: QUOTES_18[s] for s in syms if s in QUOTES_18})
+            router = rig.dual_router(
+                gate=gate,
+                index_reference_source=lambda syms: {
+                    s: {
+                        "bid": QUOTES_18[s][0],
+                        "ask": QUOTES_18[s][1],
+                        "source_provider": "TEST_PUBLIC_INDEX",
+                        "source_broker_id": None,
+                        "is_independent_public": True,
+                        "observed_at": T0.isoformat().replace("+00:00", "Z"),
+                    }
+                    for s in syms
+                    if s in QUOTES_18
+                },
+            )
             oracle = router.oracle()
             verdicts = oracle.verify_cross_venue_index_quotes(
                 symbol="NAS100",
@@ -1058,7 +1072,8 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
             srv_p7_b = LoopbackCockpitServer(repo_root=Path(__file__).resolve().parents[2], token_file=tok_path)
             srv_p7_b.start()
             try:
-                self.assertEqual(srv_p7_b.auth_token, tok1)
+                self.assertNotEqual(srv_p7_b.auth_token, tok1)
+                self.assertEqual(tok_path.read_text(encoding="utf-8").strip(), srv_p7_b.auth_token)
             finally:
                 srv_p7_b.stop()
 

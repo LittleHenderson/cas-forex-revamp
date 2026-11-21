@@ -212,7 +212,7 @@ class Tier4WorkflowsE2ETests(unittest.TestCase):
                 stop_price=D("1.09500"),
                 take_profit_price=D("1.11000"),
             )
-            prop = build_valve_proposal(order_id=order.order_id, action_ref=order.action_ref, stop_price=order.stop_price, take_profit_price=order.take_profit_price)
+            prop = build_valve_proposal(order_id=order.order_id, action_ref=order.action_ref, limit_price=None, stop_price=order.stop_price, take_profit_price=order.take_profit_price)
             dec = rig.gate.require_admissible(prop, current_view=default_view(), policy=default_policy(), now=T0 + timedelta(seconds=1))
             res = router.execute_open(order, valve_decision=dec)
             self.assertEqual(res.executed_on, BROKER_HUGOSWAY_MT5)

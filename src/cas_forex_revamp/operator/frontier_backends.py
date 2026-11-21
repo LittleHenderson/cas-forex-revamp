@@ -1071,6 +1071,40 @@ class _UnixSupervisedHttpConnection(http.client.HTTPConnection):
         self.sock = sock
 
 
+class _LoopbackSupervisedHttpConnection(http.client.HTTPConnection):
+    """Direct 127.0.0.1 TCP connection ignoring all ambient HTTP_PROXY/ALL_PROXY variables (Finding [14])."""
+
+    def __init__(
+        self,
+        port: int,
+        *,
+        supervised_binding: SupervisedOllamaBinding,
+        timeout: float,
+    ) -> None:
+        super().__init__("127.0.0.1", port=port, timeout=timeout)
+        self._target_port = int(port)
+        self._supervised_binding = supervised_binding
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect(("127.0.0.1", self._target_port))
+            peer = sock.getpeername()
+            peer_ip = str(peer[0]) if isinstance(peer, tuple) and len(peer) >= 2 else ""
+            peer_port = int(peer[1]) if isinstance(peer, tuple) and len(peer) >= 2 else -1
+            if peer_ip != "127.0.0.1" or peer_port != self._target_port:
+                raise FrontierTransportError(
+                    f"OLLAMA_NON_LOOPBACK_PEER_REFUSED: connected peer {peer_ip}:{peer_port} != 127.0.0.1:{self._target_port}",
+                    retryable=False,
+                )
+            self._supervised_binding.verify_binding()
+        except Exception:
+            sock.close()
+            raise
+        self.sock = sock
+
+
 def default_ollama_loopback_post(
     url: str,
     headers: dict[str, str],
@@ -1080,7 +1114,7 @@ def default_ollama_loopback_post(
     *,
     supervised_binding: SupervisedOllamaBinding | None = None,
 ) -> tuple[int, bytes]:
-    """Execute one authenticated POST strictly to a verified SupervisedOllamaBinding endpoint."""
+    """Execute one authenticated POST strictly to a verified SupervisedOllamaBinding endpoint (zero proxy leak)."""
     if supervised_binding is None:
         raise FrontierConfigurationError(
             "OLLAMA_UNSUPERVISED_ENDPOINT_FORBIDDEN: unauthenticated 127.0.0.1:11434 fallback is forbidden; SupervisedOllamaBinding required"
@@ -1117,34 +1151,53 @@ def default_ollama_loopback_post(
         return status, raw
 
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None or int(parsed.port) == 11434 or parsed.path != "/api/chat":
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.port is None
+        or int(parsed.port) == 11434
+        or parsed.path != "/api/chat"
+        or parsed.query
+        or parsed.fragment
+    ):
+        req_headers.clear()
         raise FrontierConfigurationError(
             "Ollama fallback requires a dedicated supervised loopback endpoint (port 11434 forbidden)"
         )
-    opener = urllib.request.build_opener(_NoRedirectHandler())
-    req = urllib.request.Request(url, data=body, headers=req_headers, method="POST")
+    tcp_conn = _LoopbackSupervisedHttpConnection(
+        int(parsed.port),
+        supervised_binding=supervised_binding,
+        timeout=timeout_seconds,
+    )
     try:
-        with opener.open(req, timeout=timeout_seconds) as resp:  # nosec B310: verified dedicated supervised 127.0.0.1 endpoint with per-launch auth secret
-            status = int(getattr(resp, "status", 200))
-            raw = resp.read(max_wire_bytes + 1)
-    except urllib.error.HTTPError as exc:
-        code = int(exc.code)
-        raise FrontierTransportError(
-            f"Ollama fallback HTTP status {code}",
-            status_code=code,
-            retryable=(code == 429 or 500 <= code <= 599),
-        ) from None
+        tcp_conn.request("POST", "/api/chat", body=body, headers=req_headers)
+        resp = tcp_conn.getresponse()
+        status = int(resp.status)
+        if 300 <= status < 400:
+            raise FrontierTransportError(
+                f"Ollama supervised loopback redirect ({status}) is forbidden",
+                status_code=status,
+                retryable=False,
+            )
+        raw = resp.read(max_wire_bytes + 1)
+        if status != 200:
+            raise FrontierTransportError(
+                f"Ollama fallback HTTP status {status}",
+                status_code=status,
+                retryable=(status == 429 or 500 <= status <= 599),
+            )
+    except FrontierConfigurationError:
+        raise
     except FrontierTransportError:
         raise
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (TimeoutError, OSError, http.client.HTTPException) as exc:
         raise FrontierTransportError(
             f"Ollama fallback unavailable: {type(exc).__name__}",
             retryable=True,
         ) from None
     finally:
         req_headers.clear()
-        req.headers.clear()
-        req.unredirected_hdrs.clear()
+        tcp_conn.close()
     if len(raw) > max_wire_bytes:
         raise FrontierTransportError("Ollama fallback response exceeded byte limit")
     return status, raw
@@ -3141,6 +3194,7 @@ class FrontierModelRegistry:
         audio_mime_type: str | None = None,
         execution_gate: DurableModelExecutionGate | None = None,
         preauthorized_reservation_id: str | None = None,
+        epoch_guard: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Read-only Explainer helper routed through DurableModelExecutionGate with zero trading authority."""
         if not isinstance(question, str):
@@ -3182,6 +3236,18 @@ class FrontierModelRegistry:
         elif len(clean_q) > 500:
             raise FrontierConfigurationError("question must be 0..500 characters when audio_base64 is attached")
 
+        _epoch_abort_exc: list[BaseException | None] = [None]
+
+        def _check_epoch_guard() -> None:
+            if epoch_guard is None:
+                return
+            try:
+                epoch_guard()
+            except BaseException as exc_ep:
+                _epoch_abort_exc[0] = exc_ep
+                raise
+
+        _check_epoch_guard()
         eff_gate = execution_gate if isinstance(execution_gate, DurableModelExecutionGate) else self._execution_gate
         aux_route = "transcription" if clean_audio_b64 is not None else "explainer"
         preauth_slot: list[str | None] = [
@@ -3271,6 +3337,7 @@ class FrontierModelRegistry:
                 )
                 last_neon_res[0] = res_id
                 try:
+                    _check_epoch_guard()
                     try:
                         if self._http_post is not None:
                             st, resp_raw = self._http_post(url, dict(req_hdrs), body_bytes, t_out, MAX_EXPLAINER_RESPONSE_BYTES)
@@ -3381,6 +3448,8 @@ class FrontierModelRegistry:
             except OperatorUnavailable:
                 raise
             except Exception as exc_neon:
+                if _epoch_abort_exc[0] is not None:
+                    raise _epoch_abort_exc[0]
                 fallback_reason = type(exc_neon).__name__
             finally:
                 if last_neon_res[0] is not None and eff_gate is not None:
@@ -3458,6 +3527,7 @@ class FrontierModelRegistry:
                     supervised_ollama=self._supervised_ollama if chosen_entry.provider == "ollama" else None,
                 )
                 try:
+                    _check_epoch_guard()
                     try:
                         if self._http_post is not None and chosen_entry.provider != "ollama":
                             st, resp_raw = self._http_post(u, dict(hdrs), b, t_out, MAX_PROVIDER_WIRE_BYTES)
@@ -3576,6 +3646,8 @@ class FrontierModelRegistry:
             except OperatorUnavailable:
                 raise
             except Exception as exc_exp:
+                if _epoch_abort_exc[0] is not None:
+                    raise _epoch_abort_exc[0]
                 fallback_reason = type(exc_exp).__name__
             finally:
                 if last_exp_res[0] is not None and eff_gate is not None:
@@ -3608,6 +3680,7 @@ class FrontierModelRegistry:
         voice_name: str = "Kore",
         execution_gate: DurableModelExecutionGate | None = None,
         preauthorized_reservation_id: str | None = None,
+        epoch_guard: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Synthesize spoken Explainer audio via Gemini TTS through DurableModelExecutionGate."""
         if not isinstance(text, str):
@@ -3630,6 +3703,18 @@ class FrontierModelRegistry:
                 "reason": "GEMINI_API_KEY_UNCONFIGURED",
             })
 
+        _tts_epoch_abort: list[BaseException | None] = [None]
+
+        def _check_tts_epoch_guard() -> None:
+            if epoch_guard is None:
+                return
+            try:
+                epoch_guard()
+            except BaseException as exc_ep:
+                _tts_epoch_abort[0] = exc_ep
+                raise
+
+        _check_tts_epoch_guard()
         eff_gate = execution_gate if isinstance(execution_gate, DurableModelExecutionGate) else self._execution_gate
         preauth_slot: list[str | None] = [
             preauthorized_reservation_id.strip()
@@ -3674,6 +3759,7 @@ class FrontierModelRegistry:
             last_tts_res: list[str | None] = [None]
 
             def _attempt_tts(t_out: float) -> tuple[int, bytes]:
+                _check_tts_epoch_guard()
                 req_hdrs = dict(headers)
                 res_id: str | None = None
                 if eff_gate is not None:
@@ -3812,6 +3898,8 @@ class FrontierModelRegistry:
             except OperatorUnavailable:
                 raise
             except Exception as exc_tts:
+                if _tts_epoch_abort[0] is not None:
+                    raise _tts_epoch_abort[0]
                 safe_reason = type(exc_tts).__name__
             finally:
                 if last_tts_res[0] is not None and eff_gate is not None:

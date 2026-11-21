@@ -71,10 +71,158 @@ class _SessionRevokedError(Exception):
     """Raised when a session epoch is revoked prior to commit."""
 
 
+class _PreAuthBodyTimeoutError(TimeoutError):
+    """Raised when a pre-authenticated request body exceeds its monotonic wall-clock deadline."""
+
+
+class _PreAuthBodyTooLargeError(ValueError):
+    """Raised when a pre-authenticated request body exceeds the strict 4096-byte budget."""
+
+
+class RotationPendingDrainError(ContractError):
+    """Raised when a revoked-epoch commit lease is still active past the rotation drain window."""
+
+    def __init__(self, message: str, *, payload: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.status_payload = dict(payload)
+
+
+class _EpochGuardedOfframpClient:
+    """Enforce fresh session-epoch verification immediately before external offramp conversion/withdrawal calls (Finding [12])."""
+
+    def __init__(self, inner: Any, epoch_guard: Callable[[], None]) -> None:
+        self._inner = inner
+        self._epoch_guard = epoch_guard
+
+    def convert_to_usd(self, *args: Any, **kwargs: Any) -> Any:
+        self._epoch_guard()
+        return self._inner.convert_to_usd(*args, **kwargs)
+
+    def withdraw_usd_to_linked_bank_ach(self, *args: Any, **kwargs: Any) -> Any:
+        self._epoch_guard()
+        return self._inner.withdraw_usd_to_linked_bank_ach(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _EpochGuardedModelGate:
+    """Enforce fresh session-epoch verification immediately before external auxiliary model/TTS dispatch (Finding [12])."""
+
+    def __init__(self, inner: Any, epoch_guard: Callable[[], None]) -> None:
+        self._inner = inner
+        self._epoch_guard = epoch_guard
+
+    def authorize_auxiliary_call(self, *args: Any, **kwargs: Any) -> Any:
+        self._epoch_guard()
+        return self._inner.authorize_auxiliary_call(*args, **kwargs)
+
+    def admit_scout_call(self, *args: Any, **kwargs: Any) -> Any:
+        self._epoch_guard()
+        return self._inner.admit_scout_call(*args, **kwargs)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        self._epoch_guard()
+        return self._inner(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+LIVE_DIAL_CONFIRM_PHRASE = "CONFIRM_LIVE_HIGH_RISK_DIAL"
+
+
+def build_aggression_high_risk_confirmation(
+    scope_id: str,
+    action: str,
+    *,
+    tier_id: str | None = None,
+    target_bps: int | None = None,
+    ai_ceiling_bps: int | None = None,
+    preset: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Build canonical exact-target confirmation binding for LIVE/unknown aggression-dial mutations (Finding [17])."""
+    clean_scope = str(scope_id or "dual-shield-barbell").strip() or "dual-shield-barbell"
+    clean_action = str(action or "").strip().upper()
+    clean_tier = str(tier_id).strip().upper() if tier_id is not None and str(tier_id).strip() else None
+    clean_preset = str(preset).strip().upper() if preset is not None and str(preset).strip() else None
+    clean_bps = int(target_bps) if target_bps is not None else None
+    clean_ceil = int(ai_ceiling_bps) if ai_ceiling_bps is not None else None
+    phrase = (
+        f"{LIVE_DIAL_CONFIRM_PHRASE}|scope={clean_scope}|action={clean_action}"
+        f"|tier={clean_tier or '-'}|bps={clean_bps if clean_bps is not None else '-'}"
+        f"|ceiling={clean_ceil if clean_ceil is not None else '-'}|preset={clean_preset or '-'}"
+    )
+    doc: dict[str, Any] = {
+        "phrase": LIVE_DIAL_CONFIRM_PHRASE,
+        "scope": clean_scope,
+        "action": clean_action,
+        "tier_id": clean_tier,
+        "target_bps": clean_bps,
+        "ai_ceiling_bps": clean_ceil,
+        "preset": clean_preset,
+    }
+    return doc, phrase
+
+
+def _verify_bound_aggression_confirmation(
+    body: Mapping[str, Any],
+    *,
+    expected_doc: Mapping[str, Any],
+    expected_phrase: str,
+) -> bool:
+    raw_phrase = body.get("confirmation_phrase")
+    if isinstance(raw_phrase, str) and raw_phrase.strip():
+        return hmac.compare_digest(raw_phrase.strip().encode("utf-8"), expected_phrase.encode("utf-8"))
+    raw_obj = body.get("high_risk_confirmation")
+    if not isinstance(raw_obj, Mapping):
+        return False
+    if str(raw_obj.get("phrase") or "").strip() != LIVE_DIAL_CONFIRM_PHRASE:
+        return False
+    if str(raw_obj.get("scope") or "").strip() != str(expected_doc["scope"]):
+        return False
+    if str(raw_obj.get("action") or "").strip().upper() != str(expected_doc["action"]):
+        return False
+    exp_tier = expected_doc.get("tier_id")
+    got_tier_raw = raw_obj.get("tier_id")
+    got_tier = str(got_tier_raw).strip().upper() if got_tier_raw is not None and str(got_tier_raw).strip() else None
+    if got_tier != exp_tier:
+        return False
+    exp_preset = expected_doc.get("preset")
+    got_preset_raw = raw_obj.get("preset")
+    got_preset = (
+        str(got_preset_raw).strip().upper()
+        if got_preset_raw is not None and str(got_preset_raw).strip()
+        else None
+    )
+    if got_preset != exp_preset:
+        return False
+    exp_bps = expected_doc.get("target_bps")
+    got_bps = raw_obj.get("target_bps", raw_obj.get("bps"))
+    if exp_bps is None:
+        if got_bps is not None:
+            return False
+    else:
+        if type(got_bps) is bool or not isinstance(got_bps, int) or int(got_bps) != int(exp_bps):
+            return False
+    exp_ceil = expected_doc.get("ai_ceiling_bps")
+    got_ceil = raw_obj.get("ai_ceiling_bps", raw_obj.get("ceiling_bps"))
+    if exp_ceil is None:
+        if got_ceil is not None:
+            return False
+    else:
+        if type(got_ceil) is bool or not isinstance(got_ceil, int) or int(got_ceil) != int(exp_ceil):
+            return False
+    return True
+
+
 _COCKPIT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
 _PAIR_CODE_RE = re.compile(r"^pair-[A-Za-z0-9_-]{24,80}$")
 MAX_HTTP_HEADER_BYTES = 16384
 MAX_HTTP_HEADER_COUNT = 64
+MAX_PRE_AUTH_BODY_BYTES = 4096
+DEFAULT_PRE_AUTH_BODY_DEADLINE_SECONDS = 3.0
+DEFAULT_MAX_PRE_AUTH_BODY_READERS = 2
 
 SESSION_SCOPE_OWNER_FULL = "OWNER_FULL_CONTROL"
 SESSION_SCOPE_DEVICE_READ_EXPLAINER = "DEVICE_READ_AND_EXPLAINER"
@@ -378,6 +526,7 @@ def _build_mt5_index_snapshot_from_router(
     from cas_forex_revamp.venue.live_market_stream import INDEX_INSTRUMENTS
 
     mt5_q: dict[str, tuple[Any, Any]] = {}
+    mt5_src_broker: dict[str, str] = {}
     for broker_id, venue in router.venues.items():
         if hasattr(venue, "_transport") and venue.account is not None:
             got_tick = False
@@ -385,6 +534,7 @@ def _build_mt5_index_snapshot_from_router(
                 try:
                     tk = venue._transport.symbol_tick(sym)
                     mt5_q[sym] = (tk.bid, tk.ask)
+                    mt5_src_broker[sym] = str(broker_id)
                     got_tick = True
                 except (ContractError, OSError) as exc_sym:
                     print(f"[ai-fast] Tick skipped for {sym}: {type(exc_sym).__name__}")
@@ -435,21 +585,118 @@ def _build_mt5_index_snapshot_from_router(
                 "spread_points": _dec_txt(a_px - b_px),
                 "observed_at": obs_iso,
                 "feed_mode": "MT5_DIRECT_SPOOL_50MS",
+                "source_provider": f"MT5_BROKER:{mt5_src_broker.get(sym_idx, 'MT5')}",
+                "source_broker_id": mt5_src_broker.get(sym_idx, "MT5"),
+                "is_independent_public": False,
                 "candles_m1": _roll_mt5_index_bars(p_m1, b_m1, mid_px, _dec_txt),
                 "candles_m5": _roll_mt5_index_bars(p_m5, b_m5, mid_px, _dec_txt),
                 "candles_h1": _roll_mt5_index_bars(p_h1, b_h1, mid_px, _dec_txt),
             })
     if not idx_rows:
         return None, mt5_q
+    unique_src = sorted(set(mt5_src_broker.values()))
+    top_broker = unique_src[0] if len(unique_src) == 1 else "MULTI_MT5"
     prev_seq = int(prev_stream.get("sequence", 0)) if isinstance(prev_stream, Mapping) else 0
     return {
         "schema": "cas-forex.index-stream/1",
         "sequence": prev_seq + 1,
         "observed_at": obs_iso,
         "feed_mode": "MT5_DIRECT_SPOOL_50MS",
+        "source_provider": "MT5_DIRECT_SPOOL_50MS",
+        "source_broker_id": top_broker,
+        "is_independent_public": False,
         "instruments": list(INDEX_INSTRUMENTS),
         "markets": idx_rows,
     }, mt5_q
+
+
+def stamp_public_index_provenance(doc: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate & stamp explicit independent-public provenance on PublicUsIndexFeedClient snapshots (Finding [5])."""
+    if not isinstance(doc, Mapping):
+        raise ContractError("public index stream must be a mapping")
+    feed_mode = str(doc.get("feed_mode") or "PUBLIC_US_INDEX_FEED").strip()
+    if (
+        "MT5" in feed_mode.upper()
+        or doc.get("is_independent_public") is False
+        or doc.get("source_broker_id") is not None
+    ):
+        raise ContractError("Refusing to label broker/MT5 index stream as independent public reference")
+    top_obs = str(doc.get("observed_at") or "").strip()
+    if not top_obs:
+        raise ContractError("public index stream missing observed_at")
+    src_prov = str(doc.get("source_provider") or feed_mode or "PUBLIC_US_INDEX_FEED").strip()
+    if "MT5" in src_prov.upper() or src_prov.upper() in ("HUGOSWAY_MT5", "LHFX_MT5"):
+        raise ContractError(f"Forbidden MT5 source_provider {src_prov!r} on public index stream")
+    out = dict(doc)
+    out["source_provider"] = src_prov
+    out["source_broker_id"] = None
+    out["is_independent_public"] = True
+    rows_out: list[dict[str, Any]] = []
+    for raw_row in doc.get("markets") or ():
+        if not isinstance(raw_row, Mapping):
+            continue
+        if (
+            raw_row.get("is_independent_public") is False
+            or raw_row.get("source_broker_id") is not None
+            or "MT5" in str(raw_row.get("feed_mode") or "").upper()
+        ):
+            raise ContractError("Refusing broker-derived row inside public index stream")
+        r_copy = dict(raw_row)
+        r_copy["source_provider"] = str(raw_row.get("source_provider") or src_prov)
+        r_copy["source_broker_id"] = None
+        r_copy["is_independent_public"] = True
+        r_copy["observed_at"] = str(raw_row.get("observed_at") or top_obs)
+        rows_out.append(r_copy)
+    out["markets"] = rows_out
+    return out
+
+
+def build_public_index_reference_map(
+    public_doc: Mapping[str, Any] | None,
+    symbols: Any,
+) -> dict[str, dict[str, Any]]:
+    """Extract provenance-preserving independent public index quotes; rejects any MT5/broker-derived data (Finding [5])."""
+    from cas_forex_revamp.contracts import parse_decimal as _parse_dec
+
+    if not isinstance(public_doc, Mapping):
+        return {}
+    if (
+        public_doc.get("is_independent_public") is not True
+        or public_doc.get("source_broker_id") is not None
+        or "MT5" in str(public_doc.get("feed_mode") or "").upper()
+    ):
+        return {}
+    top_obs = str(public_doc.get("observed_at") or "").strip()
+    top_prov = str(public_doc.get("source_provider") or public_doc.get("feed_mode") or "PUBLIC_US_INDEX_FEED").strip()
+    if not top_obs or "MT5" in top_prov.upper() or top_prov.upper() in ("HUGOSWAY_MT5", "LHFX_MT5"):
+        return {}
+    wanted = {str(s) for s in symbols}
+    out: dict[str, dict[str, Any]] = {}
+    for row in public_doc.get("markets") or ():
+        if not isinstance(row, Mapping):
+            continue
+        sym = str(row.get("pair") or "")
+        if sym not in wanted or "bid" not in row or "ask" not in row:
+            continue
+        if (
+            row.get("is_independent_public") is not True
+            or row.get("source_broker_id") is not None
+            or "MT5" in str(row.get("feed_mode") or "").upper()
+        ):
+            continue
+        row_prov = str(row.get("source_provider") or top_prov).strip()
+        row_obs = str(row.get("observed_at") or top_obs).strip()
+        if not row_obs or "MT5" in row_prov.upper() or row_prov.upper() in ("HUGOSWAY_MT5", "LHFX_MT5"):
+            continue
+        out[sym] = {
+            "bid": _parse_dec(str(row["bid"]), "bid"),
+            "ask": _parse_dec(str(row["ask"]), "ask"),
+            "source_provider": row_prov,
+            "source_broker_id": None,
+            "is_independent_public": True,
+            "observed_at": row_obs,
+        }
+    return out
 
 
 MAX_HTTP_RPC_BYTES = 262_144
@@ -617,6 +864,7 @@ class LoopbackCockpitServer:
         phase8_bridge: Any | None = None,
         owner_recovery: Any | None = None,
         model_execution_gate: Any | None = None,
+        auth_token: str | None = None,
         token_file: str | Path | None = None,
         public_origin: str | None = None,
         withdrawal_provider_verifier: Callable[[str, str], Mapping[str, Any]] | None = None,
@@ -624,6 +872,9 @@ class LoopbackCockpitServer:
         max_emergency_connections: int = 4,
         header_deadline_seconds: float = 3.0,
         pre_auth_timeout_seconds: float | None = None,
+        pre_auth_body_deadline_seconds: float = DEFAULT_PRE_AUTH_BODY_DEADLINE_SECONDS,
+        max_pre_auth_body_readers: int = DEFAULT_MAX_PRE_AUTH_BODY_READERS,
+        rotation_drain_timeout_seconds: float = 5.0,
         pre_auth_conn_rate_limit: int = 256,
         mono_clock: Callable[[], float] | None = None,
     ) -> None:
@@ -702,11 +953,21 @@ class LoopbackCockpitServer:
         self._max_ordinary_connections = max(1, int(max_ordinary_connections))
         self._max_emergency_connections = max(1, int(max_emergency_connections))
         eff_deadline = header_deadline_seconds if pre_auth_timeout_seconds is None else pre_auth_timeout_seconds
-        self._header_deadline_seconds = max(0.1, float(eff_deadline))
+        self._header_deadline_seconds = max(0.05, float(eff_deadline))
+        self._pre_auth_body_deadline_seconds = min(
+            DEFAULT_PRE_AUTH_BODY_DEADLINE_SECONDS, max(0.05, float(pre_auth_body_deadline_seconds))
+        )
+        self._max_pre_auth_body_readers = max(1, min(int(max_pre_auth_body_readers), max(1, self._max_ordinary_connections // 2)))
+        self._rotation_drain_timeout_seconds = max(0.0, float(rotation_drain_timeout_seconds))
         self._pre_auth_conn_rate_limit = max(1, int(pre_auth_conn_rate_limit))
         self._mono = mono_clock or time.monotonic
         self._auth_lock = threading.RLock()
         self._auth_cond = threading.Condition(self._auth_lock)
+        self._explicit_in_memory_auth_token: _CockpitSecret | None = None
+        if auth_token is not None:
+            if not isinstance(auth_token, str) or not auth_token.strip():
+                raise ContractError("auth_token must be a non-empty string when supplied")
+            self._explicit_in_memory_auth_token = _CockpitSecret(auth_token.strip())
         self._auth_secret: _CockpitSecret | None = None
         self._session_epoch: str | None = None
         self._revoked_epochs: set[str] = set()
@@ -715,6 +976,7 @@ class LoopbackCockpitServer:
         self._device_sessions: dict[str, _DeviceSessionRecord] = {}
         self._pair_exchange_attempts: dict[str, list[float]] = {}
         self._worker_sem = threading.BoundedSemaphore(self._max_ordinary_connections)
+        self._pre_auth_body_sem = threading.BoundedSemaphore(self._max_pre_auth_body_readers)
         self._emergency_sem = threading.BoundedSemaphore(self._max_emergency_connections)
         self._sse_sem = threading.BoundedSemaphore(4)
         self._sockets_lock = threading.Lock()
@@ -1009,6 +1271,19 @@ class LoopbackCockpitServer:
         with self._auth_cond:
             return self._verify_token_unlocked(bearer_token, captured_epoch, allow_device_scope=allow_device_scope)
 
+    def _assert_epoch_active(
+        self,
+        bearer_token: str | None,
+        captured_epoch: str,
+        *,
+        allow_device_scope: bool = False,
+    ) -> None:
+        """Atomic pre-effect epoch recheck aborting external side effects if session was rotated/revoked (Finding [12])."""
+        if not self._verify_commit_epoch(
+            bearer_token, captured_epoch, allow_device_scope=allow_device_scope
+        ):
+            raise _SessionRevokedError("session epoch revoked prior to external effect")
+
     @contextmanager
     def _commit_lease(
         self,
@@ -1018,7 +1293,7 @@ class LoopbackCockpitServer:
         hold_lock: bool = True,
         allow_device_scope: bool = False,
     ):
-        """Acquire a revocable commit lease verified at commit time; rotation drains active leases before returning (Finding [10])."""
+        """Acquire a revocable commit lease verified at commit time; rotation drains active leases before returning (Finding [10], [12])."""
         if not bearer_token or not captured_epoch:
             raise _SessionRevokedError("missing bearer or epoch")
         with self._auth_cond:
@@ -1059,6 +1334,7 @@ class LoopbackCockpitServer:
         )
 
     def _load_or_init_auth_token(self) -> None:
+        """Mint and atomically persist a brand-new high-entropy bearer on EVERY launch (Finding [15])."""
         if self._token_file is not None:
             parent_path, dir_fd = open_verified_directory_fd(
                 self._token_file.parent, create=True, label="cockpit directory"
@@ -1074,35 +1350,32 @@ class LoopbackCockpitServer:
                         exists = False
                 else:
                     exists = os.path.lexists(self._token_file)
+                prev_raw: str | None = None
                 if exists:
                     raw_bytes, _ = verify_and_read_owner_only_file(
                         parent_path, fname, dir_fd=dir_fd, label="cockpit file", max_bytes=256
                     )
-                    raw = raw_bytes.decode("utf-8").strip()
-                    if not _is_valid_generated_cockpit_token(raw):
+                    prev_raw = raw_bytes.decode("utf-8").strip()
+                    if not _is_valid_generated_cockpit_token(prev_raw):
                         raise ContractError(
                             "Refusing malformed or low-entropy pre-existing cockpit token file (expected generated 43+ char high-entropy token)"
                         )
-                    new_epoch = "epoch-" + secrets.token_hex(16)
-                    with self._auth_cond:
-                        self._auth_secret = _CockpitSecret(raw)
-                        self._session_epoch = new_epoch
-                        self._pairing_codes.clear()
-                        self._device_sessions.clear()
-                        if self._ui_service is not None and callable(getattr(self._ui_service, "rotate_adapter_session", None)):
-                            self._ui_service.rotate_adapter_session(new_epoch)
-                    return
-                new_tok = _CockpitSecret(secrets.token_urlsafe(32))
+                fresh_val = secrets.token_urlsafe(32)
+                while prev_raw is not None and hmac.compare_digest(fresh_val.encode("utf-8"), prev_raw.encode("utf-8")):
+                    fresh_val = secrets.token_urlsafe(32)
+                new_tok = _CockpitSecret(fresh_val)
                 new_epoch = "epoch-" + secrets.token_hex(16)
                 create_owner_only_file_atomic(
                     parent_path,
                     fname,
                     (new_tok.reveal() + "\n").encode("utf-8"),
                     dir_fd=dir_fd,
-                    replace_existing=False,
+                    replace_existing=exists,
                     label="cockpit file",
                 )
                 with self._auth_cond:
+                    if self._session_epoch is not None:
+                        self._revoked_epochs.add(self._session_epoch)
                     self._auth_secret = new_tok
                     self._session_epoch = new_epoch
                     self._pairing_codes.clear()
@@ -1113,15 +1386,36 @@ class LoopbackCockpitServer:
             finally:
                 if dir_fd is not None:
                     os.close(dir_fd)
+        if self._explicit_in_memory_auth_token is not None:
+            new_epoch = "epoch-" + secrets.token_hex(16)
+            with self._auth_cond:
+                if self._session_epoch is not None:
+                    self._revoked_epochs.add(self._session_epoch)
+                self._auth_secret = _CockpitSecret(self._explicit_in_memory_auth_token.reveal())
+                self._session_epoch = new_epoch
+                self._pairing_codes.clear()
+                self._device_sessions.clear()
+                if self._ui_service is not None and callable(getattr(self._ui_service, "rotate_adapter_session", None)):
+                    self._ui_service.rotate_adapter_session(new_epoch)
+            return
         self.rotate_auth_token()
 
-    def rotate_auth_token(self, *, exclude_sock: socket.socket | None = None) -> str:
-        """Rotate per-launch bearer secret + session_epoch, revoking prior epoch, pairing codes & device sessions."""
+    def rotate_auth_token_detailed(
+        self,
+        *,
+        exclude_sock: socket.socket | None = None,
+        drain_timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Rotate bearer + epoch and report exact old-epoch drain completion status (Finding [12])."""
         with self._auth_cond:
             old_epoch = self._session_epoch
             if old_epoch is not None:
                 self._revoked_epochs.add(old_epoch)
-            new_tok = _CockpitSecret(secrets.token_urlsafe(32))
+            prev_tok = self._auth_secret.reveal() if self._auth_secret is not None else None
+            fresh_val = secrets.token_urlsafe(32)
+            while prev_tok is not None and hmac.compare_digest(fresh_val.encode("utf-8"), prev_tok.encode("utf-8")):
+                fresh_val = secrets.token_urlsafe(32)
+            new_tok = _CockpitSecret(fresh_val)
             new_epoch = "epoch-" + secrets.token_hex(16)
             self._auth_secret = new_tok
             self._session_epoch = new_epoch
@@ -1134,12 +1428,55 @@ class LoopbackCockpitServer:
             self._auth_cond.notify_all()
         self.notify_stream_updated()
         self._close_active_sockets(exclude_sock=exclude_sock)
-        if old_epoch is not None:
-            drain_deadline = time.monotonic() + 5.0
-            with self._auth_cond:
-                while self._inflight_commits.get(old_epoch, 0) > 0 and time.monotonic() < drain_deadline:
-                    self._auth_cond.wait(timeout=0.05)
-        return new_tok.reveal()
+        eff_drain = (
+            self._rotation_drain_timeout_seconds
+            if drain_timeout_seconds is None
+            else max(0.0, float(drain_timeout_seconds))
+        )
+        drain_deadline = time.monotonic() + eff_drain
+        with self._auth_cond:
+            while (
+                sum(cnt for ep, cnt in self._inflight_commits.items() if ep != self._session_epoch and cnt > 0) > 0
+                and time.monotonic() < drain_deadline
+            ):
+                self._auth_cond.wait(timeout=min(0.05, max(0.005, drain_deadline - time.monotonic())))
+            active_old = sum(
+                cnt for ep, cnt in self._inflight_commits.items() if ep != self._session_epoch and cnt > 0
+            )
+        return {
+            "new_token": new_tok.reveal(),
+            "session_epoch": new_epoch,
+            "old_epoch_revoked": True,
+            "rotation_complete": active_old == 0,
+            "active_old_leases": int(active_old),
+            "status": "ROTATED" if active_old == 0 else "ROTATION_PENDING_DRAIN",
+        }
+
+    def rotate_auth_token(
+        self,
+        *,
+        exclude_sock: socket.socket | None = None,
+        drain_timeout_seconds: float | None = None,
+        require_drained: bool = False,
+    ) -> str:
+        """Rotate per-launch bearer secret + session_epoch, revoking prior epoch, pairing codes & device sessions."""
+        info = self.rotate_auth_token_detailed(
+            exclude_sock=exclude_sock,
+            drain_timeout_seconds=drain_timeout_seconds,
+        )
+        if require_drained and not bool(info["rotation_complete"]):
+            raise RotationPendingDrainError(
+                f"Token rotation revoked prior epoch, but {info['active_old_leases']} old-epoch lease(s) have not yet drained",
+                payload={
+                    "ok": False,
+                    "status": "ROTATION_PENDING_DRAIN",
+                    "old_epoch_revoked": True,
+                    "rotation_complete": False,
+                    "active_old_leases": int(info["active_old_leases"]),
+                    "session_epoch": str(info["session_epoch"]),
+                },
+            )
+        return str(info["new_token"])
 
     def notify_stream_updated(self) -> None:
         with self._sse_cond:
@@ -1253,18 +1590,49 @@ class LoopbackCockpitServer:
             raise ContractError("broker routing payload must be a JSON object")
         return safe_broker_routing_payload(payload)
 
+    def _resolve_aggression_live_mode_fail_closed(self) -> tuple[bool, str]:
+        """Require positive proof of DEMO + not live_armed; treat any error or missing routing state as LIVE_OR_UNKNOWN (Finding [17])."""
+        if self._broker_router_reader is not None:
+            try:
+                routing = self._read_broker_routing()
+            except Exception as exc_rt:
+                self._last_routing_error = type(exc_rt).__name__
+                return True, "LIVE_OR_UNKNOWN"
+            if not isinstance(routing, Mapping):
+                return True, "LIVE_OR_UNKNOWN"
+            raw_em = routing.get("execution_mode")
+            if not isinstance(raw_em, str) or not raw_em.strip():
+                return True, "LIVE_OR_UNKNOWN"
+            em_up = raw_em.strip().upper()
+            lr = routing.get("live_readiness") if isinstance(routing.get("live_readiness"), Mapping) else {}
+            live_armed = bool(routing.get("live_trading_armed", False)) or bool(lr.get("live_armed", False))
+            if em_up == "DEMO" and not live_armed:
+                return False, "DEMO"
+            if em_up == "LIVE" or live_armed:
+                return True, "LIVE"
+            return True, "LIVE_OR_UNKNOWN"
+
+        if self._autonomous_trader is not None:
+            router_obj = getattr(self._autonomous_trader, "_router", None)
+            if router_obj is not None:
+                try:
+                    raw_r_em = getattr(router_obj, "execution_mode", None)
+                    r_armed = bool(getattr(router_obj, "_live_armed", False))
+                    if isinstance(raw_r_em, str) and raw_r_em.strip().upper() == "DEMO" and not r_armed:
+                        return False, "DEMO"
+                    if isinstance(raw_r_em, str) and raw_r_em.strip().upper() == "LIVE":
+                        return True, "LIVE"
+                except Exception as exc_r2:
+                    self._last_routing_error = type(exc_r2).__name__
+                    return True, "LIVE_OR_UNKNOWN"
+
+        return True, "LIVE_OR_UNKNOWN"
+
     def _read_aggression_dial_snapshot(self, *, owner_controls_allowed: bool = True) -> dict[str, Any] | None:
         if self._aggression_dial is None:
             return None
-        execution_mode = "DEMO"
-        try:
-            routing = self._read_broker_routing()
-            if isinstance(routing, Mapping):
-                raw_em = str(routing.get("execution_mode") or "DEMO").strip().upper()
-                if raw_em == "LIVE":
-                    execution_mode = "LIVE"
-        except Exception as exc_rt:
-            self._last_routing_error = type(exc_rt).__name__
+        is_live_or_unk, _ = self._resolve_aggression_live_mode_fail_closed()
+        execution_mode = "LIVE" if is_live_or_unk else "DEMO"
 
         regime = "NEUTRAL"
         consec = 0
@@ -1664,6 +2032,63 @@ class LoopbackCockpitServer:
                         "required_scope": SESSION_SCOPE_OWNER_FULL,
                     },
                 )
+
+            def _read_pre_auth_json_body(self, *, max_bytes: int = MAX_PRE_AUTH_BODY_BYTES) -> Any:
+                """Read pre-auth JSON body under an absolute monotonic deadline and <=4096-byte budget (Finding [11])."""
+                if self.headers.get("Transfer-Encoding") is not None:
+                    raise ContractError("Transfer-Encoding is forbidden on pre-authenticated endpoints")
+                raw_len = self.headers.get("Content-Length")
+                if raw_len is None or not str(raw_len).strip().isdigit():
+                    raise ContractError("Content-Length header required")
+                cap = min(int(max_bytes), MAX_PRE_AUTH_BODY_BYTES)
+                length = int(str(raw_len).strip())
+                if length < 0 or length > cap:
+                    raise _PreAuthBodyTooLargeError(f"Pre-authenticated body exceeds {cap}-byte limit")
+                abs_deadline = outer._mono() + outer._pre_auth_body_deadline_seconds
+                chunks = bytearray()
+                if callable(getattr(self.rfile, "peek", None)):
+                    buffered = bytes(self.rfile.peek(length))
+                    if buffered:
+                        take_n = min(length, len(buffered))
+                        chunks.extend(self.rfile.read(take_n))
+                raw_sock = self.connection if isinstance(self.connection, socket.socket) else None
+                while len(chunks) < length:
+                    rem = abs_deadline - outer._mono()
+                    if rem <= 0.0:
+                        if raw_sock is not None:
+                            raw_sock.settimeout(1.0)
+                        outer._record_pre_auth_timeout()
+                        self.close_connection = True
+                        raise _PreAuthBodyTimeoutError("Pre-authenticated request body deadline exceeded")
+                    need = min(length - len(chunks), 1024)
+                    try:
+                        if raw_sock is not None:
+                            raw_sock.settimeout(rem)
+                            part = raw_sock.recv(need)
+                        else:
+                            part = self.rfile.read(need)
+                    except (TimeoutError, socket.timeout):
+                        if raw_sock is not None:
+                            raw_sock.settimeout(1.0)
+                        outer._record_pre_auth_timeout()
+                        self.close_connection = True
+                        raise _PreAuthBodyTimeoutError(
+                            "Pre-authenticated request body deadline exceeded"
+                        ) from None
+                    if not part:
+                        raise ContractError("Unexpected EOF while reading pre-authenticated request body")
+                    chunks.extend(part)
+                    if len(chunks) > cap:
+                        raise _PreAuthBodyTooLargeError(f"Pre-authenticated body exceeds {cap}-byte limit")
+                if raw_sock is not None:
+                    raw_sock.settimeout(5.0)
+                if len(chunks) != length:
+                    raise ContractError("incomplete HTTP request body")
+
+                def _reject_non_finite_pre(token: str) -> Any:
+                    raise ContractError(f"non-finite JSON constant {token!r} forbidden")
+
+                return json.loads(bytes(chunks).decode("utf-8"), parse_constant=_reject_non_finite_pre)
 
             def _read_json_body(self, *, max_bytes: int = MAX_HTTP_RPC_BYTES) -> Any:
                 raw_len = self.headers.get("Content-Length")
@@ -2181,10 +2606,17 @@ class LoopbackCockpitServer:
                     )
                     return
 
-                # Pre-bearer single-use pairing code exchange (Finding [2])
+                # Pre-bearer single-use pairing code exchange with bounded pre-auth admission & monotonic body deadline (Finding [2], [11])
                 if route == "/api/pair-exchange":
+                    if not outer._pre_auth_body_sem.acquire(blocking=False):
+                        self.close_connection = True
+                        self._write_json(
+                            HTTPStatus.TOO_MANY_REQUESTS,
+                            {"error": "Pre-authenticated pairing exchange capacity reached"},
+                        )
+                        return
                     try:
-                        body = self._read_json_body(max_bytes=4096)
+                        body = self._read_pre_auth_json_body(max_bytes=MAX_PRE_AUTH_BODY_BYTES)
                         if type(body) is not dict or not isinstance(body.get("pair_code"), str):
                             raise ContractError("pair_code field required")
                         peer_k = str(self.client_address[0]) if self.client_address else "127.0.0.1"
@@ -2192,8 +2624,19 @@ class LoopbackCockpitServer:
                         if st_code == int(HTTPStatus.UNAUTHORIZED):
                             outer._record_auth_failure()
                         self._write_json(HTTPStatus(st_code), resp_doc)
+                    except _PreAuthBodyTimeoutError as exc_to:
+                        self.close_connection = True
+                        try:
+                            self._write_json(HTTPStatus.REQUEST_TIMEOUT, {"error": str(exc_to)})
+                        except OSError:
+                            pass
+                    except _PreAuthBodyTooLargeError as exc_lg:
+                        self.close_connection = True
+                        self._write_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc_lg)})
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    finally:
+                        outer._pre_auth_body_sem.release()
                     return
 
                 authed, supplied, auth_epoch, supplied_tok, auth_scope, _ = self._check_auth_scoped(is_post=True)
@@ -2262,8 +2705,31 @@ class LoopbackCockpitServer:
                             self._reject_unauthorized()
                             return
                         cur_sock = self.connection if isinstance(self.connection, socket.socket) else None
-                        outer.rotate_auth_token(exclude_sock=cur_sock)
-                        self._write_json(HTTPStatus.OK, {"ok": True, "session_epoch": outer.session_epoch})
+                        rot_info = outer.rotate_auth_token_detailed(exclude_sock=cur_sock)
+                        if not bool(rot_info["rotation_complete"]):
+                            self._write_json(
+                                HTTPStatus.CONFLICT,
+                                {
+                                    "ok": False,
+                                    "status": "ROTATION_PENDING_DRAIN",
+                                    "old_epoch_revoked": True,
+                                    "rotation_complete": False,
+                                    "active_old_leases": int(rot_info["active_old_leases"]),
+                                    "session_epoch": str(rot_info["session_epoch"]),
+                                },
+                            )
+                        else:
+                            self._write_json(
+                                HTTPStatus.OK,
+                                {
+                                    "ok": True,
+                                    "status": "ROTATED",
+                                    "old_epoch_revoked": True,
+                                    "rotation_complete": True,
+                                    "active_old_leases": 0,
+                                    "session_epoch": str(rot_info["session_epoch"]),
+                                },
+                            )
                     except _SessionRevokedError:
                         self._reject_unauthorized()
                     except Exception as exc:
@@ -2299,6 +2765,9 @@ class LoopbackCockpitServer:
                     if outer._aggression_dial is None:
                         self._write_json(HTTPStatus.NOT_FOUND, {"error": "Aggression dial store not configured"})
                         return
+                    req_conf_doc: dict[str, Any] | None = None
+                    req_conf_phrase: str | None = None
+                    routing_mode_lbl = "LIVE_OR_UNKNOWN"
                     try:
                         body = self._read_json_body(max_bytes=16384)
                         if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
@@ -2306,16 +2775,10 @@ class LoopbackCockpitServer:
                             return
                         if type(body) is not dict:
                             raise ContractError("JSON object required")
-                        exec_mode_str = "DEMO"
-                        try:
-                            routing_doc = outer._read_broker_routing()
-                            if isinstance(routing_doc, Mapping):
-                                exec_mode_str = str(routing_doc.get("execution_mode") or "DEMO").strip().upper()
-                        except Exception as exc_rt:
-                            outer._last_routing_error = type(exc_rt).__name__
+                        is_live_or_unk, routing_mode_lbl = outer._resolve_aggression_live_mode_fail_closed()
                         if "live_mode" in body and type(body["live_mode"]) is not bool:
                             raise ContractError("live_mode must be a boolean")
-                        live_mode_flag = (exec_mode_str == "LIVE") or bool(body.get("live_mode", False))
+                        live_mode_flag = bool(is_live_or_unk) or bool(body.get("live_mode", False))
                         raw_hrc = body.get("high_risk_confirmed", False)
                         if type(raw_hrc) is not bool:
                             raise ContractError("high_risk_confirmed must be a boolean")
@@ -2338,6 +2801,62 @@ class LoopbackCockpitServer:
                             elif "ai_discretion_ceiling_bps" in body or "ceiling_bps" in body:
                                 raw_action = "SET_AI_DISCRETION_CEILING"
 
+                        dial_scope_id = str(getattr(outer._aggression_dial, "scope_id", "dual-shield-barbell"))
+
+                        def _enforce_bound_live_dial_confirm(
+                            canon_act: str,
+                            *,
+                            tier_id: str | None = None,
+                            target_bps: Any = None,
+                            ai_ceiling_bps: Any = None,
+                            preset: Any = None,
+                            requires_confirm: bool,
+                        ) -> bool:
+                            nonlocal req_conf_doc, req_conf_phrase
+                            if not live_mode_flag:
+                                return bool(raw_hrc)
+                            t_bps_int = int(target_bps) if isinstance(target_bps, int) and type(target_bps) is not bool else None
+                            c_bps_int = int(ai_ceiling_bps) if isinstance(ai_ceiling_bps, int) and type(ai_ceiling_bps) is not bool else None
+                            req_conf_doc, req_conf_phrase = build_aggression_high_risk_confirmation(
+                                dial_scope_id,
+                                canon_act,
+                                tier_id=tier_id,
+                                target_bps=t_bps_int,
+                                ai_ceiling_bps=c_bps_int,
+                                preset=None if preset is None else str(preset),
+                            )
+                            has_explicit_binding = (
+                                "confirmation_phrase" in body or "high_risk_confirmation" in body
+                            )
+                            must_bind = True
+                            if requires_confirm:
+                                if not raw_hrc:
+                                    raise HighRiskConfirmationRequiredError(
+                                        f"High-risk confirmation required in {routing_mode_lbl} mode for {canon_act}"
+                                    )
+                                if must_bind and not _verify_bound_aggression_confirmation(
+                                    body, expected_doc=req_conf_doc, expected_phrase=req_conf_phrase
+                                ):
+                                    raise HighRiskConfirmationRequiredError(
+                                        f"Exact target-bound high-risk confirmation required in {routing_mode_lbl} mode for {canon_act}"
+                                    )
+                                return True
+                            if routing_mode_lbl == "LIVE_OR_UNKNOWN":
+                                if not raw_hrc or not _verify_bound_aggression_confirmation(
+                                    body, expected_doc=req_conf_doc, expected_phrase=req_conf_phrase
+                                ):
+                                    raise HighRiskConfirmationRequiredError(
+                                        f"Routing state unavailable ({routing_mode_lbl}); bound confirmation required for {canon_act}"
+                                    )
+                                return True
+                            if has_explicit_binding and not _verify_bound_aggression_confirmation(
+                                body, expected_doc=req_conf_doc, expected_phrase=req_conf_phrase
+                            ):
+                                raise HighRiskConfirmationRequiredError(
+                                    f"Bound high-risk confirmation does not match requested {canon_act} parameters"
+                                )
+                            return bool(raw_hrc)
+
                         with outer._commit_lease(supplied_tok, auth_epoch):
                             if raw_action == "SET_MASTER_RISK_BPS":
                                 bps_val = (
@@ -2355,12 +2874,22 @@ class LoopbackCockpitServer:
                                     if "ai_discretion_ceiling_bps" in body
                                     else body.get("ceiling_bps")
                                 )
+                                need_hr = (
+                                    (isinstance(bps_val, int) and type(bps_val) is not bool and bps_val >= HIGH_RISK_MIN_BPS)
+                                    or (isinstance(ceil_val, int) and type(ceil_val) is not bool and ceil_val >= HIGH_RISK_MIN_BPS)
+                                )
+                                eff_hrc = _enforce_bound_live_dial_confirm(
+                                    "SET_MASTER_RISK_BPS",
+                                    target_bps=bps_val,
+                                    ai_ceiling_bps=ceil_val,
+                                    requires_confirm=need_hr,
+                                )
                                 outer._aggression_dial.set_master_risk_bps(
                                     bps_val,
                                     ai_discretion_enabled=ai_disc,
                                     ai_discretion_ceiling_bps=ceil_val,
                                     live_mode=live_mode_flag,
-                                    high_risk_confirmed=raw_hrc,
+                                    high_risk_confirmed=eff_hrc,
                                     owner_controls_allowed=True,
                                     actor=actor_str,
                                 )
@@ -2379,11 +2908,17 @@ class LoopbackCockpitServer:
                                     if "ai_discretion_ceiling_bps" in body
                                     else body.get("ceiling_bps")
                                 )
+                                need_hr = isinstance(ceil_val, int) and type(ceil_val) is not bool and ceil_val >= HIGH_RISK_MIN_BPS
+                                eff_hrc = _enforce_bound_live_dial_confirm(
+                                    "SET_AI_DISCRETION",
+                                    ai_ceiling_bps=ceil_val,
+                                    requires_confirm=need_hr,
+                                )
                                 outer._aggression_dial.set_ai_discretion(
                                     en_val,
                                     ceiling_bps=ceil_val,
                                     live_mode=live_mode_flag,
-                                    high_risk_confirmed=raw_hrc,
+                                    high_risk_confirmed=eff_hrc,
                                     owner_controls_allowed=True,
                                     actor=actor_str,
                                 )
@@ -2401,20 +2936,35 @@ class LoopbackCockpitServer:
                                     en_cur = body["enabled"]
                                 else:
                                     en_cur = bool(outer._aggression_dial.snapshot()["ai_discretion_enabled"])
+                                need_hr = isinstance(ceil_val, int) and type(ceil_val) is not bool and ceil_val >= HIGH_RISK_MIN_BPS
+                                eff_hrc = _enforce_bound_live_dial_confirm(
+                                    "SET_AI_DISCRETION_CEILING",
+                                    ai_ceiling_bps=ceil_val,
+                                    requires_confirm=need_hr,
+                                )
                                 outer._aggression_dial.set_ai_discretion(
                                     en_cur,
                                     ceiling_bps=ceil_val,
                                     live_mode=live_mode_flag,
-                                    high_risk_confirmed=raw_hrc,
+                                    high_risk_confirmed=eff_hrc,
                                     owner_controls_allowed=True,
                                     actor=actor_str,
                                 )
                             elif raw_action == "SET_TIER_RISK_BPS":
+                                tid_raw = body.get("tier_id")
+                                t_bps_raw = body.get("risk_bps")
+                                need_hr = isinstance(t_bps_raw, int) and type(t_bps_raw) is not bool and t_bps_raw >= HIGH_RISK_MIN_BPS
+                                eff_hrc = _enforce_bound_live_dial_confirm(
+                                    "SET_TIER_RISK_BPS",
+                                    tier_id=None if tid_raw is None else str(tid_raw),
+                                    target_bps=t_bps_raw,
+                                    requires_confirm=need_hr,
+                                )
                                 outer._aggression_dial.set_tier_risk_bps(
-                                    body.get("tier_id"),
-                                    body.get("risk_bps"),
+                                    tid_raw,
+                                    t_bps_raw,
                                     live_mode=live_mode_flag,
-                                    high_risk_confirmed=raw_hrc,
+                                    high_risk_confirmed=eff_hrc,
                                     owner_controls_allowed=True,
                                     actor=actor_str,
                                 )
@@ -2430,10 +2980,21 @@ class LoopbackCockpitServer:
                                     preset_val = "STAGGER_SAFE_TO_EXTREME"
                                 else:
                                     preset_val = body.get("preset")
+                                cur_master = int(outer._aggression_dial.snapshot()["master_risk_bps"])
+                                p_up = str(preset_val or "").strip().upper()
+                                need_hr = (
+                                    p_up == "STAGGER_SAFE_TO_EXTREME"
+                                    or (p_up in ("SYNC_MASTER", "SYNC_ALL_TO_MASTER") and cur_master >= HIGH_RISK_MIN_BPS)
+                                )
+                                eff_hrc = _enforce_bound_live_dial_confirm(
+                                    "APPLY_TIER_PRESET",
+                                    preset=preset_val,
+                                    requires_confirm=need_hr,
+                                )
                                 outer._aggression_dial.apply_tier_preset(
                                     preset_val,
                                     live_mode=live_mode_flag,
-                                    high_risk_confirmed=raw_hrc,
+                                    high_risk_confirmed=eff_hrc,
                                     owner_controls_allowed=True,
                                     actor=actor_str,
                                 )
@@ -2445,15 +3006,18 @@ class LoopbackCockpitServer:
                     except _SessionRevokedError:
                         self._reject_unauthorized()
                     except HighRiskConfirmationRequiredError as exc:
-                        self._write_json(
-                            HTTPStatus.CONFLICT,
-                            {
-                                "error": str(exc),
-                                "code": "HIGH_RISK_CONFIRMATION_REQUIRED",
-                                "live_mode": True,
-                                "high_risk_min_bps": HIGH_RISK_MIN_BPS,
-                            },
-                        )
+                        err_doc: dict[str, Any] = {
+                            "error": str(exc),
+                            "code": "HIGH_RISK_CONFIRMATION_REQUIRED",
+                            "live_mode": True,
+                            "routing_mode": routing_mode_lbl,
+                            "high_risk_min_bps": HIGH_RISK_MIN_BPS,
+                        }
+                        if req_conf_doc is not None:
+                            err_doc["required_confirmation"] = req_conf_doc
+                        if req_conf_phrase is not None:
+                            err_doc["required_confirmation_phrase"] = req_conf_phrase
+                        self._write_json(HTTPStatus.CONFLICT, err_doc)
                     except OwnerKeyRequiredError:
                         self._reject_insufficient_scope()
                     except Exception as exc:
@@ -2854,41 +3418,70 @@ class LoopbackCockpitServer:
                                     intent_sha256=body.get("intent_sha256"),
                                 )
                         elif act == "CONFIRM_BROKER_2FA_WITHDRAWAL":
+                            def _epoch_guard_2fa() -> None:
+                                outer._assert_epoch_active(supplied_tok, auth_epoch)
+
+                            raw_pv = outer._withdrawal_provider_verifier
+
+                            def _guarded_pv(b_id: str, tx_id: str) -> Mapping[str, Any]:
+                                _epoch_guard_2fa()
+                                if raw_pv is None:
+                                    raise ContractError("withdrawal_provider_verifier not configured")
+                                out_pv = raw_pv(b_id, tx_id)
+                                _epoch_guard_2fa()
+                                return out_pv
+
                             with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=False):
-                                res = outer._profit_vault.confirm_broker_2fa_withdrawal(
-                                    transfer_id=str(body["transfer_id"]),
-                                    provider_tx_id=str(body["provider_tx_id"]),
-                                    owner_request_id=req_id,
-                                    verifier=outer._owner_recovery,
-                                    recovery_token=str(rec_tok or ""),
-                                    provider_verifier=outer._withdrawal_provider_verifier,  # type: ignore[arg-type]
-                                )
+                                _epoch_guard_2fa()
+                                confirm_fn = outer._profit_vault.confirm_broker_2fa_withdrawal
+                                confirm_kwargs: dict[str, Any] = {
+                                    "transfer_id": str(body["transfer_id"]),
+                                    "provider_tx_id": str(body["provider_tx_id"]),
+                                    "owner_request_id": req_id,
+                                    "verifier": outer._owner_recovery,
+                                    "recovery_token": str(rec_tok or ""),
+                                    "provider_verifier": None if raw_pv is None else _guarded_pv,
+                                }
+                                if "epoch_guard" in inspect.signature(confirm_fn).parameters:
+                                    confirm_kwargs["epoch_guard"] = _epoch_guard_2fa
+                                res = confirm_fn(**confirm_kwargs)
                         elif act == "EXECUTE_OFFRAMP_ACH":
                             from cas_forex_revamp.treasury.profit_sweep import CoinbaseOfframpClient, KrakenOfframpClient
                             rail_name = str(body.get("rail") or "COINBASE_ACH").strip().upper()
-                            cb = CoinbaseOfframpClient.from_environ(os.environ) if rail_name == "COINBASE_ACH" else None
-                            krk = KrakenOfframpClient.from_environ(os.environ) if rail_name == "KRAKEN_ACH" else None
+                            raw_cb = CoinbaseOfframpClient.from_environ(os.environ) if rail_name == "COINBASE_ACH" else None
+                            raw_krk = KrakenOfframpClient.from_environ(os.environ) if rail_name == "KRAKEN_ACH" else None
                             conv_amt = _Dec(str(body["convert_amount"])) if body.get("convert_amount") is not None else None
+
+                            def _epoch_guard_ach() -> None:
+                                outer._assert_epoch_active(supplied_tok, auth_epoch)
+
+                            cb = None if raw_cb is None else _EpochGuardedOfframpClient(raw_cb, _epoch_guard_ach)
+                            krk = None if raw_krk is None else _EpochGuardedOfframpClient(raw_krk, _epoch_guard_ach)
                             with outer._commit_lease(supplied_tok, auth_epoch, hold_lock=False):
-                                res = outer._profit_vault.execute_offramp_ach_payout(
-                                    rail=rail_name,
-                                    amount_usd=_Dec(str(body["amount_usd"])),
-                                    owner_request_id=req_id,
-                                    reason=reason,
-                                    verifier=outer._owner_recovery,
-                                    recovery_token=str(rec_tok or ""),
-                                    coinbase_client=cb,
-                                    kraken_client=krk,
-                                    convert_from_currency=body.get("convert_from_currency"),
-                                    convert_amount=conv_amt,
-                                    coinbase_source_account_uuid=body.get("coinbase_source_account_uuid"),
-                                    coinbase_usd_account_uuid=body.get("coinbase_usd_account_uuid"),
-                                    kraken_pair=str(body.get("kraken_pair") or "USDCUSD"),
-                                    idempotency_key=body.get("idempotency_key"),
-                                    retry_transfer_id=body.get("retry_transfer_id"),
-                                    intent_id=body.get("intent_id"),
-                                    intent_sha256=body.get("intent_sha256"),
-                                )
+                                _epoch_guard_ach()
+                                ach_fn = outer._profit_vault.execute_offramp_ach_payout
+                                ach_kwargs: dict[str, Any] = {
+                                    "rail": rail_name,
+                                    "amount_usd": _Dec(str(body["amount_usd"])),
+                                    "owner_request_id": req_id,
+                                    "reason": reason,
+                                    "verifier": outer._owner_recovery,
+                                    "recovery_token": str(rec_tok or ""),
+                                    "coinbase_client": cb,
+                                    "kraken_client": krk,
+                                    "convert_from_currency": body.get("convert_from_currency"),
+                                    "convert_amount": conv_amt,
+                                    "coinbase_source_account_uuid": body.get("coinbase_source_account_uuid"),
+                                    "coinbase_usd_account_uuid": body.get("coinbase_usd_account_uuid"),
+                                    "kraken_pair": str(body.get("kraken_pair") or "USDCUSD"),
+                                    "idempotency_key": body.get("idempotency_key"),
+                                    "retry_transfer_id": body.get("retry_transfer_id"),
+                                    "intent_id": body.get("intent_id"),
+                                    "intent_sha256": body.get("intent_sha256"),
+                                }
+                                if "epoch_guard" in inspect.signature(ach_fn).parameters:
+                                    ach_kwargs["epoch_guard"] = _epoch_guard_ach
+                                res = ach_fn(**ach_kwargs)
                         else:
                             raise ContractError(f"unsupported treasury action {act!r}")
                         outer.notify_stream_updated()
@@ -3131,17 +3724,35 @@ class LoopbackCockpitServer:
                                 except Exception as exc_ctx:
                                     outer._last_routing_error = type(exc_ctx).__name__
 
+                            def _epoch_guard_ask() -> None:
+                                outer._assert_epoch_active(supplied_tok, auth_epoch, allow_device_scope=True)
+
                             safe_ctx = assert_safe_ai_catalog_payload(ctx_summary)
+                            _epoch_guard_ask()
+                            from cas_forex_revamp.operator.frontier_backends import DurableModelExecutionGate as _DMEG
                             ask_fn = outer._ai_model_registry.answer_explainer_question
                             ask_params = inspect.signature(ask_fn).parameters
-                            if "execution_gate" in ask_params:
-                                ans_doc = ask_fn(
-                                    question=raw_q,
-                                    context_summary=safe_ctx,
-                                    audio_base64=raw_audio,
-                                    audio_mime_type=raw_mime,
-                                    execution_gate=outer._model_gate,
+                            has_ask_ep = "epoch_guard" in ask_params
+                            guarded_ask_gate = (
+                                None
+                                if outer._model_gate is None
+                                else (
+                                    outer._model_gate
+                                    if (has_ask_ep and isinstance(outer._model_gate, _DMEG))
+                                    else _EpochGuardedModelGate(outer._model_gate, _epoch_guard_ask)
                                 )
+                            )
+                            if "execution_gate" in ask_params:
+                                ask_kw: dict[str, Any] = {
+                                    "question": raw_q,
+                                    "context_summary": safe_ctx,
+                                    "audio_base64": raw_audio,
+                                    "audio_mime_type": raw_mime,
+                                    "execution_gate": guarded_ask_gate,
+                                }
+                                if has_ask_ep:
+                                    ask_kw["epoch_guard"] = _epoch_guard_ask
+                                ans_doc = ask_fn(**ask_kw)
                             else:
                                 est_audio_bytes = (len(raw_audio.strip()) * 3) // 4 if isinstance(raw_audio, str) and has_audio else 0
                                 est_input_bytes = len(raw_q.encode("utf-8")) + len(json.dumps(safe_ctx).encode("utf-8"))
@@ -3153,6 +3764,7 @@ class LoopbackCockpitServer:
                                     input_bytes=est_input_bytes,
                                     audio_bytes=est_audio_bytes,
                                 )
+                                _epoch_guard_ask()
                                 ans_doc = ask_fn(
                                     question=raw_q,
                                     context_summary=safe_ctx,
@@ -3192,14 +3804,31 @@ class LoopbackCockpitServer:
                                     "reason": "AI_REGISTRY_NOT_ATTACHED",
                                 }
                             else:
+                                def _epoch_guard_tts() -> None:
+                                    outer._assert_epoch_active(supplied_tok, auth_epoch, allow_device_scope=True)
+
+                                _epoch_guard_tts()
+                                from cas_forex_revamp.operator.frontier_backends import DurableModelExecutionGate as _DMEG
                                 tts_fn = outer._ai_model_registry.synthesize_explainer_speech
                                 tts_params = inspect.signature(tts_fn).parameters
-                                if "execution_gate" in tts_params:
-                                    tts_doc = tts_fn(
-                                        body["text"],
-                                        voice_name=clean_voice,
-                                        execution_gate=outer._model_gate,
+                                has_tts_ep = "epoch_guard" in tts_params
+                                guarded_tts_gate = (
+                                    None
+                                    if outer._model_gate is None
+                                    else (
+                                        outer._model_gate
+                                        if (has_tts_ep and isinstance(outer._model_gate, _DMEG))
+                                        else _EpochGuardedModelGate(outer._model_gate, _epoch_guard_tts)
                                     )
+                                )
+                                if "execution_gate" in tts_params:
+                                    tts_kw: dict[str, Any] = {
+                                        "voice_name": clean_voice,
+                                        "execution_gate": guarded_tts_gate,
+                                    }
+                                    if has_tts_ep:
+                                        tts_kw["epoch_guard"] = _epoch_guard_tts
+                                    tts_doc = tts_fn(body["text"], **tts_kw)
                                 else:
                                     tts_model = str(
                                         getattr(outer._ai_model_registry, "_explainer_tts_model_slug", "gemini-2.5-flash-preview-tts")
@@ -3210,6 +3839,7 @@ class LoopbackCockpitServer:
                                         max_output_tokens=2048,
                                         input_bytes=len(body["text"].encode("utf-8")),
                                     )
+                                    _epoch_guard_tts()
                                     tts_doc = tts_fn(
                                         body["text"],
                                         voice_name=clean_voice,
@@ -3531,20 +4161,13 @@ def run_cockpit_cli(
     gate = runtime_state.valve_gate
     from cas_forex_revamp.contracts import parse_decimal as _parse_dec
     stream_lock = threading.Lock()
-    latest_index_stream: list[dict[str, Any] | None] = [None]
+    latest_public_index_stream: list[dict[str, Any] | None] = [None]
+    latest_mt5_index_stream: list[dict[str, Any] | None] = [None]
 
-    def _read_index_ref(symbols: Any) -> dict[str, tuple[Any, Any]]:
+    def _read_index_ref(symbols: Any) -> dict[str, dict[str, Any]]:
         with stream_lock:
-            doc = latest_index_stream[0]
-        if not isinstance(doc, dict):
-            return {}
-        out: dict[str, tuple[Any, Any]] = {}
-        wanted = set(symbols)
-        for row in doc.get("markets") or ():
-            sym = row.get("pair")
-            if sym in wanted and "bid" in row and "ask" in row:
-                out[sym] = (_parse_dec(str(row["bid"])), _parse_dec(str(row["ask"])))
-        return out
+            pub_doc = latest_public_index_stream[0]
+        return build_public_index_reference_map(pub_doc, symbols)
 
     router = DualShieldBrokerRouter(
         environ=merged,
@@ -3642,12 +4265,12 @@ def run_cockpit_cli(
             print(f"[feed] Initial live quote fetch skipped ({type(exc).__name__}); using sealed fixture until next poll.")
     if index_client is not None:
         try:
-            latest_index_stream[0] = index_client.fetch_index_stream()
+            latest_public_index_stream[0] = stamp_public_index_provenance(index_client.fetch_index_stream())
         except Exception as exc:
             print(f"[feed] Initial index fetch skipped ({type(exc).__name__}); awaiting MT5 ticks.")
-    mt5_idx_init, _ = _build_mt5_index_snapshot_from_router(router, prev_stream=latest_index_stream[0])
+    mt5_idx_init, _ = _build_mt5_index_snapshot_from_router(router, prev_stream=latest_mt5_index_stream[0])
     if mt5_idx_init is not None:
-        latest_index_stream[0] = mt5_idx_init
+        latest_mt5_index_stream[0] = mt5_idx_init
 
     def _read_stream() -> dict[str, Any] | None:
         with stream_lock:
@@ -3655,7 +4278,7 @@ def run_cockpit_cli(
 
     def _read_index_stream() -> dict[str, Any] | None:
         with stream_lock:
-            return latest_index_stream[0]
+            return latest_mt5_index_stream[0] if latest_mt5_index_stream[0] is not None else latest_public_index_stream[0]
 
     if callable(getattr(registry, "bind_execution_gate", None)):
         registry.bind_execution_gate(runtime_state.model_gate)
@@ -3695,17 +4318,21 @@ def run_cockpit_cli(
             try:
                 env_stream = feed_client.fetch_market_stream().to_wire_dict()
                 with stream_lock:
-                    prev_idx = latest_index_stream[0]
-                mt5_idx_snap, _ = _build_mt5_index_snapshot_from_router(router, prev_stream=prev_idx)
-                idx_stream = mt5_idx_snap if mt5_idx_snap is not None else prev_idx
-                if mt5_idx_snap is None and index_client is not None:
+                    prev_mt5_idx = latest_mt5_index_stream[0]
+                    prev_pub_idx = latest_public_index_stream[0]
+                mt5_idx_snap, _ = _build_mt5_index_snapshot_from_router(router, prev_stream=prev_mt5_idx)
+                pub_idx_snap = prev_pub_idx
+                if index_client is not None:
                     try:
-                        idx_stream = index_client.fetch_index_stream()
+                        pub_idx_snap = stamp_public_index_provenance(index_client.fetch_index_stream())
                     except Exception as exc_idx:
                         print(f"[feed] Index poll skipped ({type(exc_idx).__name__}).")
                 with stream_lock:
                     latest_stream[0] = env_stream
-                    latest_index_stream[0] = idx_stream
+                    latest_public_index_stream[0] = pub_idx_snap
+                    if mt5_idx_snap is not None:
+                        latest_mt5_index_stream[0] = mt5_idx_snap
+                idx_stream = mt5_idx_snap if mt5_idx_snap is not None else pub_idx_snap
                 if args.autonomous_ai:
                     try:
                         trader.run_cycle(env_stream, index_stream=idx_stream)
@@ -3723,12 +4350,12 @@ def run_cockpit_cli(
                 continue
             try:
                 with stream_lock:
-                    prev_idx = latest_index_stream[0]
+                    prev_idx = latest_mt5_index_stream[0]
                 mt5_idx_snap, mt5_q = _build_mt5_index_snapshot_from_router(router, prev_stream=prev_idx)
                 if mt5_q:
                     if mt5_idx_snap is not None:
                         with stream_lock:
-                            latest_index_stream[0] = mt5_idx_snap
+                            latest_mt5_index_stream[0] = mt5_idx_snap
                     if trader._inference_lock.acquire(blocking=False):
                         try:
                             trader.run_fast_tick_cycle(mt5_quotes=mt5_q)
