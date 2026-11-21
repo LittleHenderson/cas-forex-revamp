@@ -608,7 +608,7 @@ class Audit443a5c4AutoMergerFindingsTests(unittest.TestCase):
                 with patch("pathlib.Path.is_file", return_value=True):
                     with patch("pathlib.Path.read_text", fake_read_text):
                         with patch("builtins.print", side_effect=lambda *a: captured.append(" ".join(str(x) for x in a))):
-                            exec(compile(py_block, str(wf_path), "exec"), {})
+                            exec(compile(py_block, str(wf_path), "exec"), {})  # nosec B102: intentional execution of pinned workflow YAML Python block against mocked gh subprocess in test
         joined = "\n".join(captured)
         self.assertIn("SKIP_UNTRUSTED_HEAD_REPO:LittleHenderson/other-repo", joined)
         self.assertIn("SKIP_UNTRUSTED_BOT_AUTHOR:333333:4444", joined)

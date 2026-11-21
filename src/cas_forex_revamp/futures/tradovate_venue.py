@@ -5981,8 +5981,8 @@ class TradovateMicroFuturesVenue:
                         now=self._clock(),
                         order_id=receipt.order_id,
                     )
-                except Exception:
-                    pass
+                except Exception as exc_rec:
+                    detail = f"{detail}; fallback_record_err={type(exc_rec).__name__}"
                 raise TradovateOutcomeUnknownError(
                     f"Tradovate post-effect journal failure for clOrdId={cl_ord_id} ({detail}); "
                     "venue frozen until reconcile_unknown_outcome() verifies broker history",
@@ -6910,8 +6910,8 @@ class TradovateMicroFuturesVenue:
                         now=self._clock(),
                         order_id=receipt.order_id,
                     )
-                except Exception:
-                    pass
+                except Exception as exc_rec:
+                    detail = f"{detail}; fallback_record_err={type(exc_rec).__name__}"
                 raise TradovateOutcomeUnknownError(
                     f"Tradovate post-amend journal failure for clOrdId={cl_ord_id} ({detail}); "
                     "safety freeze engaged until reconciled",
@@ -7175,8 +7175,8 @@ class TradovateMicroFuturesVenue:
                         now=self._clock(),
                         order_id=receipt.order_id,
                     )
-                except Exception:
-                    pass
+                except Exception as exc_rec:
+                    detail = f"{detail}; fallback_record_err={type(exc_rec).__name__}"
                 raise TradovateOutcomeUnknownError(
                     f"Tradovate post-close journal failure for clOrdId={cl_ord_id} ({detail}); "
                     "safety freeze engaged until reconciled",
@@ -7311,8 +7311,8 @@ class TradovateMicroFuturesVenue:
                             detail=detail,
                             now=self._clock(),
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc_rec:
+                        detail = f"{detail}; fallback_record_err={type(exc_rec).__name__}"
                     leg_failures.append((leg_req_id, leg_cl_ord_id, detail))
                     continue
 
@@ -7332,8 +7332,8 @@ class TradovateMicroFuturesVenue:
                             now=self._clock(),
                             order_id=getattr(raw_leg, "order_id", None) if isinstance(raw_leg, TradovateOrderReceipt) else None,
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc_rec:
+                        leg_err = f"{leg_err}; fallback_record_err={type(exc_rec).__name__}"
                     leg_failures.append((leg_req_id, leg_cl_ord_id, leg_err))
                     continue
 
@@ -7402,8 +7402,8 @@ class TradovateMicroFuturesVenue:
                             now=self._clock(),
                             order_id=leg_receipt.order_id,
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc_rec:
+                        detail = f"{detail}; fallback_record_err={type(exc_rec).__name__}"
                     leg_failures.append((leg_req_id, leg_cl_ord_id, detail))
                     continue
 

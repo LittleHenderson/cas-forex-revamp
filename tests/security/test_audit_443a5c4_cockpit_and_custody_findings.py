@@ -246,7 +246,7 @@ class Audit443a5c4CockpitAndCustodyFindingsTests(unittest.TestCase):
                 ),
             ):
                 with self.assertRaises(ContractError):
-                    verify_windows_owner_and_dacl(Path("/tmp/null_dacl"))
+                    verify_windows_owner_and_dacl(REPO_ROOT / "simulated_null_dacl_target")
             return
 
         with tempfile.TemporaryDirectory() as td:
