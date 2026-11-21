@@ -118,6 +118,19 @@ def _usd_cpi_event(scheduled_utc: datetime) -> EconomicEvent:
     )
 
 
+_STATIC_SQLITE_COUNT_QUERIES: dict[str, str] = {
+    "audit_events": "SELECT COUNT(*) FROM audit_events",
+    "compounding_audit": "SELECT COUNT(*) FROM compounding_audit",
+    "compounding_config": "SELECT COUNT(*) FROM compounding_config",
+    "compounding_milestones": "SELECT COUNT(*) FROM compounding_milestones",
+    "daily_sessions": "SELECT COUNT(*) FROM daily_sessions",
+    "disbursements": "SELECT COUNT(*) FROM disbursements",
+    "ledger_meta": "SELECT COUNT(*) FROM ledger_meta",
+    "milestone_events": "SELECT COUNT(*) FROM milestone_events",
+    "realized_trades": "SELECT COUNT(*) FROM realized_trades",
+}
+
+
 def _sqlite_data_version_and_counts(db_path: Path) -> tuple[int, dict[str, int]]:
     uri = f"{db_path.resolve().as_uri()}?mode=ro"
     with closing(sqlite3.connect(uri, uri=True, isolation_level=None)) as conn:
@@ -129,10 +142,12 @@ def _sqlite_data_version_and_counts(db_path: Path) -> tuple[int, dict[str, int]]
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
             ).fetchall()
         ]
-        counts = {
-            t: int(conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0])
-            for t in tables
-        }
+        counts: dict[str, int] = {}
+        for t in tables:
+            sql = _STATIC_SQLITE_COUNT_QUERIES.get(str(t))
+            if sql is None:
+                raise ValueError(f"Unmapped SQLite table in read-only count helper: {t!r}")
+            counts[t] = int(conn.execute(sql).fetchone()[0])
         return data_version, counts
 
 

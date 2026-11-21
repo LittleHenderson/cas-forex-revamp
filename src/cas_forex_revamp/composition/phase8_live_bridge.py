@@ -29,6 +29,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
+import logging
 import threading
 import time
 from typing import Any
@@ -459,8 +460,11 @@ class Phase8LiveTradingBridge:
             sub_id = self._ledger_subscriber_id
         try:
             self._event_bus.unsubscribe(sub_id, timeout=timeout, drain=drain)
-        except Exception:
-            pass
+        except Exception as exc_unsub:
+            logging.getLogger(__name__).debug(
+                "phase8 ledger subscriber unsubscribe skipped (%s)",
+                type(exc_unsub).__name__,
+            )
         return self._event_bus.shutdown(timeout=timeout, drain=drain)
 
     def close(self, timeout: float = 2.0, *, drain: bool = True) -> bool:
