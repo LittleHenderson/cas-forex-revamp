@@ -12,8 +12,9 @@ Safety, Security & Constitutional Invariants (PR #25 Hardened):
    with ``TradovateStandbyError`` until explicitly activated.
 2. **Strict Demo-vs-Live HTTPS Host Pinning**:
    Only ``https://demo.tradovateapi.com/v1`` (``DEMO``) and
-   ``https://live.tradovateapi.com/v1`` (``LIVE``, requiring explicit
-   ``live_arming_verified=True``) are permitted. Rejects ``http://``,
+   ``https://live.tradovateapi.com/v1`` (``LIVE``, requiring verified opaque
+   ``LiveAuthorizationContext`` bound to ``TRADOVATE_FUTURES`` + exact LIVE arm
+   confirmation) are permitted. Rejects ``http://``,
    ``file://``, credentials in URL, query strings, fragments, non-443 ports,
    localhost/private/link-local IPs, unpinned hosts, and HTTP 3xx redirects.
 3. **Mandatory Real ``ForexMetaValveGate`` on Every Entry**:
@@ -39,7 +40,7 @@ Safety, Security & Constitutional Invariants (PR #25 Hardened):
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -111,13 +112,26 @@ from cas_forex_revamp.valve.tks_meta_valve_controller import (
     load_default_forex_valve_gate,
     validate_constitutional_drawdown_pct,
 )
+from cas_forex_revamp.venue.live_auth_ticket import (
+    BROKER_TRADOVATE_FUTURES,
+    LIVE_ARM_CONFIRMATION_TEXT,
+    LiveAuthorizationContext,
+    LiveAuthorizationError,
+    verify_live_authorization_context,
+    verify_live_environ_authorization_context,
+)
 from cas_forex_revamp.venue.live_market_stream import verify_public_ip_address
 
 __all__ = [
+    "BROKER_TRADOVATE_FUTURES",
     "CONNECTION_STATUS_CONNECTED",
     "CONNECTION_STATUS_DISCONNECTED",
     "CONNECTION_STATUS_STANDBY",
+    "DEFAULT_MAX_QUOTE_AGE_SECONDS",
+    "DEFAULT_MAX_QUOTE_FUTURE_SKEW_SECONDS",
     "DEFAULT_PAPER_STARTING_EQUITY_USD",
+    "ENV_LIVE_ARM_PHRASE",
+    "ENV_TRADOVATE_ACCOUNT_ID",
     "ENV_TRADOVATE_APP_ID",
     "ENV_TRADOVATE_BASE_URL",
     "ENV_TRADOVATE_CID",
@@ -128,10 +142,17 @@ __all__ = [
     "ENV_TRADOVATE_USERNAME",
     "FuturesOrderAction",
     "GENESIS_AUDIT_SHA256",
+    "LIVE_ARM_CONFIRMATION_TEXT",
+    "LiveAuthorizationContext",
+    "LiveAuthorizationError",
+    "MUTATION_STATUS_OUTCOME_UNKNOWN",
+    "MUTATION_STATUS_PENDING",
+    "MUTATION_STATUS_PROTECTION_UNCONFIRMED",
     "PINNED_TRADOVATE_HOSTS",
     "TRADOVATE_BROKER_ID",
     "TRADOVATE_DEMO_BASE_URL",
     "TRADOVATE_DEMO_HOST",
+    "TRADOVATE_LIVE_AUTH_BROKER_ID",
     "TRADOVATE_LIVE_BASE_URL",
     "TRADOVATE_LIVE_HOST",
     "TRADOVATE_MODE_DEMO",
@@ -151,8 +172,11 @@ __all__ = [
     "TradovateOrderError",
     "TradovateOrderReceipt",
     "TradovateOrderRequest",
+    "TradovateOutcomeUnknownError",
     "TradovatePosition",
+    "TradovateProtectionUnconfirmedError",
     "TradovateQuote",
+    "TradovateStaleQuoteError",
     "TradovateStandbyError",
     "TradovateTransport",
     "TradovateTransportError",
@@ -167,11 +191,26 @@ __all__ = [
     "load_default_forex_valve_gate",
     "load_tradovate_credentials",
     "validate_tradovate_endpoint",
+    "verify_live_authorization_context",
+    "verify_live_environ_authorization_context",
 ]
 
 TRADOVATE_BROKER_ID = "TRADOVATE_MICRO_FUTURES"
+TRADOVATE_LIVE_AUTH_BROKER_ID = BROKER_TRADOVATE_FUTURES
 TRADOVATE_REGULATED_JURISDICTION = "US_CFTC_NFA"
 TRADOVATE_SUPPORTED_CONTRACTS: tuple[str, ...] = ("MNQ", "MYM", "MES", "MGC")
+
+DEFAULT_MAX_QUOTE_AGE_SECONDS = Decimal("30.0")
+DEFAULT_MAX_QUOTE_FUTURE_SKEW_SECONDS = Decimal("5.0")
+
+MUTATION_STATUS_PENDING = "PENDING"
+MUTATION_STATUS_OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN"
+MUTATION_STATUS_PROTECTION_UNCONFIRMED = "PROTECTION_UNCONFIRMED"
+_UNRESOLVED_MUTATION_STATUSES: tuple[str, str, str] = (
+    MUTATION_STATUS_PENDING,
+    MUTATION_STATUS_OUTCOME_UNKNOWN,
+    MUTATION_STATUS_PROTECTION_UNCONFIRMED,
+)
 
 TRADOVATE_DEMO_HOST = "demo.tradovateapi.com"
 TRADOVATE_LIVE_HOST = "live.tradovateapi.com"
@@ -209,6 +248,8 @@ ENV_TRADOVATE_APP_ID = _tradovate_env_var("APP", "ID")
 ENV_TRADOVATE_CID = _tradovate_env_var("CID")
 ENV_TRADOVATE_SEC = _tradovate_env_var("SEC")
 ENV_TRADOVATE_BASE_URL = _tradovate_env_var("BASE", "URL")
+ENV_TRADOVATE_ACCOUNT_ID = _tradovate_env_var("ACCOUNT", "ID")
+ENV_LIVE_ARM_PHRASE = "_".join(("CAS", "FOREX", "LIVE", "ARM", "PHRASE"))
 
 _QUANT_2 = Decimal("0.01")
 _QUANT_4 = Decimal("0.0001")
@@ -244,8 +285,8 @@ class TradovateEndpointError(TradovateVenueError):
     """Raised on unpinned, non-HTTPS, private/localhost, or malformed endpoints."""
 
 
-class TradovateLiveLockError(TradovateEndpointError):
-    """Raised when LIVE mode or live host is accessed without live arming clearance."""
+class TradovateLiveLockError(LiveAuthorizationError, TradovateEndpointError):
+    """Raised when LIVE mode or live host is accessed without verified LiveAuthorizationContext."""
 
 
 class TradovateNotConfiguredError(TradovateVenueError):
@@ -254,6 +295,33 @@ class TradovateNotConfiguredError(TradovateVenueError):
 
 class TradovateTransportError(TradovateVenueError):
     """Raised on HTTPS transport failures, disconnects, or refused redirects."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        ambiguous: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.ambiguous = bool(ambiguous)
+
+
+class TradovateOutcomeUnknownError(TradovateTransportError):
+    """Raised when a post-dispatch outcome is ambiguous or unresolved freeze latch blocks opens."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        cl_ord_id: str | None = None,
+        request_id: str | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        super().__init__(message, http_status=http_status, ambiguous=True)
+        self.cl_ord_id = cl_ord_id
+        self.request_id = request_id
 
 
 class TradovateDrawdownLockError(TradovateVenueError):
@@ -266,6 +334,27 @@ class TradovateMarginRefusalError(TradovateVenueError):
 
 class TradovateOrderError(TradovateVenueError):
     """Raised on invalid order geometry, unknown position ID, or execution error."""
+
+
+class TradovateProtectionUnconfirmedError(TradovateOrderError):
+    """Raised when broker confirmation of stop-loss/take-profit bracket children is missing or mismatched."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        cl_ord_id: str | None = None,
+        order_id: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.cl_ord_id = cl_ord_id
+        self.order_id = order_id
+        self.request_id = request_id
+
+
+class TradovateStaleQuoteError(TradovateOrderError):
+    """Raised fail-closed when quote observed_at is missing, unparseable, future-skewed, or stale."""
 
 
 class TradovateValveRefusalError(ValveRefusalError, TradovateVenueError):
@@ -366,6 +455,266 @@ def _is_ip_literal(hostname: str) -> bool:
         return False
 
 
+def _parse_seconds_decimal(
+    value: Decimal | int | float | str,
+    field: str,
+    *,
+    allow_zero: bool = False,
+) -> Decimal:
+    if isinstance(value, bool):
+        raise ContractError(f"{field} cannot be a bool")
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ContractError(f"{field} must be finite")
+        parsed = Decimal(str(value))
+    else:
+        parsed = _exact_decimal(value, field)
+    if not parsed.is_finite():
+        raise ContractError(f"{field} must be finite")
+    if allow_zero:
+        if parsed < Decimal("0"):
+            raise ContractError(f"{field} must be non-negative")
+    elif parsed <= Decimal("0"):
+        raise ContractError(f"{field} must be strictly positive")
+    return parsed
+
+
+def _decimal_seconds_between(later: datetime, earlier: datetime) -> Decimal:
+    delta = later - earlier
+    whole_seconds = delta.days * 86_400 + delta.seconds
+    return Decimal(whole_seconds) + (Decimal(delta.microseconds) / Decimal(1_000_000))
+
+
+def _parse_quote_observed_at(raw: Any, *, symbol_label: str = "quote") -> datetime:
+    if raw is None:
+        raise TradovateStaleQuoteError(f"Quote for {symbol_label} is missing observed_at timestamp")
+    if isinstance(raw, datetime):
+        if raw.tzinfo is None or raw.utcoffset() is None:
+            raise TradovateStaleQuoteError(
+                f"Quote for {symbol_label} has naive observed_at timestamp (UTC timezone required)"
+            )
+        return raw.astimezone(timezone.utc)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            raise TradovateStaleQuoteError(f"Quote for {symbol_label} has empty observed_at timestamp")
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise TradovateStaleQuoteError(
+                f"Quote for {symbol_label} has unparseable observed_at timestamp: {raw!r}"
+            ) from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise TradovateStaleQuoteError(
+                f"Quote for {symbol_label} observed_at string lacks timezone offset: {raw!r}"
+            )
+        return parsed.astimezone(timezone.utc)
+    raise TradovateStaleQuoteError(
+        f"Quote for {symbol_label} has invalid observed_at type: {type(raw).__name__}"
+    )
+
+
+def _validate_quote_freshness(
+    quote: Any,
+    *,
+    now: datetime,
+    max_age_seconds: Decimal = DEFAULT_MAX_QUOTE_AGE_SECONDS,
+    max_future_skew_seconds: Decimal = DEFAULT_MAX_QUOTE_FUTURE_SKEW_SECONDS,
+) -> datetime:
+    if quote is None:
+        raise TradovateStaleQuoteError("Market quote is missing (fail-closed)")
+    sym = str(getattr(quote, "symbol", "UNKNOWN") or "UNKNOWN")
+    obs_dt = _parse_quote_observed_at(getattr(quote, "observed_at", None), symbol_label=sym)
+    check_now = utc_time(now, "now")
+    age_seconds = _decimal_seconds_between(check_now, obs_dt)
+    if age_seconds < -max_future_skew_seconds:
+        raise TradovateStaleQuoteError(
+            f"Quote for {sym} is future-skewed by {decimal_text(-age_seconds)}s "
+            f"(exceeds tolerance {decimal_text(max_future_skew_seconds)}s)"
+        )
+    if age_seconds > max_age_seconds:
+        raise TradovateStaleQuoteError(
+            f"Quote for {sym} is stale ({decimal_text(age_seconds)}s old > "
+            f"max_quote_age_seconds={decimal_text(max_age_seconds)}s)"
+        )
+    return obs_dt
+
+
+def _parse_broker_decimal(
+    value: Any,
+    field: str,
+    *,
+    positive: bool = False,
+    non_negative: bool = False,
+) -> Decimal:
+    if isinstance(value, bool) or value is None:
+        raise ContractError(f"{field} is missing or invalid in broker payload")
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ContractError(f"{field} must be finite in broker payload")
+        return _exact_decimal(Decimal(str(value)), field, positive=positive, non_negative=non_negative)
+    return _exact_decimal(value, field, positive=positive, non_negative=non_negative)
+
+
+def _parse_broker_int(
+    value: Any,
+    field: str,
+    *,
+    positive: bool = False,
+    non_negative: bool = False,
+) -> int:
+    if isinstance(value, bool) or value is None:
+        raise ContractError(f"{field} must be an integer in broker payload")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, Decimal):
+        if not value.is_finite() or value != value.to_integral_value():
+            raise ContractError(f"{field} must be an exact integer in broker payload")
+        parsed = int(value)
+    elif isinstance(value, str) and value.strip().lstrip("+-").isdigit():
+        parsed = int(value.strip())
+    else:
+        raise ContractError(f"{field} must be an integer in broker payload, got {value!r}")
+    if positive and parsed <= 0:
+        raise ContractError(f"{field} must be strictly positive")
+    if non_negative and parsed < 0:
+        raise ContractError(f"{field} must be non-negative")
+    return parsed
+
+
+def _parse_broker_id(value: Any, field: str) -> str:
+    if isinstance(value, bool) or value is None:
+        raise TradovateProtectionUnconfirmedError(f"Broker response missing required {field}")
+    if isinstance(value, int):
+        if value <= 0:
+            raise TradovateProtectionUnconfirmedError(f"Broker response has invalid {field}: {value!r}")
+        return str(value)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned or any(ch.isspace() or ord(ch) < 32 for ch in cleaned):
+            raise TradovateProtectionUnconfirmedError(f"Broker response has invalid {field}: {value!r}")
+        return cleaned
+    raise TradovateProtectionUnconfirmedError(
+        f"Broker response has unsupported {field} type: {type(value).__name__}"
+    )
+
+
+def _encode_wire_json_str(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ContractError("Non-finite Decimal cannot be JSON-encoded")
+        return decimal_text(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=True)
+    if isinstance(value, Mapping):
+        items = sorted(value.items(), key=lambda kv: str(kv[0]))
+        parts = [
+            f"{json.dumps(str(k), ensure_ascii=True)}:{_encode_wire_json_str(v)}"
+            for k, v in items
+        ]
+        return "{" + ",".join(parts) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_encode_wire_json_str(v) for v in value) + "]"
+    raise ContractError(f"Unsupported wire JSON type: {type(value).__name__}")
+
+
+def _encode_wire_json_bytes(payload: Mapping[str, Any]) -> bytes:
+    return _encode_wire_json_str(payload).encode("utf-8")
+
+
+def _compute_stable_cl_ord_id(
+    *,
+    account_id: str,
+    idempotency_key: str,
+    contract_code: str,
+    action: str,
+    side: str | None,
+    contracts: int,
+    stop_loss_price: Decimal | None,
+    take_profit_price: Decimal | None,
+) -> str:
+    canonical = "|".join(
+        (
+            "cas-tv-clord/1",
+            account_id.strip(),
+            idempotency_key.strip(),
+            contract_code.strip().upper(),
+            action.strip().upper(),
+            (side or "").strip().upper(),
+            str(contracts),
+            decimal_text(stop_loss_price) if stop_loss_price is not None else "",
+            decimal_text(take_profit_price) if take_profit_price is not None else "",
+        )
+    )
+    digest = sha256(canonical.encode("utf-8")).hexdigest()
+    return f"cas-tv-{digest[:24]}"
+
+
+def _verify_tradovate_live_authorization(
+    *,
+    live_auth_context: LiveAuthorizationContext | None,
+    live_arm_phrase: str | None,
+    account_id: str | None,
+    server_host: str,
+    now_utc: datetime | None = None,
+) -> LiveAuthorizationContext:
+    """Verify opaque LiveAuthorizationContext + exact LIVE arm phrase + exact target binding."""
+    norm_host = (server_host or "").strip().lower()
+    if norm_host != TRADOVATE_LIVE_HOST:
+        raise TradovateEndpointError(
+            f"LIVE mode requires pinned host {TRADOVATE_LIVE_HOST!r}, got {server_host!r}"
+        )
+    if not isinstance(live_auth_context, LiveAuthorizationContext):
+        raise TradovateLiveLockError(
+            "LIVE Tradovate mode requires a verified opaque LiveAuthorizationContext "
+            "(bare live_arming_verified boolean is rejected fail-closed)"
+        )
+    acct = (account_id or "").strip() if isinstance(account_id, str) else ""
+    if not acct:
+        raise TradovateLiveLockError(
+            "LIVE Tradovate mode requires a non-empty account_id bound to LiveAuthorizationContext"
+        )
+    _check_no_control_chars(acct, "account_id")
+    if live_arm_phrase is not None:
+        if not isinstance(live_arm_phrase, str) or not hmac.compare_digest(
+            live_arm_phrase.strip().encode("utf-8"),
+            LIVE_ARM_CONFIRMATION_TEXT.encode("utf-8"),
+        ):
+            raise TradovateLiveLockError(
+                f"LIVE Tradovate mode requires exact {ENV_LIVE_ARM_PHRASE} confirmation phrase"
+            )
+    if live_auth_context.execution_mode != TRADOVATE_MODE_LIVE:
+        raise TradovateLiveLockError(
+            f"LiveAuthorizationContext execution_mode must be 'LIVE', got {live_auth_context.execution_mode!r}"
+        )
+    check_now = _utc_now() if now_utc is None else utc_time(now_utc, "now_utc")
+    try:
+        live_auth_context.verify_provenance(
+            now=check_now,
+            reverify_ticket=True,
+            require_arm_phrase=True,
+        )
+        live_auth_context.assert_valid_at(
+            check_now,
+            expected_broker_id=TRADOVATE_LIVE_AUTH_BROKER_ID,
+            expected_account_id=acct,
+            expected_server=TRADOVATE_LIVE_HOST,
+            require_arm_phrase=True,
+            reverify_ticket=True,
+        )
+    except LiveAuthorizationError as exc:
+        raise TradovateLiveLockError(str(exc)) from None
+    return live_auth_context
+
+
 # ---------------------------------------------------------------------------
 # 1. Strict Endpoint Pinning & Redacted Credentials
 # ---------------------------------------------------------------------------
@@ -376,6 +725,10 @@ def validate_tradovate_endpoint(
     base_url: str,
     *,
     live_arming_verified: bool = False,
+    live_auth_context: LiveAuthorizationContext | None = None,
+    live_arm_phrase: str | None = None,
+    account_id: str | None = None,
+    now_utc: datetime | None = None,
 ) -> str:
     """Validate and canonicalize a pinned Tradovate HTTPS API base URL.
 
@@ -385,8 +738,10 @@ def validate_tradovate_endpoint(
     - Default HTTPS port (443) only
     - Zero localhost, IP literals, private/link-local hosts, or unpinned domains
     - ``DEMO`` mode MUST pin ``demo.tradovateapi.com`` (refuses live host)
-    - ``LIVE`` mode MUST pin ``live.tradovateapi.com`` AND require
-      ``live_arming_verified=True`` (otherwise raises ``TradovateLiveLockError``)
+    - ``LIVE`` mode MUST pin ``live.tradovateapi.com`` AND present a verified
+      opaque ``LiveAuthorizationContext`` bound to
+      ``(broker_id="TRADOVATE_FUTURES", account_id, "live.tradovateapi.com", "LIVE")``
+      with verified LIVE arm phrase (bare ``live_arming_verified=True`` is rejected).
     """
     norm_mode = _normalize_mode(mode)
     if type(live_arming_verified) is not bool:
@@ -446,14 +801,17 @@ def validate_tradovate_endpoint(
                 f"expected {TRADOVATE_DEMO_HOST!r}"
             )
     else:
-        if not live_arming_verified:
-            raise TradovateLiveLockError(
-                "LIVE Tradovate mode requires explicit live_arming_verified=True clearance"
-            )
         if hostname != TRADOVATE_LIVE_HOST:
             raise TradovateEndpointError(
                 f"LIVE mode requires pinned host {TRADOVATE_LIVE_HOST!r}, got {hostname!r}"
             )
+        _verify_tradovate_live_authorization(
+            live_auth_context=live_auth_context,
+            live_arm_phrase=live_arm_phrase,
+            account_id=account_id,
+            server_host=hostname,
+            now_utc=now_utc,
+        )
 
     return f"https://{hostname}/v1"
 
@@ -493,12 +851,23 @@ class _RedactedSecret:
 
 @dataclass(frozen=True, slots=True)
 class TradovateCredentials:
-    """Immutable Tradovate configuration defaulting to STANDBY (enabled=False)."""
+    """Immutable Tradovate configuration defaulting to STANDBY (enabled=False).
+
+    LIVE mode strictly requires a verified opaque ``LiveAuthorizationContext``
+    bound to ``(broker_id="TRADOVATE_FUTURES", account_id, "live.tradovateapi.com",
+    "LIVE")`` with verified exact LIVE arm confirmation. A bare
+    ``live_arming_verified=True`` boolean without a verified
+    ``LiveAuthorizationContext`` ALWAYS fails closed with ``LiveAuthorizationError``.
+    """
 
     enabled: bool = False
     mode: str = TRADOVATE_MODE_DEMO
     base_url: str = TRADOVATE_DEMO_BASE_URL
     live_arming_verified: bool = False
+    account_id: str = ""
+    live_auth_context: LiveAuthorizationContext | None = None
+    live_arm_phrase: str | None = None
+    auth_checked_at: datetime | None = None
     username: str = ""
     password: _RedactedSecret | None = None
     app_id: str = ""
@@ -511,11 +880,37 @@ class TradovateCredentials:
             raise ContractError("enabled must be a bool")
         if type(self.live_arming_verified) is not bool:
             raise TradovateLiveLockError("live_arming_verified must be a bool")
+        if not isinstance(self.account_id, str):
+            raise ContractError("account_id must be a string")
+        _check_no_control_chars(self.account_id, "account_id")
+        norm_account_id = self.account_id.strip()
+        if self.live_auth_context is not None and not isinstance(
+            self.live_auth_context, LiveAuthorizationContext
+        ):
+            raise TradovateLiveLockError(
+                "live_auth_context must be a verified LiveAuthorizationContext or None"
+            )
+        if self.live_arm_phrase is not None and not isinstance(self.live_arm_phrase, str):
+            raise TradovateLiveLockError("live_arm_phrase must be a string or None")
+        checked_at = (
+            utc_time(self.auth_checked_at, "auth_checked_at")
+            if self.auth_checked_at is not None
+            else None
+        )
         norm_mode = _normalize_mode(self.mode)
+        if norm_mode == TRADOVATE_MODE_LIVE and self.live_auth_context is None:
+            raise TradovateLiveLockError(
+                "LIVE Tradovate credentials require a verified opaque LiveAuthorizationContext "
+                "(bare live_arming_verified boolean is rejected fail-closed)"
+            )
         canonical_url = validate_tradovate_endpoint(
             norm_mode,
             self.base_url,
             live_arming_verified=self.live_arming_verified,
+            live_auth_context=self.live_auth_context,
+            live_arm_phrase=self.live_arm_phrase,
+            account_id=norm_account_id,
+            now_utc=checked_at,
         )
         _check_no_control_chars(self.username, "username")
         _check_no_control_chars(self.app_id, "app_id")
@@ -528,6 +923,13 @@ class TradovateCredentials:
             raise ContractError("bearer_token must be _RedactedSecret or None")
         object.__setattr__(self, "mode", norm_mode)
         object.__setattr__(self, "base_url", canonical_url)
+        object.__setattr__(self, "account_id", norm_account_id)
+        object.__setattr__(self, "auth_checked_at", checked_at)
+        object.__setattr__(
+            self,
+            "live_arming_verified",
+            bool(norm_mode == TRADOVATE_MODE_LIVE and self.live_auth_context is not None),
+        )
 
     def has_api_credentials(self) -> bool:
         return bool(
@@ -543,9 +945,12 @@ class TradovateCredentials:
         pw_state = redacted_marker if self.password is not None else "None"
         sec_state = redacted_marker if self.sec is not None else "None"
         tok_state = redacted_marker if self.bearer_token is not None else "None"
+        phrase_state = redacted_marker if self.live_arm_phrase is not None else "None"
         return (
             f"TradovateCredentials(enabled={self.enabled!r}, mode={self.mode!r}, "
-            f"base_url={self.base_url!r}, live_arming_verified={self.live_arming_verified!r}, "
+            f"base_url={self.base_url!r}, account_id={self.account_id!r}, "
+            f"live_auth_bound={self.live_auth_context is not None!r}, "
+            f"live_arm_phrase={phrase_state}, "
             f"username={self.username!r}, password={pw_state}, "
             f"app_id={self.app_id!r}, cid={self.cid!r}, "
             f"sec={sec_state}, bearer_token={tok_state})"
@@ -559,13 +964,25 @@ def load_tradovate_credentials(
     environ: Mapping[str, str] | None = None,
     *,
     live_arming_verified: bool = False,
+    live_auth_context: LiveAuthorizationContext | None = None,
+    live_arm_phrase: str | None = None,
+    account_id: str | None = None,
+    now_utc: datetime | None = None,
 ) -> TradovateCredentials:
     """Load optional Tradovate credentials from environment; defaults to STANDBY.
 
     When environment variables are unset, returns ``enabled=False`` in ``DEMO``
     mode pointing at ``https://demo.tradovateapi.com/v1`` so existing brokers
     (Hugo's Way / LHFX / OANDA) remain 100% unaffected.
+
+    For ``LIVE`` mode, requires a verified opaque ``LiveAuthorizationContext``
+    (passed explicitly or verified from ``CAS_FOREX_LIVE_AUTH_KEY_FILE`` +
+    signed ticket env/file bound to ``broker_id="TRADOVATE_FUTURES"``,
+    ``account_id``, and ``live.tradovateapi.com``) plus the exact LIVE arm
+    confirmation. Bare ``live_arming_verified=True`` fails closed.
     """
+    if type(live_arming_verified) is not bool:
+        raise TradovateLiveLockError("live_arming_verified must be a strict bool")
     env = os.environ if environ is None else environ
     raw_enabled = str(env.get(ENV_TRADOVATE_ENABLED, "")).strip().lower()
     if raw_enabled in _TRUTHY_ENV_VALUES:
@@ -588,6 +1005,11 @@ def load_tradovate_credentials(
     )
     raw_base_url = str(env.get(ENV_TRADOVATE_BASE_URL, "")).strip() or default_url
 
+    eff_account_id = (
+        account_id.strip()
+        if isinstance(account_id, str) and account_id.strip()
+        else str(env.get(ENV_TRADOVATE_ACCOUNT_ID, "")).strip()
+    )
     username = str(env.get(ENV_TRADOVATE_USERNAME, "")).strip()
     raw_password = str(env.get(ENV_TRADOVATE_PASSWORD, "")).strip()
     app_id = str(env.get(ENV_TRADOVATE_APP_ID, "")).strip()
@@ -597,11 +1019,40 @@ def load_tradovate_credentials(
     password = _RedactedSecret(raw_password) if raw_password else None
     sec = _RedactedSecret(raw_sec) if raw_sec else None
 
+    eff_phrase: str | None = live_arm_phrase
+    eff_ctx: LiveAuthorizationContext | None = live_auth_context
+    check_now = _utc_now() if now_utc is None else utc_time(now_utc, "now_utc")
+    if mode == TRADOVATE_MODE_LIVE:
+        if eff_phrase is None:
+            raw_env_phrase = str(env.get(ENV_LIVE_ARM_PHRASE, "")).strip()
+            eff_phrase = raw_env_phrase if raw_env_phrase else None
+        if eff_ctx is None:
+            if not eff_account_id:
+                raise TradovateLiveLockError(
+                    f"LIVE Tradovate mode requires {ENV_TRADOVATE_ACCOUNT_ID} bound to a signed LIVE ticket"
+                )
+            try:
+                _ticket, eff_ctx = verify_live_environ_authorization_context(
+                    env,
+                    expected_broker_id=TRADOVATE_LIVE_AUTH_BROKER_ID,
+                    expected_account_login=eff_account_id,
+                    expected_server=TRADOVATE_LIVE_HOST,
+                    live_arm_phrase=eff_phrase,
+                    require_arm_phrase=True,
+                    now=check_now,
+                )
+            except LiveAuthorizationError as exc:
+                raise TradovateLiveLockError(str(exc)) from None
+
     return TradovateCredentials(
         enabled=enabled,
         mode=mode,
         base_url=raw_base_url,
         live_arming_verified=live_arming_verified,
+        account_id=eff_account_id,
+        live_auth_context=eff_ctx,
+        live_arm_phrase=eff_phrase,
+        auth_checked_at=check_now if mode == TRADOVATE_MODE_LIVE else None,
         username=username,
         password=password,
         app_id=app_id,
@@ -668,6 +1119,8 @@ class TradovateOrderRequest:
     order_id: str | None = None
     client_tag: str = ""
     created_at: datetime | None = None
+    cl_ord_id: str | None = None
+    quote_observed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request_id, str) or not self.request_id.strip():
@@ -694,6 +1147,19 @@ class TradovateOrderRequest:
                 "take_profit_price",
                 _exact_decimal(self.take_profit_price, "take_profit_price", positive=True),
             )
+        if self.cl_ord_id is not None:
+            if not isinstance(self.cl_ord_id, str) or not self.cl_ord_id.strip():
+                raise ContractError("cl_ord_id must be a non-empty string when provided")
+            cleaned_cl = self.cl_ord_id.strip()
+            if len(cleaned_cl) > 64 or any(ch.isspace() or ord(ch) < 32 for ch in cleaned_cl):
+                raise ContractError("cl_ord_id must be <= 64 printable non-whitespace chars")
+            object.__setattr__(self, "cl_ord_id", cleaned_cl)
+        if self.quote_observed_at is not None:
+            object.__setattr__(
+                self,
+                "quote_observed_at",
+                utc_time(self.quote_observed_at, "quote_observed_at"),
+            )
         ts = _utc_now() if self.created_at is None else utc_time(self.created_at, "created_at")
         object.__setattr__(self, "created_at", ts)
         object.__setattr__(self, "request_id", self.request_id.strip())
@@ -704,6 +1170,7 @@ class TradovateOrderRequest:
     def to_dict(self) -> dict[str, Any]:
         return {
             "request_id": self.request_id,
+            "cl_ord_id": self.cl_ord_id,
             "action": self.action.value,
             "contract_code": self.contract_code,
             "root_symbol": self.root_symbol,
@@ -720,6 +1187,9 @@ class TradovateOrderRequest:
             "position_id": self.position_id,
             "order_id": self.order_id,
             "client_tag": self.client_tag,
+            "quote_observed_at": (
+                _iso_utc(self.quote_observed_at) if self.quote_observed_at is not None else None
+            ),
             "created_at": _iso_utc(self.created_at) if self.created_at is not None else None,
         }
 
@@ -747,10 +1217,16 @@ class TradovateOrderReceipt:
     executed_at: datetime
     valve_score: Decimal | None = None
     valve_weights_sha256: str | None = None
+    cl_ord_id: str | None = None
+    stop_loss_order_id: str | None = None
+    take_profit_order_id: str | None = None
+    protection_confirmed: bool = False
 
     def __post_init__(self) -> None:
         if type(self.accepted) is not bool:
             raise ContractError("accepted must be bool")
+        if type(self.protection_confirmed) is not bool:
+            raise ContractError("protection_confirmed must be bool")
         if type(self.filled_contracts) is not int or self.filled_contracts < 0:
             raise ContractError("filled_contracts must be non-negative int")
         if self.fill_price is not None:
@@ -769,6 +1245,34 @@ class TradovateOrderReceipt:
                 "take_profit_price",
                 _exact_decimal(self.take_profit_price, "take_profit_price", positive=True),
             )
+        if self.protection_confirmed and self.action is FuturesOrderAction.OPEN_BRACKET:
+            if not isinstance(self.stop_loss_order_id, str) or not self.stop_loss_order_id.strip():
+                raise TradovateProtectionUnconfirmedError(
+                    "OPEN_BRACKET receipt cannot claim protection_confirmed without stop_loss_order_id"
+                )
+            if self.stop_loss_price is None:
+                raise TradovateProtectionUnconfirmedError(
+                    "OPEN_BRACKET receipt cannot claim protection_confirmed without stop_loss_price"
+                )
+            if self.stop_loss_order_id.strip() == self.order_id.strip():
+                raise TradovateProtectionUnconfirmedError(
+                    "stop_loss_order_id must be distinct from entry order_id"
+                )
+            if self.take_profit_price is not None:
+                if (
+                    not isinstance(self.take_profit_order_id, str)
+                    or not self.take_profit_order_id.strip()
+                ):
+                    raise TradovateProtectionUnconfirmedError(
+                        "OPEN_BRACKET receipt with take_profit_price requires take_profit_order_id"
+                    )
+                if self.take_profit_order_id.strip() in (
+                    self.order_id.strip(),
+                    self.stop_loss_order_id.strip(),
+                ):
+                    raise TradovateProtectionUnconfirmedError(
+                        "take_profit_order_id must be distinct from entry and stop-loss order IDs"
+                    )
         object.__setattr__(
             self,
             "commission_usd",
@@ -795,10 +1299,14 @@ class TradovateOrderReceipt:
     def to_dict(self) -> dict[str, Any]:
         return {
             "request_id": self.request_id,
+            "cl_ord_id": self.cl_ord_id,
             "action": self.action.value,
             "accepted": self.accepted,
             "status": self.status,
             "order_id": self.order_id,
+            "stop_loss_order_id": self.stop_loss_order_id,
+            "take_profit_order_id": self.take_profit_order_id,
+            "protection_confirmed": self.protection_confirmed,
             "position_id": self.position_id,
             "contract_code": self.contract_code,
             "root_symbol": self.root_symbol,
@@ -839,6 +1347,9 @@ class TradovatePosition:
     commission_usd: Decimal
     opened_at: datetime
     updated_at: datetime
+    stop_loss_order_id: str | None = None
+    take_profit_order_id: str | None = None
+    cl_ord_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.contracts) is not int or self.contracts <= 0:
@@ -901,6 +1412,9 @@ class TradovatePosition:
             "commission_usd": decimal_text(self.commission_usd),
             "opened_at": _iso_utc(self.opened_at),
             "updated_at": _iso_utc(self.updated_at),
+            "stop_loss_order_id": self.stop_loss_order_id,
+            "take_profit_order_id": self.take_profit_order_id,
+            "cl_ord_id": self.cl_ord_id,
         }
 
 
@@ -1116,14 +1630,18 @@ class TradovateHttpsTransport:
         if type(max_wire_bytes) is not int or max_wire_bytes < 1024:
             raise ContractError("max_wire_bytes must be an integer >= 1024")
         self._credentials = credentials
+        self._clock = clock if clock is not None else _utc_now
         self._base_url = validate_tradovate_endpoint(
             credentials.mode,
             credentials.base_url,
             live_arming_verified=credentials.live_arming_verified,
+            live_auth_context=credentials.live_auth_context,
+            live_arm_phrase=credentials.live_arm_phrase,
+            account_id=credentials.account_id,
+            now_utc=self._clock() if credentials.mode == TRADOVATE_MODE_LIVE else None,
         )
         self._timeout_seconds = timeout_seconds
         self._max_wire_bytes = max_wire_bytes
-        self._clock = clock if clock is not None else _utc_now
         self._bearer_token: _RedactedSecret | None = credentials.bearer_token
         self._connected = False
 
@@ -1166,14 +1684,28 @@ class TradovateHttpsTransport:
             raise TradovateEndpointError("Constructed Tradovate request URL failed host pinning")
         return full_url
 
-    def _request_json(
+    def _require_live_authorization(self, now: datetime) -> None:
+        """Revalidate opaque LiveAuthorizationContext at the final HTTPS dispatch sink."""
+        if self._credentials.mode != TRADOVATE_MODE_LIVE:
+            return
+        parsed = urllib.parse.urlsplit(self._base_url)
+        host = (parsed.hostname or "").lower()
+        _verify_tradovate_live_authorization(
+            live_auth_context=self._credentials.live_auth_context,
+            live_arm_phrase=self._credentials.live_arm_phrase,
+            account_id=self._credentials.account_id,
+            server_host=host,
+            now_utc=now,
+        )
+
+    def _request_json_raw(
         self,
         method: str,
         endpoint_path: str,
         *,
         payload: Mapping[str, Any] | None = None,
         require_auth: bool = True,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | list[Any]:
         full_url = self._build_safe_url(endpoint_path)
         headers: dict[str, str] = {
             "Accept": "application/json",
@@ -1187,11 +1719,7 @@ class TradovateHttpsTransport:
                 )
             headers["Authorization"] = f"Bearer {self._bearer_token.reveal()}"
 
-        body_bytes = (
-            json.dumps(dict(payload), separators=(",", ":"), sort_keys=True).encode("utf-8")
-            if payload is not None
-            else None
-        )
+        body_bytes = _encode_wire_json_bytes(payload) if payload is not None else None
         parsed = urllib.parse.urlsplit(full_url)
         host = (parsed.hostname or "").lower()
         if parsed.scheme != "https" or host not in PINNED_TRADOVATE_HOSTS:
@@ -1216,32 +1744,90 @@ class TradovateHttpsTransport:
             status = int(resp.status)
             if 300 <= status < 400:
                 raise TradovateTransportError(
-                    f"HTTP redirect ({status}) refused on pinned Tradovate HTTPS transport"
+                    f"HTTP redirect ({status}) refused on pinned Tradovate HTTPS transport",
+                    http_status=status,
+                    ambiguous=True,
                 )
             if status not in (200, 201):
-                raise TradovateTransportError(f"Tradovate HTTP status {status}")
+                raise TradovateTransportError(
+                    f"Tradovate HTTP status {status}",
+                    http_status=status,
+                    ambiguous=True,
+                )
             raw = resp.read(self._max_wire_bytes + 1)
         except TradovateVenueError:
             raise
         except (http.client.HTTPException, ssl.SSLError, TimeoutError, OSError) as exc:
             raise TradovateTransportError(
-                f"Tradovate HTTPS connection failed: {type(exc).__name__}"
+                f"Tradovate HTTPS connection failed: {type(exc).__name__}",
+                ambiguous=True,
             ) from None
         finally:
             headers.clear()
             conn.close()
 
         if not raw or len(raw) > self._max_wire_bytes:
-            raise TradovateTransportError("Tradovate response empty or exceeded max wire bytes")
+            raise TradovateTransportError(
+                "Tradovate response empty or exceeded max wire bytes",
+                ambiguous=True,
+            )
         try:
-            decoded = json.loads(raw.decode("utf-8"))
+            decoded = json.loads(raw.decode("utf-8"), parse_float=Decimal)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise TradovateTransportError("Tradovate response was not valid UTF-8 JSON") from exc
-        if not isinstance(decoded, dict):
-            raise TradovateTransportError("Tradovate response root must be a JSON object")
+            raise TradovateTransportError(
+                "Tradovate response was not valid UTF-8 JSON",
+                ambiguous=True,
+            ) from exc
+        if not isinstance(decoded, (dict, list)):
+            raise TradovateTransportError(
+                "Tradovate response root must be a JSON object or array",
+                ambiguous=True,
+            )
         return decoded
 
+    def _request_json(
+        self,
+        method: str,
+        endpoint_path: str,
+        *,
+        payload: Mapping[str, Any] | None = None,
+        require_auth: bool = True,
+    ) -> dict[str, Any]:
+        decoded = self._request_json_raw(
+            method,
+            endpoint_path,
+            payload=payload,
+            require_auth=require_auth,
+        )
+        if not isinstance(decoded, dict):
+            raise TradovateTransportError(
+                "Tradovate response root must be a JSON object",
+                ambiguous=True,
+            )
+        return decoded
+
+    def _request_json_list(
+        self,
+        method: str,
+        endpoint_path: str,
+        *,
+        require_auth: bool = True,
+    ) -> list[dict[str, Any]]:
+        decoded = self._request_json_raw(
+            method,
+            endpoint_path,
+            payload=None,
+            require_auth=require_auth,
+        )
+        if not isinstance(decoded, list) or any(not isinstance(item, dict) for item in decoded):
+            raise TradovateTransportError(
+                "Tradovate list response must be a JSON array of objects",
+                ambiguous=True,
+            )
+        return list(decoded)
+
     def connect(self) -> None:
+        self._require_live_authorization(self._clock())
         if self._bearer_token is not None:
             self._connected = True
             return
@@ -1287,14 +1873,17 @@ class TradovateHttpsTransport:
         self._require_connected()
         now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
         resp = self._request_json("GET", "cashBalance/getcashbalancesnapshot")
-        balance = _exact_decimal(str(resp.get("amount", "0")), "balance_usd")
-        open_pnl = _exact_decimal(str(resp.get("openPnL", "0")), "floating_pnl_usd")
+        balance = _parse_broker_decimal(resp.get("amount", "0"), "balance_usd")
+        open_pnl = _parse_broker_decimal(resp.get("openPnL", "0"), "floating_pnl_usd")
         equity = _q2(balance + open_pnl)
-        used_margin = _exact_decimal(str(resp.get("initialMargin", "0")), "used_margin_usd", non_negative=True)
+        used_margin = _parse_broker_decimal(
+            resp.get("initialMargin", "0"), "used_margin_usd", non_negative=True
+        )
         available = _q2(equity - used_margin)
         margin_level = _q2((equity * Decimal("100")) / used_margin) if used_margin > Decimal("0") else None
+        acct_id = str(resp.get("accountId") or self._credentials.account_id or "TRADOVATE-LIVE")
         return TradovateAccountSnapshot(
-            account_id=str(resp.get("accountId", "TRADOVATE-LIVE")),
+            account_id=acct_id,
             mode=self._credentials.mode,
             connected=True,
             connection_status=CONNECTION_STATUS_CONNECTED,
@@ -1307,7 +1896,7 @@ class TradovateHttpsTransport:
             available_margin_usd=available,
             margin_level_pct=margin_level,
             floating_pnl_usd=open_pnl,
-            realized_pnl_usd=_exact_decimal(str(resp.get("realizedPnL", "0")), "realized_pnl_usd"),
+            realized_pnl_usd=_parse_broker_decimal(resp.get("realizedPnL", "0"), "realized_pnl_usd"),
             total_commissions_usd=Decimal("0.00"),
             open_position_count=0,
             observed_at=now,
@@ -1315,7 +1904,236 @@ class TradovateHttpsTransport:
 
     def positions(self) -> tuple[TradovatePosition, ...]:
         self._require_connected()
-        return ()
+        now = self._clock()
+        raw_positions = self._request_json_list("GET", "position/list")
+        result: list[TradovatePosition] = []
+        for item in raw_positions:
+            net_pos_raw = item.get("netPos", 0)
+            try:
+                net_pos = _parse_broker_int(net_pos_raw, "netPos")
+            except ContractError as exc:
+                raise TradovateTransportError(f"Malformed netPos in position/list: {exc}") from exc
+            if net_pos == 0:
+                continue
+            pos_id = str(item.get("id") or item.get("positionId") or "").strip()
+            if not pos_id:
+                raise TradovateTransportError("Tradovate position/list entry missing id")
+            contract_code = str(
+                item.get("contractCode") or item.get("symbol") or item.get("contractId") or ""
+            ).strip().upper()
+            raw_root = str(item.get("rootSymbol") or contract_code[:3] or "").strip().upper()
+            root = translate_cas_symbol_to_micro_root(raw_root)
+            cas_symbol = translate_micro_root_to_cas_symbol(root)
+            side = "BUY" if net_pos > 0 else "SELL"
+            entry_px = _parse_broker_decimal(
+                item.get("netPrice") or item.get("entryPrice"), "netPrice", positive=True
+            )
+            current_px = (
+                _parse_broker_decimal(item["currentPrice"], "currentPrice", positive=True)
+                if item.get("currentPrice") is not None
+                else entry_px
+            )
+            sl_px = (
+                _parse_broker_decimal(item["stopLossPrice"], "stopLossPrice", positive=True)
+                if item.get("stopLossPrice") is not None
+                else None
+            )
+            tp_px = (
+                _parse_broker_decimal(item["takeProfitPrice"], "takeProfitPrice", positive=True)
+                if item.get("takeProfitPrice") is not None
+                else None
+            )
+            used_margin = _parse_broker_decimal(
+                item.get("usedMarginUsd", "0.00"), "used_margin_usd", non_negative=True
+            )
+            floating = _parse_broker_decimal(item.get("floatingPnlUsd", "0.00"), "floating_pnl_usd")
+            comm = _parse_broker_decimal(
+                item.get("commissionUsd", "0.00"), "commission_usd", non_negative=True
+            )
+            result.append(
+                TradovatePosition(
+                    position_id=pos_id,
+                    contract_code=contract_code,
+                    root_symbol=root,
+                    cas_symbol=cas_symbol,
+                    side=side,
+                    contracts=abs(net_pos),
+                    entry_price=entry_px,
+                    current_price=current_px,
+                    stop_loss_price=sl_px,
+                    take_profit_price=tp_px,
+                    used_margin_usd=used_margin,
+                    floating_pnl_usd=floating,
+                    commission_usd=comm,
+                    opened_at=now,
+                    updated_at=now,
+                    stop_loss_order_id=(
+                        str(item["stopLossOrderId"]).strip()
+                        if item.get("stopLossOrderId") is not None
+                        else None
+                    ),
+                    take_profit_order_id=(
+                        str(item["takeProfitOrderId"]).strip()
+                        if item.get("takeProfitOrderId") is not None
+                        else None
+                    ),
+                    cl_ord_id=(
+                        str(item["clOrdId"]).strip()
+                        if item.get("clOrdId") is not None
+                        else None
+                    ),
+                )
+            )
+        return tuple(result)
+
+    def list_orders(self) -> list[dict[str, Any]]:
+        """Query authoritative Tradovate order list for post-ambiguity reconciliation."""
+        self._require_connected()
+        return self._request_json_list("GET", "order/list")
+
+    def find_orders_by_cl_ord_id(self, cl_ord_id: str) -> list[dict[str, Any]]:
+        """Return broker order records matching an exact stable client order ID."""
+        if not isinstance(cl_ord_id, str) or not cl_ord_id.strip():
+            raise ContractError("cl_ord_id must be a non-empty string")
+        target = cl_ord_id.strip()
+        return [
+            dict(order)
+            for order in self.list_orders()
+            if str(order.get("clOrdId", "")).strip() == target
+        ]
+
+    def _fetch_order_details(self, order_id: str) -> dict[str, Any]:
+        """Fetch broker-side order item + latest orderVersion details to verify child protections."""
+        cleaned = order_id.strip()
+        if not cleaned or any(ch.isspace() or ch in "?#&/" or ord(ch) < 32 for ch in cleaned):
+            raise TradovateProtectionUnconfirmedError(
+                f"Cannot query malformed child order ID {order_id!r}"
+            )
+        try:
+            item = self._request_json("GET", f"order/item?id={cleaned}")
+        except TradovateVenueError as exc:
+            raise TradovateProtectionUnconfirmedError(
+                f"Failed to confirm broker child order {cleaned}: {exc}",
+                order_id=cleaned,
+            ) from None
+        merged = dict(item)
+        if merged.get("stopPrice") is None and merged.get("price") is None:
+            try:
+                versions = self._request_json_list("GET", f"orderVersion/deps?masterid={cleaned}")
+            except TradovateVenueError:
+                versions = []
+            if versions:
+                latest = versions[-1]
+                for key in ("orderQty", "orderType", "price", "stopPrice", "timeInForce"):
+                    if latest.get(key) is not None and merged.get(key) is None:
+                        merged[key] = latest[key]
+        return merged
+
+    def _resolve_child_order_confirmation(
+        self,
+        resp: Mapping[str, Any],
+        *,
+        child_order_id: str,
+        inline_keys: tuple[str, ...],
+    ) -> Mapping[str, Any]:
+        for key in inline_keys:
+            candidate = resp.get(key)
+            if isinstance(candidate, Mapping):
+                return candidate
+        for list_key in ("orders", "childOrders"):
+            raw_list = resp.get(list_key)
+            if isinstance(raw_list, list):
+                for entry in raw_list:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    eid = entry.get("orderId") if entry.get("orderId") is not None else entry.get("id")
+                    if eid is not None and str(eid).strip() == child_order_id:
+                        return entry
+        return self._fetch_order_details(child_order_id)
+
+    @staticmethod
+    def _validate_child_protection(
+        child_doc: Mapping[str, Any],
+        *,
+        expected_order_id: str,
+        expected_action: str,
+        expected_order_type: str,
+        expected_qty: int,
+        expected_price: Decimal,
+        price_keys: tuple[str, ...],
+        label: str,
+        cl_ord_id: str,
+    ) -> Decimal:
+        raw_id = child_doc.get("orderId") if child_doc.get("orderId") is not None else child_doc.get("id")
+        if raw_id is not None and str(raw_id).strip() != expected_order_id:
+            raise TradovateProtectionUnconfirmedError(
+                f"Broker {label} child orderId mismatch: expected {expected_order_id!r}, got {raw_id!r}",
+                cl_ord_id=cl_ord_id,
+                order_id=expected_order_id,
+            )
+        ord_status = str(child_doc.get("ordStatus") or child_doc.get("status") or "").strip().lower()
+        if ord_status in ("rejected", "canceled", "cancelled", "expired", "suspended"):
+            raise TradovateProtectionUnconfirmedError(
+                f"Broker {label} child order {expected_order_id} is not active (status={ord_status!r})",
+                cl_ord_id=cl_ord_id,
+                order_id=expected_order_id,
+            )
+        raw_action = str(child_doc.get("action") or child_doc.get("side") or "").strip().lower()
+        if raw_action != expected_action.lower():
+            raise TradovateProtectionUnconfirmedError(
+                f"Broker {label} child action mismatch: expected {expected_action!r}, got {raw_action!r}",
+                cl_ord_id=cl_ord_id,
+                order_id=expected_order_id,
+            )
+        raw_type = str(child_doc.get("orderType") or child_doc.get("type") or "").strip().lower()
+        if raw_type != expected_order_type.lower():
+            raise TradovateProtectionUnconfirmedError(
+                f"Broker {label} child orderType mismatch: expected {expected_order_type!r}, got {raw_type!r}",
+                cl_ord_id=cl_ord_id,
+                order_id=expected_order_id,
+            )
+        raw_qty = child_doc.get("orderQty") if child_doc.get("orderQty") is not None else child_doc.get("qty")
+        try:
+            confirmed_qty = _parse_broker_int(raw_qty, f"{label}.orderQty", positive=True)
+        except ContractError as exc:
+            raise TradovateProtectionUnconfirmedError(
+                f"Broker {label} child order missing/invalid quantity: {exc}",
+                cl_ord_id=cl_ord_id,
+                order_id=expected_order_id,
+            ) from None
+        if confirmed_qty != expected_qty:
+            raise TradovateProtectionUnconfirmedError(
+                f"Broker {label} child quantity mismatch: expected {expected_qty}, got {confirmed_qty}",
+                cl_ord_id=cl_ord_id,
+                order_id=expected_order_id,
+            )
+        raw_price = None
+        for pkey in price_keys:
+            if child_doc.get(pkey) is not None:
+                raw_price = child_doc.get(pkey)
+                break
+        if raw_price is None:
+            raise TradovateProtectionUnconfirmedError(
+                f"Broker {label} child order {expected_order_id} missing confirmed price",
+                cl_ord_id=cl_ord_id,
+                order_id=expected_order_id,
+            )
+        try:
+            confirmed_price = _parse_broker_decimal(raw_price, f"{label}.price", positive=True)
+        except ContractError as exc:
+            raise TradovateProtectionUnconfirmedError(
+                f"Broker {label} child order price invalid: {exc}",
+                cl_ord_id=cl_ord_id,
+                order_id=expected_order_id,
+            ) from None
+        if confirmed_price != expected_price:
+            raise TradovateProtectionUnconfirmedError(
+                f"Broker {label} child price mismatch: expected {decimal_text(expected_price)}, "
+                f"got {decimal_text(confirmed_price)}",
+                cl_ord_id=cl_ord_id,
+                order_id=expected_order_id,
+            )
+        return confirmed_price
 
     def get_quote(self, symbol_or_root: str) -> TradovateQuote:
         self._require_connected()
@@ -1323,43 +2141,399 @@ class TradovateHttpsTransport:
             "Live market data quotes must be supplied via Tradovate WebSocket market-data adapter"
         )
 
+    def place_protected_order(self, request: TradovateOrderRequest) -> TradovateOrderReceipt:
+        """Place an atomic broker-native Tradovate OSO bracket and strictly verify child protections."""
+        if not isinstance(request, TradovateOrderRequest):
+            raise ContractError("request must be TradovateOrderRequest")
+        if request.action is not FuturesOrderAction.OPEN_BRACKET:
+            raise TradovateOrderError(
+                f"place_protected_order requires OPEN_BRACKET action, got {request.action.value}"
+            )
+        self._require_connected()
+        now = self._clock()
+        self._require_live_authorization(now)
+
+        if request.side not in ("BUY", "SELL"):
+            raise TradovateOrderError("OPEN_BRACKET requires side 'BUY' or 'SELL'")
+        if request.contracts <= 0:
+            raise TradovateOrderError("OPEN_BRACKET requires contracts >= 1")
+        if request.stop_loss_price is None:
+            raise TradovateOrderError("OPEN_BRACKET requires protective stop_loss_price")
+        if request.entry_price is not None:
+            if request.side == "BUY":
+                if request.stop_loss_price >= request.entry_price:
+                    raise TradovateOrderError("BUY stop_loss_price must be strictly below entry_price")
+                if request.take_profit_price is not None and request.take_profit_price <= request.entry_price:
+                    raise TradovateOrderError("BUY take_profit_price must be strictly above entry_price")
+            else:
+                if request.stop_loss_price <= request.entry_price:
+                    raise TradovateOrderError("SELL stop_loss_price must be strictly above entry_price")
+                if request.take_profit_price is not None and request.take_profit_price >= request.entry_price:
+                    raise TradovateOrderError("SELL take_profit_price must be strictly below entry_price")
+
+        cl_ord_id = (request.cl_ord_id or "").strip()
+        if not cl_ord_id:
+            raise TradovateOrderError("OPEN_BRACKET requires a stable cl_ord_id idempotency key")
+
+        entry_action = "Buy" if request.side == "BUY" else "Sell"
+        protective_action = "Sell" if request.side == "BUY" else "Buy"
+
+        bracket1: dict[str, Any] = {
+            "action": protective_action,
+            "orderType": "Stop",
+            "orderQty": request.contracts,
+            "stopPrice": request.stop_loss_price,
+            "timeInForce": "GTC",
+            "isAutomated": True,
+        }
+        payload: dict[str, Any] = {
+            "clOrdId": cl_ord_id,
+            "symbol": request.contract_code,
+            "action": entry_action,
+            "orderQty": request.contracts,
+            "orderType": "Market",
+            "isAutomated": True,
+            "bracket1": bracket1,
+        }
+        if self._credentials.account_id:
+            payload["accountSpec"] = self._credentials.account_id
+            if self._credentials.account_id.isdigit():
+                payload["accountId"] = int(self._credentials.account_id)
+        if request.take_profit_price is not None:
+            payload["bracket2"] = {
+                "action": protective_action,
+                "orderType": "Limit",
+                "orderQty": request.contracts,
+                "price": request.take_profit_price,
+                "timeInForce": "GTC",
+                "isAutomated": True,
+            }
+
+        resp = self._request_json("POST", "order/placeOSO", payload=payload)
+
+        err_text = resp.get("errorText") or resp.get("failureReason") or resp.get("failureText")
+        if err_text:
+            if resp.get("orderId") is not None:
+                raise TradovateProtectionUnconfirmedError(
+                    f"Tradovate placeOSO reported error with orderId present: {err_text}",
+                    cl_ord_id=cl_ord_id,
+                    order_id=str(resp.get("orderId")),
+                    request_id=request.request_id,
+                )
+            raise TradovateProtectionUnconfirmedError(
+                f"Tradovate placeOSO refused or failed without confirmed protection: {err_text}",
+                cl_ord_id=cl_ord_id,
+                request_id=request.request_id,
+            )
+
+        if resp.get("clOrdId") is not None and str(resp.get("clOrdId")).strip() != cl_ord_id:
+            raise TradovateProtectionUnconfirmedError(
+                f"Tradovate placeOSO clOrdId mismatch: expected {cl_ord_id!r}, got {resp.get('clOrdId')!r}",
+                cl_ord_id=cl_ord_id,
+                request_id=request.request_id,
+            )
+
+        entry_order_id = _parse_broker_id(resp.get("orderId"), "orderId")
+        oso1_id = _parse_broker_id(resp.get("oso1Id"), "oso1Id")
+        if oso1_id == entry_order_id:
+            raise TradovateProtectionUnconfirmedError(
+                "Tradovate placeOSO returned oso1Id identical to entry orderId",
+                cl_ord_id=cl_ord_id,
+                order_id=entry_order_id,
+                request_id=request.request_id,
+            )
+
+        sl_doc = self._resolve_child_order_confirmation(
+            resp,
+            child_order_id=oso1_id,
+            inline_keys=("bracket1", "oso1", "stopOrder"),
+        )
+        confirmed_sl = self._validate_child_protection(
+            sl_doc,
+            expected_order_id=oso1_id,
+            expected_action=protective_action,
+            expected_order_type="Stop",
+            expected_qty=request.contracts,
+            expected_price=request.stop_loss_price,
+            price_keys=("stopPrice", "stop_price", "stopLossPrice"),
+            label="stop-loss (oso1)",
+            cl_ord_id=cl_ord_id,
+        )
+
+        oso2_id: str | None = None
+        confirmed_tp: Decimal | None = None
+        if request.take_profit_price is not None:
+            oso2_id = _parse_broker_id(resp.get("oso2Id"), "oso2Id")
+            if oso2_id in (entry_order_id, oso1_id):
+                raise TradovateProtectionUnconfirmedError(
+                    "Tradovate placeOSO returned oso2Id colliding with entry or stop-loss orderId",
+                    cl_ord_id=cl_ord_id,
+                    order_id=entry_order_id,
+                    request_id=request.request_id,
+                )
+            tp_doc = self._resolve_child_order_confirmation(
+                resp,
+                child_order_id=oso2_id,
+                inline_keys=("bracket2", "oso2", "takeProfitOrder"),
+            )
+            confirmed_tp = self._validate_child_protection(
+                tp_doc,
+                expected_order_id=oso2_id,
+                expected_action=protective_action,
+                expected_order_type="Limit",
+                expected_qty=request.contracts,
+                expected_price=request.take_profit_price,
+                price_keys=("price", "limitPrice", "takeProfitPrice"),
+                label="take-profit (oso2)",
+                cl_ord_id=cl_ord_id,
+            )
+
+        # NEVER synthesize fill_price or filled_contracts from request inputs.
+        raw_filled_qty = (
+            resp.get("filledQty")
+            if resp.get("filledQty") is not None
+            else (resp.get("cumQty") if resp.get("cumQty") is not None else resp.get("fillQty"))
+        )
+        raw_fill_price = (
+            resp.get("fillPrice")
+            if resp.get("fillPrice") is not None
+            else (resp.get("avgPx") if resp.get("avgPx") is not None else resp.get("avgFillPrice"))
+        )
+        filled_contracts = 0
+        confirmed_fill_price: Decimal | None = None
+        if raw_filled_qty is not None:
+            try:
+                filled_contracts = _parse_broker_int(raw_filled_qty, "filledQty", non_negative=True)
+            except ContractError as exc:
+                raise TradovateProtectionUnconfirmedError(
+                    f"Broker placeOSO returned invalid filledQty: {exc}",
+                    cl_ord_id=cl_ord_id,
+                    order_id=entry_order_id,
+                    request_id=request.request_id,
+                ) from None
+            if filled_contracts > request.contracts:
+                raise TradovateProtectionUnconfirmedError(
+                    f"Broker placeOSO filledQty ({filled_contracts}) exceeds requested contracts ({request.contracts})",
+                    cl_ord_id=cl_ord_id,
+                    order_id=entry_order_id,
+                    request_id=request.request_id,
+                )
+        if filled_contracts > 0:
+            if raw_fill_price is None:
+                raise TradovateProtectionUnconfirmedError(
+                    "Broker placeOSO reported filledQty > 0 without confirmed fillPrice",
+                    cl_ord_id=cl_ord_id,
+                    order_id=entry_order_id,
+                    request_id=request.request_id,
+                )
+            try:
+                confirmed_fill_price = _parse_broker_decimal(raw_fill_price, "fillPrice", positive=True)
+            except ContractError as exc:
+                raise TradovateProtectionUnconfirmedError(
+                    f"Broker placeOSO returned invalid fillPrice: {exc}",
+                    cl_ord_id=cl_ord_id,
+                    order_id=entry_order_id,
+                    request_id=request.request_id,
+                ) from None
+            receipt_status = "FILLED" if filled_contracts == request.contracts else "PARTIALLY_FILLED"
+        else:
+            receipt_status = "SUBMITTED_PROTECTED"
+
+        raw_pos_id = resp.get("positionId")
+        pos_id = str(raw_pos_id).strip() if raw_pos_id is not None and str(raw_pos_id).strip() else None
+
+        return TradovateOrderReceipt(
+            request_id=request.request_id,
+            cl_ord_id=cl_ord_id,
+            action=request.action,
+            accepted=True,
+            status=receipt_status,
+            order_id=entry_order_id,
+            stop_loss_order_id=oso1_id,
+            take_profit_order_id=oso2_id,
+            protection_confirmed=True,
+            position_id=pos_id,
+            contract_code=request.contract_code,
+            root_symbol=request.root_symbol,
+            cas_symbol=request.cas_symbol,
+            side=request.side,
+            filled_contracts=filled_contracts,
+            fill_price=confirmed_fill_price,
+            stop_loss_price=confirmed_sl,
+            take_profit_price=confirmed_tp,
+            commission_usd=Decimal("0.00"),
+            realized_pnl_usd=Decimal("0.00"),
+            net_pnl_usd=Decimal("0.00"),
+            reason="OSO_BRACKET_CONFIRMED",
+            executed_at=now,
+        )
+
     def send_order(self, request: TradovateOrderRequest) -> TradovateOrderReceipt:
         self._require_connected()
         now = self._clock()
         if request.action is FuturesOrderAction.OPEN_BRACKET:
-            resp = self._request_json(
-                "POST",
-                "order/placeOSO",
-                payload={
-                    "symbol": request.contract_code,
-                    "action": "Buy" if request.side == "BUY" else "Sell",
-                    "orderQty": request.contracts,
-                    "orderType": "Market",
-                    "isAutomated": True,
-                },
-            )
-            order_id = str(resp.get("orderId", request.request_id))
+            return self.place_protected_order(request)
+
+        self._require_live_authorization(now)
+
+        if request.action is FuturesOrderAction.AMEND_STOP:
+            if not request.order_id or request.stop_loss_price is None or request.contracts <= 0:
+                raise TradovateOrderError(
+                    "LIVE AMEND_STOP requires order_id, stop_loss_price, and contracts >= 1"
+                )
+            mod_payload: dict[str, Any] = {
+                "orderId": int(request.order_id) if request.order_id.isdigit() else request.order_id,
+                "orderQty": request.contracts,
+                "orderType": "Stop",
+                "stopPrice": request.stop_loss_price,
+                "isAutomated": True,
+            }
+            if request.cl_ord_id:
+                mod_payload["clOrdId"] = request.cl_ord_id
+            resp = self._request_json("POST", "order/modifyOrder", payload=mod_payload)
+            confirmed_id = _parse_broker_id(resp.get("orderId", request.order_id), "orderId")
             return TradovateOrderReceipt(
                 request_id=request.request_id,
+                cl_ord_id=request.cl_ord_id,
                 action=request.action,
                 accepted=True,
-                status="SUBMITTED",
-                order_id=order_id,
-                position_id=None,
+                status="AMENDED",
+                order_id=confirmed_id,
+                stop_loss_order_id=confirmed_id,
+                position_id=request.position_id,
                 contract_code=request.contract_code,
                 root_symbol=request.root_symbol,
                 cas_symbol=request.cas_symbol,
                 side=request.side,
                 filled_contracts=request.contracts,
-                fill_price=request.entry_price,
+                fill_price=None,
                 stop_loss_price=request.stop_loss_price,
                 take_profit_price=request.take_profit_price,
                 commission_usd=Decimal("0.00"),
                 realized_pnl_usd=Decimal("0.00"),
                 net_pnl_usd=Decimal("0.00"),
-                reason="SUBMITTED_HTTPS",
+                reason="STOP_LOSS_AMENDED_HTTPS",
                 executed_at=now,
             )
+
+        if request.action is FuturesOrderAction.CANCEL_ORDER:
+            if not request.order_id:
+                raise TradovateOrderError("LIVE CANCEL_ORDER requires order_id")
+            resp = self._request_json(
+                "POST",
+                "order/cancelOrder",
+                payload={
+                    "orderId": int(request.order_id) if request.order_id.isdigit() else request.order_id,
+                    "isAutomated": True,
+                },
+            )
+            confirmed_id = _parse_broker_id(resp.get("orderId", request.order_id), "orderId")
+            return TradovateOrderReceipt(
+                request_id=request.request_id,
+                cl_ord_id=request.cl_ord_id,
+                action=request.action,
+                accepted=True,
+                status="CANCELLED",
+                order_id=confirmed_id,
+                position_id=request.position_id,
+                contract_code=request.contract_code,
+                root_symbol=request.root_symbol,
+                cas_symbol=request.cas_symbol,
+                side=request.side,
+                filled_contracts=0,
+                fill_price=None,
+                stop_loss_price=None,
+                take_profit_price=None,
+                commission_usd=Decimal("0.00"),
+                realized_pnl_usd=Decimal("0.00"),
+                net_pnl_usd=Decimal("0.00"),
+                reason="ORDER_CANCELLED_HTTPS",
+                executed_at=now,
+            )
+
+        if request.action is FuturesOrderAction.CLOSE_POSITION:
+            if not request.contract_code:
+                raise TradovateOrderError("LIVE CLOSE_POSITION requires contract_code")
+            liq_payload: dict[str, Any] = {
+                "symbol": request.contract_code,
+                "admin": False,
+                "isAutomated": True,
+            }
+            if self._credentials.account_id:
+                liq_payload["accountSpec"] = self._credentials.account_id
+                if self._credentials.account_id.isdigit():
+                    liq_payload["accountId"] = int(self._credentials.account_id)
+            if request.cl_ord_id:
+                liq_payload["clOrdId"] = request.cl_ord_id
+            resp = self._request_json("POST", "order/liquidatePosition", payload=liq_payload)
+            confirmed_id = _parse_broker_id(resp.get("orderId"), "orderId")
+            return TradovateOrderReceipt(
+                request_id=request.request_id,
+                cl_ord_id=request.cl_ord_id,
+                action=request.action,
+                accepted=True,
+                status="CLOSED",
+                order_id=confirmed_id,
+                position_id=request.position_id,
+                contract_code=request.contract_code,
+                root_symbol=request.root_symbol,
+                cas_symbol=request.cas_symbol,
+                side=request.side,
+                filled_contracts=request.contracts,
+                fill_price=None,
+                stop_loss_price=None,
+                take_profit_price=None,
+                commission_usd=Decimal("0.00"),
+                realized_pnl_usd=Decimal("0.00"),
+                net_pnl_usd=Decimal("0.00"),
+                reason="POSITION_LIQUIDATED_HTTPS",
+                executed_at=now,
+            )
+
+        if request.action is FuturesOrderAction.EMERGENCY_CLOSE_ALL:
+            open_positions = self.positions()
+            closed_qty = 0
+            last_order_id = f"EMERGENCY-{request.request_id}"
+            for idx, pos in enumerate(open_positions, start=1):
+                close_req = TradovateOrderRequest(
+                    request_id=f"{request.request_id}-{idx}",
+                    cl_ord_id=f"{request.cl_ord_id}-{idx}" if request.cl_ord_id else None,
+                    action=FuturesOrderAction.CLOSE_POSITION,
+                    contract_code=pos.contract_code,
+                    root_symbol=pos.root_symbol,
+                    cas_symbol=pos.cas_symbol,
+                    side=pos.side,
+                    contracts=pos.contracts,
+                    position_id=pos.position_id,
+                    client_tag=request.client_tag or "EMERGENCY_CLOSE_ALL",
+                    created_at=now,
+                )
+                rec = self.send_order(close_req)
+                closed_qty += rec.filled_contracts
+                last_order_id = rec.order_id
+            return TradovateOrderReceipt(
+                request_id=request.request_id,
+                cl_ord_id=request.cl_ord_id,
+                action=request.action,
+                accepted=True,
+                status="EMERGENCY_CLOSED",
+                order_id=last_order_id,
+                position_id=None,
+                contract_code="",
+                root_symbol="",
+                cas_symbol="",
+                side=None,
+                filled_contracts=closed_qty,
+                fill_price=None,
+                stop_loss_price=None,
+                take_profit_price=None,
+                commission_usd=Decimal("0.00"),
+                realized_pnl_usd=Decimal("0.00"),
+                net_pnl_usd=Decimal("0.00"),
+                reason=f"EMERGENCY_CLOSED_{len(open_positions)}_POSITIONS_HTTPS",
+                executed_at=now,
+            )
+
         raise TradovateTransportError(f"Unsupported live HTTPS action {request.action.value}")
 
 
@@ -1383,6 +2557,9 @@ class _MutablePaperPosition:
     commission_usd: Decimal
     opened_at: datetime
     updated_at: datetime
+    stop_loss_order_id: str | None = None
+    take_profit_order_id: str | None = None
+    cl_ord_id: str | None = None
 
 
 class TradovateMicroFuturesPaperEmulator:
@@ -1423,6 +2600,9 @@ class TradovateMicroFuturesPaperEmulator:
         self._position_seq = 0
         self._quotes: dict[str, TradovateQuote] = {}
         self._positions: dict[str, _MutablePaperPosition] = {}
+        self._submitted_oso_payloads: list[dict[str, Any]] = []
+        self._order_history: list[dict[str, Any]] = []
+        self._seen_cl_ord_ids: set[str] = set()
 
     @property
     def account_id(self) -> str:
@@ -1510,6 +2690,9 @@ class TradovateMicroFuturesPaperEmulator:
             commission_usd=pos.commission_usd,
             opened_at=pos.opened_at,
             updated_at=pos.updated_at,
+            stop_loss_order_id=pos.stop_loss_order_id,
+            take_profit_order_id=pos.take_profit_order_id,
+            cl_ord_id=pos.cl_ord_id,
         )
 
     def _current_equity_unlocked(self) -> tuple[Decimal, Decimal, Decimal]:
@@ -1818,103 +3001,229 @@ class TradovateMicroFuturesPaperEmulator:
                 )
         return tuple(receipts)
 
+    @property
+    def submitted_oso_payloads(self) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            return tuple(dict(p) for p in self._submitted_oso_payloads)
+
+    def list_orders(self) -> list[dict[str, Any]]:
+        with self._lock:
+            self._require_connected()
+            return [dict(item) for item in self._order_history]
+
+    def find_orders_by_cl_ord_id(self, cl_ord_id: str) -> list[dict[str, Any]]:
+        if not isinstance(cl_ord_id, str) or not cl_ord_id.strip():
+            raise ContractError("cl_ord_id must be a non-empty string")
+        target = cl_ord_id.strip()
+        with self._lock:
+            self._require_connected()
+            return [
+                dict(item)
+                for item in self._order_history
+                if str(item.get("clOrdId", "")).strip() == target
+            ]
+
+    def place_protected_order(self, request: TradovateOrderRequest) -> TradovateOrderReceipt:
+        if not isinstance(request, TradovateOrderRequest):
+            raise ContractError("request must be TradovateOrderRequest")
+        if request.action is not FuturesOrderAction.OPEN_BRACKET:
+            raise TradovateOrderError(
+                f"place_protected_order requires OPEN_BRACKET action, got {request.action.value}"
+            )
+        now = self._clock() if request.created_at is None else request.created_at
+        root = translate_cas_symbol_to_micro_root(request.root_symbol or request.contract_code)
+        cas_symbol = translate_micro_root_to_cas_symbol(root)
+        spec = self._spec_for(root)
+        if request.side not in ("BUY", "SELL"):
+            raise TradovateOrderError("OPEN_BRACKET requires side 'BUY' or 'SELL'")
+        if request.contracts <= 0:
+            raise TradovateOrderError("OPEN_BRACKET requires contracts >= 1")
+        with self._lock:
+            self._require_connected()
+            if request.entry_price is not None:
+                fill_px = align_price_to_tick(root, request.entry_price)
+            else:
+                quote = self._quotes.get(root)
+                if quote is None:
+                    raise TradovateOrderError(
+                        f"No quote seeded in paper emulator for {root!r}"
+                    )
+                fill_px = quote.ask if request.side == "BUY" else quote.bid
+
+            sl_px = (
+                align_price_to_tick(root, request.stop_loss_price)
+                if request.stop_loss_price is not None
+                else None
+            )
+            tp_px = (
+                align_price_to_tick(root, request.take_profit_price)
+                if request.take_profit_price is not None
+                else None
+            )
+            if sl_px is None:
+                raise TradovateOrderError("OPEN_BRACKET requires protective stop_loss_price")
+            if request.side == "BUY":
+                if sl_px >= fill_px:
+                    raise TradovateOrderError(
+                        f"BUY stop_loss_price ({sl_px}) must be strictly below entry ({fill_px})"
+                    )
+                if tp_px is not None and tp_px <= fill_px:
+                    raise TradovateOrderError(
+                        f"BUY take_profit_price ({tp_px}) must be strictly above entry ({fill_px})"
+                    )
+            else:
+                if sl_px <= fill_px:
+                    raise TradovateOrderError(
+                        f"SELL stop_loss_price ({sl_px}) must be strictly above entry ({fill_px})"
+                    )
+                if tp_px is not None and tp_px >= fill_px:
+                    raise TradovateOrderError(
+                        f"SELL take_profit_price ({tp_px}) must be strictly below entry ({fill_px})"
+                    )
+
+            cl_ord_id = (request.cl_ord_id or "").strip() or _compute_stable_cl_ord_id(
+                account_id=self._account_id,
+                idempotency_key=request.request_id,
+                contract_code=request.contract_code,
+                action=request.action.value,
+                side=request.side,
+                contracts=request.contracts,
+                stop_loss_price=sl_px,
+                take_profit_price=tp_px,
+            )
+            if cl_ord_id in self._seen_cl_ord_ids:
+                raise TradovateOrderError(
+                    f"Duplicate clOrdId {cl_ord_id!r} rejected by paper emulator idempotency guard"
+                )
+
+            entry_action = "Buy" if request.side == "BUY" else "Sell"
+            protective_action = "Sell" if request.side == "BUY" else "Buy"
+            margin_req = _q2(self._margin_per_contract(spec) * Decimal(request.contracts))
+            round_turn_comm = _q2(spec.default_round_turn_commission_usd * Decimal(request.contracts))
+            pos_id = self._next_position_id()
+            ord_id = self._next_order_id()
+            sl_ord_id = self._next_order_id()
+            tp_ord_id = self._next_order_id() if tp_px is not None else None
+
+            bracket1_payload: dict[str, Any] = {
+                "orderId": sl_ord_id,
+                "action": protective_action,
+                "orderType": "Stop",
+                "orderQty": request.contracts,
+                "stopPrice": sl_px,
+                "timeInForce": "GTC",
+                "isAutomated": True,
+            }
+            oso_payload: dict[str, Any] = {
+                "clOrdId": cl_ord_id,
+                "symbol": request.contract_code,
+                "action": entry_action,
+                "orderQty": request.contracts,
+                "orderType": "Market",
+                "isAutomated": True,
+                "bracket1": dict(bracket1_payload),
+            }
+            bracket2_payload: dict[str, Any] | None = None
+            if tp_px is not None and tp_ord_id is not None:
+                bracket2_payload = {
+                    "orderId": tp_ord_id,
+                    "action": protective_action,
+                    "orderType": "Limit",
+                    "orderQty": request.contracts,
+                    "price": tp_px,
+                    "timeInForce": "GTC",
+                    "isAutomated": True,
+                }
+                oso_payload["bracket2"] = dict(bracket2_payload)
+
+            self._seen_cl_ord_ids.add(cl_ord_id)
+            self._submitted_oso_payloads.append(oso_payload)
+            history_entry: dict[str, Any] = {
+                "orderId": ord_id,
+                "oso1Id": sl_ord_id,
+                "oso2Id": tp_ord_id,
+                "clOrdId": cl_ord_id,
+                "positionId": pos_id,
+                "symbol": request.contract_code,
+                "action": entry_action,
+                "orderType": "Market",
+                "orderQty": request.contracts,
+                "filledQty": request.contracts,
+                "fillPrice": decimal_text(fill_px),
+                "ordStatus": "Filled",
+                "bracket1": {
+                    "orderId": sl_ord_id,
+                    "action": protective_action,
+                    "orderType": "Stop",
+                    "orderQty": request.contracts,
+                    "stopPrice": decimal_text(sl_px),
+                    "ordStatus": "Working",
+                },
+                "executedAt": _iso_utc(now),
+            }
+            if bracket2_payload is not None:
+                history_entry["bracket2"] = {
+                    "orderId": tp_ord_id,
+                    "action": protective_action,
+                    "orderType": "Limit",
+                    "orderQty": request.contracts,
+                    "price": decimal_text(tp_px),
+                    "ordStatus": "Working",
+                }
+            self._order_history.append(history_entry)
+
+            self._positions[pos_id] = _MutablePaperPosition(
+                position_id=pos_id,
+                contract_code=request.contract_code,
+                root_symbol=root,
+                cas_symbol=cas_symbol,
+                side=request.side,
+                contracts=request.contracts,
+                entry_price=fill_px,
+                stop_loss_price=sl_px,
+                take_profit_price=tp_px,
+                used_margin_usd=margin_req,
+                commission_usd=round_turn_comm,
+                opened_at=now,
+                updated_at=now,
+                stop_loss_order_id=sl_ord_id,
+                take_profit_order_id=tp_ord_id,
+                cl_ord_id=cl_ord_id,
+            )
+            self._current_equity_unlocked()
+            return TradovateOrderReceipt(
+                request_id=request.request_id,
+                cl_ord_id=cl_ord_id,
+                action=FuturesOrderAction.OPEN_BRACKET,
+                accepted=True,
+                status="FILLED",
+                order_id=ord_id,
+                stop_loss_order_id=sl_ord_id,
+                take_profit_order_id=tp_ord_id,
+                protection_confirmed=True,
+                position_id=pos_id,
+                contract_code=request.contract_code,
+                root_symbol=root,
+                cas_symbol=cas_symbol,
+                side=request.side,
+                filled_contracts=request.contracts,
+                fill_price=fill_px,
+                stop_loss_price=sl_px,
+                take_profit_price=tp_px,
+                commission_usd=Decimal("0.00"),
+                realized_pnl_usd=Decimal("0.00"),
+                net_pnl_usd=Decimal("0.00"),
+                reason="PAPER_BRACKET_FILLED",
+                executed_at=now,
+            )
+
     def send_order(self, request: TradovateOrderRequest) -> TradovateOrderReceipt:
         if not isinstance(request, TradovateOrderRequest):
             raise ContractError("request must be TradovateOrderRequest")
         now = self._clock() if request.created_at is None else request.created_at
 
         if request.action is FuturesOrderAction.OPEN_BRACKET:
-            root = translate_cas_symbol_to_micro_root(request.root_symbol or request.contract_code)
-            cas_symbol = translate_micro_root_to_cas_symbol(root)
-            spec = self._spec_for(root)
-            if request.side not in ("BUY", "SELL"):
-                raise TradovateOrderError("OPEN_BRACKET requires side 'BUY' or 'SELL'")
-            if request.contracts <= 0:
-                raise TradovateOrderError("OPEN_BRACKET requires contracts >= 1")
-            with self._lock:
-                self._require_connected()
-                if request.entry_price is not None:
-                    fill_px = align_price_to_tick(root, request.entry_price)
-                else:
-                    quote = self._quotes.get(root)
-                    if quote is None:
-                        raise TradovateOrderError(
-                            f"No quote seeded in paper emulator for {root!r}"
-                        )
-                    fill_px = quote.ask if request.side == "BUY" else quote.bid
-
-                sl_px = (
-                    align_price_to_tick(root, request.stop_loss_price)
-                    if request.stop_loss_price is not None
-                    else None
-                )
-                tp_px = (
-                    align_price_to_tick(root, request.take_profit_price)
-                    if request.take_profit_price is not None
-                    else None
-                )
-                if sl_px is None:
-                    raise TradovateOrderError("OPEN_BRACKET requires protective stop_loss_price")
-                if request.side == "BUY":
-                    if sl_px >= fill_px:
-                        raise TradovateOrderError(
-                            f"BUY stop_loss_price ({sl_px}) must be strictly below entry ({fill_px})"
-                        )
-                    if tp_px is not None and tp_px <= fill_px:
-                        raise TradovateOrderError(
-                            f"BUY take_profit_price ({tp_px}) must be strictly above entry ({fill_px})"
-                        )
-                else:
-                    if sl_px <= fill_px:
-                        raise TradovateOrderError(
-                            f"SELL stop_loss_price ({sl_px}) must be strictly above entry ({fill_px})"
-                        )
-                    if tp_px is not None and tp_px >= fill_px:
-                        raise TradovateOrderError(
-                            f"SELL take_profit_price ({tp_px}) must be strictly below entry ({fill_px})"
-                        )
-
-                margin_req = _q2(self._margin_per_contract(spec) * Decimal(request.contracts))
-                round_turn_comm = _q2(spec.default_round_turn_commission_usd * Decimal(request.contracts))
-                pos_id = self._next_position_id()
-                ord_id = self._next_order_id()
-                self._positions[pos_id] = _MutablePaperPosition(
-                    position_id=pos_id,
-                    contract_code=request.contract_code,
-                    root_symbol=root,
-                    cas_symbol=cas_symbol,
-                    side=request.side,
-                    contracts=request.contracts,
-                    entry_price=fill_px,
-                    stop_loss_price=sl_px,
-                    take_profit_price=tp_px,
-                    used_margin_usd=margin_req,
-                    commission_usd=round_turn_comm,
-                    opened_at=now,
-                    updated_at=now,
-                )
-                self._current_equity_unlocked()
-                return TradovateOrderReceipt(
-                    request_id=request.request_id,
-                    action=FuturesOrderAction.OPEN_BRACKET,
-                    accepted=True,
-                    status="FILLED",
-                    order_id=ord_id,
-                    position_id=pos_id,
-                    contract_code=request.contract_code,
-                    root_symbol=root,
-                    cas_symbol=cas_symbol,
-                    side=request.side,
-                    filled_contracts=request.contracts,
-                    fill_price=fill_px,
-                    stop_loss_price=sl_px,
-                    take_profit_price=tp_px,
-                    commission_usd=Decimal("0.00"),
-                    realized_pnl_usd=Decimal("0.00"),
-                    net_pnl_usd=Decimal("0.00"),
-                    reason="PAPER_BRACKET_FILLED",
-                    executed_at=now,
-                )
+            return self.place_protected_order(request)
 
         if request.action is FuturesOrderAction.AMEND_STOP:
             if not request.position_id or request.stop_loss_price is None:
@@ -2018,9 +3327,21 @@ def _build_futures_valve_proposal(
     reason: str,
     now: datetime,
     seq: int,
+    max_quote_age_seconds: Decimal = DEFAULT_MAX_QUOTE_AGE_SECONDS,
 ) -> DecisionProposal:
-    """Build a genuine typed DecisionProposal for ForexMetaValveGate evaluation."""
-    valid_until = now + timedelta(seconds=120)
+    """Build a genuine typed DecisionProposal preserving original quote.observed_at."""
+    quote_observed_at = _parse_quote_observed_at(
+        getattr(quote, "observed_at", None),
+        symbol_label=root_symbol,
+    )
+    age_limit_us = int(max_quote_age_seconds * Decimal(1_000_000))
+    state_valid_until = quote_observed_at + timedelta(microseconds=age_limit_us + 1)
+    if now < quote_observed_at or now >= state_valid_until:
+        intent_created_at = quote_observed_at
+    else:
+        intent_created_at = now
+    intent_expires_at = state_valid_until
+
     scope = RunScope(
         account_id=account_id,
         run_id=f"tradovate-futures-{request_id}",
@@ -2034,8 +3355,8 @@ def _build_futures_valve_proposal(
         state_id=f"state-{request_id}",
         scope=scope,
         version=max(1, seq),
-        observed_at=now,
-        valid_until=valid_until,
+        observed_at=quote_observed_at,
+        valid_until=state_valid_until,
         venue_sequence=max(1, seq),
     )
     obs_obj = {
@@ -2043,6 +3364,7 @@ def _build_futures_valve_proposal(
         "contract_code": contract_code,
         "bid": decimal_text(quote.bid),
         "ask": decimal_text(quote.ask),
+        "quote_observed_at": _iso_utc(quote_observed_at),
         "balance": decimal_text(account.balance_usd),
         "equity": decimal_text(account.equity_usd),
         "available_margin": decimal_text(account.available_margin_usd),
@@ -2057,7 +3379,7 @@ def _build_futures_valve_proposal(
         kind=EvidenceKind.OBSERVATION,
         producer_id="tradovate-micro-futures-venue",
         content_sha256=sha256(obs_json.encode("utf-8")).hexdigest(),
-        observed_at=now,
+        observed_at=quote_observed_at,
     )
     fact = DecisionFact(
         fact_id=f"observed-{request_id}",
@@ -2075,8 +3397,8 @@ def _build_futures_valve_proposal(
         kind=ActionKind.OPEN,
         instrument_id=root_symbol,
         origin=DecisionOrigin.POLICY,
-        created_at=now,
-        expires_at=valid_until,
+        created_at=intent_created_at,
+        expires_at=intent_expires_at,
         quantity=Decimal(contracts),
         side=Side.BUY if side == "BUY" else Side.SELL,
         limit_price=entry_price,
@@ -2106,14 +3428,15 @@ def _build_futures_valve_proposal(
         reason,
         (ev_id,),
     )
+    prov_ts = now if now >= quote_observed_at else quote_observed_at
     provenance = DecisionProvenance(
         DecisionOrigin.POLICY,
         "tradovate-micro-futures-venue",
         content_digest(request),
         content_digest(selection),
         "tradovate-venue-v1",
-        now,
-        now,
+        prov_ts,
+        prov_ts,
     )
     result = DecisionResult(
         decision_id=intent.decision_id,
@@ -2150,9 +3473,14 @@ class TradovateMicroFuturesVenue:
         enabled: bool | None = None,
         mode: str | None = None,
         base_url: str | None = None,
+        account_id: str | None = None,
         live_arming_verified: bool = False,
+        live_auth_context: LiveAuthorizationContext | None = None,
+        live_arm_phrase: str | None = None,
         max_drawdown_pct: Decimal = MAX_CONSTITUTIONAL_DRAWDOWN_PCT,
         min_margin_level_pct: Decimal = DEFAULT_MIN_MARGIN_LEVEL_PCT,
+        max_quote_age_seconds: Decimal | int | float | str = DEFAULT_MAX_QUOTE_AGE_SECONDS,
+        max_quote_future_skew_seconds: Decimal | int | float | str = DEFAULT_MAX_QUOTE_FUTURE_SKEW_SECONDS,
         roll_buffer_days: int = 7,
         use_exchange_margin: bool = False,
         clock: Callable[[], datetime] | None = None,
@@ -2176,13 +3504,28 @@ class TradovateMicroFuturesVenue:
                 f"min_margin_level_pct ({margin_floor}%) cannot be below constitutional floor "
                 f"{DEFAULT_MIN_MARGIN_LEVEL_PCT}%"
             )
+        max_q_age = _parse_seconds_decimal(max_quote_age_seconds, "max_quote_age_seconds")
+        max_q_skew = _parse_seconds_decimal(
+            max_quote_future_skew_seconds, "max_quote_future_skew_seconds", allow_zero=True
+        )
+        eff_clock = clock if clock is not None else _utc_now
 
         if credentials is not None:
             if not isinstance(credentials, TradovateCredentials):
                 raise ContractError("credentials must be TradovateCredentials")
             eff_enabled = credentials.enabled if enabled is None else enabled
             eff_mode = _normalize_mode(mode) if mode is not None else credentials.mode
-            eff_live_arm = live_arming_verified or credentials.live_arming_verified
+            eff_account_id = (
+                account_id.strip()
+                if isinstance(account_id, str) and account_id.strip()
+                else credentials.account_id
+            )
+            eff_live_ctx = (
+                live_auth_context if live_auth_context is not None else credentials.live_auth_context
+            )
+            eff_live_phrase = (
+                live_arm_phrase if live_arm_phrase is not None else credentials.live_arm_phrase
+            )
             eff_base_url = (
                 base_url
                 if base_url is not None
@@ -2200,7 +3543,11 @@ class TradovateMicroFuturesVenue:
                 enabled=eff_enabled,
                 mode=eff_mode,
                 base_url=eff_base_url,
-                live_arming_verified=eff_live_arm,
+                live_arming_verified=live_arming_verified,
+                account_id=eff_account_id,
+                live_auth_context=eff_live_ctx,
+                live_arm_phrase=eff_live_phrase,
+                auth_checked_at=eff_clock() if eff_mode == TRADOVATE_MODE_LIVE else None,
                 username=credentials.username,
                 password=credentials.password,
                 app_id=credentials.app_id,
@@ -2215,11 +3562,16 @@ class TradovateMicroFuturesVenue:
                 TRADOVATE_LIVE_BASE_URL if eff_mode == TRADOVATE_MODE_LIVE else TRADOVATE_DEMO_BASE_URL
             )
             eff_base_url = base_url if base_url is not None else default_url
+            eff_account_id = account_id.strip() if isinstance(account_id, str) else ""
             eff_creds = TradovateCredentials(
                 enabled=eff_enabled,
                 mode=eff_mode,
                 base_url=eff_base_url,
                 live_arming_verified=live_arming_verified,
+                account_id=eff_account_id,
+                live_auth_context=live_auth_context,
+                live_arm_phrase=live_arm_phrase,
+                auth_checked_at=eff_clock() if eff_mode == TRADOVATE_MODE_LIVE else None,
             )
 
         self._db_path = Path(db_path)
@@ -2227,13 +3579,17 @@ class TradovateMicroFuturesVenue:
         self._enabled = eff_creds.enabled
         self._mode = eff_creds.mode
         self._base_url = eff_creds.base_url
-        self._live_arming_verified = eff_creds.live_arming_verified
+        self._account_id = eff_creds.account_id
+        self._live_auth_context: LiveAuthorizationContext | None = eff_creds.live_auth_context
+        self._live_arm_phrase: str | None = eff_creds.live_arm_phrase
         self._valve_gate = valve_gate
         self._max_drawdown_pct = dd_cap
         self._min_margin_level_pct = margin_floor
+        self._max_quote_age_seconds = max_q_age
+        self._max_quote_future_skew_seconds = max_q_skew
         self._roll_buffer_days = roll_buffer_days
         self._use_exchange_margin = bool(use_exchange_margin)
-        self._clock = clock if clock is not None else _utc_now
+        self._clock = eff_clock
         self._lock = RLock()
         self._req_seq = 0
 
@@ -2406,6 +3762,7 @@ class TradovateMicroFuturesVenue:
                     CREATE TABLE IF NOT EXISTS mutation_journal (
                         seq INTEGER PRIMARY KEY AUTOINCREMENT,
                         request_id TEXT NOT NULL UNIQUE,
+                        cl_ord_id TEXT,
                         action TEXT NOT NULL,
                         contract_code TEXT NOT NULL,
                         root_symbol TEXT NOT NULL,
@@ -2413,8 +3770,40 @@ class TradovateMicroFuturesVenue:
                         status TEXT NOT NULL,
                         request_json TEXT NOT NULL,
                         receipt_json TEXT,
+                        error_detail TEXT,
+                        reconciled_at TEXT,
+                        reconciliation_json TEXT,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                existing_cols = {
+                    str(r["name"]) for r in conn.execute("PRAGMA table_info(mutation_journal)").fetchall()
+                }
+                for col_name, col_type in (
+                    ("cl_ord_id", "TEXT"),
+                    ("error_detail", "TEXT"),
+                    ("reconciled_at", "TEXT"),
+                    ("reconciliation_json", "TEXT"),
+                ):
+                    if col_name not in existing_cols:
+                        conn.execute(f"ALTER TABLE mutation_journal ADD COLUMN {col_name} {col_type}")
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_mutation_journal_cl_ord_id "
+                    "ON mutation_journal(cl_ord_id) WHERE cl_ord_id IS NOT NULL"
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS venue_freeze_latches (
+                        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                        latch_kind TEXT NOT NULL,
+                        request_id TEXT NOT NULL,
+                        cl_ord_id TEXT,
+                        detail TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        cleared_at TEXT,
+                        reconciliation_json TEXT
                     )
                     """
                 )
@@ -2431,6 +3820,46 @@ class TradovateMicroFuturesVenue:
                     )
                     """
                 )
+                leftover_pending = conn.execute(
+                    "SELECT request_id, cl_ord_id FROM mutation_journal WHERE status = ?",
+                    (MUTATION_STATUS_PENDING,),
+                ).fetchall()
+                for pending_row in leftover_pending:
+                    p_req_id = str(pending_row["request_id"])
+                    p_cl_id = pending_row["cl_ord_id"]
+                    conn.execute(
+                        "UPDATE mutation_journal SET status = ?, error_detail = ?, updated_at = ? "
+                        "WHERE request_id = ?",
+                        (
+                            MUTATION_STATUS_OUTCOME_UNKNOWN,
+                            "CRASH_RECOVERY_PENDING_PROMOTED_TO_OUTCOME_UNKNOWN",
+                            ts_str,
+                            p_req_id,
+                        ),
+                    )
+                    conn.execute(
+                        "INSERT INTO venue_freeze_latches "
+                        "(latch_kind, request_id, cl_ord_id, detail, created_at, cleared_at, reconciliation_json) "
+                        "VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+                        (
+                            MUTATION_STATUS_OUTCOME_UNKNOWN,
+                            p_req_id,
+                            p_cl_id,
+                            "Crash recovery promoted unresolved PENDING mutation to OUTCOME_UNKNOWN",
+                            ts_str,
+                        ),
+                    )
+                    self._append_audit_unlocked(
+                        conn,
+                        event_type="ORDER_OUTCOME_UNKNOWN_RECOVERY",
+                        entity_id=p_req_id,
+                        payload={
+                            "request_id": p_req_id,
+                            "cl_ord_id": p_cl_id,
+                            "status": MUTATION_STATUS_OUTCOME_UNKNOWN,
+                        },
+                        occurred_at=now,
+                    )
                 existing = conn.execute("SELECT id, peak_equity_usd FROM venue_meta WHERE id = 1").fetchone()
                 if existing is None:
                     conn.execute(
@@ -2545,7 +3974,10 @@ class TradovateMicroFuturesVenue:
         *,
         mode: str | None = None,
         base_url: str | None = None,
+        account_id: str | None = None,
         live_arming_verified: bool | None = None,
+        live_auth_context: LiveAuthorizationContext | None = None,
+        live_arm_phrase: str | None = None,
         now_utc: datetime | None = None,
     ) -> dict[str, Any]:
         """Activate venue from STANDBY_READY into DEMO_ACTIVE or LIVE_ACTIVE."""
@@ -2554,10 +3986,16 @@ class TradovateMicroFuturesVenue:
             raise TradovateLiveLockError("live_arming_verified must be a strict bool or None")
         with self._lock:
             target_mode = _normalize_mode(mode) if mode is not None else self._mode
-            target_live_arm = (
-                self._live_arming_verified
-                if live_arming_verified is None
-                else live_arming_verified
+            target_account_id = (
+                account_id.strip()
+                if isinstance(account_id, str) and account_id.strip()
+                else self._account_id
+            )
+            target_live_ctx = (
+                live_auth_context if live_auth_context is not None else self._live_auth_context
+            )
+            target_live_phrase = (
+                live_arm_phrase if live_arm_phrase is not None else self._live_arm_phrase
             )
             default_url = (
                 TRADOVATE_LIVE_BASE_URL
@@ -2568,7 +4006,11 @@ class TradovateMicroFuturesVenue:
             canonical_url = validate_tradovate_endpoint(
                 target_mode,
                 target_url,
-                live_arming_verified=target_live_arm,
+                live_arming_verified=bool(live_arming_verified) if live_arming_verified is not None else False,
+                live_auth_context=target_live_ctx if target_mode == TRADOVATE_MODE_LIVE else None,
+                live_arm_phrase=target_live_phrase if target_mode == TRADOVATE_MODE_LIVE else None,
+                account_id=target_account_id if target_mode == TRADOVATE_MODE_LIVE else None,
+                now_utc=now,
             )
             target_status = (
                 VENUE_STATUS_LIVE_ACTIVE
@@ -2612,7 +4054,10 @@ class TradovateMicroFuturesVenue:
 
             self._mode = target_mode
             self._base_url = canonical_url
-            self._live_arming_verified = target_live_arm
+            self._account_id = target_account_id
+            if target_mode == TRADOVATE_MODE_LIVE:
+                self._live_auth_context = target_live_ctx
+                self._live_arm_phrase = target_live_phrase
             self._enabled = True
         return self.snapshot(now_utc=now)
 
@@ -2686,6 +4131,10 @@ class TradovateMicroFuturesVenue:
                 "and cannot be None (fail-closed)"
             )
 
+        quote_observed_at = _parse_quote_observed_at(
+            getattr(quote, "observed_at", None),
+            symbol_label=root_symbol,
+        )
         proposal = _build_futures_valve_proposal(
             request_id=request_id,
             account_id=account.account_id,
@@ -2702,6 +4151,7 @@ class TradovateMicroFuturesVenue:
             reason=reason,
             now=now,
             seq=self._req_seq,
+            max_quote_age_seconds=self._max_quote_age_seconds,
         )
         current_view: dict[str, Any] = {
             "account_id": account.account_id,
@@ -2713,6 +4163,7 @@ class TradovateMicroFuturesVenue:
             "symbol": root_symbol,
             "bid": decimal_text(quote.bid),
             "ask": decimal_text(quote.ask),
+            "quote_observed_at": _iso_utc(quote_observed_at),
         }
         eff_policy: dict[str, Any] = {
             "new_risk_permission": "ALLOWED",
@@ -2809,6 +4260,131 @@ class TradovateMicroFuturesVenue:
 
     # -- Entry Execution (Full Constitutional + Valve + Sizing Wall) --
 
+    def _query_unresolved_mutations_unlocked(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            "SELECT request_id, cl_ord_id, action, contract_code, root_symbol, status, "
+            "error_detail, created_at, updated_at FROM mutation_journal "
+            "WHERE status IN (?, ?, ?) ORDER BY seq ASC",
+            _UNRESOLVED_MUTATION_STATUSES,
+        ).fetchall()
+        return [
+            {
+                "request_id": str(r["request_id"]),
+                "cl_ord_id": r["cl_ord_id"],
+                "action": str(r["action"]),
+                "contract_code": str(r["contract_code"]),
+                "root_symbol": str(r["root_symbol"]),
+                "status": str(r["status"]),
+                "error_detail": r["error_detail"],
+                "created_at": str(r["created_at"]),
+                "updated_at": str(r["updated_at"]),
+            }
+            for r in rows
+        ]
+
+    def _query_active_latches_unlocked(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            "SELECT seq, latch_kind, request_id, cl_ord_id, detail, created_at "
+            "FROM venue_freeze_latches WHERE cleared_at IS NULL ORDER BY seq ASC"
+        ).fetchall()
+        return [
+            {
+                "seq": int(r["seq"]),
+                "latch_kind": str(r["latch_kind"]),
+                "request_id": str(r["request_id"]),
+                "cl_ord_id": r["cl_ord_id"],
+                "detail": str(r["detail"]),
+                "created_at": str(r["created_at"]),
+            }
+            for r in rows
+        ]
+
+    def _enforce_no_unresolved_freeze_unlocked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        request_id: str,
+        now: datetime,
+    ) -> None:
+        unresolved = self._query_unresolved_mutations_unlocked(conn)
+        latches = self._query_active_latches_unlocked(conn)
+        if not unresolved and not latches:
+            return
+        ids = ", ".join(
+            f"{item['request_id']}({item['cl_ord_id'] or 'no-clOrdId'}:{item['status']})"
+            for item in unresolved
+        ) or ", ".join(f"{l['request_id']}({l['latch_kind']})" for l in latches)
+        has_unknown = any(
+            item["status"] in (MUTATION_STATUS_OUTCOME_UNKNOWN, MUTATION_STATUS_PENDING)
+            for item in unresolved
+        ) or any(l["latch_kind"] == MUTATION_STATUS_OUTCOME_UNKNOWN for l in latches)
+        self._append_audit_unlocked(
+            conn,
+            event_type="ORDER_REFUSED_UNRESOLVED_FREEZE",
+            entity_id=request_id,
+            payload={
+                "unresolved_mutations": unresolved,
+                "active_latches": latches,
+            },
+            occurred_at=now,
+        )
+        conn.execute("COMMIT")
+        if has_unknown:
+            raise TradovateOutcomeUnknownError(
+                f"TRADOVATE_OUTCOME_UNKNOWN_FREEZE: unresolved mutation(s) [{ids}] block all "
+                "new opens/retries until reconcile_unknown_outcome() verifies broker history",
+                request_id=request_id,
+            )
+        raise TradovateProtectionUnconfirmedError(
+            f"TRADOVATE_PROTECTION_UNCONFIRMED_FREEZE: unresolved protection latch(es) [{ids}] "
+            "block all new opens until reconciled",
+            request_id=request_id,
+        )
+
+    def _record_unresolved_latch(
+        self,
+        *,
+        request_id: str,
+        cl_ord_id: str,
+        status: str,
+        event_type: str,
+        detail: str,
+        now: datetime,
+        order_id: str | None = None,
+    ) -> None:
+        ts_str = _iso_utc(now)
+        with closing(self._connect_rw()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "UPDATE mutation_journal SET status = ?, error_detail = ?, updated_at = ? "
+                    "WHERE request_id = ?",
+                    (status, detail, ts_str, request_id),
+                )
+                conn.execute(
+                    "INSERT INTO venue_freeze_latches "
+                    "(latch_kind, request_id, cl_ord_id, detail, created_at, cleared_at, reconciliation_json) "
+                    "VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+                    (status, request_id, cl_ord_id, detail, ts_str),
+                )
+                self._append_audit_unlocked(
+                    conn,
+                    event_type=event_type,
+                    entity_id=request_id,
+                    payload={
+                        "request_id": request_id,
+                        "cl_ord_id": cl_ord_id,
+                        "order_id": order_id,
+                        "status": status,
+                        "detail": detail,
+                    },
+                    occurred_at=now,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     def place_bracket_order(
         self,
         *,
@@ -2822,13 +4398,18 @@ class TradovateMicroFuturesVenue:
         risk_pct: Decimal = MAX_CONSTITUTIONAL_STOP_RISK_PCT,
         contracts: int | None = None,
         contract_code: str | None = None,
+        idempotency_key: str | None = None,
         reason: str = "CAS_MICRO_FUTURES_ENTRY",
         policy_overrides: Mapping[str, Any] | None = None,
         now_utc: datetime | None = None,
     ) -> TradovateOrderReceipt:
-        """Open a tick-aligned, risk-sized, valve-cleared CME micro-futures bracket order."""
+        """Open a tick-aligned, risk-sized, valve-cleared, broker-protected CME micro-futures bracket order."""
         now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
         norm_side = _normalize_side(side)
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+                raise ContractError("idempotency_key must be a non-empty string when provided")
+            _check_no_control_chars(idempotency_key, "idempotency_key")
 
         with self._lock:
             request_id = self._next_request_id("open")
@@ -2849,6 +4430,20 @@ class TradovateMicroFuturesVenue:
                     "TradovateMicroFuturesVenue is in STANDBY_READY mode; "
                     "explicitly activate() before placing new micro-futures entries"
                 )
+
+            # 1b. Durable unresolved OUTCOME_UNKNOWN / PROTECTION_UNCONFIRMED freeze latch gate
+            with closing(self._connect_rw()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._enforce_no_unresolved_freeze_unlocked(
+                        conn, request_id=request_id, now=now
+                    )
+                    conn.execute("COMMIT")
+                except (TradovateOutcomeUnknownError, TradovateProtectionUnconfirmedError):
+                    raise
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
 
             # 2. Transport connection gate
             if not self._transport.is_connected():
@@ -2915,8 +4510,29 @@ class TradovateMicroFuturesVenue:
                     "new entries refused (protective close/amend actions remain allowed)"
                 )
 
-            # 5. Live quote, tick alignment, & stop/TP geometry
+            # 5. Live quote freshness gate (Finding [16]), tick alignment, & stop/TP geometry
             quote = self._transport.get_quote(root)
+            try:
+                quote_observed_at = _validate_quote_freshness(
+                    quote,
+                    now=now,
+                    max_age_seconds=self._max_quote_age_seconds,
+                    max_future_skew_seconds=self._max_quote_future_skew_seconds,
+                )
+            except TradovateStaleQuoteError as exc:
+                self._record_audit_event(
+                    event_type="ORDER_REFUSED_STALE_QUOTE",
+                    entity_id=request_id,
+                    payload={
+                        "root_symbol": root,
+                        "contract_code": front_month.contract_code,
+                        "error": str(exc),
+                        "max_quote_age_seconds": decimal_text(self._max_quote_age_seconds),
+                    },
+                    now=now,
+                )
+                raise
+
             ref_entry = (
                 align_price_to_tick(root, _exact_decimal(entry_price, "entry_price", positive=True))
                 if entry_price is not None
@@ -2990,7 +4606,7 @@ class TradovateMicroFuturesVenue:
             else:
                 final_contracts = sizing.contracts
 
-            # 7. Mandatory real ForexMetaValveGate (161 params, 0.55 cutoff)
+            # 7. Mandatory real ForexMetaValveGate (161 params, 0.55 cutoff) with original quote.observed_at
             valve_decision = self._evaluate_mandatory_valve(
                 request_id=request_id,
                 root_symbol=root,
@@ -3010,9 +4626,55 @@ class TradovateMicroFuturesVenue:
             )
             valve_score_dec = Decimal(f"{valve_decision.mlp_score:.8f}")
 
-            # 8. Build request, journal PENDING, dispatch, commit receipt & audit chain
+            # 8. Immediate pre-dispatch freshness + LIVE auth rechecks (Findings [6], [16])
+            dispatch_now = self._clock() if now_utc is None else now
+            try:
+                quote_observed_at = _validate_quote_freshness(
+                    quote,
+                    now=dispatch_now,
+                    max_age_seconds=self._max_quote_age_seconds,
+                    max_future_skew_seconds=self._max_quote_future_skew_seconds,
+                )
+            except TradovateStaleQuoteError as exc:
+                self._record_audit_event(
+                    event_type="ORDER_REFUSED_STALE_QUOTE_PRE_DISPATCH",
+                    entity_id=request_id,
+                    payload={
+                        "root_symbol": root,
+                        "contract_code": front_month.contract_code,
+                        "error": str(exc),
+                        "quote_observed_at": _iso_utc(quote_observed_at),
+                    },
+                    now=dispatch_now,
+                )
+                raise
+
+            if self._mode == TRADOVATE_MODE_LIVE:
+                parsed_url = urllib.parse.urlsplit(self._base_url)
+                _verify_tradovate_live_authorization(
+                    live_auth_context=self._live_auth_context,
+                    live_arm_phrase=self._live_arm_phrase,
+                    account_id=self._account_id,
+                    server_host=(parsed_url.hostname or "").lower(),
+                    now_utc=dispatch_now,
+                )
+
+            # 9. Persist deterministic stable clOrdId + PENDING row BEFORE transport call (Finding [3])
+            stable_key = idempotency_key.strip() if idempotency_key is not None else request_id
+            cl_ord_id = _compute_stable_cl_ord_id(
+                account_id=self._account_id or acct.account_id,
+                idempotency_key=stable_key,
+                contract_code=front_month.contract_code,
+                action=FuturesOrderAction.OPEN_BRACKET.value,
+                side=norm_side,
+                contracts=final_contracts,
+                stop_loss_price=aligned_sl,
+                take_profit_price=aligned_tp,
+            )
+
             order_req = TradovateOrderRequest(
                 request_id=request_id,
+                cl_ord_id=cl_ord_id,
                 action=FuturesOrderAction.OPEN_BRACKET,
                 contract_code=front_month.contract_code,
                 root_symbol=root,
@@ -3023,43 +4685,190 @@ class TradovateMicroFuturesVenue:
                 stop_loss_price=aligned_sl,
                 take_profit_price=aligned_tp,
                 client_tag=reason,
-                created_at=now,
+                quote_observed_at=quote_observed_at,
+                created_at=dispatch_now,
             )
             req_json = canonical_bytes(order_req.to_dict()).decode("utf-8")
-            ts_str = _iso_utc(now)
+            ts_str = _iso_utc(dispatch_now)
 
             with closing(self._connect_rw()) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
+                    self._enforce_no_unresolved_freeze_unlocked(
+                        conn, request_id=request_id, now=dispatch_now
+                    )
+                    dup_row = conn.execute(
+                        "SELECT request_id, status FROM mutation_journal WHERE cl_ord_id = ?",
+                        (cl_ord_id,),
+                    ).fetchone()
+                    if dup_row is not None:
+                        dup_status = str(dup_row["status"])
+                        conn.execute("COMMIT")
+                        if dup_status in _UNRESOLVED_MUTATION_STATUSES:
+                            raise TradovateOutcomeUnknownError(
+                                f"Duplicate clOrdId {cl_ord_id!r} already in unresolved state {dup_status!r}",
+                                cl_ord_id=cl_ord_id,
+                                request_id=str(dup_row["request_id"]),
+                            )
+                        raise TradovateOrderError(
+                            f"Duplicate idempotent clOrdId {cl_ord_id!r} already committed "
+                            f"(request_id={dup_row['request_id']}, status={dup_status})"
+                        )
                     conn.execute(
                         "INSERT INTO mutation_journal "
-                        "(request_id, action, contract_code, root_symbol, cas_symbol, status, "
-                        "request_json, receipt_json, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                        "(request_id, cl_ord_id, action, contract_code, root_symbol, cas_symbol, status, "
+                        "request_json, receipt_json, error_detail, reconciled_at, reconciliation_json, "
+                        "created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
                         (
                             request_id,
+                            cl_ord_id,
                             order_req.action.value,
                             order_req.contract_code,
                             order_req.root_symbol,
                             order_req.cas_symbol,
-                            "PENDING",
+                            MUTATION_STATUS_PENDING,
                             req_json,
                             ts_str,
                             ts_str,
                         ),
                     )
                     conn.execute("COMMIT")
+                except (TradovateOutcomeUnknownError, TradovateProtectionUnconfirmedError, TradovateOrderError):
+                    raise
                 except Exception:
                     conn.execute("ROLLBACK")
                     raise
 
-            raw_receipt = self._transport.send_order(order_req)
+            # 10. Dispatch via place_protected_order / send_order with fail-closed OUTCOME_UNKNOWN promotion
+            dispatch_fn = getattr(self._transport, "place_protected_order", None)
+            try:
+                if callable(dispatch_fn):
+                    raw_receipt = dispatch_fn(order_req)
+                else:
+                    raw_receipt = self._transport.send_order(order_req)
+            except LiveAuthorizationError as exc:
+                with closing(self._connect_rw()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        conn.execute(
+                            "UPDATE mutation_journal SET status = ?, error_detail = ?, updated_at = ? "
+                            "WHERE request_id = ?",
+                            ("REFUSED_LIVE_AUTH", str(exc), _iso_utc(self._clock()), request_id),
+                        )
+                        self._append_audit_unlocked(
+                            conn,
+                            event_type="ORDER_REFUSED_LIVE_AUTH",
+                            entity_id=request_id,
+                            payload={"cl_ord_id": cl_ord_id, "error": str(exc)},
+                            occurred_at=self._clock(),
+                        )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        conn.execute("ROLLBACK")
+                        raise
+                raise
+            except TradovateProtectionUnconfirmedError as exc:
+                self._record_unresolved_latch(
+                    request_id=request_id,
+                    cl_ord_id=cl_ord_id,
+                    status=MUTATION_STATUS_PROTECTION_UNCONFIRMED,
+                    event_type="ORDER_PROTECTION_UNCONFIRMED",
+                    detail=str(exc),
+                    now=self._clock(),
+                    order_id=exc.order_id,
+                )
+                raise
+            except Exception as exc:
+                http_status = getattr(exc, "http_status", None)
+                detail = f"AMBIGUOUS_TRANSPORT_OUTCOME ({type(exc).__name__}): {exc}"
+                self._record_unresolved_latch(
+                    request_id=request_id,
+                    cl_ord_id=cl_ord_id,
+                    status=MUTATION_STATUS_OUTCOME_UNKNOWN,
+                    event_type="ORDER_OUTCOME_UNKNOWN",
+                    detail=detail,
+                    now=self._clock(),
+                )
+                raise TradovateOutcomeUnknownError(
+                    f"Tradovate order outcome unknown for clOrdId={cl_ord_id} ({detail}); "
+                    "venue frozen until reconcile_unknown_outcome() verifies broker history",
+                    cl_ord_id=cl_ord_id,
+                    request_id=request_id,
+                    http_status=http_status,
+                ) from None
+
+            # 11. Venue-layer broker protection confirmation audit (Finding [2] defense-in-depth)
+            protection_failure: str | None = None
+            if not isinstance(raw_receipt, TradovateOrderReceipt):
+                protection_failure = "Transport returned non-TradovateOrderReceipt object"
+            elif not raw_receipt.accepted:
+                protection_failure = f"Broker did not accept protected bracket (status={raw_receipt.status!r})"
+            elif not raw_receipt.protection_confirmed:
+                protection_failure = "Broker receipt did not confirm stop/take-profit child protection"
+            elif not isinstance(raw_receipt.order_id, str) or not raw_receipt.order_id.strip():
+                protection_failure = "Broker receipt missing confirmed entry order_id"
+            elif not isinstance(raw_receipt.stop_loss_order_id, str) or not raw_receipt.stop_loss_order_id.strip():
+                protection_failure = "Broker receipt missing confirmed stop_loss_order_id (oso1Id)"
+            elif raw_receipt.stop_loss_order_id.strip() == raw_receipt.order_id.strip():
+                protection_failure = "Broker receipt stop_loss_order_id collides with entry order_id"
+            elif raw_receipt.stop_loss_price != aligned_sl:
+                protection_failure = (
+                    f"Broker confirmed stop_loss_price ({raw_receipt.stop_loss_price}) "
+                    f"does not match requested stop_loss_price ({aligned_sl})"
+                )
+            elif aligned_tp is not None and (
+                not isinstance(raw_receipt.take_profit_order_id, str)
+                or not raw_receipt.take_profit_order_id.strip()
+            ):
+                protection_failure = "Broker receipt missing confirmed take_profit_order_id (oso2Id)"
+            elif aligned_tp is not None and raw_receipt.take_profit_order_id is not None and (
+                raw_receipt.take_profit_order_id.strip()
+                in (raw_receipt.order_id.strip(), raw_receipt.stop_loss_order_id.strip())
+            ):
+                protection_failure = "Broker receipt take_profit_order_id collides with entry/stop order_id"
+            elif aligned_tp is not None and raw_receipt.take_profit_price != aligned_tp:
+                protection_failure = (
+                    f"Broker confirmed take_profit_price ({raw_receipt.take_profit_price}) "
+                    f"does not match requested take_profit_price ({aligned_tp})"
+                )
+            elif raw_receipt.cl_ord_id is not None and raw_receipt.cl_ord_id != cl_ord_id:
+                protection_failure = (
+                    f"Broker receipt cl_ord_id ({raw_receipt.cl_ord_id!r}) != requested ({cl_ord_id!r})"
+                )
+
+            if protection_failure is not None:
+                raw_oid = (
+                    getattr(raw_receipt, "order_id", None)
+                    if isinstance(raw_receipt, TradovateOrderReceipt)
+                    else None
+                )
+                self._record_unresolved_latch(
+                    request_id=request_id,
+                    cl_ord_id=cl_ord_id,
+                    status=MUTATION_STATUS_PROTECTION_UNCONFIRMED,
+                    event_type="ORDER_PROTECTION_UNCONFIRMED",
+                    detail=protection_failure,
+                    now=self._clock(),
+                    order_id=raw_oid,
+                )
+                raise TradovateProtectionUnconfirmedError(
+                    protection_failure,
+                    cl_ord_id=cl_ord_id,
+                    order_id=raw_oid,
+                    request_id=request_id,
+                )
+
             receipt = TradovateOrderReceipt(
                 request_id=raw_receipt.request_id,
+                cl_ord_id=cl_ord_id,
                 action=raw_receipt.action,
                 accepted=raw_receipt.accepted,
                 status=raw_receipt.status,
                 order_id=raw_receipt.order_id,
+                stop_loss_order_id=raw_receipt.stop_loss_order_id,
+                take_profit_order_id=raw_receipt.take_profit_order_id,
+                protection_confirmed=True,
                 position_id=raw_receipt.position_id,
                 contract_code=raw_receipt.contract_code,
                 root_symbol=raw_receipt.root_symbol,
@@ -3093,6 +4902,7 @@ class TradovateMicroFuturesVenue:
                         entity_id=request_id,
                         payload={
                             "receipt": receipt.to_dict(),
+                            "quote_observed_at": _iso_utc(quote_observed_at),
                             "valve_mode": valve_decision.valve_mode,
                             "valve_score": decimal_text(valve_score_dec),
                             "valve_weights_sha256": valve_decision.weights_sha256,
@@ -3105,6 +4915,319 @@ class TradovateMicroFuturesVenue:
                     raise
 
             return receipt
+
+    # -- Explicit Broker-History Reconciliation (Findings [2] & [3]) --
+
+    def reconcile_unknown_outcome(
+        self,
+        *,
+        cl_ord_id: str | None = None,
+        request_id: str | None = None,
+        broker_orders: Sequence[Mapping[str, Any]] | None = None,
+        confirm_protection_resolved: bool = False,
+        now_utc: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Reconcile OUTCOME_UNKNOWN / PROTECTION_UNCONFIRMED latches against broker order history.
+
+        Queries broker orders by exact ``clOrdId`` (via ``broker_orders`` or the
+        transport's ``find_orders_by_cl_ord_id`` / ``list_orders``) and releases
+        the durable venue freeze latch ONLY once every unresolved mutation reaches
+        a broker-confirmed terminal or fully-protected state.
+        """
+        now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
+        ts_str = _iso_utc(now)
+        if type(confirm_protection_resolved) is not bool:
+            raise ContractError("confirm_protection_resolved must be a strict bool")
+        if broker_orders is not None:
+            if isinstance(broker_orders, (str, bytes)) or not isinstance(broker_orders, Sequence):
+                raise ContractError("broker_orders must be a sequence of order mappings")
+            if any(not isinstance(item, Mapping) for item in broker_orders):
+                raise ContractError("every item in broker_orders must be a Mapping")
+
+        with self._lock:
+            with closing(self._connect_rw()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    rows = conn.execute(
+                        "SELECT seq, request_id, cl_ord_id, contract_code, status, request_json "
+                        "FROM mutation_journal WHERE status IN (?, ?, ?) ORDER BY seq ASC",
+                        _UNRESOLVED_MUTATION_STATUSES,
+                    ).fetchall()
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+
+            targets = []
+            for row in rows:
+                r_req = str(row["request_id"])
+                r_cl = str(row["cl_ord_id"]).strip() if row["cl_ord_id"] is not None else ""
+                if cl_ord_id is not None and r_cl != cl_ord_id.strip():
+                    continue
+                if request_id is not None and r_req != request_id.strip():
+                    continue
+                targets.append(row)
+
+            if (cl_ord_id is not None or request_id is not None) and not targets:
+                raise TradovateOrderError(
+                    f"No unresolved mutation matching cl_ord_id={cl_ord_id!r}, request_id={request_id!r}"
+                )
+
+            reconciled_results: list[dict[str, Any]] = []
+            for row in targets:
+                r_req = str(row["request_id"])
+                r_cl = str(row["cl_ord_id"]).strip() if row["cl_ord_id"] is not None else ""
+                r_contract = str(row["contract_code"])
+                orig_req = json.loads(str(row["request_json"]))
+                req_sl = orig_req.get("stop_loss_price")
+                req_tp = orig_req.get("take_profit_price")
+
+                if not r_cl:
+                    raise TradovateOutcomeUnknownError(
+                        f"Unresolved mutation {r_req} lacks cl_ord_id; cannot safely reconcile",
+                        request_id=r_req,
+                    )
+
+                if broker_orders is not None:
+                    matched = [
+                        dict(o) for o in broker_orders if str(o.get("clOrdId", "")).strip() == r_cl
+                    ]
+                else:
+                    if not self._transport.is_connected():
+                        raise TradovateOutcomeUnknownError(
+                            "Transport disconnected during reconcile_unknown_outcome(); freeze latch retained",
+                            cl_ord_id=r_cl,
+                            request_id=r_req,
+                        )
+                    finder = getattr(self._transport, "find_orders_by_cl_ord_id", None)
+                    lister = getattr(self._transport, "list_orders", None)
+                    try:
+                        if callable(finder):
+                            matched = [dict(o) for o in finder(r_cl)]
+                        elif callable(lister):
+                            matched = [
+                                dict(o)
+                                for o in lister()
+                                if str(o.get("clOrdId", "")).strip() == r_cl
+                            ]
+                        else:
+                            raise TradovateOutcomeUnknownError(
+                                "Transport does not expose broker order-history lookup; freeze latch retained",
+                                cl_ord_id=r_cl,
+                                request_id=r_req,
+                            )
+                    except TradovateOutcomeUnknownError:
+                        raise
+                    except Exception as exc:
+                        raise TradovateOutcomeUnknownError(
+                            f"Broker history lookup failed during reconciliation ({type(exc).__name__}: {exc}); "
+                            "freeze latch retained",
+                            cl_ord_id=r_cl,
+                            request_id=r_req,
+                        ) from None
+
+                new_status: str
+                resolved = False
+                reason_code: str
+                if not matched:
+                    new_status = "RECONCILED_ABSENT"
+                    resolved = True
+                    reason_code = "CONFIRMED_ABSENT_IN_BROKER_HISTORY"
+                else:
+                    order_doc = matched[-1]
+                    ord_status = str(order_doc.get("ordStatus") or order_doc.get("status") or "").strip().lower()
+                    filled_raw = order_doc.get("filledQty", order_doc.get("cumQty", 0))
+                    try:
+                        filled_qty = _parse_broker_int(filled_raw, "filledQty", non_negative=True)
+                    except ContractError:
+                        filled_qty = -1
+
+                    if ord_status in ("rejected", "canceled", "cancelled", "expired") and filled_qty == 0:
+                        new_status = "RECONCILED_REJECTED"
+                        resolved = True
+                        reason_code = f"CONFIRMED_{ord_status.upper()}_ZERO_FILL"
+                    elif ord_status in (
+                        "filled",
+                        "working",
+                        "accepted",
+                        "completed",
+                        "partiallyfilled",
+                        "partially_filled",
+                    ):
+                        req_side = str(orig_req.get("side") or "").strip().upper()
+                        expected_prot_action = "sell" if req_side == "BUY" else ("buy" if req_side == "SELL" else "")
+                        req_qty = orig_req.get("contracts")
+                        all_history_orders: list[Mapping[str, Any]] = (
+                            list(broker_orders) if broker_orders is not None else []
+                        )
+
+                        def _find_child_doc(
+                            parent_doc: Mapping[str, Any],
+                            child_id_val: Any,
+                            inline_names: tuple[str, ...],
+                        ) -> Mapping[str, Any] | None:
+                            for iname in inline_names:
+                                cand = parent_doc.get(iname)
+                                if isinstance(cand, Mapping):
+                                    return cand
+                            cid = str(child_id_val).strip() if child_id_val is not None else ""
+                            if not cid:
+                                return None
+                            for entry in all_history_orders:
+                                eid = entry.get("orderId") if entry.get("orderId") is not None else entry.get("id")
+                                if eid is not None and str(eid).strip() == cid:
+                                    return entry
+                            fetcher = getattr(self._transport, "_fetch_order_details", None)
+                            if callable(fetcher) and self._transport.is_connected():
+                                try:
+                                    fetched = fetcher(cid)
+                                    if isinstance(fetched, Mapping):
+                                        return fetched
+                                except TradovateVenueError:
+                                    return None
+                            return None
+
+                        def _child_matches(
+                            cdoc: Mapping[str, Any] | None,
+                            expected_px_str: Any,
+                            px_keys: tuple[str, ...],
+                        ) -> bool:
+                            if not isinstance(cdoc, Mapping) or expected_px_str is None:
+                                return False
+                            c_status = str(cdoc.get("ordStatus") or cdoc.get("status") or "").strip().lower()
+                            if c_status in ("rejected", "canceled", "cancelled", "expired", "suspended"):
+                                return False
+                            c_action = str(cdoc.get("action") or cdoc.get("side") or "").strip().lower()
+                            if expected_prot_action and c_action and c_action != expected_prot_action:
+                                return False
+                            c_qty = cdoc.get("orderQty") if cdoc.get("orderQty") is not None else cdoc.get("qty")
+                            if c_qty is not None and req_qty is not None:
+                                try:
+                                    if _parse_broker_int(c_qty, "orderQty", positive=True) != int(req_qty):
+                                        return False
+                                except (ContractError, ValueError):
+                                    return False
+                            raw_px = None
+                            for pk in px_keys:
+                                if cdoc.get(pk) is not None:
+                                    raw_px = cdoc.get(pk)
+                                    break
+                            if raw_px is None:
+                                return False
+                            try:
+                                return (
+                                    _parse_broker_decimal(raw_px, "child_price", positive=True)
+                                    == Decimal(str(expected_px_str))
+                                )
+                            except (ContractError, InvalidOperation):
+                                return False
+
+                        oso1_val = order_doc.get("oso1Id")
+                        has_oso1 = bool(oso1_val)
+                        sl_doc = (
+                            _find_child_doc(order_doc, oso1_val, ("bracket1", "oso1", "stopOrder"))
+                            if has_oso1
+                            else None
+                        )
+                        sl_ok = has_oso1 and _child_matches(
+                            sl_doc, req_sl, ("stopPrice", "stop_price", "stopLossPrice")
+                        )
+
+                        tp_ok = req_tp is None
+                        if req_tp is not None:
+                            oso2_val = order_doc.get("oso2Id")
+                            has_oso2 = bool(oso2_val)
+                            tp_doc = (
+                                _find_child_doc(order_doc, oso2_val, ("bracket2", "oso2", "takeProfitOrder"))
+                                if has_oso2
+                                else None
+                            )
+                            tp_ok = has_oso2 and _child_matches(
+                                tp_doc, req_tp, ("price", "limitPrice", "takeProfitPrice")
+                            )
+                        if sl_ok and tp_ok:
+                            new_status = "RECONCILED_FILLED_PROTECTED"
+                            resolved = True
+                            reason_code = "CONFIRMED_FILLED_WITH_VERIFIED_PROTECTION"
+                        elif confirm_protection_resolved:
+                            open_same = False
+                            if self._transport.is_connected():
+                                open_same = any(
+                                    p.contract_code == r_contract for p in self._transport.positions()
+                                )
+                            if not open_same:
+                                new_status = "RECONCILED_CLOSED_EXTERNALLY"
+                                resolved = True
+                                reason_code = "CONFIRMED_NO_OPEN_UNPROTECTED_POSITION"
+                            else:
+                                new_status = MUTATION_STATUS_PROTECTION_UNCONFIRMED
+                                resolved = False
+                                reason_code = "OPEN_POSITION_STILL_LACKS_VERIFIED_PROTECTION"
+                        else:
+                            new_status = MUTATION_STATUS_PROTECTION_UNCONFIRMED
+                            resolved = False
+                            reason_code = "BROKER_ORDER_PRESENT_WITHOUT_VERIFIED_PROTECTION"
+                    else:
+                        new_status = MUTATION_STATUS_OUTCOME_UNKNOWN
+                        resolved = False
+                        reason_code = f"BROKER_ORDER_STILL_AMBIGUOUS_{ord_status.upper() or 'MISSING_STATUS'}"
+
+                rec_doc = {
+                    "request_id": r_req,
+                    "cl_ord_id": r_cl,
+                    "new_status": new_status,
+                    "resolved": resolved,
+                    "reason": reason_code,
+                    "matched_order_count": len(matched),
+                    "reconciled_at": ts_str,
+                }
+                rec_json = canonical_bytes(rec_doc).decode("utf-8")
+
+                with closing(self._connect_rw()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        conn.execute(
+                            "UPDATE mutation_journal SET status = ?, reconciled_at = ?, "
+                            "reconciliation_json = ?, updated_at = ? WHERE request_id = ?",
+                            (
+                                new_status,
+                                ts_str if resolved else None,
+                                rec_json,
+                                ts_str,
+                                r_req,
+                            ),
+                        )
+                        if resolved:
+                            conn.execute(
+                                "UPDATE venue_freeze_latches SET cleared_at = ?, reconciliation_json = ? "
+                                "WHERE request_id = ? AND cleared_at IS NULL",
+                                (ts_str, rec_json, r_req),
+                            )
+                        self._append_audit_unlocked(
+                            conn,
+                            event_type="OUTCOME_UNKNOWN_RECONCILED",
+                            entity_id=r_req,
+                            payload=rec_doc,
+                            occurred_at=now,
+                        )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        conn.execute("ROLLBACK")
+                        raise
+
+                reconciled_results.append(rec_doc)
+
+            with closing(self._connect_ro()) as conn:
+                remaining_unresolved = self._query_unresolved_mutations_unlocked(conn)
+                remaining_latches = self._query_active_latches_unlocked(conn)
+
+            return {
+                "reconciled": reconciled_results,
+                "remaining_unresolved_count": len(remaining_unresolved),
+                "remaining_active_latch_count": len(remaining_latches),
+                "freeze_active": bool(remaining_unresolved or remaining_latches),
+                "reconciled_at": ts_str,
+            }
 
     # -- Protective Actions (ALWAYS ALLOWED regardless of standby/drawdown/valve) --
 
@@ -3139,6 +5262,7 @@ class TradovateMicroFuturesVenue:
                 contracts=open_pos.contracts,
                 stop_loss_price=aligned_sl,
                 position_id=position_id,
+                order_id=open_pos.stop_loss_order_id,
                 client_tag=reason,
                 created_at=now,
             )
@@ -3377,6 +5501,8 @@ class TradovateMicroFuturesVenue:
                 "peak_equity_usd, max_drawdown_pct, min_margin_level_pct FROM venue_meta WHERE id = 1"
             ).fetchone()
             mutation_row = conn.execute("SELECT COUNT(*) AS cnt FROM mutation_journal").fetchone()
+            unresolved_mutations = self._query_unresolved_mutations_unlocked(conn)
+            active_latches = self._query_active_latches_unlocked(conn)
             audit_rows = conn.execute(
                 "SELECT seq, event_type, entity_id, payload_json, occurred_at, "
                 "prev_sha256, entry_sha256 FROM audit_events ORDER BY seq ASC"
@@ -3449,6 +5575,17 @@ class TradovateMicroFuturesVenue:
             "max_drawdown_pct": decimal_text(self._max_drawdown_pct),
             "min_margin_level_pct": decimal_text(self._min_margin_level_pct),
             "drawdown_locked": drawdown_locked,
+            "outcome_unknown_freeze": any(
+                item["status"] in (MUTATION_STATUS_OUTCOME_UNKNOWN, MUTATION_STATUS_PENDING)
+                for item in unresolved_mutations
+            ) or any(l["latch_kind"] == MUTATION_STATUS_OUTCOME_UNKNOWN for l in active_latches),
+            "protection_unconfirmed_latch": any(
+                item["status"] == MUTATION_STATUS_PROTECTION_UNCONFIRMED
+                for item in unresolved_mutations
+            ) or any(l["latch_kind"] == MUTATION_STATUS_PROTECTION_UNCONFIRMED for l in active_latches),
+            "unresolved_mutation_count": len(unresolved_mutations),
+            "unresolved_mutations": unresolved_mutations,
+            "max_quote_age_seconds": decimal_text(self._max_quote_age_seconds),
             "valve_configured": self._valve_gate is not None,
             "valve_cutoff": decimal_text(VALVE_ADMISSIBILITY_CUTOFF),
             "audit_chain_valid": audit_valid,

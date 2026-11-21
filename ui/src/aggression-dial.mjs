@@ -528,6 +528,7 @@ function buildStaticState() {
   );
   return Object.freeze({
     schema: AGGRESSION_DIAL_SCHEMA,
+    scopeId: 'dual-shield-barbell',
     connected: false,
     liveMode: false,
     ownerControlsAllowed: true,
@@ -733,9 +734,15 @@ export function normalizeAggressionDial(doc) {
     : true;
 
   const masterTargets = scaleTierTargets(effectiveRiskBps, masterCapitalCents);
+  const scopeId = cleanStr(
+    source.scopeId ?? source.scope_id ?? doc.scopeId ?? doc.scope_id,
+    'dual-shield-barbell',
+    96,
+  );
 
   return Object.freeze({
     schema: AGGRESSION_DIAL_SCHEMA,
+    scopeId,
     connected,
     liveMode,
     ownerControlsAllowed,

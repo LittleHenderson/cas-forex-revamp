@@ -10,7 +10,7 @@ with zero live network calls and exact Decimal accounting:
 - Scenario B: Gold `XAUUSD` -> `MGC` roll & execution, constitutional `1.01%` refusal,
   `$3,000.00` honest refusal, and `>= 10.00%` drawdown brake blocking new entries
   while preserving protective `amend_stop` / `emergency_close_all`.
-- Scenario C: LIVE host pinning (`live_arming_verified=True` strict bool), DEMO
+- Scenario C: LIVE host pinning (cryptographic `LiveAuthorizationContext` required; bare boolean rejected), DEMO
   isolation from `live.tradovateapi.com`, failed-connect `activate()` atomicity,
   credential redaction across `repr`/`str`/`format`/SQLite audit log, and SHA-256
   audit tamper detection.
@@ -49,6 +49,7 @@ from cas_forex_revamp.futures.tradovate_venue import (
     TradovateDrawdownLockError,
     TradovateEndpointError,
     TradovateHttpsTransport,
+    LiveAuthorizationError,
     TradovateLiveLockError,
     TradovateMicroFuturesPaperEmulator,
     TradovateMicroFuturesVenue,
@@ -188,6 +189,10 @@ class TestOptionBMicroFuturesIntegration(unittest.TestCase):
             now_utc=now,
         )
         self.assertTrue(mnq_open.accepted)
+        self.assertTrue(mnq_open.protection_confirmed)
+        self.assertIsNotNone(mnq_open.cl_ord_id)
+        self.assertIsNotNone(mnq_open.stop_loss_order_id)
+        self.assertIsNotNone(mnq_open.take_profit_order_id)
         self.assertEqual(mnq_open.root_symbol, "MNQ")
         self.assertEqual(mnq_open.cas_symbol, "NAS100")
         self.assertEqual(mnq_open.contract_code, "MNQZ6")
@@ -465,7 +470,17 @@ class TestOptionBMicroFuturesIntegration(unittest.TestCase):
         """Scenario C: LIVE lock, DEMO pinning, failed-activate atomicity, secret redaction, tamper detection."""
         now = datetime(2026, 11, 20, 17, 0, 0, tzinfo=timezone.utc)
 
-        # 1. LIVE without live_arming_verified=True fails closed everywhere.
+        # 1. LIVE without verified LiveAuthorizationContext (including bare live_arming_verified=True) fails closed everywhere.
+        with self.assertRaises(LiveAuthorizationError):
+            validate_tradovate_endpoint("LIVE", TRADOVATE_LIVE_BASE_URL, live_arming_verified=True)
+        with self.assertRaises(LiveAuthorizationError):
+            TradovateCredentials(
+                enabled=True,
+                mode="LIVE",
+                base_url=TRADOVATE_LIVE_BASE_URL,
+                account_id="TV-LIVE-SCENARIO-C",
+                live_arming_verified=True,
+            )
         with self.assertRaises(TradovateLiveLockError):
             validate_tradovate_endpoint("LIVE", TRADOVATE_LIVE_BASE_URL, live_arming_verified=False)
         with self.assertRaises(TradovateLiveLockError):

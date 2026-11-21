@@ -201,6 +201,231 @@ def _verify_posix_ancestor_stat(st: os.stat_result, euid: int, path_label: str) 
             raise ContractError(f"Refusing {path_label} beneath group/world-writable non-sticky ancestor (mode={oct(st.st_mode & 0o7777)})")
 
 
+def _audit_directory_children_custody(
+    directory: Path,
+    *,
+    dir_fd: int | None,
+    label: str = "state_dir",
+) -> None:
+    """Audit every existing child entry inside ``directory`` before hardening or opening DBs (Finding [13])."""
+    if os.name == "posix" and dir_fd is not None:
+        euid = os.geteuid()
+        dup_fd = os.dup(dir_fd)
+        with os.scandir(dup_fd) as it:
+            for entry in it:
+                name = entry.name
+                if name in (".", ".."):
+                    continue
+                try:
+                    cst = os.lstat(name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(cst.st_mode):
+                    raise ContractError(
+                        f"Refusing pre-positioned child symlink {name!r} inside {label}: {directory / name}"
+                    )
+                if not stat.S_ISREG(cst.st_mode) and not stat.S_ISDIR(cst.st_mode):
+                    raise ContractError(
+                        f"Refusing special/non-regular child entry {name!r} inside {label}: {directory / name}"
+                    )
+                if cst.st_uid != euid:
+                    raise ContractError(
+                        f"Refusing foreign-owned child entry {name!r} (uid={cst.st_uid}, expected {euid}) in {label}"
+                    )
+                if (cst.st_mode & 0o022) != 0:
+                    raise ContractError(
+                        f"Refusing group/world-writable child entry {name!r} (mode={oct(cst.st_mode & 0o7777)}) in {label}"
+                    )
+                if stat.S_ISREG(cst.st_mode) and cst.st_nlink != 1:
+                    raise ContractError(
+                        f"Refusing hard-linked child entry {name!r} (nlink={cst.st_nlink}) in {label}"
+                    )
+        return
+
+    if not directory.exists():
+        return
+    with os.scandir(directory) as it:
+        for entry in it:
+            cpath = directory / entry.name
+            try:
+                cst = os.lstat(cpath)
+            except FileNotFoundError:
+                continue
+            if _is_symlink_or_reparse(cpath, cst):
+                raise ContractError(
+                    f"Refusing pre-positioned child symlink or reparse point {entry.name!r} inside {label}: {cpath}"
+                )
+            if not stat.S_ISREG(cst.st_mode) and not stat.S_ISDIR(cst.st_mode):
+                raise ContractError(
+                    f"Refusing special/non-regular child entry {entry.name!r} inside {label}: {cpath}"
+                )
+            if stat.S_ISREG(cst.st_mode) and cst.st_nlink > 1:
+                raise ContractError(
+                    f"Refusing hard-linked child entry {entry.name!r} (nlink={cst.st_nlink}) in {label}"
+                )
+
+
+def verify_non_symlink_sqlite_target(
+    db_path: str | Path,
+    *,
+    create_parent: bool = True,
+    label: str = "safety SQLite DB",
+) -> Path:
+    """Validate parent & leaf SQLite target without Path.resolve() symlink dereferencing (Finding [13])."""
+    if not isinstance(db_path, (str, Path)):
+        raise ContractError(f"{label} path must be a filesystem path")
+    raw_str = str(db_path).strip()
+    if not raw_str or raw_str == ":memory:" or raw_str.startswith("file:") or "\x00" in raw_str:
+        raise ContractError(f"{label} must be a concrete on-disk SQLite file path")
+    expanded = os.path.expanduser(raw_str)
+    raw_target = Path(expanded)
+    if ".." in raw_target.parts:
+        raise ContractError(f"Refusing parent-traversal '..' in {label}: {raw_target}")
+    if not raw_target.is_absolute():
+        raw_target = Path(os.getcwd()) / raw_target
+    db_name = raw_target.name
+    if not db_name or db_name in (".", ".."):
+        raise ContractError(f"Invalid {label} filename: {raw_target}")
+
+    parent_dir, dir_fd = open_verified_directory_fd(
+        raw_target.parent, create=create_parent, label=f"parent of {label}"
+    )
+    try:
+        candidates = (db_name, f"{db_name}-wal", f"{db_name}-shm", f"{db_name}-journal")
+        if os.name == "posix" and dir_fd is not None:
+            euid = os.geteuid()
+            for cname in candidates:
+                try:
+                    cst = os.lstat(cname, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(cst.st_mode) or not stat.S_ISREG(cst.st_mode):
+                    raise ContractError(f"Refusing symlink or non-regular {label} artifact {cname!r}")
+                if cst.st_uid != euid:
+                    raise ContractError(f"Refusing foreign-owned {label} artifact {cname!r} (uid={cst.st_uid})")
+                if cst.st_nlink != 1:
+                    raise ContractError(f"Refusing hard-linked {label} artifact {cname!r} (nlink={cst.st_nlink})")
+                if (cst.st_mode & 0o077) != 0:
+                    raise ContractError(f"Refusing {label} artifact {cname!r} with unsafe permissions")
+        else:
+            for cname in candidates:
+                cpath = parent_dir / cname
+                if os.path.lexists(cpath):
+                    cst = os.lstat(cpath)
+                    if _is_symlink_or_reparse(cpath, cst) or not stat.S_ISREG(cst.st_mode):
+                        raise ContractError(f"Refusing symlink/reparse or non-regular {label} artifact: {cpath}")
+                    if cst.st_nlink > 1:
+                        raise ContractError(f"Refusing hard-linked {label} artifact (nlink={cst.st_nlink}): {cpath}")
+                    if cname == db_name:
+                        verify_windows_owner_and_dacl(cpath, label=label)
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+    return parent_dir / db_name
+
+
+def open_verified_sqlite_connection(
+    db_path: str | Path,
+    *,
+    read_only: bool = False,
+    timeout: float = 5.0,
+    create_parent: bool = True,
+    label: str = "safety SQLite DB",
+) -> sqlite3.Connection:
+    """Open SQLite DB relative to verified parent dir_fd with O_NOFOLLOW and post-open inode verification (Finding [13])."""
+    target = verify_non_symlink_sqlite_target(
+        db_path, create_parent=(create_parent and not read_only), label=label
+    )
+    parent_dir = target.parent
+    db_name = target.name
+    _, held_dir_fd = open_verified_directory_fd(
+        parent_dir, create=(create_parent and not read_only), label=f"parent of {label}"
+    )
+    try:
+        expected_id: tuple[int, int] | None = None
+        if os.name == "posix" and held_dir_fd is not None:
+            euid = os.geteuid()
+            for sc in (f"{db_name}-wal", f"{db_name}-shm", f"{db_name}-journal"):
+                try:
+                    sc_st = os.lstat(sc, dir_fd=held_dir_fd)
+                except FileNotFoundError:
+                    continue
+                if (
+                    stat.S_ISLNK(sc_st.st_mode)
+                    or not stat.S_ISREG(sc_st.st_mode)
+                    or sc_st.st_uid != euid
+                    or sc_st.st_nlink != 1
+                    or (sc_st.st_mode & 0o077) != 0
+                ):
+                    raise ContractError(f"Refusing unsafe {label} sidecar {sc!r}")
+            open_flags = (
+                (os.O_RDONLY if read_only else (os.O_RDWR | os.O_CREAT))
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            try:
+                db_fd = os.open(db_name, open_flags, 0o600, dir_fd=held_dir_fd)
+            except OSError as exc:
+                raise ContractError(f"Refusing symlink or inaccessible {label} {db_name!r}: {exc}") from exc
+            try:
+                if not read_only:
+                    os.fchmod(db_fd, 0o600)
+                st_db = os.fstat(db_fd)
+                if not stat.S_ISREG(st_db.st_mode):
+                    raise ContractError(f"Refusing non-regular {label}: {target}")
+                if st_db.st_uid != euid:
+                    raise ContractError(f"Refusing foreign-owned {label} (uid={st_db.st_uid}): {target}")
+                if st_db.st_nlink != 1:
+                    raise ContractError(f"Refusing hard-linked {label} (nlink={st_db.st_nlink}): {target}")
+                if (st_db.st_mode & 0o077) != 0:
+                    raise ContractError(f"Refusing {label} with unsafe group/world permissions: {target}")
+                expected_id = (int(st_db.st_dev), int(st_db.st_ino))
+            finally:
+                os.close(db_fd)
+        else:
+            if os.path.lexists(target):
+                st_pre = os.lstat(target)
+                if _is_symlink_or_reparse(target, st_pre) or not stat.S_ISREG(st_pre.st_mode) or st_pre.st_nlink > 1:
+                    raise ContractError(f"Refusing symlink/reparse or hard-linked {label}: {target}")
+                verify_windows_owner_and_dacl(target, label=label)
+                if int(getattr(st_pre, "st_ino", 0)) != 0:
+                    expected_id = (int(st_pre.st_dev), int(st_pre.st_ino))
+            elif read_only:
+                raise ContractError(f"Missing read-only {label}: {target}")
+
+        if read_only:
+            ro_uri = f"{target.as_uri()}?mode=ro"
+            conn = sqlite3.connect(ro_uri, uri=True, timeout=timeout, isolation_level=None)
+        else:
+            conn = sqlite3.connect(str(target), timeout=timeout, isolation_level=None)
+        try:
+            if os.name == "posix" and held_dir_fd is not None:
+                st_post = os.lstat(db_name, dir_fd=held_dir_fd)
+                if (
+                    stat.S_ISLNK(st_post.st_mode)
+                    or not stat.S_ISREG(st_post.st_mode)
+                    or st_post.st_nlink != 1
+                    or (expected_id is not None and (int(st_post.st_dev), int(st_post.st_ino)) != expected_id)
+                ):
+                    raise ContractError(f"{label} inode changed or became symlink during SQLite open: {target}")
+            else:
+                st_post_w = os.lstat(target)
+                if _is_symlink_or_reparse(target, st_post_w) or not stat.S_ISREG(st_post_w.st_mode) or st_post_w.st_nlink > 1:
+                    raise ContractError(f"{label} became symlink/reparse or hard-linked during open: {target}")
+                if expected_id is not None and int(getattr(st_post_w, "st_ino", 0)) != 0:
+                    if (int(st_post_w.st_dev), int(st_post_w.st_ino)) != expected_id:
+                        raise ContractError(f"{label} file identity changed during SQLite open: {target}")
+                if not read_only:
+                    verify_windows_owner_and_dacl(target, label=label)
+            return conn
+        except Exception:
+            conn.close()
+            raise
+    finally:
+        if held_dir_fd is not None:
+            os.close(held_dir_fd)
+
+
 def open_verified_directory_fd(
     directory: str | Path,
     *,
@@ -259,6 +484,12 @@ def open_verified_directory_fd(
                         raise ContractError(
                             f"Refusing attacker/foreign-owned {label} (uid={st.st_uid}, expected euid={euid}): {target}"
                         )
+                    if (st.st_mode & 0o022) != 0:
+                        raise ContractError(
+                            f"Refusing {label} that is initially group/world-writable "
+                            f"(mode={oct(st.st_mode & 0o7777)}): {target}"
+                        )
+                    _audit_directory_children_custody(target, dir_fd=cur_fd, label=label)
                     if (st.st_mode & 0o077) != 0:
                         os.fchmod(cur_fd, 0o700)
                         st = os.fstat(cur_fd)
@@ -289,8 +520,10 @@ def open_verified_directory_fd(
                 raise ContractError(f"Created {label} component invalid: {cur}")
         if is_leaf:
             verify_windows_owner_and_dacl(cur, label=label)
+            _audit_directory_children_custody(cur, dir_fd=None, label=label)
     if len(parts) == 1:
         verify_windows_owner_and_dacl(cur, label=label)
+        _audit_directory_children_custody(cur, dir_fd=None, label=label)
     return cur, None
 
 

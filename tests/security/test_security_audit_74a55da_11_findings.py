@@ -243,7 +243,8 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
             srv2 = LoopbackCockpitServer(repo_root=REPO_ROOT, port=0, token_file=good_tok)
             srv2.start()
             try:
-                self.assertEqual(srv2.auth_token, tok2)
+                self.assertNotEqual(srv2.auth_token, tok2)
+                self.assertEqual(good_tok.read_text(encoding="utf-8").strip(), srv2.auth_token)
             finally:
                 srv2.stop()
 
@@ -505,9 +506,26 @@ class SecurityAudit11FindingsTests(unittest.TestCase):
             self.assertEqual(ok_rec["remaining_unknown"], 0)
 
             # LIVE MT5 without durable journal MUST fail closed
+            from cas_forex_revamp.venue.live_auth_ticket import (
+                LIVE_ARM_CONFIRMATION_TEXT,
+                mint_live_authorization_ticket,
+                provision_live_auth_key,
+                verify_live_authorization_context,
+            )
+            _live_kp = provision_live_auth_key(Path(td) / "live_jcheck.key")
+            _live_tkt = mint_live_authorization_ticket(
+                key_file=_live_kp, broker_id=BROKER_HUGOSWAY_MT5, account_login="9001122",
+                server="Hugo PRO5", ttl_seconds=300, issued_at=T0,
+            )
+            _, _live_ctx = verify_live_authorization_context(
+                _live_tkt, key_file=_live_kp, expected_broker_id=BROKER_HUGOSWAY_MT5,
+                expected_account_login="9001122", expected_server="Hugo PRO5",
+                live_arm_phrase=LIVE_ARM_CONFIRMATION_TEXT, require_arm_phrase=True, now=T0,
+            )
             live_creds = Mt5Credentials(
                 broker_id=BROKER_HUGOSWAY_MT5, login=9001122, server="Hugo PRO5",
                 password=_RedactedSecret("live-pass-1"), execution_mode=EXECUTION_MODE_LIVE,
+                live_auth_context=_live_ctx,
             )
             with self.assertRaises(ContractError):
                 Mt5PaperBrokerVenue(

@@ -204,6 +204,18 @@ def _build_valid_proposal(now_utc: datetime, *, symbol: str = "NAS100", qty: Dec
     return _Proposal()
 
 
+
+class _PublicIndexQuoteEntry(dict):
+    """6-key independent public index provenance mapping (backwards-compatible with tuple indexing during rollout)."""
+
+    def __getitem__(self, key: object) -> object:
+        if key == 0:
+            return super().__getitem__("bid")
+        if key == 1:
+            return super().__getitem__("ask")
+        return super().__getitem__(key)
+
+
 class Pr28CompoundingAndPhase8WiringTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="cas_pr28_wt_")
@@ -274,7 +286,18 @@ class Pr28CompoundingAndPhase8WiringTests(unittest.TestCase):
             valve_gate=valve_gate,
             peak_equity_store=peak_store,
             equity_attestations=equity_attestations,
-            index_reference_source=lambda _syms: dict(emulator.quotes),
+            clock=self._clock,
+            index_reference_source=lambda _syms: {
+                sym: _PublicIndexQuoteEntry(
+                    bid=q[0],
+                    ask=q[1],
+                    source_provider="YAHOO_STOOQ_PUBLIC",
+                    source_broker_id=None,
+                    is_independent_public=True,
+                    observed_at=self._clock().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+                for sym, q in emulator.quotes.items()
+            },
         )
         router.attach_venue(venue)
 
@@ -728,7 +751,7 @@ class Pr28CompoundingAndPhase8WiringTests(unittest.TestCase):
                 quantity_units=Decimal("0.05"),
                 side=Side.BUY,
                 stop_price=Decimal("20470.00"),
-                limit_price=Decimal("20502.00"),
+                limit_price=Decimal("20501.00"),
                 take_profit_price=Decimal("20580.00"),
             )
             exec_res = router_ns.execute_open(open_order, valve_decision=v_dec)

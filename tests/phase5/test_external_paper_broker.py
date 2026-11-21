@@ -457,6 +457,34 @@ class ExternalPaperBrokerPhase5Tests(unittest.TestCase):
         self.assertEqual(summary["last_transaction_id"], "90071992547409999")
         self.assertIsInstance(summary["last_transaction_id"], str)
 
+        from types import SimpleNamespace as _SN
+        from cas_forex_revamp.valve.tks_meta_valve_controller import load_default_forex_valve_gate as _ld_p5_gate
+        _p5_gate = _ld_p5_gate()
+        _p5_prop = _SN(
+            request=_SN(
+                request_id="req-p5-paper-ord-1", facts=(),
+                evidence=(_SN(evidence_id="ev-1"),),
+                state=_SN(observed_at=self.T0, valid_until=self.T0 + timedelta(minutes=5)),
+            ),
+            result=_SN(selection=_SN(evidence_ids=("ev-1",), reason="ID=02 phase5 paper test", selected_action_ref="act-p5-paper-1")),
+            intent=_SN(
+                intent_id="p5-paper-ord-1", action_ref="act-p5-paper-1", kind=ActionKind.OPEN,
+                instrument_id="EURUSD", quantity=Decimal("100"), side=Side.BUY,
+                stop_price=Decimal("1.09300"), limit_price=None, take_profit_price=None, target_id=None,
+            ),
+        )
+        _p5_dec = _p5_gate.require_admissible(
+            _p5_prop,
+            current_view={"balance": "100000", "equity": "100000", "available_margin": "90000", "position_inventory": "[]"},
+            policy={"new_risk_permission": "ALLOWED", "management_permission": "ALLOWED", "max_entry_quantity": "100000"},
+            now=self.T0,
+        )
+        _p5_grant = _p5_gate.issue_order_grant(
+            _p5_dec, broker_id="OANDA_PRACTICE", account_id="101-001-1234567-001",
+            server="api-fxpractice.oanda.com", execution_mode="DEMO", action_kind="OPEN",
+            symbol="EURUSD", side=Side.BUY, volume=Decimal("100"), stop_loss=Decimal("1.09300"),
+            order_action_ref="act-p5-paper-1", order_quantity_units=Decimal("100"), now=self.T0,
+        )
         order_rec = client.submit_paper_market_order(
             symbol="EURUSD",
             side=Side.BUY,
@@ -464,6 +492,7 @@ class ExternalPaperBrokerPhase5Tests(unittest.TestCase):
             client_order_id="p5-paper-ord-1",
             stop_loss_price=Decimal("1.09300"),
             price_bound=Decimal("1.09950"),
+            valve_grant=_p5_grant,
             now=self.T0,
         )
         strict_safe_json_loads(json.dumps(order_rec))

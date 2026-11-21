@@ -270,14 +270,14 @@ _VIEW = {"balance": "100000", "equity": "100000", "available_margin": "95000", "
 _POLICY = {"new_risk_permission": "ALLOWED", "management_permission": "ALLOWED", "max_entry_quantity": "500000"}
 
 
-def _clear_proposal(req_id: str, kind: ActionKind, qty: Decimal, stop: Decimal | None = None, *, ref: str = "fxopt-live", reason: str | None = None, ev_ids: tuple[str, ...] = ("ev-quote-1",)) -> tuple[SimpleNamespace, OrderIntent]:
+def _clear_proposal(req_id: str, kind: ActionKind, qty: Decimal, stop: Decimal | None = None, *, ref: str = "fxopt-live", side: Side = Side.BUY, reason: str | None = None, ev_ids: tuple[str, ...] = ("ev-quote-1",)) -> tuple[SimpleNamespace, OrderIntent]:
     order = OrderIntent(
         order_id=req_id,
         action_ref=ref,
         kind=kind,
         symbol="EURUSD",
         quantity_units=qty if kind in (ActionKind.OPEN, ActionKind.REDUCE) else None,
-        side=Side.BUY if kind is ActionKind.OPEN else None,
+        side=side if kind is ActionKind.OPEN else None,
         stop_price=stop,
         position_ticket="500000001" if kind is not ActionKind.OPEN else None,
     )
@@ -455,7 +455,7 @@ class DualModeBrokerTests(unittest.TestCase):
             self.assertEqual(plan.exposure_after.get("EURUSD"), Decimal("0"))  # type: ignore[union-attr]
             off_vds = {}
             for oi in plan.to_order_intents():  # type: ignore[union-attr]
-                op, _ = _clear_proposal(oi.order_id, oi.kind, oi.quantity_units or Decimal("0"), oi.stop_price, ref=oi.action_ref)
+                op, _ = _clear_proposal(oi.order_id, oi.kind, oi.quantity_units or Decimal("0"), oi.stop_price, ref=oi.action_ref, side=oi.side or Side.BUY)
                 off_vds[oi.action_ref] = GATE.require_admissible(op, current_view=_VIEW, policy=_POLICY, now=_T0 + timedelta(seconds=6))
             off_res = router.execute_offset_plan(plan, valve_decisions=off_vds)  # type: ignore[arg-type]
             self.assertEqual(off_res[0].oanda_receipt["provider"], "oanda-fxtrade-v3")  # type: ignore[index]
@@ -584,9 +584,9 @@ class DualModeBrokerTests(unittest.TestCase):
                     ENV_LHFX_MT5_SERVER: "LHFXSA-Trade",
                 },
             )
-        assert live_creds is not None
-        nat_live_wrong = Mt5NativePythonTransport(mt5_module=_FakeMt5Sdk(server="LHFXSA-Trade", login=122590, trade_mode=0))
-        with self.assertRaises(ContractError):
-            nat_live_wrong.connect(live_creds)
-        nat_live_ok = Mt5NativePythonTransport(mt5_module=_FakeMt5Sdk(server="LHFXSA-Trade", login=122590, trade_mode=2))
-        self.assertEqual(nat_live_ok.connect(live_creds).trade_mode, "REAL")
+            assert live_creds is not None
+            nat_live_wrong = Mt5NativePythonTransport(mt5_module=_FakeMt5Sdk(server="LHFXSA-Trade", login=122590, trade_mode=0))
+            with self.assertRaises(ContractError):
+                nat_live_wrong.connect(live_creds)
+            nat_live_ok = Mt5NativePythonTransport(mt5_module=_FakeMt5Sdk(server="LHFXSA-Trade", login=122590, trade_mode=2))
+            self.assertEqual(nat_live_ok.connect(live_creds).trade_mode, "REAL")

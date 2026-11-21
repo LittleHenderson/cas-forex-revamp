@@ -127,6 +127,43 @@ def clear(order: OrderIntent, max_qty: str = "500000"):
     return GATE.require_admissible(proposal_for(order), current_view=VIEW, policy=policy(max_qty), now=T0 + timedelta(seconds=1))
 
 
+def _grant_for_req(req: Mt5OrderRequest, *, broker_id: str = BROKER_HUGOSWAY_MT5, login: int = 7001234, server: str = "Hugo demo PRO5", now: datetime | None = None):
+    eff_now = datetime.now(timezone.utc) if now is None else now
+    units = (req.volume_lots * D("100000")) if req.volume_lots is not None else D("10000")
+    ord_i = OrderIntent(
+        order_id=req.request_id,
+        action_ref=f"act-{req.request_id}",
+        kind=ActionKind(req.action),
+        symbol=req.symbol,
+        quantity_units=units if req.action in ("OPEN", "REDUCE") else None,
+        side=req.side if req.action == "OPEN" else None,
+        stop_price=req.stop_loss,
+        take_profit_price=req.take_profit,
+        position_ticket=req.position_ticket,
+    )
+    prop = proposal_for(ord_i)
+    prop.request.state = SimpleNamespace(observed_at=eff_now, valid_until=eff_now + timedelta(minutes=5))
+    dec = GATE.require_admissible(prop, current_view=VIEW, policy=policy("10000000"), now=eff_now)
+    return GATE.issue_order_grant(
+        dec,
+        broker_id=broker_id,
+        account_id=str(login),
+        server=server,
+        execution_mode="DEMO",
+        action_kind=req.action,
+        symbol=req.symbol,
+        side=req.side.value,
+        volume=req.volume_lots,
+        stop_loss=req.stop_loss,
+        take_profit=req.take_profit,
+        position_ticket=req.position_ticket,
+        order_action_ref=ord_i.action_ref,
+        order_quantity_units=ord_i.quantity_units,
+        order_side=ord_i.side,
+        now=eff_now,
+    )
+
+
 def open_order(order_id: str, symbol: str = "EURUSD", side: Side = Side.BUY, units: str = "100000", stop: str = "1.09500") -> OrderIntent:
     return OrderIntent(order_id=order_id, action_ref=f"act-{order_id}", kind=ActionKind.OPEN, symbol=symbol,
                        quantity_units=D(units), side=side, stop_price=D(stop))
@@ -555,7 +592,7 @@ class NativePythonTransportTests(unittest.TestCase):
                               price=D("1.10010"), stop_loss=D("1.09500"), position_ticket=None, deviation_points=20,
                               magic=20261116, comment="cas-open", created_at=T0)
         with self.assertRaises(Mt5OutcomeUnknownError):
-            transport.send_order(req)
+            transport.send_order(req, valve_grant=_grant_for_req(req, server=creds.server))
 
     def test_native_transport_requires_password(self) -> None:
         creds = Mt5Credentials(broker_id=BROKER_HUGOSWAY_MT5, login=7001234, server="Hugo demo PRO5")
@@ -631,7 +668,7 @@ class SpoolBridgeTransportTests(unittest.TestCase):
             transport.connect(creds)
             signed_req = sign_spool_valve_admission(transport.prepare_request(req), spool_dir=tmp)
             with self.assertRaises(Mt5TransportError):
-                transport.send_order(signed_req)
+                transport.send_order(signed_req, valve_grant=_grant_for_req(signed_req))
 
             ticks = iter(range(1000))
             silent = Mt5SpoolBridgeTransport(tmp, sleep=lambda _s: None, monotonic=lambda: float(next(ticks)),
@@ -641,9 +678,9 @@ class SpoolBridgeTransportTests(unittest.TestCase):
                 silent.prepare_request(dataclasses.replace(req, request_id="req-silent")), spool_dir=tmp
             )
             with self.assertRaises(Mt5OutcomeUnknownError):
-                silent.send_order(req2)
+                silent.send_order(req2, valve_grant=_grant_for_req(req2))
             with self.assertRaises(Mt5TransportError):
-                silent.send_order(req2)
+                silent.send_order(req2, valve_grant=_grant_for_req(req2))
 
     def test_float_and_unsafe_integer_spool_json_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -99,19 +99,42 @@ def _dummy_cred(slot: str) -> str:
 
 
 def _admit_order(order: OrderIntent) -> ValveDecision:
-    return ValveDecision(
-        admitted=True,
-        valve_mode="ADMIT",
-        mlp_score=0.92,
-        threshold=0.55,
-        mlp_admitted=True,
-        hard_veto=False,
-        hard_veto_reasons=(),
-        features={},
-        weights_sha256=VALVE_GATE.weights_sha256,
-        request_id=order.order_id,
-        selected_action_ref=order.action_ref,
+    from types import SimpleNamespace as _SN
+    bid_q, ask_q = QUOTES_FX.get(order.symbol, (D("1.10000"), D("1.10010")))
+    intent = _SN(
+        intent_id=order.order_id,
+        action_ref=order.action_ref,
+        kind=order.kind,
+        instrument_id=order.symbol,
+        quantity=order.quantity_units,
+        side=order.side,
+        stop_price=order.stop_price,
+        limit_price=order.limit_price,
+        take_profit_price=order.take_profit_price,
+        target_id=order.position_ticket,
     )
+    req = _SN(
+        request_id=f"req-{order.order_id}",
+        facts=(),
+        evidence=(_SN(evidence_id="ev-1"),),
+        state=_SN(observed_at=T0, valid_until=T0 + timedelta(minutes=5)),
+    )
+    sel = _SN(evidence_ids=("ev-1",), reason="ID=02 pr27 test", selected_action_ref=order.action_ref)
+    prop = _SN(request=req, result=_SN(selection=sel), intent=intent)
+    view = {
+        "balance": "100000",
+        "equity": "100000",
+        "available_margin": "90000",
+        "position_inventory": [],
+        "bid": str(bid_q),
+        "ask": str(ask_q),
+        "policy": {
+            "new_risk_permission": "ALLOWED",
+            "management_permission": "ALLOWED",
+            "max_entry_quantity": "5000000",
+        },
+    }
+    return VALVE_GATE.require_admissible(prop, current_view=view, now=T0)
 
 
 def _make_open_order(

@@ -73,13 +73,21 @@ from typing import Any, Protocol
 
 from cas_forex_revamp.contracts import ActionKind, ContractError, Side, canonical_bytes, decimal_text, parse_decimal
 from cas_forex_revamp.contracts.primitives import decimal_value, identifier, utc_time
-from cas_forex_revamp.valve.tks_meta_valve_controller import ForexMetaValveGate, ValveDecision, ValveRefusalError
+from cas_forex_revamp.valve.tks_meta_valve_controller import (
+    ForexMetaValveGate,
+    ValveDecision,
+    ValveGrantError,
+    ValveOrderGrant,
+    ValveRefusalError,
+    verify_and_consume_valve_order_grant,
+)
 from .live_auth_ticket import (
     LiveAuthTicketError,
     LiveAuthorizationContext,
     LiveAuthorizationError,
     build_live_authorization_context,
     verify_live_environ_authorization,
+    verify_live_environ_authorization_context,
 )
 from .external_paper_broker import (
     DEFAULT_OANDA_LIVE_BASE_URL,
@@ -161,8 +169,12 @@ __all__ = [
     "EXPANDED_MARKETS",
     "INDEX_INSTRUMENTS",
     "Mt5ValveClearanceError",
+    "MANAGEMENT_ACTION_KINDS",
     "OandaPracticeFallbackVenue",
     "OrderIntent",
+    "RISK_INCREASING_ACTION_KINDS",
+    "RiskIncreasingOrderIntent",
+    "RiskReducingOrderIntent",
     "normalize_market_symbol",
     "resolve_mt5_spool_dir",
     "apply_verified_directory_mode",
@@ -1502,11 +1514,42 @@ class Mt5Credentials:
         )
         if self.password is not None and not isinstance(self.password, _RedactedSecret):
             raise ContractError("MT5 password must be wrapped in _RedactedSecret")
-        if self.live_auth_context is not None:
+        if self.execution_mode == EXECUTION_MODE_LIVE:
+            if self.live_auth_context is None:
+                raise LiveAuthorizationError(
+                    f"LIVE Mt5Credentials for {self.broker_id} require a verified LiveAuthorizationContext"
+                )
             if not isinstance(self.live_auth_context, LiveAuthorizationContext):
-                raise ContractError("live_auth_context must be a LiveAuthorizationContext")
-            if self.execution_mode != EXECUTION_MODE_LIVE:
-                raise ContractError("live_auth_context is only valid when execution_mode=LIVE")
+                raise LiveAuthorizationError("live_auth_context must be a verified LiveAuthorizationContext")
+            self.live_auth_context.verify_provenance(reverify_ticket=True)
+            if self.live_auth_context.broker_id.strip().upper() != self.broker_id.strip().upper():
+                raise LiveAuthorizationError(
+                    f"live_auth_context broker_id mismatch for {self.broker_id}"
+                )
+            if self.live_auth_context.account_id.strip() != str(self.login):
+                raise LiveAuthorizationError(
+                    f"live_auth_context account_id mismatch for {self.broker_id}"
+                )
+            if self.live_auth_context.server.strip().casefold() != self.server.strip().casefold():
+                raise LiveAuthorizationError(
+                    f"live_auth_context server mismatch for {self.broker_id}"
+                )
+            if self.live_auth_context.execution_mode != EXECUTION_MODE_LIVE:
+                raise LiveAuthorizationError("live_auth_context execution_mode must be LIVE")
+            if self.live_auth_ticket_json is not None:
+                try:
+                    parsed_tkt = json.loads(self.live_auth_ticket_json)
+                except Exception as exc:
+                    raise LiveAuthorizationError("invalid live_auth_ticket_json on Mt5Credentials") from exc
+                canonical_tkt = json.dumps(
+                    dict(parsed_tkt), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+                if not hmac.compare_digest(
+                    sha256(canonical_tkt).hexdigest(), self.live_auth_context.ticket_sha256.lower()
+                ):
+                    raise LiveAuthorizationError("live_auth_ticket_json digest does not match live_auth_context")
+        elif self.live_auth_context is not None:
+            raise ContractError("live_auth_context is only valid when execution_mode=LIVE")
 
     def __repr__(self) -> str:
         return (
@@ -1588,14 +1631,15 @@ def load_mt5_credentials(
     live_auth_ctx: LiveAuthorizationContext | None = None
     if mode == EXECUTION_MODE_LIVE:
         try:
-            ticket_obj = verify_live_environ_authorization(
+            ticket_obj, live_auth_ctx = verify_live_environ_authorization_context(
                 environ,
                 expected_broker_id=broker_id,
                 expected_account_login=login_raw,
                 expected_server=str(server),
+                live_arm_phrase=live_arm_phrase,
+                require_arm_phrase=True,
                 now=now,
             )
-            live_auth_ctx = build_live_authorization_context(ticket_obj)
             live_ticket_json = json.dumps(ticket_obj, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
         except LiveAuthTicketError as exc:
             raise LiveBrokerEndpointForbiddenError(f"{broker_id} LIVE ticket invalid: {exc}") from None
@@ -1943,6 +1987,44 @@ class OrderIntent:
         return sha256(canonical_bytes(self)).hexdigest()
 
 
+RISK_INCREASING_ACTION_KINDS: frozenset[ActionKind] = frozenset({ActionKind.OPEN, ActionKind.ADD})
+MANAGEMENT_ACTION_KINDS: frozenset[ActionKind] = frozenset({
+    ActionKind.AMEND_STOP,
+    ActionKind.REDUCE,
+    ActionKind.CLOSE,
+})
+
+
+@dataclass(frozen=True, slots=True)
+class RiskIncreasingOrderIntent:
+    """Typed wrapper proving an order intent is strictly risk-increasing (OPEN)."""
+
+    order: OrderIntent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.order, OrderIntent) or self.order.kind not in RISK_INCREASING_ACTION_KINDS:
+            raise ContractError("RiskIncreasingOrderIntent requires an OPEN/ADD OrderIntent")
+
+
+@dataclass(frozen=True, slots=True)
+class RiskReducingOrderIntent:
+    """Typed wrapper proving an order intent is strictly risk-reducing management (AMEND_STOP/REDUCE/CLOSE)."""
+
+    order: OrderIntent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.order, OrderIntent) or self.order.kind not in MANAGEMENT_ACTION_KINDS:
+            raise ContractError("RiskReducingOrderIntent requires an AMEND_STOP, REDUCE, or CLOSE OrderIntent")
+
+
+def _unwrap_order_intent(order: OrderIntent | RiskIncreasingOrderIntent | RiskReducingOrderIntent) -> OrderIntent:
+    if isinstance(order, (RiskIncreasingOrderIntent, RiskReducingOrderIntent)):
+        return order.order
+    if not isinstance(order, OrderIntent):
+        raise ContractError("execute requires an OrderIntent")
+    return order
+
+
 @dataclass(frozen=True, slots=True)
 class Mt5Tick:
     symbol: str
@@ -2219,7 +2301,14 @@ class Mt5Transport(Protocol):
 
     def positions(self) -> tuple[Mt5Position, ...]: ...
 
-    def send_order(self, request: Mt5OrderRequest) -> Mt5OrderReceipt: ...
+    def send_order(
+        self,
+        request: Mt5OrderRequest,
+        *,
+        valve_grant: ValveOrderGrant | None = None,
+        require_risk_reducing: bool = False,
+        now: datetime | None = None,
+    ) -> Mt5OrderReceipt: ...
 
     def shutdown(self) -> None: ...
 
@@ -2294,6 +2383,19 @@ class Mt5NativePythonTransport:
         )
         if credentials.password is None:
             raise Mt5NotConfiguredError(f"{credentials.broker_id}: native MT5 login requires a password")
+        if credentials.execution_mode == EXECUTION_MODE_LIVE:
+            if credentials.live_auth_context is None:
+                raise LiveAuthorizationError(
+                    f"LIVE connect on {credentials.broker_id} refused: missing verified LiveAuthorizationContext"
+                )
+            credentials.live_auth_context.assert_valid_at(
+                self._clock(),
+                expected_broker_id=credentials.broker_id,
+                expected_account_id=str(credentials.login),
+                expected_server=credentials.server,
+                require_arm_phrase=True,
+                reverify_ticket=True,
+            )
         sdk = self._sdk()
         ok = sdk.initialize(
             login=credentials.login,
@@ -2348,6 +2450,17 @@ class Mt5NativePythonTransport:
                 raise ContractError("LIVE execution mode requires ACCOUNT_TRADE_MODE_REAL; refusing DEMO/CONTEST account")
             validate_mt5_server_name(broker_id, server, execution_mode=EXECUTION_MODE_LIVE, live_armed=True)
             trade_mode_label = "REAL"
+        snap_login = int(_sdk_field(info, "login"))
+        if self._credentials is not None:
+            if snap_login != self._credentials.login or server.casefold() != self._credentials.server.casefold():
+                self.shutdown()
+                if self._credentials.execution_mode == EXECUTION_MODE_LIVE:
+                    raise LiveAuthorizationError(
+                        "MT5 terminal account/server drifted from bound LIVE credentials; reconnect required"
+                    )
+                raise Mt5PreDispatchTransportError(
+                    "MT5 terminal account/server drifted from bound credentials; reconnect required"
+                )
         leverage = int(_sdk_field(info, "leverage"))
         if leverage <= 0 or leverage > self._max_leverage:
             raise Mt5MarginRefusalError(f"MT5 account leverage 1:{leverage} exceeds the 1:{self._max_leverage} cap")
@@ -2355,11 +2468,13 @@ class Mt5NativePythonTransport:
         term_connected = True
         if callable(term_fn):
             tinfo = term_fn()
-            if tinfo is not None:
-                term_connected = bool(getattr(tinfo, "connected", True))
+            if tinfo is None:
+                term_connected = False
+            else:
+                term_connected = bool(getattr(tinfo, "connected", False))
         return Mt5AccountSnapshot(
             server=server,
-            login=int(_sdk_field(info, "login")),
+            login=snap_login,
             currency=str(_sdk_field(info, "currency")),
             balance=_sdk_decimal(_sdk_field(info, "balance"), "balance"),
             equity=_sdk_decimal(_sdk_field(info, "equity"), "equity"),
@@ -2440,7 +2555,7 @@ class Mt5NativePythonTransport:
             ))
         return tuple(out)
 
-    def _assert_live_dispatch_authorized(self) -> None:
+    def _assert_live_dispatch_authorized(self, *, now: datetime | None = None) -> None:
         creds = self._credentials
         if creds is None or creds.execution_mode != EXECUTION_MODE_LIVE:
             return
@@ -2448,18 +2563,109 @@ class Mt5NativePythonTransport:
             raise LiveAuthorizationError(
                 f"LIVE dispatch on {creds.broker_id} refused: missing verified LiveAuthorizationContext"
             )
+        check_now = self._clock() if now is None else utc_time(now, "now")
+        creds.live_auth_context.verify_provenance(
+            now=check_now,
+            reverify_ticket=True,
+            require_arm_phrase=True,
+        )
         creds.live_auth_context.assert_valid_at(
-            self._clock(),
+            check_now,
             expected_broker_id=creds.broker_id,
             expected_account_id=str(creds.login),
             expected_server=creds.server,
+            require_arm_phrase=True,
+            reverify_ticket=True,
         )
 
-    def send_order(self, request: Mt5OrderRequest) -> Mt5OrderReceipt:
+    def _verify_terminal_binding_before_send(self, sdk: Any, creds: Mt5Credentials) -> Mt5AccountSnapshot:
+        """Re-verify live MT5 terminal connection, login, server, and trade_mode immediately before order_send."""
+        term_fn = getattr(sdk, "terminal_info", None)
+        if callable(term_fn):
+            tinfo = term_fn()
+            if tinfo is None or getattr(tinfo, "connected", False) is not True:
+                self.shutdown()
+                raise Mt5PreDispatchTransportError(
+                    f"MT5 terminal disconnected before order_send on {creds.broker_id}; shutdown & reconnect required"
+                )
+        try:
+            snap = self.account_info()
+        except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
+            self.shutdown()
+            raise
+        except Exception as exc:
+            self.shutdown()
+            if isinstance(exc, Mt5PreDispatchTransportError):
+                raise
+            raise Mt5PreDispatchTransportError(
+                f"MT5 terminal account rebind failed before order_send ({type(exc).__name__}); reconnect required"
+            ) from None
+        expected_trade_mode = "REAL" if creds.execution_mode == EXECUTION_MODE_LIVE else "DEMO"
+        if not snap.connected:
+            self.shutdown()
+            raise Mt5PreDispatchTransportError(
+                f"MT5 terminal reports connected=False before order_send on {creds.broker_id}; reconnect required"
+            )
+        if (
+            snap.login != creds.login
+            or snap.server.casefold() != creds.server.casefold()
+            or snap.trade_mode != expected_trade_mode
+        ):
+            self.shutdown()
+            if creds.execution_mode == EXECUTION_MODE_LIVE:
+                raise LiveAuthorizationError(
+                    "MT5 terminal account/server/mode drifted from LIVE target before order_send; reconnect required"
+                )
+            raise Mt5PreDispatchTransportError(
+                "MT5 terminal account/server/mode drifted from target before order_send; reconnect required"
+            )
+        if creds.execution_mode == EXECUTION_MODE_LIVE and creds.live_auth_context is not None:
+            if (
+                str(snap.login) != creds.live_auth_context.account_id.strip()
+                or snap.server.casefold() != creds.live_auth_context.server.strip().casefold()
+            ):
+                self.shutdown()
+                raise LiveAuthorizationError(
+                    "MT5 terminal account/server does not match verified LiveAuthorizationContext; reconnect required"
+                )
+        return snap
+
+    def _raw_order_send(self, sdk: Any, payload: dict[str, Any]) -> Any:
+        return sdk.order_send(payload)
+
+    def send_order(
+        self,
+        request: Mt5OrderRequest,
+        *,
+        valve_grant: ValveOrderGrant | None = None,
+        require_risk_reducing: bool = False,
+        now: datetime | None = None,
+    ) -> Mt5OrderReceipt:
         sdk = self._require_connected()
-        self._assert_live_dispatch_authorized()
+        creds = self._credentials
+        if creds is None:
+            raise Mt5TransportError("native MT5 transport has no bound credentials")
+        check_now = self._clock() if now is None else utc_time(now, "now")
+        self._assert_live_dispatch_authorized(now=check_now)
+        self._verify_terminal_binding_before_send(sdk, creds)
+        verify_and_consume_valve_order_grant(
+            valve_grant,
+            broker_id=creds.broker_id,
+            account_id=str(creds.login),
+            server=creds.server,
+            execution_mode=creds.execution_mode,
+            action_kind=request.action,
+            symbol=request.symbol,
+            side=request.side.value,
+            volume=request.volume_lots,
+            stop_loss=request.stop_loss,
+            take_profit=request.take_profit,
+            position_ticket=request.position_ticket,
+            now=check_now,
+            require_risk_reducing=require_risk_reducing,
+        )
         payload = request.to_native_request(sdk)
-        result = sdk.order_send(payload)
+        result = self._raw_order_send(sdk, payload)
         if result is None:
             raise Mt5OutcomeUnknownError(f"MetaTrader5.order_send returned no result (code {self._last_error()}); outcome UNKNOWN")
         const = _sdk_constants(sdk)
@@ -2633,18 +2839,26 @@ class Mt5SpoolBridgeTransport:
             raise Mt5TransportError("spool MT5 transport is not connected")
         return self._credentials
 
-    def _assert_live_dispatch_authorized(self, creds: Mt5Credentials) -> None:
+    def _assert_live_dispatch_authorized(self, creds: Mt5Credentials, *, now: datetime | None = None) -> None:
         if creds.execution_mode != EXECUTION_MODE_LIVE:
             return
         if creds.live_auth_context is None:
             raise LiveAuthorizationError(
                 f"LIVE dispatch on {creds.broker_id} refused: missing verified LiveAuthorizationContext"
             )
+        check_now = self._clock() if now is None else utc_time(now, "now")
+        creds.live_auth_context.verify_provenance(
+            now=check_now,
+            reverify_ticket=True,
+            require_arm_phrase=True,
+        )
         creds.live_auth_context.assert_valid_at(
-            self._clock(),
+            check_now,
             expected_broker_id=creds.broker_id,
             expected_account_id=str(creds.login),
             expected_server=creds.server,
+            require_arm_phrase=True,
+            reverify_ticket=True,
         )
 
     def _market_doc(self) -> dict[str, Any]:
@@ -2824,9 +3038,17 @@ class Mt5SpoolBridgeTransport:
             execution_mode=creds.execution_mode,
         )
 
-    def send_order(self, request: Mt5OrderRequest) -> Mt5OrderReceipt:
+    def send_order(
+        self,
+        request: Mt5OrderRequest,
+        *,
+        valve_grant: ValveOrderGrant | None = None,
+        require_risk_reducing: bool = False,
+        now: datetime | None = None,
+    ) -> Mt5OrderReceipt:
         creds = self._require_connected()
-        self._assert_live_dispatch_authorized(creds)
+        check_now = self._clock() if now is None else utc_time(now, "now")
+        self._assert_live_dispatch_authorized(creds, now=check_now)
         channel_key, expected_key_id = self._channel_hmac_key_and_id(creds)
         bound_req = self.prepare_request(request)
         if bound_req.channel_key_id != expected_key_id:
@@ -2835,12 +3057,28 @@ class Mt5SpoolBridgeTransport:
             raise Mt5ValveClearanceError(
                 "MT5 spool dispatch refused: missing short-lived signed Valve admission (valve_admission_sig)"
             )
-        doc = bound_req.to_spool_dict()
-        doc["request_hmac_sha256"] = _spool_hmac_hex(channel_key, _canonical_spool_request_hmac_input(doc))
         request_path = self.spool_dir / f"order_request_{bound_req.request_id}.json"
         receipt_path = self.spool_dir / f"order_receipt_{bound_req.request_id}.json"
         if request_path.exists() or receipt_path.exists():
             raise Mt5TransportError(f"request_id {bound_req.request_id} already present in spool; never resubmitted")
+        verify_and_consume_valve_order_grant(
+            valve_grant,
+            broker_id=creds.broker_id,
+            account_id=str(creds.login),
+            server=creds.server,
+            execution_mode=creds.execution_mode,
+            action_kind=bound_req.action,
+            symbol=bound_req.symbol,
+            side=bound_req.side.value,
+            volume=bound_req.volume_lots,
+            stop_loss=bound_req.stop_loss,
+            take_profit=bound_req.take_profit,
+            position_ticket=bound_req.position_ticket,
+            now=check_now,
+            require_risk_reducing=require_risk_reducing,
+        )
+        doc = bound_req.to_spool_dict()
+        doc["request_hmac_sha256"] = _spool_hmac_hex(channel_key, _canonical_spool_request_hmac_input(doc))
         _atomic_write_json(request_path, doc, custody_inspector=self._custody_inspector)
         deadline = self._monotonic() + self._timeout
         while True:
@@ -3331,10 +3569,21 @@ SimMt5SpoolEa = Mt5SpoolPaperTerminalEmulator
 # ---------------------------------------------------------------------------
 
 
-def require_valve_clearance(order: OrderIntent, decision: Any, *, expected_weights_sha256: str) -> ValveDecision:
-    """Refuse execution unless ``decision`` is an admitted ForexMetaValveGate decision for this order."""
+def require_valve_clearance(
+    order: OrderIntent,
+    decision: Any,
+    *,
+    expected_weights_sha256: str,
+    now: datetime | None = None,
+    require_risk_reducing: bool = False,
+) -> ValveDecision:
+    """Refuse execution unless ``decision`` is a genuine gate-minted admitted ForexMetaValveGate decision bound to this order."""
     if not isinstance(decision, ValveDecision):
         raise Mt5ValveClearanceError("ForexMetaValveGate pre-clearance is mandatory before any MT5/OANDA execution")
+    try:
+        decision.verify_provenance(expected_weights_sha256=expected_weights_sha256, now=now)
+    except ValveGrantError as exc:
+        raise Mt5ValveClearanceError(str(exc), decision=decision) from None
     if not decision.admitted or decision.valve_mode != "ADMIT" or decision.hard_veto or not decision.mlp_admitted:
         raise Mt5ValveClearanceError(
             f"ForexMetaValveGate did not admit this order ({decision.valve_mode})", decision=decision
@@ -3343,8 +3592,24 @@ def require_valve_clearance(order: OrderIntent, decision: Any, *, expected_weigh
         raise Mt5ValveClearanceError("ForexMetaValveGate score below threshold", decision=decision)
     if decision.weights_sha256 != expected_weights_sha256:
         raise Mt5ValveClearanceError("ValveDecision was produced by different Valve weights", decision=decision)
-    if decision.selected_action_ref != order.action_ref:
-        raise Mt5ValveClearanceError("ValveDecision does not bind this order's action_ref", decision=decision)
+    if require_risk_reducing and order.kind not in MANAGEMENT_ACTION_KINDS:
+        raise Mt5ValveClearanceError(
+            f"Management path refuses non-risk-reducing action {order.kind.value!r}", decision=decision
+        )
+    try:
+        decision.assert_binds_order(
+            action_ref=order.action_ref,
+            action_kind=order.kind,
+            symbol=order.symbol,
+            side=order.side,
+            quantity_units=order.quantity_units,
+            stop_price=order.stop_price,
+            take_profit_price=order.take_profit_price,
+            limit_price=order.limit_price,
+            position_ticket=order.position_ticket,
+        )
+    except ValveGrantError as exc:
+        raise Mt5ValveClearanceError(str(exc), decision=decision) from None
     return decision
 
 
@@ -3800,6 +4065,7 @@ class Mt5PaperBrokerVenue:
         self.broker_id = broker_id
         self._credentials = credentials
         self._transport = transport
+        self._valve_gate: ForexMetaValveGate | None = valve_gate
         self._valve_sha = _expected_valve_sha(valve_gate, expected_valve_weights_sha256)
         self._calc = margin_calculator or Mt5MarginCalculator(leverage=BROKER_SPECS[broker_id].max_leverage)
         self._min_level = decimal_value(min_post_trade_margin_level_pct, "min_post_trade_margin_level_pct", positive=True)
@@ -3954,19 +4220,31 @@ class Mt5PaperBrokerVenue:
 
     def execute(
         self,
-        order: OrderIntent,
+        order: OrderIntent | RiskIncreasingOrderIntent | RiskReducingOrderIntent,
         *,
-        valve_decision: ValveDecision,
+        valve_decision: ValveDecision | None = None,
         quote_guard: Callable[[str, Mt5Tick], None] | None = None,
         margin_guard: Callable[[Mt5MarginCheck, Mt5AccountSnapshot], None] | None = None,
+        valve_grant: ValveOrderGrant | None = None,
+        allowed_actions: frozenset[ActionKind] | None = None,
+        require_risk_reducing: bool = False,
     ) -> Mt5ExecutionResult:
-        """Valve clearance -> quotes -> ``quote_guard`` -> margin check -> ``margin_guard`` -> send.
+        """Valve clearance -> quotes -> ``quote_guard`` -> margin check -> ``margin_guard`` -> grant -> send.
 
         Every guard runs strictly before anything is sent, so a guard refusal is always safe to
         route elsewhere. A failure after sending raises :class:`Mt5OutcomeUnknownError`.
         """
-        if not isinstance(order, OrderIntent):
-            raise ContractError("execute requires an OrderIntent")
+        if isinstance(order, RiskReducingOrderIntent):
+            require_risk_reducing = True
+        order = _unwrap_order_intent(order)
+        if allowed_actions is not None and order.kind not in allowed_actions:
+            raise ContractError(
+                f"{self.broker_id} refused action {order.kind.value!r}; allowed={[a.value for a in sorted(allowed_actions, key=lambda x: x.value)]}"
+            )
+        if require_risk_reducing and order.kind not in MANAGEMENT_ACTION_KINDS:
+            raise ContractError(
+                f"{self.broker_id} management path refused risk-increasing action {order.kind.value!r}"
+            )
         if self._account is None:
             raise Mt5PreDispatchTransportError(f"{self.broker_id} venue is not connected")
         if self.is_offline:
@@ -3981,23 +4259,46 @@ class Mt5PaperBrokerVenue:
                 raise Mt5PreDispatchTransportError(
                     f"{self.broker_id} terminal is offline and disconnected: {STATUS_BROKER_OFFLINE}"
                 )
-        decision = require_valve_clearance(order, valve_decision, expected_weights_sha256=self._valve_sha)
         now = self._clock()
+        if valve_grant is not None and valve_decision is None:
+            if not isinstance(valve_grant, ValveOrderGrant) or not valve_grant.risk_reducing or order.kind not in MANAGEMENT_ACTION_KINDS:
+                raise Mt5ValveClearanceError(
+                    "Non-protective execution requires an admitted ForexMetaValveGate ValveDecision"
+                )
+            decision: ValveDecision | None = None
+            valve_mode_label = "PROTECTIVE_GRANT"
+            valve_sha = valve_grant.decision_sha256
+        else:
+            decision = require_valve_clearance(
+                order,
+                valve_decision,
+                expected_weights_sha256=self._valve_sha,
+                now=now,
+                require_risk_reducing=require_risk_reducing,
+            )
+            valve_mode_label = decision.valve_mode
+            valve_sha = sha256(canonical_bytes(decision.to_dict())).hexdigest()
         if self._credentials.execution_mode == EXECUTION_MODE_LIVE:
             if self._credentials.live_auth_context is None:
                 raise LiveAuthorizationError(
                     f"LIVE dispatch on {self.broker_id} refused: missing verified LiveAuthorizationContext"
                 )
+            self._credentials.live_auth_context.verify_provenance(
+                now=now,
+                reverify_ticket=True,
+                require_arm_phrase=True,
+            )
             self._credentials.live_auth_context.assert_valid_at(
                 now,
                 expected_broker_id=self.broker_id,
                 expected_account_id=str(self._credentials.login),
                 expected_server=self._credentials.server,
+                require_arm_phrase=True,
+                reverify_ticket=True,
             )
         margin_check: Mt5MarginCheck | None = None
         request_id = self._next_request_id(order)
         comment = f"cas-{order.kind.value.lower()}"[:31]
-        valve_sha = sha256(canonical_bytes(decision.to_dict())).hexdigest()
         v_channel = self.broker_id.lower()
         v_login = str(self._credentials.login)
         v_srv = self._credentials.server
@@ -4139,7 +4440,37 @@ class Mt5PaperBrokerVenue:
                 expires_at=request.expires_at,
                 custody_inspector=self._transport._custody_inspector,
             )
-        now_utc_str = _iso(self._clock())
+        grant_now = self._clock()
+        if valve_grant is not None:
+            eff_grant = valve_grant
+        else:
+            if self._valve_gate is None or decision is None:
+                raise Mt5ValveClearanceError(
+                    f"{self.broker_id} cannot mint single-use ValveOrderGrant without a bound ForexMetaValveGate"
+                )
+            eff_grant = self._valve_gate.issue_order_grant(
+                decision,
+                broker_id=self.broker_id,
+                account_id=str(self._credentials.login),
+                server=self._credentials.server,
+                execution_mode=self._credentials.execution_mode,
+                action_kind=request.action,
+                symbol=request.symbol,
+                side=request.side.value,
+                volume=request.volume_lots,
+                stop_loss=request.stop_loss,
+                take_profit=request.take_profit,
+                position_ticket=request.position_ticket,
+                order_action_ref=order.action_ref,
+                order_quantity_units=order.quantity_units,
+                order_side=order.side,
+                order_stop_price=order.stop_price,
+                order_take_profit_price=order.take_profit_price,
+                order_limit_price=order.limit_price,
+                require_risk_reducing=require_risk_reducing,
+                now=grant_now,
+            )
+        now_utc_str = _iso(grant_now)
         sem_key = (
             f"{order.kind.value}|{self.broker_id}|{self._credentials.login}|{self._credentials.server}|"
             f"{order.symbol}|{request.position_ticket or ''}"
@@ -4156,13 +4487,18 @@ class Mt5PaperBrokerVenue:
             now_utc=now_utc_str,
         )
         try:
-            receipt = self._transport.send_order(request)
-        except LiveAuthorizationError:
+            receipt = self._transport.send_order(
+                request,
+                valve_grant=eff_grant,
+                require_risk_reducing=require_risk_reducing,
+                now=grant_now,
+            )
+        except (LiveAuthorizationError, ValveRefusalError, Mt5PreDispatchTransportError) as pre_exc:
             self._mutation_journal.mark_outcome(
                 request_id=request.request_id,
                 status="CONFIRMED_ABSENT",
                 now_utc=_iso(self._clock()),
-                error_detail="LIVE_AUTHORIZATION_EXPIRED",
+                error_detail=type(pre_exc).__name__,
             )
             raise
         except Mt5OutcomeUnknownError as exc:
@@ -4262,7 +4598,7 @@ class Mt5PaperBrokerVenue:
             "order_id": order.order_id,
             "action_ref": order.action_ref,
             "kind": order.kind.value,
-            "valve_mode": decision.valve_mode,
+            "valve_mode": valve_mode_label,
             "valve_weights_sha256": decision.weights_sha256,
             "request": request.to_spool_dict(),
             "receipt": receipt.to_wire_dict(),
@@ -4281,7 +4617,7 @@ class Mt5PaperBrokerVenue:
             account_after=account_after,
             positions_after=positions_after,
             margin_check=margin_check,
-            valve_mode=decision.valve_mode,
+            valve_mode=valve_mode_label,
             audit_record=record,
             reconciliation_required=reconciliation_required,
             post_fill_refresh_error=post_fill_err,
@@ -4419,6 +4755,7 @@ class OandaPracticeFallbackVenue:
             raise ContractError("summary_max_age_seconds must be a positive finite number")
         self.broker_id = BROKER_OANDA_LIVE if client.execution_mode == EXECUTION_MODE_LIVE else BROKER_OANDA_PRACTICE
         self._client = client
+        self._valve_gate: ForexMetaValveGate | None = valve_gate
         self._valve_sha = _expected_valve_sha(valve_gate, expected_valve_weights_sha256)
         self._clock = clock or _utc_now
         self._audit = _AuditChain()
@@ -4611,21 +4948,119 @@ class OandaPracticeFallbackVenue:
         ts = self._clock() if now is None else utc_time(now, "now")
         return self._client.reconcile_unknown_mutations(now=ts, max_pages=max_pages)
 
-    def execute(self, order: OrderIntent, *, valve_decision: ValveDecision) -> Mt5ExecutionResult:
+    def execute(
+        self,
+        order: OrderIntent | RiskIncreasingOrderIntent | RiskReducingOrderIntent,
+        *,
+        valve_decision: ValveDecision | None = None,
+        valve_grant: ValveOrderGrant | None = None,
+        allowed_actions: frozenset[ActionKind] | None = None,
+        require_risk_reducing: bool = False,
+    ) -> Mt5ExecutionResult:
+        if isinstance(order, RiskReducingOrderIntent):
+            require_risk_reducing = True
+        order = _unwrap_order_intent(order)
+        if allowed_actions is not None and order.kind not in allowed_actions:
+            raise ContractError(
+                f"{self.broker_id} refused action {order.kind.value!r}; allowed={[a.value for a in sorted(allowed_actions, key=lambda x: x.value)]}"
+            )
+        if require_risk_reducing and order.kind not in MANAGEMENT_ACTION_KINDS:
+            raise ContractError(
+                f"{self.broker_id} management path refused risk-increasing action {order.kind.value!r}"
+            )
         if self._summary is None:
             raise Mt5TransportError("OANDA practice fallback is not connected")
-        decision = require_valve_clearance(order, valve_decision, expected_weights_sha256=self._valve_sha)
         now = self._clock()
+        if valve_grant is not None and valve_decision is None:
+            if not isinstance(valve_grant, ValveOrderGrant) or not valve_grant.risk_reducing or order.kind not in MANAGEMENT_ACTION_KINDS:
+                raise Mt5ValveClearanceError(
+                    "Non-protective OANDA execution requires an admitted ForexMetaValveGate ValveDecision"
+                )
+            decision: ValveDecision | None = None
+            valve_mode_label = "PROTECTIVE_GRANT"
+        else:
+            decision = require_valve_clearance(
+                order,
+                valve_decision,
+                expected_weights_sha256=self._valve_sha,
+                now=now,
+                require_risk_reducing=require_risk_reducing,
+            )
+            valve_mode_label = decision.valve_mode
+        acct_id = str(self._client.account_id or "").strip()
+        if not acct_id:
+            raise Mt5TransportError(f"{self.broker_id} client has no bound account_id")
+
+        def _mint_oanda_grant(
+            *,
+            action_kind: str,
+            side: Side | None,
+            volume: Decimal | str | None,
+            stop_loss: Decimal | None,
+            take_profit: Decimal | None,
+            position_ticket: str | None,
+            req_rr: bool,
+        ) -> ValveOrderGrant:
+            if valve_grant is not None:
+                return valve_grant
+            if self._valve_gate is None or decision is None:
+                raise Mt5ValveClearanceError(
+                    f"{self.broker_id} cannot mint single-use ValveOrderGrant without a bound ForexMetaValveGate"
+                )
+            return self._valve_gate.issue_order_grant(
+                decision,
+                broker_id=self._client.broker_id,
+                account_id=acct_id,
+                server=self._client.server_host,
+                execution_mode=self._client.execution_mode,
+                action_kind=action_kind,
+                symbol=order.symbol,
+                side=side,
+                volume=volume,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                position_ticket=position_ticket,
+                order_action_ref=order.action_ref,
+                order_quantity_units=order.quantity_units,
+                order_side=order.side,
+                order_stop_price=order.stop_price,
+                order_take_profit_price=order.take_profit_price,
+                order_limit_price=order.limit_price,
+                require_risk_reducing=req_rr,
+                now=now,
+            )
+
         if order.kind is ActionKind.AMEND_STOP:
+            tid = str(order.position_ticket)
+            grant = _mint_oanda_grant(
+                action_kind="AMEND_STOP",
+                side=None,
+                volume=None,
+                stop_loss=order.stop_price,
+                take_profit=order.take_profit_price,
+                position_ticket=tid,
+                req_rr=True,
+            )
             receipt = self._client.amend_trade_protection(
-                trade_id=str(order.position_ticket),
+                trade_id=tid,
                 stop_loss_price=order.stop_price,
                 take_profit_price=order.take_profit_price,
+                symbol=order.symbol,
+                valve_grant=grant,
                 now=now,
             )
         elif order.kind is ActionKind.OPEN:
             # Finding [3]: Ensure fresh OANDA NAV & margin summary immediately before new-risk OPEN.
             self.probe_account_summary(now=now)
+            grant = _mint_oanda_grant(
+                action_kind="OPEN",
+                side=order.side,
+                volume=order.quantity_units,
+                stop_loss=order.stop_price,
+                take_profit=order.take_profit_price,
+                position_ticket=None,
+                req_rr=False,
+            )
             receipt = self._client.submit_paper_market_order(
                 symbol=order.symbol,
                 side=order.side,  # type: ignore[arg-type]
@@ -4634,6 +5069,7 @@ class OandaPracticeFallbackVenue:
                 stop_loss_price=order.stop_price,
                 take_profit_price=order.take_profit_price,
                 price_bound=order.limit_price,
+                valve_grant=grant,
                 now=now,
             )
         elif order.kind in (ActionKind.CLOSE, ActionKind.REDUCE):
@@ -4654,12 +5090,22 @@ class OandaPracticeFallbackVenue:
                 if order.quantity_units is None or not (Decimal("0") < order.quantity_units < open_units):
                     raise ContractError("OANDA REDUCE quantity must be strictly positive and below open trade units")
                 close_units = order.quantity_units
+            grant = _mint_oanda_grant(
+                action_kind=order.kind.value,
+                side=None,
+                volume=close_units,
+                stop_loss=None,
+                take_profit=None,
+                position_ticket=tid,
+                req_rr=True,
+            )
             receipt = self._client.close_trade(
                 trade_id=tid,
                 units=close_units,
                 client_order_id=order.order_id,
                 symbol=order.symbol,
                 action_kind=order.kind.value,
+                valve_grant=grant,
                 now=now,
             )
         else:
@@ -4693,7 +5139,7 @@ class OandaPracticeFallbackVenue:
             "order_id": order.order_id,
             "action_ref": order.action_ref,
             "kind": order.kind.value,
-            "valve_mode": decision.valve_mode,
+            "valve_mode": valve_mode_label,
             "receipt": receipt,
             "reconciliation_required": reconciliation_required,
             "post_fill_refresh_error": post_err,
@@ -4707,7 +5153,7 @@ class OandaPracticeFallbackVenue:
             account_after=None,
             positions_after=positions_after,
             margin_check=None,
-            valve_mode=decision.valve_mode,
+            valve_mode=valve_mode_label,
             audit_record=record,
             reconciliation_required=reconciliation_required,
             post_fill_refresh_error=post_err,

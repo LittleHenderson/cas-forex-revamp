@@ -676,24 +676,45 @@ class AutonomousAiTrader:
             if initial_capital_usd is not None
             else None
         )
-        self._state_dir: Path | None = Path(state_dir).resolve() if state_dir is not None else None
+        from cas_forex_revamp.composition.state_store import (
+            ensure_secure_state_directory,
+            verify_non_symlink_sqlite_target,
+        )
+
+        if self._journal_path is not None:
+            self._journal_path = verify_non_symlink_sqlite_target(
+                self._journal_path, create_parent=True, label="AI trader cycle journal DB"
+            )
+
+        self._state_dir: Path | None = (
+            ensure_secure_state_directory(state_dir) if state_dir is not None else None
+        )
         resolved_comp = compounding_controller
         resolved_bridge = phase8_bridge
         if self._state_dir is not None:
-            self._state_dir.mkdir(parents=True, exist_ok=True)
             boot_ts = self._now()
             boot_principal = self._resolve_initial_capital_usd(allow_vault_io=True) or Decimal("5000.00")
             if resolved_comp is None:
-                resolved_comp = CompoundingAndMilestoneController(
+                comp_db_target = verify_non_symlink_sqlite_target(
                     self._state_dir / "compounding.sqlite3",
+                    create_parent=False,
+                    label="compounding SQLite DB",
+                )
+                resolved_comp = CompoundingAndMilestoneController(
+                    comp_db_target,
                     starting_principal_usd=boot_principal,
                     mode=CompoundingMode.BALANCED_SPLIT_50_50,
                     scope_id=self._scope.account_id,
                     now_utc=boot_ts,
                 )
             if resolved_bridge is None:
-                p8_ledger = UnifiedRealTimeLedger(
+                p8_db_target = verify_non_symlink_sqlite_target(
                     self._state_dir / "phase8_unified_ledger.sqlite3",
+                    create_parent=False,
+                    label="phase8 unified ledger DB",
+                )
+                p8_ledger = UnifiedRealTimeLedger(
+                    p8_db_target,
                     scope_id=self._scope.account_id,
                     principal_usd=boot_principal,
                     sweep_ratio=Decimal("0.50"),
@@ -942,8 +963,15 @@ class AutonomousAiTrader:
     def _connect_journal(self) -> sqlite3.Connection | None:
         if self._journal_path is None:
             return None
-        self._journal_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self._journal_path), timeout=10.0, isolation_level=None)
+        from cas_forex_revamp.composition.state_store import open_verified_sqlite_connection
+
+        conn = open_verified_sqlite_connection(
+            self._journal_path,
+            read_only=False,
+            timeout=10.0,
+            create_parent=True,
+            label="AI trader cycle journal DB",
+        )
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         if not self._journal_initialized:

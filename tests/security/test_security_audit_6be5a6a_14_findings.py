@@ -277,7 +277,41 @@ class SecurityAudit14FindingsTests(unittest.TestCase):
             sig = _spool_hmac_hex(hkey, _canonical_spool_request_hmac_input(doc))
             self.assertEqual(len(sig), 64)
             # Valid order succeeds with verified receipt HMAC; duplicate request_id blocked
-            rcpt = tr.send_order(bound)
+            from types import SimpleNamespace
+            from cas_forex_revamp.valve.tks_meta_valve_controller import load_default_forex_valve_gate as _ld_gate
+            _g7 = _ld_gate()
+            _now7 = datetime.now(timezone.utc)
+            _ord7 = _mbb.OrderIntent(
+                order_id=bound.request_id, action_ref=f"act-{bound.request_id}", kind=_mbb.ActionKind.OPEN,
+                symbol=bound.symbol, quantity_units=bound.volume_lots * Decimal("100000"),
+                side=bound.side, stop_price=bound.stop_loss,
+            )
+            _prop7 = SimpleNamespace(
+                request=SimpleNamespace(
+                    request_id=f"req-{bound.request_id}", facts=(),
+                    evidence=(SimpleNamespace(evidence_id="ev-1"),),
+                    state=SimpleNamespace(observed_at=_now7, valid_until=_now7 + timedelta(minutes=5)),
+                ),
+                result=SimpleNamespace(selection=SimpleNamespace(evidence_ids=("ev-1",), reason="ID=02 f7", selected_action_ref=_ord7.action_ref)),
+                intent=SimpleNamespace(
+                    intent_id=_ord7.order_id, action_ref=_ord7.action_ref, kind=_ord7.kind,
+                    instrument_id=_ord7.symbol, quantity=_ord7.quantity_units, side=_ord7.side,
+                    stop_price=_ord7.stop_price, limit_price=None, take_profit_price=None, target_id=None,
+                ),
+            )
+            _dec7 = _g7.require_admissible(
+                _prop7,
+                current_view={"balance": "100000", "equity": "100000", "available_margin": "90000", "position_inventory": "[]"},
+                policy={"new_risk_permission": "ALLOWED", "management_permission": "ALLOWED", "max_entry_quantity": "1000000"},
+                now=_now7,
+            )
+            _grant7 = _g7.issue_order_grant(
+                _dec7, broker_id=BROKER_HUGOSWAY_MT5, account_id="7001234", server=creds.server,
+                execution_mode="DEMO", action_kind=bound.action, symbol=bound.symbol,
+                side=bound.side.value, volume=bound.volume_lots, stop_loss=bound.stop_loss,
+                order_action_ref=_ord7.action_ref, order_quantity_units=_ord7.quantity_units, now=_now7,
+            )
+            rcpt = tr.send_order(bound, valve_grant=_grant7)
             self.assertTrue(bool(rcpt.position_ticket))
 
             # Tampered request HMAC fails closed inside emulator/spool handler

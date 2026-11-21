@@ -390,8 +390,14 @@ class CompoundingAndMilestoneController:
         raw_path = str(db_path).strip()
         if not raw_path or raw_path == ":memory:" or raw_path.startswith("file:"):
             raise CompoundingControllerError("db_path must be a concrete on-disk SQLite file path")
-        self.db_path = Path(raw_path).expanduser().resolve()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        from cas_forex_revamp.composition.state_store import verify_non_symlink_sqlite_target
+
+        try:
+            self.db_path = verify_non_symlink_sqlite_target(
+                raw_path, create_parent=True, label="compounding SQLite DB"
+            )
+        except ContractError as exc:
+            raise CompoundingControllerError(str(exc)) from exc
 
         try:
             self.scope_id = identifier(scope_id, "scope_id")
@@ -440,7 +446,18 @@ class CompoundingAndMilestoneController:
         )
 
     def _connect_rw(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=5.0, isolation_level=None)
+        from cas_forex_revamp.composition.state_store import open_verified_sqlite_connection
+
+        try:
+            conn = open_verified_sqlite_connection(
+                self.db_path,
+                read_only=False,
+                timeout=5.0,
+                create_parent=True,
+                label="compounding SQLite DB",
+            )
+        except ContractError as exc:
+            raise CompoundingControllerError(str(exc)) from exc
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
@@ -452,10 +469,21 @@ class CompoundingAndMilestoneController:
             raise
 
     def _connect_ro(self) -> sqlite3.Connection:
-        ro_uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
-        conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0, isolation_level=None)
+        from cas_forex_revamp.composition.state_store import open_verified_sqlite_connection
+
+        try:
+            conn = open_verified_sqlite_connection(
+                self.db_path,
+                read_only=True,
+                timeout=5.0,
+                create_parent=False,
+                label="compounding SQLite DB",
+            )
+        except ContractError as exc:
+            raise CompoundingControllerError(str(exc)) from exc
         try:
             conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
             conn.execute("PRAGMA busy_timeout=5000")
             return conn
         except Exception:

@@ -33,6 +33,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from unittest import mock
 import urllib.parse
 
 from cas_forex_revamp.composition.autonomous_trader import AutonomousAiTrader
@@ -193,18 +194,8 @@ class _FixedScoreValveGate(ForexMetaValveGate):
         policy: object = None,
         now: datetime | None = None,
     ) -> ValveDecision:
-        base = super().evaluate(proposal, current_view=current_view, policy=policy, now=now)
-        if base.hard_veto_reasons:
-            return base
-        score = float(self.forced_score)
-        admitted = score >= float(base.threshold)
-        return dataclasses.replace(
-            base,
-            admitted=admitted,
-            mlp_admitted=admitted,
-            mlp_score=score,
-            valve_mode="ADMIT" if admitted else "VETO",
-        )
+        with mock.patch.object(self.controller, "forward", return_value=float(self.forced_score)):
+            return super().evaluate(proposal, current_view=current_view, policy=policy, now=now)
 
 
 def _load_schema(name: str) -> dict[str, object]:
@@ -622,16 +613,44 @@ class Pr26AggressionDialIntegrationTests(unittest.TestCase):
                 self.assertEqual(err_409["high_risk_min_bps"], 80)
             self.assertEqual(dial.snapshot()["audit_count"], audit_before)
 
-            # With high_risk_confirmed=True, 100 bps & STAGGER_SAFE_TO_EXTREME succeed in LIVE mode
-            st_ok1, ok1 = self._http_json(
+            # Unbound high_risk_confirmed=True without target-bound confirmation is also rejected (Finding [17])
+            st_unb1, unb1 = self._http_json(
                 srv,
                 "POST",
                 "/api/aggression-dial",
                 headers=srv.auth_headers(),
                 body_obj={"action": "SET_MASTER_RISK_BPS", "risk_bps": 100, "high_risk_confirmed": True},
             )
+            self.assertEqual(st_unb1, 409)
+
+            # With exact target-bound confirmation, 100 bps & STAGGER_SAFE_TO_EXTREME succeed in LIVE mode
+            st_ok1, ok1 = self._http_json(
+                srv,
+                "POST",
+                "/api/aggression-dial",
+                headers=srv.auth_headers(),
+                body_obj={
+                    "action": "SET_MASTER_RISK_BPS",
+                    "risk_bps": 100,
+                    "high_risk_confirmed": True,
+                    "high_risk_confirmation": unb1["required_confirmation"],
+                },
+            )
             self.assertEqual(st_ok1, 200)
             self.assertEqual(ok1["master_risk_bps"], 100)
+
+            st_unb2, unb2 = self._http_json(
+                srv,
+                "POST",
+                "/api/aggression-dial",
+                headers=srv.auth_headers(),
+                body_obj={
+                    "action": "APPLY_TIER_PRESET",
+                    "preset": "STAGGER_SAFE_TO_EXTREME",
+                    "high_risk_confirmed": True,
+                },
+            )
+            self.assertEqual(st_unb2, 409)
 
             st_ok2, ok2 = self._http_json(
                 srv,
@@ -642,6 +661,7 @@ class Pr26AggressionDialIntegrationTests(unittest.TestCase):
                     "action": "APPLY_TIER_PRESET",
                     "preset": "STAGGER_SAFE_TO_EXTREME",
                     "high_risk_confirmed": True,
+                    "confirmation_phrase": unb2["required_confirmation_phrase"],
                 },
             )
             self.assertEqual(st_ok2, 200)

@@ -105,7 +105,7 @@ class _StubMt5Transport:
         bid, ask = self._ticks[symbol]
         return Mt5Tick(symbol=symbol, bid=bid, ask=ask, time_msc="1795091559795")
 
-    def send_order(self, request: Mt5OrderRequest) -> Mt5OrderReceipt:
+    def send_order(self, request: Mt5OrderRequest, **kwargs) -> Mt5OrderReceipt:
         self.submitted_requests.append(request)
         if self._reject_with is not None:
             retcode, msg = self._reject_with
@@ -153,6 +153,7 @@ def _admitted_valve_decision(order: OrderIntent):
         side=order.side,
         stop_price=order.stop_price,
         limit_price=order.limit_price,
+        take_profit_price=order.take_profit_price,
         target_id=None,
     )
     req = SimpleNamespace(

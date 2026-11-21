@@ -41,6 +41,10 @@ from cas_forex_revamp.futures.tradovate_venue import (
     TradovateDrawdownLockError,
     TradovateEndpointError,
     TradovateHttpsTransport,
+    BROKER_TRADOVATE_FUTURES,
+    LIVE_ARM_CONFIRMATION_TEXT,
+    LiveAuthorizationError,
+    TRADOVATE_LIVE_HOST,
     TradovateLiveLockError,
     TradovateMicroFuturesPaperEmulator,
     TradovateMicroFuturesVenue,
@@ -56,12 +60,46 @@ from cas_forex_revamp.futures.tradovate_venue import (
     load_default_forex_valve_gate,
     load_tradovate_credentials,
     validate_tradovate_endpoint,
+    verify_live_authorization_context,
 )
 from cas_forex_revamp.valve.tks_meta_valve_controller import ValveDecision
+from cas_forex_revamp.venue.live_auth_ticket import (
+    mint_live_authorization_ticket,
+    provision_live_auth_key,
+)
 
 
 def _utc(year: int, month: int, day: int, hour: int = 15, minute: int = 0) -> datetime:
     return datetime(year, month, day, hour, minute, 0, tzinfo=timezone.utc)
+
+
+def _mint_verified_tradovate_live_ctx(
+    tmp_dir: Path,
+    *,
+    account_id: str = "TV-LIVE-1001",
+    now: datetime | None = None,
+) -> object:
+    key_file = provision_live_auth_key(tmp_dir / "live_auth.key")
+    issued = now or _utc(2026, 11, 20, 15, 0)
+    ticket = mint_live_authorization_ticket(
+        key_file=key_file,
+        broker_id=BROKER_TRADOVATE_FUTURES,
+        account_login=account_id,
+        server=TRADOVATE_LIVE_HOST,
+        ttl_seconds=3600,
+        issued_at=issued,
+    )
+    _verified, ctx = verify_live_authorization_context(
+        ticket,
+        key_file=key_file,
+        expected_broker_id=BROKER_TRADOVATE_FUTURES,
+        expected_account_login=account_id,
+        expected_server=TRADOVATE_LIVE_HOST,
+        live_arm_phrase=LIVE_ARM_CONFIRMATION_TEXT,
+        require_arm_phrase=True,
+        now=issued,
+    )
+    return ctx
 
 
 class _FixedClock:
@@ -145,29 +183,46 @@ class TestTradovateEndpointAndSecrets(unittest.TestCase):
             validate_tradovate_endpoint("DEMO", "https://demo.tradovateapi.com:443/v1/"),
             TRADOVATE_DEMO_BASE_URL,
         )
-        # Valid LIVE only with live_arming_verified=True
-        self.assertEqual(
-            validate_tradovate_endpoint(
-                "LIVE",
-                "https://live.tradovateapi.com/v1",
-                live_arming_verified=True,
-            ),
-            TRADOVATE_LIVE_BASE_URL,
-        )
+        # Valid LIVE only with verified opaque LiveAuthorizationContext + exact LIVE arm phrase
+        t_now = _utc(2026, 11, 20, 15, 0)
+        with tempfile.TemporaryDirectory() as td:
+            live_ctx = _mint_verified_tradovate_live_ctx(
+                Path(td), account_id="TV-LIVE-1001", now=t_now
+            )
+            self.assertEqual(
+                validate_tradovate_endpoint(
+                    "LIVE",
+                    "https://live.tradovateapi.com/v1",
+                    live_auth_context=live_ctx,
+                    live_arm_phrase=LIVE_ARM_CONFIRMATION_TEXT,
+                    account_id="TV-LIVE-1001",
+                    now_utc=t_now,
+                ),
+                TRADOVATE_LIVE_BASE_URL,
+            )
+            # LIVE refuses demo host even with verified LiveAuthorizationContext
+            with self.assertRaises(TradovateEndpointError):
+                validate_tradovate_endpoint(
+                    "LIVE",
+                    "https://demo.tradovateapi.com/v1",
+                    live_auth_context=live_ctx,
+                    live_arm_phrase=LIVE_ARM_CONFIRMATION_TEXT,
+                    account_id="TV-LIVE-1001",
+                    now_utc=t_now,
+                )
         # DEMO refuses live host
         with self.assertRaises(TradovateLiveLockError):
             validate_tradovate_endpoint("DEMO", "https://live.tradovateapi.com/v1")
-        # LIVE without live_arming_verified=True refuses fail-closed
-        with self.assertRaises(TradovateLiveLockError):
+        # LIVE without verified LiveAuthorizationContext refuses fail-closed (even with live_arming_verified=True)
+        with self.assertRaises(LiveAuthorizationError):
             validate_tradovate_endpoint("LIVE", "https://live.tradovateapi.com/v1")
-        with self.assertRaises(TradovateLiveLockError):
+        with self.assertRaises(LiveAuthorizationError):
             validate_tradovate_endpoint(
                 "LIVE", "https://live.tradovateapi.com/v1", live_arming_verified=False
             )
-        # LIVE refuses demo host even if armed
-        with self.assertRaises(TradovateEndpointError):
+        with self.assertRaises(LiveAuthorizationError):
             validate_tradovate_endpoint(
-                "LIVE", "https://demo.tradovateapi.com/v1", live_arming_verified=True
+                "LIVE", "https://live.tradovateapi.com/v1", live_arming_verified=True
             )
         # Reject http, file, credentials, query, fragment, non-443 ports, localhost/private IPs, unpinned hosts
         bad_urls = [
@@ -424,8 +479,10 @@ class TestTradovateVenueStandbyValveAndLifecycle(unittest.TestCase):
         self.assertEqual(acct_after_tp.open_position_count, 0)
 
         # Trade 2: US30 -> MYM (50-pt SL = $25.00/contract -> 1 contract at 0.50% risk)
+        # Refresh US30 live quote at current clock time (Finding [16] enforces <=30s quote age).
         # Move stop to break-even, then hit break-even stop -> $0.00 gross, -$1.24 net
         self.clock.advance(60)
+        venue.process_market_quote("US30", Decimal("43000.00"), Decimal("43001.00"))
         open_mym = venue.place_bracket_order(
             symbol="US30",
             side="BUY",
@@ -863,8 +920,21 @@ class TestTradovateVenueStandbyValveAndLifecycle(unittest.TestCase):
             enabled=False,
             clock=self.clock,
         )
-        with self.assertRaises(TradovateNotConfiguredError):
+        # Bare boolean without LiveAuthorizationContext MUST fail closed with LiveAuthorizationError
+        with self.assertRaises(LiveAuthorizationError):
             venue.activate(mode=TRADOVATE_MODE_LIVE, live_arming_verified=True)
+
+        # With verified LiveAuthorizationContext, connect() failure MUST remain strictly atomic
+        live_ctx = _mint_verified_tradovate_live_ctx(
+            self.tmp, account_id="TV-LIVE-1001", now=self.clock()
+        )
+        with self.assertRaises(TradovateNotConfiguredError):
+            venue.activate(
+                mode=TRADOVATE_MODE_LIVE,
+                account_id="TV-LIVE-1001",
+                live_auth_context=live_ctx,
+                live_arm_phrase=LIVE_ARM_CONFIRMATION_TEXT,
+            )
 
         # In-memory state AND SQLite venue_meta MUST BOTH remain unchanged (STANDBY_READY / DEMO)
         self.assertFalse(venue.enabled)

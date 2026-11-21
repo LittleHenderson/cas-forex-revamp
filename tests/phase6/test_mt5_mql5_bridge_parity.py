@@ -81,19 +81,80 @@ MQ5_PATH = REPO_ROOT / "mt5" / "CasForexMt5Bridge.mq5"
 DEFAULT_VALVE_GATE = load_default_forex_valve_gate()
 
 
-def _clear_valve(order: OrderIntent) -> ValveDecision:
-    return ValveDecision(
-        admitted=True,
-        valve_mode="ADMIT",
-        mlp_score=0.91,
-        threshold=0.55,
-        mlp_admitted=True,
-        hard_veto=False,
-        hard_veto_reasons=(),
-        features={},
-        weights_sha256=DEFAULT_VALVE_GATE.controller.weights_sha256(),
-        request_id=order.order_id,
-        selected_action_ref=order.action_ref,
+def _clear_valve(order: OrderIntent, *, now: datetime | None = None) -> ValveDecision:
+    from types import SimpleNamespace as _SN
+    eff_now = T0 if now is None else now
+    intent = _SN(
+        intent_id=order.order_id,
+        action_ref=order.action_ref,
+        kind=order.kind,
+        instrument_id=order.symbol,
+        quantity=order.quantity_units,
+        side=order.side,
+        stop_price=order.stop_price,
+        limit_price=order.limit_price,
+        take_profit_price=order.take_profit_price,
+        target_id=order.position_ticket,
+    )
+    req = _SN(
+        request_id=f"req-{order.order_id}",
+        facts=(),
+        evidence=(_SN(evidence_id="ev-1"),),
+        state=_SN(observed_at=eff_now, valid_until=eff_now + timedelta(minutes=5)),
+    )
+    sel = _SN(evidence_ids=("ev-1",), reason="ID=02 parity test", selected_action_ref=order.action_ref)
+    prop = _SN(request=req, result=_SN(selection=sel), intent=intent)
+    view = {"balance": "100000", "equity": "100000", "available_margin": "90000", "position_inventory": "[]"}
+    pol = {"new_risk_permission": "ALLOWED", "management_permission": "ALLOWED", "max_entry_quantity": "10000000"}
+    return DEFAULT_VALVE_GATE.require_admissible(prop, current_view=view, policy=pol, now=eff_now)
+
+
+def _grant_for_req(req: Mt5OrderRequest, *, broker_id: str = BROKER_HUGOSWAY_MT5, login: int = 7001234, server: str = "Hugosway-Demo", now: datetime | None = None):
+    eff_now = datetime.now(timezone.utc) if now is None else now
+    if req.action in ("CLOSE", "REDUCE", "AMEND_STOP"):
+        return DEFAULT_VALVE_GATE.issue_protective_order_grant(
+            broker_id=broker_id,
+            account_id=str(login),
+            server=server,
+            execution_mode=EXECUTION_MODE_DEMO,
+            action_kind=req.action,
+            symbol=req.symbol,
+            position_ticket=str(req.position_ticket),
+            side=req.side.value,
+            volume=req.volume_lots,
+            stop_loss=req.stop_loss,
+            take_profit=req.take_profit,
+            now=eff_now,
+        )
+    units = (req.volume_lots * D("100000")) if req.volume_lots is not None else D("10000")
+    ord_i = OrderIntent(
+        order_id=req.request_id,
+        action_ref=f"act-{req.request_id}",
+        kind=ActionKind.OPEN,
+        symbol=req.symbol,
+        quantity_units=units,
+        side=req.side,
+        stop_price=req.stop_loss or D("1.09500"),
+        take_profit_price=req.take_profit,
+    )
+    dec = _clear_valve(ord_i, now=eff_now)
+    return DEFAULT_VALVE_GATE.issue_order_grant(
+        dec,
+        broker_id=broker_id,
+        account_id=str(login),
+        server=server,
+        execution_mode=EXECUTION_MODE_DEMO,
+        action_kind=req.action,
+        symbol=req.symbol,
+        side=req.side.value,
+        volume=req.volume_lots,
+        stop_loss=req.stop_loss,
+        take_profit=req.take_profit,
+        position_ticket=req.position_ticket,
+        order_action_ref=ord_i.action_ref,
+        order_quantity_units=ord_i.quantity_units,
+        order_side=ord_i.side,
+        now=eff_now,
     )
 
 
@@ -325,7 +386,7 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
             )
             transport.connect(Mt5Credentials(BROKER_HUGOSWAY_MT5, 7001234, "Hugosway-Demo"))
             signed_order_req = sign_spool_valve_admission(transport.prepare_request(order_req), spool_dir=spool_dir)
-            receipt = transport.send_order(signed_order_req)
+            receipt = transport.send_order(signed_order_req, valve_grant=_grant_for_req(signed_order_req))
             self.assertTrue(receipt.accepted)
             self.assertEqual(receipt.status, "FILLED")
 
@@ -502,7 +563,7 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                 spool_dir=spool_dir,
                 expires_at=expired_req.issued_at + timedelta(seconds=30),
             )
-            rcpt_exp = transport.send_order(signed_exp)
+            rcpt_exp = transport.send_order(signed_exp, valve_grant=_grant_for_req(signed_exp))
             self.assertFalse(rcpt_exp.accepted)
             self.assertEqual(rcpt_exp.retcode, 10013)
             self.assertEqual(rcpt_exp.status, "REJECTED")
@@ -539,7 +600,7 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                 no_reply_transport.prepare_request(timeout_req), spool_dir=spool_dir
             )
             with self.assertRaises(Mt5OutcomeUnknownError):
-                no_reply_transport.send_order(signed_timeout)
+                no_reply_transport.send_order(signed_timeout, valve_grant=_grant_for_req(signed_timeout))
 
     def test_execute_request_rejection_codes_and_python_interpretation(self) -> None:
         m_max_vol = re.search(r"input\s+double\s+InpMaxVolumeLots\s*=\s*([0-9.]+);", self.mq5)
@@ -619,53 +680,51 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
             ):
                 raw_req = _mk_req(req_id, **overrides)
                 signed_req = sign_spool_valve_admission(t_h.prepare_request(raw_req), spool_dir=t_h.spool_dir)
-                rcpt = t_h.send_order(signed_req)
+                rcpt = t_h.send_order(signed_req, valve_grant=_grant_for_req(signed_req))
                 self.assertFalse(rcpt.accepted)
                 self.assertEqual(rcpt.retcode, expected_code)
                 self.assertEqual(rcpt.status, "REJECTED")
                 self.assertIsNone(rcpt.position_ticket)
 
             # 10014 invalid volume (open 0.10 then REDUCE 99.00 lots)
-            rcpt_open = t_h.send_order(sign_spool_valve_admission(t_h.prepare_request(_mk_req("req-open-for-14")), spool_dir=t_h.spool_dir))
+            _req_o14 = sign_spool_valve_admission(t_h.prepare_request(_mk_req("req-open-for-14")), spool_dir=t_h.spool_dir)
+            rcpt_open = t_h.send_order(_req_o14, valve_grant=_grant_for_req(_req_o14))
             self.assertTrue(rcpt_open.accepted)
-            rcpt_14 = t_h.send_order(
-                sign_spool_valve_admission(
-                    t_h.prepare_request(_mk_req("req-rej-10014", action="REDUCE", position_ticket=rcpt_open.position_ticket, volume_lots=D("99.00"))),
-                    spool_dir=t_h.spool_dir,
-                )
+            _req_14 = sign_spool_valve_admission(
+                t_h.prepare_request(_mk_req("req-rej-10014", action="REDUCE", position_ticket=rcpt_open.position_ticket, volume_lots=D("99.00"))),
+                spool_dir=t_h.spool_dir,
             )
+            rcpt_14 = t_h.send_order(_req_14, valve_grant=_grant_for_req(_req_14))
             self.assertFalse(rcpt_14.accepted)
             self.assertEqual(rcpt_14.retcode, 10014)
             self.assertEqual(rcpt_14.status, "REJECTED")
             self.assertIsNone(rcpt_14.position_ticket)
 
             # 10014 oversized OPEN volume (> 50.00 lots) parity with CasForexMt5Bridge.mq5 InpMaxVolumeLots
-            rcpt_open_over = t_h.send_order(
-                sign_spool_valve_admission(t_h.prepare_request(_mk_req("req-rej-open-10014", action="OPEN", volume_lots=D("50.01"))), spool_dir=t_h.spool_dir)
-            )
+            _req_over = sign_spool_valve_admission(t_h.prepare_request(_mk_req("req-rej-open-10014", action="OPEN", volume_lots=D("50.01"))), spool_dir=t_h.spool_dir)
+            rcpt_open_over = t_h.send_order(_req_over, valve_grant=_grant_for_req(_req_over))
             self.assertFalse(rcpt_open_over.accepted)
             self.assertEqual(rcpt_open_over.retcode, 10014)
             self.assertEqual(rcpt_open_over.status, "REJECTED")
             self.assertIsNone(rcpt_open_over.position_ticket)
 
             # 10017 account binding mismatch (keep issued_at/expires_at/server so prepare_request keeps account_login)
-            rcpt_17 = t_h.send_order(
-                sign_spool_valve_admission(
-                    t_h.prepare_request(
-                        _mk_req(
-                            "req-rej-10017",
-                            monotonic_nonce=99,
-                            issued_at=T0,
-                            expires_at=T0 + timedelta(seconds=30),
-                            broker_channel="hugosway_mt5",
-                            account_login="9999999",
-                            server="Hugosway-Demo",
-                            execution_mode=EXECUTION_MODE_DEMO,
-                        )
-                    ),
-                    spool_dir=t_h.spool_dir,
-                )
+            _req_17 = sign_spool_valve_admission(
+                t_h.prepare_request(
+                    _mk_req(
+                        "req-rej-10017",
+                        monotonic_nonce=99,
+                        issued_at=T0,
+                        expires_at=T0 + timedelta(seconds=30),
+                        broker_channel="hugosway_mt5",
+                        account_login="9999999",
+                        server="Hugosway-Demo",
+                        execution_mode=EXECUTION_MODE_DEMO,
+                    )
+                ),
+                spool_dir=t_h.spool_dir,
             )
+            rcpt_17 = t_h.send_order(_req_17, valve_grant=_grant_for_req(_req_17))
             self.assertFalse(rcpt_17.accepted)
             self.assertEqual(rcpt_17.retcode, 10017)
 
@@ -858,12 +917,12 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
             self.assertEqual(bound1.monotonic_nonce, 1)
             # Idempotent re-preparation of the already-prepared object must not burn nonce 2
             self.assertEqual(tr.prepare_request(bound1).monotonic_nonce, 1)
-            rcpt1 = tr.send_order(bound1)
+            rcpt1 = tr.send_order(bound1, valve_grant=_grant_for_req(bound1))
             self.assertTrue(rcpt1.accepted)
             self.assertEqual(rcpt1.status, "FILLED")
 
             req2 = sign_spool_valve_admission(tr.prepare_request(_prebound("req-prebound-2")), spool_dir=tr.spool_dir)
-            rcpt2 = tr.send_order(req2)
+            rcpt2 = tr.send_order(req2, valve_grant=_grant_for_req(req2))
             self.assertTrue(rcpt2.accepted)
             self.assertEqual(rcpt2.status, "FILLED")
             last_nonce, _ = tr._nonce_ledger.load()
@@ -956,7 +1015,7 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                 valve_decision_sha256="e" * 64,
             )
             signed_off = sign_spool_valve_admission(tr.prepare_request(req_off), spool_dir=tr.spool_dir)
-            rcpt_off = tr.send_order(signed_off)
+            rcpt_off = tr.send_order(signed_off, valve_grant=_grant_for_req(signed_off))
             self.assertFalse(rcpt_off.accepted)
             self.assertEqual(rcpt_off.status, "REJECTED")
             self.assertEqual(rcpt_off.retcode, 10031)

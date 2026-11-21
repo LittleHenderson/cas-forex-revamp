@@ -913,6 +913,18 @@ function syncAggressionDialDom(focusSelector = null, forceSectionReplace = false
   restoreScrollPosition(scrollSnap);
 }
 
+function buildHighRiskDialConfirmation(scopeId, action, { tierId = null, targetBps = null, aiCeilingBps = null, preset = null } = {}) {
+  return {
+    phrase: 'CONFIRM_LIVE_HIGH_RISK_DIAL',
+    scope: String(scopeId || 'dual-shield-barbell'),
+    action: String(action || '').toUpperCase(),
+    tier_id: tierId ? String(tierId).toUpperCase() : null,
+    target_bps: typeof targetBps === 'number' ? targetBps : null,
+    ai_ceiling_bps: typeof aiCeilingBps === 'number' ? aiCeilingBps : null,
+    preset: preset ? String(preset).toUpperCase() : null,
+  };
+}
+
 function submitAggressionDialMutation(payload, { debounceMs = 0, onHighRiskConflict = null } = {}) {
   if (!state.liveStreamConnected) return;
   if (!requireOwnerControlOrWarn('Aggression dial update')) return;
@@ -976,7 +988,14 @@ function applyMasterDialSelection(bps, focusSelector = null, debounceMs = 0, hig
   });
   syncAggressionDialDom(focusSelector);
   submitAggressionDialMutation(
-    { action: 'SET_MASTER_RISK_BPS', risk_bps: safeBps, high_risk_confirmed: Boolean(highRiskConfirmed) },
+    {
+      action: 'SET_MASTER_RISK_BPS',
+      risk_bps: safeBps,
+      high_risk_confirmed: Boolean(highRiskConfirmed),
+      ...(highRiskConfirmed
+        ? { high_risk_confirmation: buildHighRiskDialConfirmation(cur.scopeId, 'SET_MASTER_RISK_BPS', { targetBps: safeBps }) }
+        : {}),
+    },
     {
       debounceMs,
       onHighRiskConflict: () => applyMasterDialSelection(safeBps, focusSelector, 0, false),
@@ -1014,7 +1033,15 @@ function applyTierDialSelection(tierId, bps, focusSelector = null, debounceMs = 
   });
   syncAggressionDialDom(focusSelector);
   submitAggressionDialMutation(
-    { action: 'SET_TIER_RISK_BPS', tier_id: cleanTierId, risk_bps: safeBps, high_risk_confirmed: Boolean(highRiskConfirmed) },
+    {
+      action: 'SET_TIER_RISK_BPS',
+      tier_id: cleanTierId,
+      risk_bps: safeBps,
+      high_risk_confirmed: Boolean(highRiskConfirmed),
+      ...(highRiskConfirmed
+        ? { high_risk_confirmation: buildHighRiskDialConfirmation(cur.scopeId, 'SET_TIER_RISK_BPS', { tierId: cleanTierId, targetBps: safeBps }) }
+        : {}),
+    },
     {
       debounceMs,
       onHighRiskConflict: () => applyTierDialSelection(cleanTierId, safeBps, focusSelector, 0, false),
@@ -1053,6 +1080,9 @@ function applyAllTiersPresetSelection(presetId, focusSelector = null, highRiskCo
     action: 'APPLY_TIER_PRESET',
     preset: cleanPreset,
     high_risk_confirmed: Boolean(highRiskConfirmed),
+    ...(highRiskConfirmed
+      ? { high_risk_confirmation: buildHighRiskDialConfirmation(cur.scopeId, 'APPLY_TIER_PRESET', { preset: cleanPreset }) }
+      : {}),
   });
 }
 
@@ -1610,6 +1640,7 @@ root.addEventListener('click', (event) => {
         ai_discretion_enabled: true,
         ai_discretion_ceiling_bps: confirmBps,
         high_risk_confirmed: true,
+        high_risk_confirmation: buildHighRiskDialConfirmation(cur.scopeId, 'SET_AI_DISCRETION', { aiCeilingBps: confirmBps }),
       });
       return;
     }
