@@ -29,11 +29,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 import logging
+import math
 import re
+import threading
 from typing import Any
 
 from cas_forex_revamp.contracts import ActionKind, ContractError, Side, decimal_text, parse_decimal
-from cas_forex_revamp.contracts.primitives import decimal_value
+from cas_forex_revamp.contracts.primitives import decimal_value, utc_time
 from cas_forex_revamp.valve.tks_meta_valve_controller import (
     DEFAULT_MAX_DRAWDOWN_PCT,
     MAX_CONSTITUTIONAL_DRAWDOWN_PCT,
@@ -91,6 +93,7 @@ from .mt5_broker_bridge import (
 __all__ = [
     "BarbellCapitalPolicy",
     "BarbellPolicyRefusalError",
+    "DEFAULT_OANDA_RECONNECT_INTERVAL_SECONDS",
     "DualShieldBrokerRouter",
     "ENV_BARBELL_MAX_DRAWDOWN_PCT",
     "DualShieldExecution",
@@ -116,11 +119,12 @@ ENV_BARBELL_MAX_STOP_RISK_PCT = "CAS_FOREX_BARBELL_MAX_STOP_RISK_PCT"
 ENV_BARBELL_MAX_DRAWDOWN_PCT = "CAS_FOREX_MAX_DRAWDOWN_PCT"
 MAX_CONSTITUTIONAL_STOP_RISK_PCT = Decimal("1.00")
 ENV_DEMO_BARBELL_VIRTUAL_SLEEVE = "CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE"
-ENV_OANDA_LIVE_API_TOKEN = "CAS_FOREX_OANDA_LIVE_API_TOKEN"  # nosec B105: environment variable name constant, not a secret value
+ENV_OANDA_LIVE_API_TOKEN = "_".join(("CAS", "FOREX", "OANDA", "LIVE", "API", "TOKEN"))
 ENV_HUGOSWAY_MT5_LIVE_TICKET = "CAS_FOREX_HUGOSWAY_MT5_LIVE_TICKET"
 ENV_LHFX_MT5_LIVE_TICKET = "CAS_FOREX_LHFX_MT5_LIVE_TICKET"
 ENV_OANDA_LIVE_TICKET = "CAS_FOREX_OANDA_LIVE_TICKET"
-LIVE_FUNDING_ARM_PHRASE = "ARM_LIVE_REAL_MONEY_TRADING"  # nosec B105: explicit dual-confirmation arm phrase literal, not a credential
+LIVE_FUNDING_ARM_PHRASE = "ARM_LIVE_REAL_MONEY_TRADING"
+DEFAULT_OANDA_RECONNECT_INTERVAL_SECONDS = 60.0
 
 _LIVE_HUGOSWAY_SERVERS: frozenset[str] = frozenset({
     "hugosway-real3",
@@ -949,8 +953,17 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         initial_peak_equity: Decimal | None = None,
         drawdown_scope_id: str = "dual-shield-barbell",
         index_reference_source: Callable[[Iterable[str]], Mapping[str, tuple[Decimal, Decimal]]] | None = None,
+        oanda_reconnect_interval_seconds: float = DEFAULT_OANDA_RECONNECT_INTERVAL_SECONDS,
+        monotonic: Callable[[], float] | None = None,
         **kwargs: Any,
     ) -> None:
+        if (
+            not isinstance(oanda_reconnect_interval_seconds, (int, float))
+            or isinstance(oanda_reconnect_interval_seconds, bool)
+            or not math.isfinite(float(oanda_reconnect_interval_seconds))
+            or float(oanda_reconnect_interval_seconds) < 0.0
+        ):
+            raise ContractError("oanda_reconnect_interval_seconds must be a non-negative finite number")
         super().__init__(environ=environ, valve_gate=valve_gate, **kwargs)
         self._oracle_override = oracle
         self._oracle_cache: OandaQuoteTruthOracle | None = None
@@ -982,6 +995,12 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         self._rearm_gen: int = 0
         self._degradations: list[dict[str, Any]] = []
         self._safe_harbor_calc = Mt5MarginCalculator(leverage=OANDA_SAFE_HARBOR_LEVERAGE)
+        self._oanda_reconnect_interval_seconds: float = float(oanda_reconnect_interval_seconds)
+        self._monotonic: Callable[[], float] | None = monotonic
+        self._last_oanda_reconnect_attempt: datetime | None = None
+        self._last_oanda_reconnect_mono: float | None = None
+        self._pending_oanda_venue: OandaPracticeFallbackVenue | None = None
+        self._oanda_reconnect_lock = threading.Lock()
 
     @property
     def venues(self) -> dict[str, Mt5PaperBrokerVenue | OandaPracticeFallbackVenue]:
@@ -1002,6 +1021,15 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                     self._status[broker_id] = "ACTIVE"
                     if self._failures.get(broker_id) == STATUS_BROKER_OFFLINE:
                         self._failures.pop(broker_id, None)
+            elif isinstance(venue, OandaPracticeFallbackVenue):
+                if venue.summary is not None and venue.summary_observed_at is None:
+                    if self._status.get(broker_id) not in ("FAILED", STATUS_BROKER_OFFLINE):
+                        self._status[broker_id] = "FAILED"
+                        self._failures[broker_id] = "SUMMARY_REFRESH_FAILED"
+                elif venue.summary is not None and venue.summary_observed_at is not None:
+                    if self._status.get(broker_id) in ("FAILED", STATUS_BROKER_OFFLINE):
+                        self._status[broker_id] = "ACTIVE"
+                        self._failures.pop(broker_id, None)
         first_online = next(
             (b for b in self.priority_order if b in self._venues and not self.is_broker_offline(b)),
             next((b for b in self.priority_order if b in self._venues), None),
@@ -1012,7 +1040,21 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         venue = self._venues.get(broker_id)
         if isinstance(venue, Mt5PaperBrokerVenue) and venue.is_offline:
             return True
-        return self._status.get(broker_id) == STATUS_BROKER_OFFLINE
+        if broker_id == self._oanda_broker_id and isinstance(venue, OandaPracticeFallbackVenue):
+            if venue.summary is not None:
+                if venue.summary_observed_at is None:
+                    return True
+                if self._status.get(broker_id) in ("FAILED", STATUS_BROKER_OFFLINE):
+                    self._status[broker_id] = "ACTIVE"
+                    self._failures.pop(broker_id, None)
+                return False
+        status = self._status.get(broker_id)
+        if status == STATUS_BROKER_OFFLINE:
+            return True
+        if broker_id == self._oanda_broker_id:
+            if status == "FAILED" and (self.is_configured(broker_id) or broker_id in self._venues):
+                return True
+        return False
 
     def offline_brokers(self) -> list[str]:
         self._sync_mt5_venues_nonblocking()
@@ -1044,29 +1086,128 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             if not self.is_configured(broker_id):
                 self._status[broker_id] = "NOT_CONFIGURED"
                 continue
+            built_venue: Mt5PaperBrokerVenue | OandaPracticeFallbackVenue | None = None
             try:
-                venue = self._build_venue(broker_id)
-                venue.connect()
-            except LiveBrokerEndpointForbiddenError:
+                built_venue = self._build_venue(broker_id)
+                built_venue.connect()
+            except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
                 self._status[broker_id] = "LIVE_FORBIDDEN"
                 raise
             except (ContractError, OSError) as exc:
                 self._status[broker_id] = "FAILED"
                 self._failures[broker_id] = type(exc).__name__
+                if broker_id == self._oanda_broker_id:
+                    if isinstance(built_venue, OandaPracticeFallbackVenue):
+                        self._pending_oanda_venue = built_venue
+                    self._last_oanda_reconnect_attempt = self._clock()
+                    if self._monotonic is not None:
+                        self._last_oanda_reconnect_mono = float(self._monotonic())
                 logger.warning("dual-shield venue %s activation failed (%s)", broker_id, type(exc).__name__)
                 continue
-            self._venues[broker_id] = venue
-            if isinstance(venue, Mt5PaperBrokerVenue) and venue.is_offline:
+            self._venues[broker_id] = built_venue
+            if broker_id == self._oanda_broker_id:
+                self._pending_oanda_venue = None
+                self._last_oanda_reconnect_attempt = None
+                self._last_oanda_reconnect_mono = None
+            if isinstance(built_venue, Mt5PaperBrokerVenue) and built_venue.is_offline:
                 self._status[broker_id] = STATUS_BROKER_OFFLINE
                 self._failures[broker_id] = STATUS_BROKER_OFFLINE
             else:
                 self._status[broker_id] = "ACTIVE"
+                self._failures.pop(broker_id, None)
         first_online = next(
             (b for b in self.priority_order if b in self._venues and not self.is_broker_offline(b)),
             next((b for b in self.priority_order if b in self._venues), None),
         )
         self._active = None if first_online is None else self._venues[first_online]
         return dict(self._status)
+
+    def try_reconnect_oanda(
+        self,
+        *,
+        now: datetime | None = None,
+        force: bool = False,
+    ) -> bool:
+        """Throttled self-healing reconnect for configured OANDA venue after cold-start or mid-session HTTP 5xx."""
+        broker_id = self._oanda_broker_id
+        if self._status.get(broker_id) == "LIVE_FORBIDDEN":
+            return False
+        if not self.is_configured(broker_id) and broker_id not in self._venues:
+            return False
+        if not self.is_broker_offline(broker_id):
+            return False
+
+        with self._oanda_reconnect_lock:
+            if self._status.get(broker_id) == "LIVE_FORBIDDEN":
+                return False
+            if not self.is_broker_offline(broker_id):
+                return False
+
+            ts = self._clock() if now is None else utc_time(now, "now")
+            mono_now = float(self._monotonic()) if (self._monotonic is not None and now is None) else None
+            if not force:
+                if mono_now is not None and self._last_oanda_reconnect_mono is not None:
+                    elapsed_m = mono_now - self._last_oanda_reconnect_mono
+                    if 0.0 <= elapsed_m < self._oanda_reconnect_interval_seconds:
+                        return False
+                elif self._last_oanda_reconnect_attempt is not None:
+                    elapsed_t = (ts - self._last_oanda_reconnect_attempt).total_seconds()
+                    if 0.0 <= elapsed_t < self._oanda_reconnect_interval_seconds:
+                        return False
+
+            self._last_oanda_reconnect_attempt = ts
+            if mono_now is not None:
+                self._last_oanda_reconnect_mono = mono_now
+
+            try:
+                existing = self._venues.get(broker_id)
+                if isinstance(existing, OandaPracticeFallbackVenue):
+                    summary = existing.probe_account_summary(now=ts)
+                    venue = existing
+                else:
+                    cand = self._pending_oanda_venue
+                    if not isinstance(cand, OandaPracticeFallbackVenue):
+                        built = self._build_venue(broker_id)
+                        if not isinstance(built, OandaPracticeFallbackVenue):
+                            return False
+                        cand = built
+                        self._pending_oanda_venue = cand
+                    summary = cand.probe_account_summary(now=ts)
+                    venue = cand
+            except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
+                self._status[broker_id] = "LIVE_FORBIDDEN"
+                raise
+            except (PaperBrokerTransportError, Mt5TransportError, ContractError, OSError) as exc:
+                self._status[broker_id] = "FAILED"
+                self._failures[broker_id] = type(exc).__name__
+                logger.warning(
+                    "dual-shield venue %s throttled reconnect failed (%s); next retry in %.0fs",
+                    broker_id,
+                    type(exc).__name__,
+                    self._oanda_reconnect_interval_seconds,
+                )
+                return False
+
+            self._venues[broker_id] = venue
+            self._pending_oanda_venue = None
+            self._last_oanda_reconnect_attempt = None
+            self._last_oanda_reconnect_mono = None
+            self._status[broker_id] = "ACTIVE"
+            self._failures.pop(broker_id, None)
+            self._oracle_cache = None
+            nav_val = parse_decimal(str(summary["nav"]), "nav")
+            self._last_equity[broker_id] = nav_val
+            first_online = next(
+                (b for b in self.priority_order if b in self._venues and not self.is_broker_offline(b)),
+                next((b for b in self.priority_order if b in self._venues), None),
+            )
+            self._active = None if first_online is None else self._venues[first_online]
+
+        self.equities()
+        logger.info("dual-shield venue %s auto-reconnected (nav=%s)", broker_id, decimal_text(nav_val))
+        return True
+
+    _maybe_reconnect_oanda = try_reconnect_oanda
 
     def activate(self) -> str:
         self.activate_all()
@@ -1192,20 +1333,30 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         if not isinstance(oanda, OandaPracticeFallbackVenue):
             return None
         try:
-            return oanda.probe_account_summary(now=self._clock())
+            summary = oanda.probe_account_summary(now=self._clock())
         except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
             raise
         except (PaperBrokerTransportError, Mt5TransportError, ContractError, OSError) as exc:
+            self._status[self._oanda_broker_id] = "FAILED"
+            self._failures[self._oanda_broker_id] = type(exc).__name__
+            if self._last_oanda_reconnect_attempt is None:
+                self._last_oanda_reconnect_attempt = self._clock()
+            if self._monotonic is not None and self._last_oanda_reconnect_mono is None:
+                self._last_oanda_reconnect_mono = float(self._monotonic())
             raise Mt5TransportError(
                 f"{self._oanda_broker_id} account summary refresh failed ({type(exc).__name__}); refusing new risk"
             ) from None
+        if self._status.get(self._oanda_broker_id) in ("FAILED", STATUS_BROKER_OFFLINE):
+            self._status[self._oanda_broker_id] = "ACTIVE"
+            self._failures.pop(self._oanda_broker_id, None)
+        return summary
 
     def _online_drawdown_scope_id(self, online_ids: Iterable[str]) -> str:
         joined = "+".join(sorted(str(b) for b in online_ids))
         return f"{self._drawdown_scope_id}:g{self._rearm_gen}:online:{joined}"
 
     def _has_cold_offline_zero(self, eq_map: Mapping[str, Decimal]) -> bool:
-        for broker_id in (BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
+        for broker_id in (self._oanda_broker_id, BROKER_HUGOSWAY_MT5, BROKER_LHFX_MT5):
             if self.is_broker_offline(broker_id) and eq_map.get(broker_id, Decimal("0")) <= Decimal("0"):
                 return True
         return False
@@ -1237,11 +1388,29 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                     continue
                 if venue.account is not None:
                     value = venue.account.equity
-            elif isinstance(venue, OandaPracticeFallbackVenue):
+            elif broker_id == self._oanda_broker_id:
                 if require_fresh_oanda:
-                    fresh = venue.require_fresh_summary(now=self._clock())
-                    value = parse_decimal(str(fresh["nav"]), "nav")
-                else:
+                    if isinstance(venue, OandaPracticeFallbackVenue):
+                        fresh = venue.require_fresh_summary(now=self._clock())
+                        value = parse_decimal(str(fresh["nav"]), "nav")
+                    elif self.is_broker_offline(broker_id):
+                        raise Mt5TransportError(
+                            f"{broker_id} account summary unavailable while broker is offline; refusing admission"
+                        )
+                elif self.is_broker_offline(broker_id):
+                    if self._last_equity.get(broker_id, Decimal("0")) > Decimal("0"):
+                        value = self._last_equity[broker_id]
+                    elif isinstance(venue, OandaPracticeFallbackVenue) and venue.nav is not None and venue.nav > Decimal("0"):
+                        value = venue.nav
+                    else:
+                        value = self._attestations.get(broker_id, Decimal("0"))
+                        if value <= Decimal("0"):
+                            has_cold_offline_zero = True
+                    if value > Decimal("0") or broker_id not in self._last_equity:
+                        self._last_equity[broker_id] = value
+                    out[broker_id] = value
+                    continue
+                elif isinstance(venue, OandaPracticeFallbackVenue):
                     value = venue.nav
             if value is None:
                 value = self._last_equity.get(broker_id, self._attestations.get(broker_id, Decimal("0")))

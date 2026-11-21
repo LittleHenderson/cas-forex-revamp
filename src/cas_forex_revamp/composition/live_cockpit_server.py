@@ -53,6 +53,11 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from cas_forex_revamp.operator.decisions import OperatorUnavailable
 from cas_forex_revamp.operator.frontier_backends import assert_safe_ai_catalog_payload
+from cas_forex_revamp.composition.autonomous_trader import build_enriched_compounding_payload
+from cas_forex_revamp.treasury.compounding_controller import (
+    CompoundingControllerError,
+    OwnerKeyRequiredError as CompoundingOwnerKeyRequiredError,
+)
 from cas_forex_revamp.valve.aggression_dial import (
     AggressionDialError,
     AggressionDialStore,
@@ -506,6 +511,7 @@ _KNOWN_METRICS_ROUTES: frozenset[str] = frozenset({
     "/api/treasury-prepare",
     "/api/ai-model-select",
     "/api/aggression-dial",
+    "/api/compounding",
 })
 
 _CONTENT_TYPES: dict[str, str] = {
@@ -607,6 +613,8 @@ class LoopbackCockpitServer:
         profit_vault: Any | None = None,
         parallel_tiers: Any | None = None,
         aggression_dial: Any | None = None,
+        compounding_controller: Any | None = None,
+        phase8_bridge: Any | None = None,
         owner_recovery: Any | None = None,
         model_execution_gate: Any | None = None,
         token_file: str | Path | None = None,
@@ -651,6 +659,18 @@ class LoopbackCockpitServer:
                 parallel_tiers, "_aggression_dial", None
             )
         self._aggression_dial = inferred_dial
+        inferred_comp = compounding_controller
+        if inferred_comp is None and autonomous_trader is not None:
+            inferred_comp = getattr(autonomous_trader, "compounding_controller", None) or getattr(
+                autonomous_trader, "_compounding_controller", None
+            )
+        self._compounding_controller = inferred_comp
+        inferred_p8 = phase8_bridge
+        if inferred_p8 is None and autonomous_trader is not None:
+            inferred_p8 = getattr(autonomous_trader, "phase8_bridge", None) or getattr(
+                autonomous_trader, "_phase8_bridge", None
+            )
+        self._phase8_bridge = inferred_p8
         self._owner_recovery = owner_recovery or (
             getattr(autonomous_trader, "_owner_verifier", None) if autonomous_trader is not None else None
         )
@@ -1291,6 +1311,54 @@ class LoopbackCockpitServer:
         doc["audit_verified"] = bool(self._aggression_dial.verify_audit_chain())
         return assert_safe_ai_catalog_payload(doc)
 
+    @staticmethod
+    def _parse_strict_decimal_field(raw: Any, field_name: str) -> Decimal:
+        if isinstance(raw, (bool, float)) or not isinstance(raw, (str, int, Decimal)):
+            raise ContractError(f"{field_name} must be a Decimal string or integer (never float or boolean)")
+        txt = str(raw).strip()
+        if not txt:
+            raise ContractError(f"{field_name} must not be empty")
+        try:
+            parsed = Decimal(txt)
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ContractError(f"{field_name} is not a valid Decimal") from exc
+        if not parsed.is_finite():
+            raise ContractError(f"{field_name} must be finite")
+        return parsed
+
+    def _read_compounding_snapshot(
+        self,
+        *,
+        owner_controls_allowed: bool = True,
+        session_scope: str = SESSION_SCOPE_OWNER_FULL,
+    ) -> dict[str, Any] | None:
+        if self._autonomous_trader is not None and callable(
+            getattr(self._autonomous_trader, "compounding_snapshot", None)
+        ):
+            snap = self._autonomous_trader.compounding_snapshot(
+                owner_controls_allowed=owner_controls_allowed,
+                session_scope=session_scope,
+            )
+            if snap is not None:
+                return snap
+        if self._compounding_controller is None:
+            return None
+        execution_mode = "DEMO"
+        try:
+            routing = self._read_broker_routing()
+            if isinstance(routing, Mapping) and str(routing.get("execution_mode") or "").strip().upper() == "LIVE":
+                execution_mode = "LIVE"
+        except Exception as exc_rt:
+            self._last_routing_error = type(exc_rt).__name__
+        return build_enriched_compounding_payload(
+            compounding_controller=self._compounding_controller,
+            phase8_bridge=self._phase8_bridge,
+            current_equity_usd=None,
+            owner_controls_allowed=owner_controls_allowed,
+            session_scope=session_scope,
+            execution_mode=execution_mode,
+        )
+
     def _resolve_static_path(self, raw_path: str) -> Path | None:
         clean = urllib.parse.unquote(raw_path.split("?", 1)[0].split("#", 1)[0])
         if clean in ("/", "/ui", "/ui/"):
@@ -1797,6 +1865,26 @@ class LoopbackCockpitServer:
                                 {"error": "Aggression dial snapshot unavailable"},
                             )
                         return
+                    if route == "/api/compounding":
+                        try:
+                            comp_snap = outer._read_compounding_snapshot(
+                                owner_controls_allowed=(auth_scope == SESSION_SCOPE_OWNER_FULL),
+                                session_scope=auth_scope,
+                            )
+                            if comp_snap is None:
+                                self._write_json(
+                                    HTTPStatus.NOT_FOUND,
+                                    {"error": "Compounding controller not configured"},
+                                )
+                            else:
+                                self._write_json(HTTPStatus.OK, comp_snap)
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(
+                                HTTPStatus.INTERNAL_SERVER_ERROR,
+                                {"error": "Compounding snapshot unavailable"},
+                            )
+                        return
                     if route == "/api/index-stream":
                         try:
                             idx_snap = outer._index_stream_reader() if outer._index_stream_reader is not None else None
@@ -1846,6 +1934,8 @@ class LoopbackCockpitServer:
                             last_parallel_tiers_mono = 0.0
                             last_aggression_dial_json = ""
                             last_aggression_dial_mono = 0.0
+                            last_compounding_json = ""
+                            last_compounding_mono = 0.0
                             outer._record_sse_client(1)
                             sse_client_recorded = True
                             try:
@@ -1972,6 +2062,33 @@ class LoopbackCockpitServer:
                                             except Exception as exc:
                                                 outer._last_routing_error = type(exc).__name__
                                                 eframe = f"event: error\ndata: {json.dumps({'source': 'aggression_dial', 'error': 'Aggression dial snapshot unavailable'})}\n\n".encode("utf-8")
+                                                self.wfile.write(eframe)
+                                                emitted_events += 1
+                                        if (
+                                            outer._compounding_controller is not None
+                                            or getattr(outer._autonomous_trader, "compounding_controller", None)
+                                            is not None
+                                        ):
+                                            try:
+                                                cpsnap = outer._read_compounding_snapshot(
+                                                    owner_controls_allowed=(auth_scope == SESSION_SCOPE_OWNER_FULL),
+                                                    session_scope=auth_scope,
+                                                )
+                                                if cpsnap is not None:
+                                                    cpjson = json.dumps(cpsnap, sort_keys=False)
+                                                    if (
+                                                        not last_compounding_json
+                                                        or cpjson != last_compounding_json
+                                                        or (now_mono - last_compounding_mono) >= 1.0
+                                                    ):
+                                                        last_compounding_json = cpjson
+                                                        last_compounding_mono = now_mono
+                                                        cpframe = f"event: compounding\ndata: {cpjson}\n\n".encode("utf-8")
+                                                        self.wfile.write(cpframe)
+                                                        emitted_events += 1
+                                            except Exception as exc:
+                                                outer._last_routing_error = type(exc).__name__
+                                                eframe = f"event: error\ndata: {json.dumps({'source': 'compounding', 'error': 'Compounding snapshot unavailable'})}\n\n".encode("utf-8")
                                                 self.wfile.write(eframe)
                                                 emitted_events += 1
                                         if emitted_events > 0:
@@ -2338,6 +2455,242 @@ class LoopbackCockpitServer:
                             },
                         )
                     except OwnerKeyRequiredError:
+                        self._reject_insufficient_scope()
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+
+                if route == "/api/compounding":
+                    has_comp = outer._compounding_controller is not None or (
+                        outer._autonomous_trader is not None
+                        and getattr(outer._autonomous_trader, "compounding_controller", None) is not None
+                    )
+                    if not has_comp:
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "Compounding controller not configured"})
+                        return
+                    try:
+                        body = self._read_json_body(max_bytes=16384)
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        if auth_scope != SESSION_SCOPE_OWNER_FULL:
+                            self._reject_insufficient_scope()
+                            return
+                        if type(body) is not dict:
+                            raise ContractError("JSON object required")
+                        raw_act = body.get("action")
+                        if not isinstance(raw_act, str) or not raw_act.strip():
+                            raise ContractError("action field required")
+                        act_norm = raw_act.strip().upper()
+                        actor_str = "cockpit-owner"
+                        if "actor" in body and body["actor"] is not None:
+                            if not isinstance(body["actor"], str) or not body["actor"].strip():
+                                raise ContractError("actor must be a non-empty string")
+                            actor_str = body["actor"].strip()
+
+                        if act_norm in ("SET_MODE", "TOGGLE_FULL_100"):
+                            allowed_keys = {
+                                "action",
+                                "mode",
+                                "custom_sweep_ratio",
+                                "custom_vault_ratio",
+                                "compounding_target_usd",
+                                "house_money_target_usd",
+                                "post_target_vault_ratio",
+                                "auto_enable_vault_at_target",
+                                "starting_principal_usd",
+                                "actor",
+                            }
+                            extra_keys = sorted(set(body.keys()) - allowed_keys)
+                            if extra_keys:
+                                raise ContractError(
+                                    f"Unexpected additional properties in POST /api/compounding: {extra_keys}"
+                                )
+                            custom_ratio_dec: Decimal | None = None
+                            if body.get("custom_sweep_ratio") is not None and body.get("custom_vault_ratio") is not None:
+                                r1 = outer._parse_strict_decimal_field(body["custom_sweep_ratio"], "custom_sweep_ratio")
+                                r2 = outer._parse_strict_decimal_field(body["custom_vault_ratio"], "custom_vault_ratio")
+                                if r1 != r2:
+                                    raise ContractError("custom_sweep_ratio and custom_vault_ratio conflict")
+                                custom_ratio_dec = r1
+                            elif body.get("custom_sweep_ratio") is not None:
+                                custom_ratio_dec = outer._parse_strict_decimal_field(
+                                    body["custom_sweep_ratio"], "custom_sweep_ratio"
+                                )
+                            elif body.get("custom_vault_ratio") is not None:
+                                custom_ratio_dec = outer._parse_strict_decimal_field(
+                                    body["custom_vault_ratio"], "custom_vault_ratio"
+                                )
+
+                            comp_target_dec = (
+                                outer._parse_strict_decimal_field(
+                                    body["compounding_target_usd"], "compounding_target_usd"
+                                )
+                                if body.get("compounding_target_usd") is not None
+                                else None
+                            )
+                            hm_target_dec = (
+                                outer._parse_strict_decimal_field(
+                                    body["house_money_target_usd"], "house_money_target_usd"
+                                )
+                                if body.get("house_money_target_usd") is not None
+                                else None
+                            )
+                            post_ratio_dec = (
+                                outer._parse_strict_decimal_field(
+                                    body["post_target_vault_ratio"], "post_target_vault_ratio"
+                                )
+                                if body.get("post_target_vault_ratio") is not None
+                                else None
+                            )
+                            auto_en_val: bool | None = None
+                            if "auto_enable_vault_at_target" in body and body["auto_enable_vault_at_target"] is not None:
+                                if type(body["auto_enable_vault_at_target"]) is not bool:
+                                    raise ContractError("auto_enable_vault_at_target must be a boolean")
+                                auto_en_val = body["auto_enable_vault_at_target"]
+                            req_principal_dec = (
+                                outer._parse_strict_decimal_field(
+                                    body["starting_principal_usd"], "starting_principal_usd"
+                                )
+                                if body.get("starting_principal_usd") is not None
+                                else None
+                            )
+
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                cur_snap = outer._read_compounding_snapshot(
+                                    owner_controls_allowed=True,
+                                    session_scope=SESSION_SCOPE_OWNER_FULL,
+                                )
+                                if cur_snap is None:
+                                    raise ContractError("Compounding controller not configured")
+                                if req_principal_dec is not None:
+                                    cur_prin = Decimal(str(cur_snap["starting_principal_usd"]))
+                                    if req_principal_dec.quantize(Decimal("0.01")) != cur_prin:
+                                        raise CompoundingControllerError(
+                                            "starting_principal_usd is immutable after initialization"
+                                        )
+                                if "mode" in body and body["mode"] is not None:
+                                    if not isinstance(body["mode"], str) or not body["mode"].strip():
+                                        raise ContractError("mode must be a non-empty string")
+                                    mode_str = body["mode"].strip().upper()
+                                elif act_norm == "TOGGLE_FULL_100":
+                                    mode_str = (
+                                        "BALANCED_SPLIT_50_50"
+                                        if str(cur_snap.get("mode")) == "FULL_COMPOUND_100"
+                                        else "FULL_COMPOUND_100"
+                                    )
+                                else:
+                                    raise ContractError("mode field required for set_mode")
+
+                                if outer._autonomous_trader is not None and callable(
+                                    getattr(outer._autonomous_trader, "set_compounding_mode", None)
+                                ) and getattr(outer._autonomous_trader, "compounding_controller", None) is not None:
+                                    updated_comp = outer._autonomous_trader.set_compounding_mode(
+                                        mode_str,
+                                        compounding_target_usd=comp_target_dec,
+                                        house_money_target_usd=hm_target_dec,
+                                        custom_vault_ratio=custom_ratio_dec,
+                                        post_target_vault_ratio=post_ratio_dec,
+                                        auto_enable_vault_at_target=auto_en_val,
+                                        owner_controls_allowed=True,
+                                        actor=actor_str,
+                                    )
+                                else:
+                                    outer._compounding_controller.set_compounding_mode(
+                                        mode_str,
+                                        compounding_target_usd=comp_target_dec,
+                                        house_money_target_usd=hm_target_dec,
+                                        custom_vault_ratio=custom_ratio_dec,
+                                        post_target_vault_ratio=post_ratio_dec,
+                                        auto_enable_vault_at_target=auto_en_val,
+                                        owner_controls_allowed=True,
+                                        actor=actor_str,
+                                    )
+                                    updated_comp = outer._read_compounding_snapshot(
+                                        owner_controls_allowed=True,
+                                        session_scope=SESSION_SCOPE_OWNER_FULL,
+                                    )
+                                    if outer._profit_vault is not None and updated_comp is not None:
+                                        eff_r = Decimal(str(updated_comp["effective_vault_sweep_ratio"]))
+                                        outer._profit_vault.set_config(sweep_ratio=eff_r, auto_sweep_enabled=True)
+
+                        elif act_norm in ("ACKNOWLEDGE_PRINCIPAL_WITHDRAWN", "ACK_PRINCIPAL_WITHDRAWN"):
+                            allowed_ack_keys = {
+                                "action",
+                                "amount_usd",
+                                "post_withdrawal_equity_usd",
+                                "note",
+                                "actor",
+                            }
+                            extra_ack = sorted(set(body.keys()) - allowed_ack_keys)
+                            if extra_ack:
+                                raise ContractError(
+                                    f"Unexpected additional properties in POST /api/compounding: {extra_ack}"
+                                )
+                            amt_dec = (
+                                outer._parse_strict_decimal_field(body["amount_usd"], "amount_usd")
+                                if body.get("amount_usd") is not None
+                                else None
+                            )
+                            post_eq_dec = (
+                                outer._parse_strict_decimal_field(
+                                    body["post_withdrawal_equity_usd"], "post_withdrawal_equity_usd"
+                                )
+                                if body.get("post_withdrawal_equity_usd") is not None
+                                else None
+                            )
+                            raw_note = body.get("note")
+                            if raw_note is not None:
+                                if (
+                                    not isinstance(raw_note, str)
+                                    or len(raw_note) > 240
+                                    or any(ch in raw_note for ch in ("\x00", "\r", "\n"))
+                                ):
+                                    raise ContractError("note must be a clean string of at most 240 characters")
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                if outer._autonomous_trader is not None and callable(
+                                    getattr(outer._autonomous_trader, "acknowledge_principal_withdrawn", None)
+                                ) and getattr(outer._autonomous_trader, "compounding_controller", None) is not None:
+                                    updated_comp = outer._autonomous_trader.acknowledge_principal_withdrawn(
+                                        amt_dec,
+                                        owner_controls_allowed=True,
+                                        actor=actor_str,
+                                        post_withdrawal_equity_usd=post_eq_dec,
+                                        note=raw_note,
+                                    )
+                                else:
+                                    cur_snap = outer._read_compounding_snapshot(
+                                        owner_controls_allowed=True,
+                                        session_scope=SESSION_SCOPE_OWNER_FULL,
+                                    )
+                                    if cur_snap is None:
+                                        raise ContractError("Compounding controller not configured")
+                                    eff_amt = amt_dec
+                                    if eff_amt is None:
+                                        sugg = Decimal(str(cur_snap["suggested_principal_pullout_usd"]))
+                                        eff_amt = (
+                                            sugg
+                                            if sugg > Decimal("0.00")
+                                            else Decimal(str(cur_snap["starting_principal_usd"]))
+                                        )
+                                    outer._compounding_controller.acknowledge_principal_withdrawn(
+                                        eff_amt,
+                                        owner_controls_allowed=True,
+                                        actor=actor_str,
+                                        post_withdrawal_equity_usd=post_eq_dec,
+                                    )
+                                    updated_comp = outer._read_compounding_snapshot(
+                                        owner_controls_allowed=True,
+                                        session_scope=SESSION_SCOPE_OWNER_FULL,
+                                    )
+                        else:
+                            raise ContractError(f"Unsupported compounding action {raw_act!r}")
+
+                        outer.notify_stream_updated()
+                        self._write_json(HTTPStatus.OK, updated_comp)
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
+                    except (OwnerKeyRequiredError, CompoundingOwnerKeyRequiredError):
                         self._reject_insufficient_scope()
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -3041,6 +3394,16 @@ class LoopbackCockpitServer:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+        if self._phase8_bridge is not None and callable(getattr(self._phase8_bridge, "close", None)):
+            try:
+                self._phase8_bridge.close(timeout=2.0, drain=True)
+            except Exception as exc_p8s:
+                self._last_routing_error = type(exc_p8s).__name__
+        if self._autonomous_trader is not None and callable(getattr(self._autonomous_trader, "close", None)):
+            try:
+                self._autonomous_trader.close(timeout=2.0, drain=True)
+            except Exception as exc_trs:
+                self._last_routing_error = type(exc_trs).__name__
 
 
 def load_dotenv_file(path: str | Path) -> dict[str, str]:
@@ -3105,6 +3468,8 @@ def run_cockpit_cli(
     from cas_forex_revamp.composition.state_store import initialize_shared_runtime_state
     from cas_forex_revamp.operator.frontier_backends import FrontierModelRegistry
     from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
+    from cas_forex_revamp.venue.live_auth_ticket import LiveAuthorizationError
+    from cas_forex_revamp.venue.mt5_broker_bridge import LiveBrokerEndpointForbiddenError
     from cas_forex_revamp.venue.live_market_stream import (
         EXPANDED_MARKETS,
         ExpandedPublicLiveFxFeedClient,
@@ -3233,6 +3598,7 @@ def run_cockpit_cli(
         risk_gear_mode=merged.get(ENV_RISK_GEAR_MODE),
         risk_gear_path=runtime_state.state_dir / "risk_gear.json",
         initial_capital_usd=cli_init_cap,
+        state_dir=runtime_state.state_dir,
     )
     if not args.autonomous_ai:
         trader.stop_automation(reason="CLI launched with --no-autonomous-ai")
@@ -3257,6 +3623,7 @@ def run_cockpit_cli(
     safe_broker_routing_payload(routing_summary)
     if args.print_check_only:
         print(json.dumps(routing_summary, indent=2))
+        trader.close()
         if tmp_state_holder is not None:
             tmp_state_holder.cleanup()
         return 0
@@ -3315,6 +3682,14 @@ def run_cockpit_cli(
 
     def _poll_loop() -> None:
         while not stop_flag.wait(float(args.poll_seconds)):
+            if callable(getattr(router, "try_reconnect_oanda", None)):
+                try:
+                    if router.try_reconnect_oanda():
+                        srv.notify_stream_updated()
+                except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
+                    raise
+                except Exception as exc_or:
+                    print(f"[broker] OANDA reconnect check skipped ({type(exc_or).__name__}).")
             if feed_client is None:
                 break
             try:

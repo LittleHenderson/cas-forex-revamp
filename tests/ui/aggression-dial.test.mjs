@@ -12,6 +12,7 @@ import {
   DEFAULT_MASTER_RISK_BPS,
   DEFAULT_TIER_DEFINITIONS,
   HIGH_RISK_MIN_BPS,
+  MARKET_MODE_PILLS,
   MAX_CONSTITUTIONAL_DRAWDOWN_PCT,
   MAX_CONSTITUTIONAL_STOP_RISK_BPS,
   MAX_CONSTITUTIONAL_STOP_RISK_PCT,
@@ -26,6 +27,7 @@ import {
   STATIC_AGGRESSION_DIAL,
   UNBREAKABLE_GUARDRAILS,
   applyAggressionDialPreset,
+  applyMarketConditionPreview,
   formatCentsPlain,
   formatCentsSignedUsd,
   formatCentsUsd,
@@ -33,7 +35,10 @@ import {
   formatRiskBpsPct,
   getRiskBpsProfile,
   normalizeAggressionDial,
+  normalizeMarketCondition,
   patchAggressionDialInPlace,
+  patchMasterAggressionDialInPlace,
+  patchSectionB5TierDialsInPlace,
   renderMasterAggressionDial,
   renderSectionB5TierDials,
   scaleTierTargets,
@@ -698,4 +703,94 @@ test('AGGRESSION_DIAL_CSS_SNIPPET defines .dial-lvl-1..11, smooth 60fps cubic-be
   assert.doesNotMatch(srcText, /\beval\s*\(/);
   assert.doesNotMatch(srcText, /\bnew\s+Function\s*\(/);
   assert.doesNotMatch(srcText, /style\s*=\s*["']/i);
+});
+
+test('Dark Obsidian visual spec: rainbow spectrum slider, glowing white thumb, Market Mode strip, 3x2 2-line presets, Signal Bar, and Section B.5 sleek cards + footer', () => {
+  assert.deepEqual(
+    MARKET_MODE_PILLS.map((p) => [p.id, p.label]),
+    [['CHOP', 'Chop'], ['TREND', 'Trend'], ['STRONG_TREND', 'Strong Trend'], ['AFTER_LOSS', 'After Loss']],
+  );
+  assert.equal(normalizeMarketCondition('CHOP'), 'CHOP');
+  assert.equal(normalizeMarketCondition('RANGING'), 'CHOP');
+  assert.equal(normalizeMarketCondition('TREND'), 'TREND');
+  assert.equal(normalizeMarketCondition('TRENDING'), 'TREND');
+  assert.equal(normalizeMarketCondition('STRONG_TREND'), 'STRONG_TREND');
+  assert.equal(normalizeMarketCondition('BREAKOUT'), 'STRONG_TREND');
+  assert.equal(normalizeMarketCondition('AFTER_LOSS'), 'AFTER_LOSS');
+  assert.equal(normalizeMarketCondition('RECOVERY'), 'AFTER_LOSS');
+  assert.equal(normalizeMarketCondition('DEFENSIVE'), 'AFTER_LOSS');
+
+  const masterHtml = renderMasterAggressionDial({
+    masterRiskBps: 60,
+    effectiveRiskBps: 100,
+    aiDiscretionEnabled: true,
+    aiDiscretionCeilingBps: 100,
+    aiDiscretionReason: 'STRONG_TREND',
+  });
+  assert.match(masterHtml, /MASTER TRADING AGGRESSION DIAL \(0\.01% STEPS\)/);
+  assert.match(masterHtml, /Base 0\.60% → AI 1\.00%/);
+  assert.match(masterHtml, /Market Mode:/);
+  for (const [id, label] of [['CHOP', 'Chop'], ['TREND', 'Trend'], ['STRONG_TREND', 'Strong Trend'], ['AFTER_LOSS', 'After Loss']]) {
+    assert.match(masterHtml, new RegExp(`data-dial-market-mode="${id}"[^>]*>${label}</button>`));
+  }
+  assert.match(masterHtml, /AI boosted UP for Strong Trend → 1\.00% \(Extreme High Risk\)/);
+  assert.match(masterHtml, /data-dial-metric="signal-bar"/);
+  assert.match(masterHtml, /data-dial-metric-value="signal-bar">0\.55<\/strong>/);
+  assert.match(masterHtml, /class="dial-preset-title">Balanced<\/span><span class="dial-preset-pct">0\.60%<\/span>/);
+
+  // Rainbow spectrum slider track + glowing crisp white circle thumb + 3x2 presets + 2x2 metrics in CSS
+  assert.match(
+    AGGRESSION_DIAL_CSS_SNIPPET,
+    /linear-gradient\(90deg,\s*#10b981 0%,\s*#22c55e 24%,\s*#eab308 50%,\s*#f97316 76%,\s*#ef4444 100%\)/,
+  );
+  assert.match(AGGRESSION_DIAL_CSS_SNIPPET, /\.dial-slider::-webkit-slider-runnable-track\s*\{[\s\S]*?height:\s*10px;/);
+  assert.match(AGGRESSION_DIAL_CSS_SNIPPET, /\.dial-slider::-webkit-slider-thumb\s*\{[\s\S]*?width:\s*22px;[\s\S]*?height:\s*22px;[\s\S]*?margin-top:\s*-6px;[\s\S]*?background:\s*#ffffff;/);
+  assert.match(AGGRESSION_DIAL_CSS_SNIPPET, /\.dial-presets\s*\{[\s\S]*?grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\);/);
+  assert.match(AGGRESSION_DIAL_CSS_SNIPPET, /\.dial-metrics-grid\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/);
+
+  // Section B.5 sleek tier names, Zone pill, inline Bar readout, micro buttons, and Safety Walls footer
+  const staggered = applyAggressionDialPreset(STATIC_AGGRESSION_DIAL, 'STAGGER_SAFE_TO_EXTREME');
+  const b5Html = renderSectionB5TierDials(staggered);
+  assert.match(b5Html, /5-Tier Account Aggression Dials \(0\.20%–1\.00% by 0\.01%\)/);
+  for (const name of ['$300,000 Main Barbell', '$6,000 Accelerator', '$3,000 Growth', '$1,000 Starter', '$300 Micro Challenge']) {
+    assert.ok(b5Html.includes(name), `Expected sleek tier title ${name}`);
+  }
+  for (const shortBtn of ['Safe', 'Std', 'Bal', 'Rsk', 'High', 'Ext']) {
+    assert.match(b5Html, new RegExp(`>${shortBtn}</button>`));
+  }
+  assert.match(b5Html, /data-tier-zone-pill="true"/);
+  assert.match(b5Html, /data-tier-metric="signal-bar">0\.76<\/strong>/);
+  assert.match(b5Html, /Hard Safety Walls ON at every 0\.01% step: Stop Risk ≤ 1\.00%\s+Max DD ≤ 10\.00%\s+Valve ≥ 0\.55\s+1,000% Margin/);
+  assert.match(b5Html, /Exact 0\.01% Steps/);
+
+  // Verify patchMasterAggressionDialInPlace & patchSectionB5TierDialsInPlace live-patch Market Mode, Signal Bar, & Tier Zone pill
+  const mBox = createStrictMockEl({ 'data-dial-market-box': 'true', 'data-active-market-mode': 'TREND' }, ['dial-market-box', 'dial-lvl-5']);
+  const mPills = ['CHOP', 'TREND', 'STRONG_TREND', 'AFTER_LOSS'].map((id) => createStrictMockEl(
+    { 'data-dial-market-mode': id, 'aria-pressed': id === 'TREND' ? 'true' : 'false' },
+    ['dial-market-pill'],
+  ));
+  const mStatus = createStrictMockEl({ 'data-dial-market-status': 'true' }, ['dial-market-status']);
+  const mBaseAi = createStrictMockEl({ 'data-dial-base-ai-pill': 'false', hidden: '' }, ['dial-base-ai-pill']);
+  const mSigBar = createStrictMockEl({ 'data-dial-metric-value': 'signal-bar' });
+  const mRoot = createStrictMockEl({ 'data-aggression-dial': 'master' }, ['aggression-dial-panel'], [mBox, ...mPills, mStatus, mBaseAi, mSigBar]);
+
+  const chopPreview = applyMarketConditionPreview({ masterRiskBps: 60, aiDiscretionEnabled: true }, 'CHOP');
+  assert.equal(chopPreview.effectiveRiskBps, 40);
+  assert.equal(patchMasterAggressionDialInPlace(mRoot, chopPreview), true);
+  assert.equal(mBox.getAttribute('data-active-market-mode'), 'CHOP');
+  assert.equal(mPills[0].classList.contains('is-active'), true);
+  assert.equal(mPills[1].classList.contains('is-active'), false);
+  assert.equal(mStatus.textContent, 'AI stepped DOWN for Chop → 0.40% (Steady)');
+  assert.equal(mBaseAi.hidden, false);
+  assert.equal(mBaseAi.textContent, 'Base 0.60% → AI 0.40%');
+  assert.equal(mSigBar.textContent, '0.72');
+
+  const tZone = createStrictMockEl({ 'data-tier-zone-pill': 'true', 'data-tier-level-name': 'true' }, ['b5-zone-pill', 'dial-lvl-5']);
+  const tBar = createStrictMockEl({ 'data-tier-metric': 'signal-bar' });
+  const tRow = createStrictMockEl({ 'data-tier-id': 'TIER_1_CURRENT', 'data-tier-bps': '60' }, ['b5-tier-row'], [tZone, tBar]);
+  const b5Root = createStrictMockEl({ 'data-section': 'b5-tier-dials' }, ['b5-tier-dials'], [tRow]);
+  assert.equal(patchSectionB5TierDialsInPlace(b5Root, staggered), 1);
+  assert.equal(tZone.textContent, 'Safe');
+  assert.equal(tZone.classList.contains('dial-lvl-1'), true);
+  assert.equal(tBar.textContent, '0.76');
 });

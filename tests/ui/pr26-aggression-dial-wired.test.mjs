@@ -11,9 +11,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import {
+  AGGRESSION_DIAL_CSS_SNIPPET,
   AGGRESSION_DIAL_SCHEMA,
   DEFAULT_TIER_DEFINITIONS,
   applyAggressionDialPreset,
+  applyMarketConditionPreview,
   normalizeAggressionDial,
   patchAggressionDialInPlace,
   resolveCockpitAggressionDial,
@@ -244,15 +246,22 @@ test('PR26_01 Operate renders Master Trading Aggression Dial near top and Sectio
   assert.match(html, /data-dial-master-slider="true"/);
   assert.match(html, /role="switch"[^>]*data-dial-action="TOGGLE_AI_DISCRETION"/);
   assert.match(html, /AI Discretion Active → 0\.85% Risky \(TREND_IGNITION_BOOST\)/);
+  assert.match(html, /Base 0\.60% → AI 0\.85%/);
+  assert.match(html, /Market Mode:/);
+  assert.match(html, /AI boosted UP for Trend → 0\.85% \(Risky\)/);
+  assert.match(html, /data-dial-metric="signal-bar"/);
   assert.match(html, /data-overseer-aggression-summary="true"/);
   assert.match(html, /Dial: 0\.85% Risky · AI Discretion ON/);
 
   // Section B.5 5-Tier Per-Account Dials render directly inside renderParallelTiersSection
   const tiersSectionHtml = renderParallelTiersSection(state);
   assert.match(tiersSectionHtml, /data-section="b5-tier-dials"/);
+  assert.match(tiersSectionHtml, /5-Tier Account Aggression Dials \(0\.20%–1\.00% by 0\.01%\)/);
   assert.match(tiersSectionHtml, /Sync All 5 to Master/);
   assert.match(tiersSectionHtml, /Stagger Safe → Extreme/);
   assert.match(tiersSectionHtml, /All Balanced \(0\.60%\)/);
+  assert.match(tiersSectionHtml, /Hard Safety Walls ON at every 0\.01% step: Stop Risk ≤ 1\.00%\s+Max DD ≤ 10\.00%\s+Valve ≥ 0\.55\s+1,000% Margin/);
+  assert.match(tiersSectionHtml, /Exact 0\.01% Steps/);
   for (const def of DEFAULT_TIER_DEFINITIONS) {
     assert.match(tiersSectionHtml, new RegExp(`data-dial-tier-slider="${def.tierId}"`));
   }
@@ -380,12 +389,23 @@ test('PR26_04 app.mjs & styles.css wire /api/aggression-dial, SSE aggression_dia
   assert.match(appSrc, /eventName === 'aggression_dial'/);
   assert.match(appSrc, /HIGH_RISK_CONFIRMATION_REQUIRED/);
   assert.match(appSrc, /patchAggressionDialInPlace\(/);
+  assert.match(appSrc, /applyMarketConditionPreview\(/);
   assert.equal(/localStorage/.test(appSrc), false);
   assert.equal(/\.focus\(\s*\)/.test(appSrc), false);
 
+  const afterLoss = applyMarketConditionPreview({ masterRiskBps: 60, aiDiscretionEnabled: true }, 'AFTER_LOSS');
+  assert.equal(afterLoss.marketCondition, 'AFTER_LOSS');
+  assert.equal(afterLoss.effectiveRiskBps, 30);
+
   const stylesCss = await readFile(new URL('../../ui/styles.css', import.meta.url), 'utf8');
+  assert.equal(
+    stylesCss.includes(AGGRESSION_DIAL_CSS_SNIPPET.trim()),
+    true,
+    'ui/styles.css must stay in 100% sync with AGGRESSION_DIAL_CSS_SNIPPET',
+  );
   assert.match(stylesCss, /\.aggression-dial-panel\b/);
   assert.match(stylesCss, /\.dial-switch-thumb\b/);
+  assert.match(stylesCss, /\.dial-market-box\b/);
   assert.match(stylesCss, /\.b5-tier-dials\b/);
   for (let lvl = 1; lvl <= 11; lvl += 1) {
     assert.match(stylesCss, new RegExp(`\\.dial-lvl-${lvl}\\b`));
