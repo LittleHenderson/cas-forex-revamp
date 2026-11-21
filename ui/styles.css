@@ -1338,3 +1338,645 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
   background: var(--warning-surface);
   color: var(--ink);
 }
+
+/* PR #26: Master & Section B.5 5-Tier Aggression Dial */
+/* Strict-CSP Trading Aggression Dial (0.20%..1.00% in 0.01% bps steps + AI Discretion) & Section B.5 5-Tier Controls */
+.aggression-dial-panel {
+  --dial-accent: #2563EB;
+  --dial-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --dial-surface: var(--panel, #FFFFFF);
+  --dial-soft: var(--panel-soft, #F7F9FC);
+  --dial-border: var(--line, #DCE2EA);
+  --dial-ink: var(--ink, #122238);
+  --dial-muted: var(--muted, #596779);
+  background: var(--dial-surface);
+  border: 1px solid var(--dial-border);
+  border-left: 4px solid var(--dial-accent);
+  border-radius: 10px;
+  padding: 18px 20px;
+  display: grid;
+  gap: 14px;
+  contain: layout style;
+  transition: border-color 220ms cubic-bezier(0.22, 1, 0.36, 1), background-color 220ms ease;
+}
+
+.dial-lvl-1 { --dial-accent: #0F766E; --dial-badge-bg: #CCFBF1; --dial-badge-ink: #115E59; }
+.dial-lvl-2 { --dial-accent: #0D9488; --dial-badge-bg: #D1FAE5; --dial-badge-ink: #065F46; }
+.dial-lvl-3 { --dial-accent: #0284C7; --dial-badge-bg: #E0F2FE; --dial-badge-ink: #075985; }
+.dial-lvl-4 { --dial-accent: #2563EB; --dial-badge-bg: #DBEAFE; --dial-badge-ink: #1E40AF; }
+.dial-lvl-5 { --dial-accent: #4F46E5; --dial-badge-bg: #E0E7FF; --dial-badge-ink: #3730A3; }
+.dial-lvl-6 { --dial-accent: #CA8A04; --dial-badge-bg: #FEF3C7; --dial-badge-ink: #92400E; }
+.dial-lvl-7 { --dial-accent: #D97706; --dial-badge-bg: #FFEDD5; --dial-badge-ink: #9A3412; }
+.dial-lvl-8 { --dial-accent: #EA580C; --dial-badge-bg: #FED7AA; --dial-badge-ink: #9A3412; }
+.dial-lvl-9 { --dial-accent: #DC2626; --dial-badge-bg: #FEE2E2; --dial-badge-ink: #991B1B; }
+.dial-lvl-10 { --dial-accent: #B91C1C; --dial-badge-bg: #FECACA; --dial-badge-ink: #7F1D1D; }
+.dial-lvl-11 { --dial-accent: #9D174D; --dial-badge-bg: #FCE7F3; --dial-badge-ink: #831843; }
+
+:root[data-theme="dark"] .dial-lvl-1 { --dial-badge-bg: #134E4A; --dial-badge-ink: #99F6E4; }
+:root[data-theme="dark"] .dial-lvl-2 { --dial-badge-bg: #064E3B; --dial-badge-ink: #A7F3D0; }
+:root[data-theme="dark"] .dial-lvl-3 { --dial-badge-bg: #0C4A6E; --dial-badge-ink: #BAE6FD; }
+:root[data-theme="dark"] .dial-lvl-4 { --dial-badge-bg: #1E3A8A; --dial-badge-ink: #BFDBFE; }
+:root[data-theme="dark"] .dial-lvl-5 { --dial-badge-bg: #312E81; --dial-badge-ink: #C7D2FE; }
+:root[data-theme="dark"] .dial-lvl-6 { --dial-badge-bg: #713F12; --dial-badge-ink: #FDE68A; }
+:root[data-theme="dark"] .dial-lvl-7 { --dial-badge-bg: #7C2D12; --dial-badge-ink: #FED7AA; }
+:root[data-theme="dark"] .dial-lvl-8 { --dial-badge-bg: #9A3412; --dial-badge-ink: #FFEDD5; }
+:root[data-theme="dark"] .dial-lvl-9 { --dial-badge-bg: #7F1D1D; --dial-badge-ink: #FECACA; }
+:root[data-theme="dark"] .dial-lvl-10 { --dial-badge-bg: #991B1B; --dial-badge-ink: #FEE2E2; }
+:root[data-theme="dark"] .dial-lvl-11 { --dial-badge-bg: #831843; --dial-badge-ink: #FBCFE8; }
+
+.dial-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dial-title-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+}
+
+.dial-badge,
+.dial-level-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 64px;
+  height: 38px;
+  padding: 0 12px;
+  border-radius: 999px;
+  font-weight: 800;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  background: var(--dial-badge-bg, #E0E7FF);
+  color: var(--dial-badge-ink, #3730A3);
+  border: 1px solid var(--dial-accent, #4F46E5);
+  transition: background-color 220ms cubic-bezier(0.22, 1, 0.36, 1), color 200ms ease, border-color 220ms cubic-bezier(0.22, 1, 0.36, 1), transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dial-heading {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.2;
+  color: var(--dial-ink);
+  transition: color 180ms ease;
+}
+
+.dial-subline {
+  display: block;
+  font-size: 12px;
+  color: var(--dial-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.dial-pill-tag,
+.dial-shift-pill,
+.dial-owner-lock-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  transition: background-color 200ms cubic-bezier(0.22, 1, 0.36, 1), border-color 200ms cubic-bezier(0.22, 1, 0.36, 1), color 200ms ease, opacity 180ms ease;
+}
+
+.dial-pill-tag[hidden] {
+  display: none;
+}
+
+.dial-shift-pill {
+  background: var(--dial-badge-bg, var(--dial-soft));
+  border: 1px solid var(--dial-accent);
+  color: var(--dial-badge-ink, var(--dial-ink));
+}
+
+.dial-owner-lock-badge {
+  background: var(--warning-surface, #FFF0E4);
+  border: 1px solid var(--orange, #C2510B);
+  color: var(--warning-text, #773408);
+}
+
+/* Buttery-smooth 60fps sliding pill switch (role="switch") */
+.dial-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 6px 14px 6px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--dial-border);
+  background: var(--dial-soft);
+  color: var(--dial-ink);
+  font-weight: 700;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 220ms cubic-bezier(0.22, 1, 0.36, 1), background-color 220ms ease, box-shadow 200ms ease;
+}
+
+.dial-switch.is-on {
+  border-color: #0F766E;
+}
+
+.dial-switch.is-off {
+  border-color: #D97706;
+}
+
+.dial-switch:focus-visible {
+  outline: 2px solid var(--focus, #1B65B2);
+  outline-offset: 2px;
+}
+
+.dial-switch-track {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 48px;
+  height: 26px;
+  padding: 3px;
+  border-radius: 999px;
+  background-color: #94A3B8;
+  transition: background-color 220ms ease;
+  flex-shrink: 0;
+}
+
+.dial-switch.is-on .dial-switch-track {
+  background-color: #0F766E;
+}
+
+.dial-switch.is-off .dial-switch-track {
+  background-color: #B45309;
+}
+
+.dial-switch-thumb {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background-color: #FFFFFF;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 28%);
+  transform: translateX(0);
+  will-change: transform;
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1), background-color 220ms ease;
+}
+
+.dial-switch.is-on .dial-switch-thumb {
+  transform: translateX(22px);
+}
+
+.dial-switch-label {
+  min-width: 11.5ch;
+  text-align: left;
+  font-variant-numeric: tabular-nums;
+}
+
+.dial-slider-wrap {
+  display: grid;
+  gap: 6px;
+}
+
+.dial-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  min-height: 44px;
+  background: transparent;
+  accent-color: var(--dial-accent, #4F46E5);
+  cursor: pointer;
+  margin: 0;
+}
+
+.dial-slider::-webkit-slider-runnable-track {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--dial-border, #DCE2EA);
+  transition: background-color 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dial-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 24px;
+  height: 24px;
+  margin-top: -8px;
+  border-radius: 999px;
+  background: var(--dial-accent, #4F46E5);
+  border: 3px solid var(--dial-surface, #FFFFFF);
+  box-shadow: 0 2px 6px rgb(15 23 42 / 24%);
+  will-change: transform;
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), background-color 200ms ease, box-shadow 200ms ease;
+}
+
+.dial-slider:hover::-webkit-slider-thumb,
+.dial-slider:active::-webkit-slider-thumb {
+  transform: scale(1.12);
+  box-shadow: 0 3px 10px rgb(15 23 42 / 32%);
+}
+
+.dial-slider::-moz-range-track {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--dial-border, #DCE2EA);
+  transition: background-color 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dial-slider::-moz-range-thumb {
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--dial-accent, #4F46E5);
+  border: 3px solid var(--dial-surface, #FFFFFF);
+  box-shadow: 0 2px 6px rgb(15 23 42 / 24%);
+  will-change: transform;
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), background-color 200ms ease, box-shadow 200ms ease;
+}
+
+.dial-slider:hover::-moz-range-thumb,
+.dial-slider:active::-moz-range-thumb {
+  transform: scale(1.12);
+  box-shadow: 0 3px 10px rgb(15 23 42 / 32%);
+}
+
+.dial-ticks {
+  display: grid;
+  grid-template-columns: repeat(9, minmax(0, 1fr));
+  text-align: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--dial-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.dial-tick {
+  transition: color 180ms cubic-bezier(0.22, 1, 0.36, 1), transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dial-tick.is-current,
+.dial-tick.is-ai-active {
+  color: var(--dial-accent);
+  font-weight: 800;
+}
+
+.dial-presets {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.dial-preset-btn {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--dial-border);
+  background: var(--dial-soft);
+  color: var(--dial-ink);
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background-color 200ms cubic-bezier(0.22, 1, 0.36, 1), border-color 200ms cubic-bezier(0.22, 1, 0.36, 1), color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 200ms ease;
+}
+
+.dial-preset-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.dial-preset-btn.is-active {
+  background: var(--dial-badge-bg);
+  color: var(--dial-badge-ink);
+  border-color: var(--dial-accent);
+  box-shadow: inset 0 0 0 1px var(--dial-accent);
+}
+
+.dial-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.dial-metric-tile {
+  min-height: 74px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--dial-border);
+  background: var(--dial-soft);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  transition: border-color 200ms cubic-bezier(0.22, 1, 0.36, 1), background-color 200ms ease;
+}
+
+.dial-metric-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--dial-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.dial-metric-value {
+  display: inline-block;
+  min-width: 8ch;
+  font-size: 20px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--dial-ink);
+  transition: color 180ms ease;
+}
+
+.dial-metric-value-sm {
+  display: inline-block;
+  min-width: 6ch;
+  font-variant-numeric: tabular-nums;
+  transition: color 180ms ease;
+}
+
+.dial-val-positive {
+  color: #0F766E;
+}
+
+.dial-val-negative {
+  color: #B91C1C;
+}
+
+.dial-guardrails-line {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--dial-muted);
+  letter-spacing: 0.2px;
+}
+
+.dial-confirm-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--dial-accent);
+  background: var(--dial-badge-bg);
+  color: var(--dial-badge-ink);
+  transition: background-color 200ms ease, border-color 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dial-confirm-copy {
+  display: grid;
+  gap: 2px;
+  font-size: 12px;
+}
+
+.dial-confirm-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.dial-confirm-btn,
+.dial-cancel-btn {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0 14px;
+  border-radius: 8px;
+  font-weight: 700;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background-color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease;
+}
+
+.dial-confirm-btn {
+  background: #B91C1C;
+  color: #FFFFFF;
+  border: 1px solid #7F1D1D;
+}
+
+.dial-cancel-btn {
+  background: transparent;
+  color: inherit;
+  border: 1px solid currentColor;
+}
+
+.b5-tier-dials {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line, #DCE2EA);
+  contain: layout style;
+}
+
+.b5-tier-dials-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.b5-tier-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.b5-tier-dials-title {
+  margin: 0;
+  font-size: 16px;
+  color: var(--ink, #122238);
+}
+
+.b5-tier-quickbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.b5-tier-preset-btn {
+  min-height: 44px;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: 1px solid var(--line, #DCE2EA);
+  background: var(--panel-soft, #F7F9FC);
+  color: var(--ink, #122238);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background-color 200ms cubic-bezier(0.22, 1, 0.36, 1), border-color 200ms cubic-bezier(0.22, 1, 0.36, 1), transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.b5-tier-preset-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.b5-tier-rows {
+  display: grid;
+  gap: 10px;
+}
+
+.b5-tier-row {
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--line, #DCE2EA);
+  border-left: 4px solid var(--dial-accent, #4F46E5);
+  background: var(--panel-soft, #F7F9FC);
+  display: grid;
+  gap: 10px;
+  transition: border-color 220ms cubic-bezier(0.22, 1, 0.36, 1), background-color 200ms ease;
+}
+
+.b5-tier-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.b5-tier-identity {
+  display: grid;
+  gap: 2px;
+  margin-right: auto;
+}
+
+.b5-tier-label {
+  font-size: 14px;
+  color: var(--ink, #122238);
+}
+
+.b5-tier-level-name {
+  font-size: 12px;
+  color: var(--muted, #596779);
+  font-variant-numeric: tabular-nums;
+}
+
+.b5-tier-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.b5-tier-metric em {
+  font-style: normal;
+  color: var(--muted, #596779);
+  margin-right: 4px;
+}
+
+.b5-metric-goal strong {
+  color: #0F766E;
+}
+
+.b5-metric-brake strong {
+  color: #B91C1C;
+}
+
+.b5-tier-controls {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.b5-tier-btn-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.dial-tier-btn,
+.b5-tier-btn {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line, #DCE2EA);
+  background: var(--panel, #FFFFFF);
+  color: var(--ink, #122238);
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background-color 200ms cubic-bezier(0.22, 1, 0.36, 1), border-color 200ms cubic-bezier(0.22, 1, 0.36, 1), color 180ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dial-tier-btn:active:not(:disabled),
+.b5-tier-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.dial-tier-btn.is-active,
+.b5-tier-btn.is-active {
+  background: var(--dial-badge-bg);
+  color: var(--dial-badge-ink);
+  border-color: var(--dial-accent);
+}
+
+.aggression-dial-panel.is-readonly button:disabled,
+.aggression-dial-panel.is-readonly input:disabled,
+.b5-tier-dials.is-readonly button:disabled,
+.b5-tier-dials.is-readonly input:disabled {
+  opacity: 0.58;
+  cursor: not-allowed;
+}
+
+@media (max-width: 820px) {
+  .dial-presets {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .dial-metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .b5-tier-controls {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .aggression-dial-panel,
+  .dial-badge,
+  .dial-level-badge,
+  .dial-pill-tag,
+  .dial-shift-pill,
+  .dial-owner-lock-badge,
+  .dial-switch,
+  .dial-switch-track,
+  .dial-switch-thumb,
+  .dial-slider::-webkit-slider-thumb,
+  .dial-slider::-moz-range-thumb,
+  .dial-tick,
+  .dial-preset-btn,
+  .dial-tier-btn,
+  .b5-tier-btn,
+  .b5-tier-preset-btn,
+  .b5-tier-row,
+  .dial-metric-tile,
+  .dial-metric-value,
+  .dial-confirm-banner,
+  .dial-confirm-btn,
+  .dial-cancel-btn {
+    transition-duration: 0.01ms !important;
+  }
+  .dial-slider:hover::-webkit-slider-thumb,
+  .dial-slider:active::-webkit-slider-thumb,
+  .dial-slider:hover::-moz-range-thumb,
+  .dial-slider:active::-moz-range-thumb,
+  .dial-preset-btn:active:not(:disabled),
+  .dial-tier-btn:active:not(:disabled),
+  .b5-tier-btn:active:not(:disabled),
+  .b5-tier-preset-btn:active:not(:disabled) {
+    transform: none !important;
+  }
+}
+.aggression-dial-panel {
+  margin-bottom: 18px;
+}
+.b5-tier-dials {
+  margin-bottom: 14px;
+}

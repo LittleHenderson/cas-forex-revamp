@@ -1,0 +1,756 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:aggression-dial:1.0",
+  "title": "AggressionDialSnapshot",
+  "description": "Master Trading Aggression Dial (20..100 bps) & Section B.5 5-Tier Controls snapshot for GET/POST /api/aggression-dial.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "scope_id",
+    "min_risk_bps",
+    "max_risk_bps",
+    "high_risk_min_bps",
+    "owner_controls_allowed",
+    "access_mode",
+    "master_risk_bps",
+    "master_risk_pct",
+    "effective_risk_bps",
+    "effective_risk_pct",
+    "effective_label",
+    "css_class",
+    "ai_discretion_enabled",
+    "ai_discretion_ceiling_bps",
+    "ai_discretion_reason",
+    "auto_shift_enabled",
+    "master",
+    "tiers",
+    "tiers_by_id",
+    "anchor_knots",
+    "bps_catalog",
+    "guardrails",
+    "audit_count",
+    "audit_head_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "cas-forex.aggression-dial/1"
+    },
+    "scope_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "min_risk_bps": {
+      "const": 20
+    },
+    "max_risk_bps": {
+      "const": 100
+    },
+    "high_risk_min_bps": {
+      "const": 80
+    },
+    "owner_controls_allowed": {
+      "type": "boolean"
+    },
+    "access_mode": {
+      "enum": [
+        "OWNER_FULL_CONTROL",
+        "DEVICE_READ_AND_EXPLAINER"
+      ]
+    },
+    "live_mode": {
+      "type": "boolean"
+    },
+    "execution_mode": {
+      "enum": [
+        "DEMO",
+        "LIVE"
+      ]
+    },
+    "connected": {
+      "type": "boolean"
+    },
+    "audit_verified": {
+      "type": "boolean"
+    },
+    "master_risk_bps": {
+      "$ref": "#/$defs/riskBps"
+    },
+    "master_risk_pct": {
+      "$ref": "#/$defs/decimal"
+    },
+    "effective_risk_bps": {
+      "$ref": "#/$defs/riskBps"
+    },
+    "effective_risk_pct": {
+      "$ref": "#/$defs/decimal"
+    },
+    "effective_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "css_class": {
+      "$ref": "#/$defs/dialCssClass"
+    },
+    "ai_discretion_enabled": {
+      "type": "boolean"
+    },
+    "ai_discretion_ceiling_bps": {
+      "$ref": "#/$defs/riskBps"
+    },
+    "ai_discretion_reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "auto_shift_enabled": {
+      "type": "boolean"
+    },
+    "master": {
+      "$ref": "#/$defs/masterDetail"
+    },
+    "tiers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": {
+        "$ref": "#/$defs/tierDialItem"
+      }
+    },
+    "tiers_by_id": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "TIER_1_CURRENT": {
+          "$ref": "#/$defs/tierDialItem"
+        },
+        "TIER_2_1000": {
+          "$ref": "#/$defs/tierDialItem"
+        },
+        "TIER_3_3000": {
+          "$ref": "#/$defs/tierDialItem"
+        },
+        "TIER_4_6000": {
+          "$ref": "#/$defs/tierDialItem"
+        },
+        "TIER_5_300": {
+          "$ref": "#/$defs/tierDialItem"
+        }
+      }
+    },
+    "anchor_knots": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "$ref": "#/$defs/anchorKnot"
+      }
+    },
+    "bps_catalog": {
+      "type": "array",
+      "minItems": 81,
+      "maxItems": 81,
+      "items": {
+        "$ref": "#/$defs/catalogItem"
+      }
+    },
+    "guardrails": {
+      "$ref": "#/$defs/guardrails"
+    },
+    "audit_count": {
+      "$ref": "#/$defs/nonNegativeInt"
+    },
+    "audit_head_sha256": {
+      "$ref": "#/$defs/sha256Hex"
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$"
+    },
+    "decimal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 31,
+      "pattern": "^-?(?:0|[1-9][0-9]{0,17})(?:\\.[0-9]{1,12})?$"
+    },
+    "nonNegativeInt": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "riskBps": {
+      "type": "integer",
+      "minimum": 20,
+      "maximum": 100
+    },
+    "dialCssClass": {
+      "type": "string",
+      "minLength": 6,
+      "maxLength": 32,
+      "pattern": "^dial-lvl-[0-9]+$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 32,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$"
+    },
+    "sha256Hex": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "guardrails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "valve_required",
+        "valve_controller",
+        "valve_parameters",
+        "valve_cutoff",
+        "min_signal_prob",
+        "max_constitutional_stop_risk_pct",
+        "max_constitutional_drawdown_pct",
+        "min_margin_level_pct",
+        "lot_floor",
+        "lot_rounding",
+        "fast_stop_protection_ms",
+        "max_drawdown_brake_pct"
+      ],
+      "properties": {
+        "valve_required": {
+          "const": true
+        },
+        "valve_controller": {
+          "const": "tks_meta_valve_controller"
+        },
+        "valve_parameters": {
+          "const": 161
+        },
+        "valve_cutoff": {
+          "const": "0.55"
+        },
+        "min_signal_prob": {
+          "$ref": "#/$defs/decimal"
+        },
+        "max_constitutional_stop_risk_pct": {
+          "const": "1.00"
+        },
+        "max_constitutional_drawdown_pct": {
+          "const": "0.10"
+        },
+        "min_margin_level_pct": {
+          "const": "1000.0"
+        },
+        "lot_floor": {
+          "const": "0.01"
+        },
+        "lot_rounding": {
+          "const": "ROUND_FLOOR"
+        },
+        "fast_stop_protection_ms": {
+          "const": 50
+        },
+        "max_drawdown_brake_pct": {
+          "const": "10.00"
+        }
+      }
+    },
+    "effectiveParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_risk_bps",
+        "requested_risk_pct",
+        "requested_label",
+        "effective_risk_bps",
+        "effective_risk_pct",
+        "effective_label",
+        "label",
+        "css_class",
+        "ai_discretion_enabled",
+        "ai_discretion_ceiling_bps",
+        "ai_discretion_reason",
+        "ai_discretion_shifted",
+        "ai_discretion_direction",
+        "auto_shift_enabled",
+        "auto_shifted",
+        "shift_reasons",
+        "regime",
+        "valve_score",
+        "consecutive_losses",
+        "drawdown_pct",
+        "capital_usd",
+        "risk_bps",
+        "risk_pct",
+        "risk_per_trade_cents",
+        "risk_per_trade_usd",
+        "max_open_trades",
+        "prob_bp",
+        "min_signal_prob",
+        "session_goal_cents",
+        "session_goal_usd",
+        "soft_goal_usd",
+        "soft_goal_ratio",
+        "daily_loss_brake_cents",
+        "daily_loss_brake_usd",
+        "goal_pct",
+        "loss_pct",
+        "max_drawdown_pct",
+        "high_risk_zone",
+        "extreme_high_risk_zone",
+        "guardrails"
+      ],
+      "properties": {
+        "requested_risk_bps": {
+          "$ref": "#/$defs/riskBps"
+        },
+        "requested_risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "requested_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "effective_risk_bps": {
+          "$ref": "#/$defs/riskBps"
+        },
+        "effective_risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "effective_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "css_class": {
+          "$ref": "#/$defs/dialCssClass"
+        },
+        "ai_discretion_enabled": {
+          "type": "boolean"
+        },
+        "ai_discretion_ceiling_bps": {
+          "$ref": "#/$defs/riskBps"
+        },
+        "ai_discretion_reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "ai_discretion_shifted": {
+          "type": "boolean"
+        },
+        "ai_discretion_direction": {
+          "enum": [
+            "UP",
+            "DOWN",
+            "HOLD"
+          ]
+        },
+        "auto_shift_enabled": {
+          "type": "boolean"
+        },
+        "auto_shifted": {
+          "type": "boolean"
+        },
+        "shift_reasons": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "regime": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "valve_score": {
+          "$ref": "#/$defs/decimal"
+        },
+        "consecutive_losses": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "drawdown_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "capital_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "risk_bps": {
+          "$ref": "#/$defs/riskBps"
+        },
+        "risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "risk_per_trade_cents": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "risk_per_trade_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "max_open_trades": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "prob_bp": {
+          "type": "integer",
+          "minimum": 55,
+          "maximum": 100
+        },
+        "min_signal_prob": {
+          "$ref": "#/$defs/decimal"
+        },
+        "session_goal_cents": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "session_goal_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "soft_goal_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "soft_goal_ratio": {
+          "$ref": "#/$defs/decimal"
+        },
+        "daily_loss_brake_cents": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "daily_loss_brake_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "goal_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "loss_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "max_drawdown_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "high_risk_zone": {
+          "type": "boolean"
+        },
+        "extreme_high_risk_zone": {
+          "type": "boolean"
+        },
+        "guardrails": {
+          "$ref": "#/$defs/guardrails"
+        }
+      }
+    },
+    "masterDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "risk_bps",
+        "risk_pct",
+        "effective_risk_bps",
+        "effective_risk_pct",
+        "effective_label",
+        "css_class",
+        "ai_discretion_enabled",
+        "ai_discretion_ceiling_bps",
+        "ai_discretion_reason",
+        "auto_shift_enabled",
+        "updated_at",
+        "updated_by",
+        "effective"
+      ],
+      "properties": {
+        "risk_bps": {
+          "$ref": "#/$defs/riskBps"
+        },
+        "risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "effective_risk_bps": {
+          "$ref": "#/$defs/riskBps"
+        },
+        "effective_risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "effective_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "css_class": {
+          "$ref": "#/$defs/dialCssClass"
+        },
+        "ai_discretion_enabled": {
+          "type": "boolean"
+        },
+        "ai_discretion_ceiling_bps": {
+          "$ref": "#/$defs/riskBps"
+        },
+        "ai_discretion_reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "auto_shift_enabled": {
+          "type": "boolean"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_by": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "effective": {
+          "$ref": "#/$defs/effectiveParams"
+        }
+      }
+    },
+    "tierDialItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tier_id",
+        "label",
+        "capital_usd",
+        "risk_bps",
+        "effective_risk_bps",
+        "effective_risk_pct",
+        "effective_label",
+        "level_label",
+        "ai_discretion_reason",
+        "css_class",
+        "risk_pct",
+        "risk_per_trade_usd",
+        "max_open_trades",
+        "min_signal_prob",
+        "session_goal_usd",
+        "soft_goal_usd",
+        "daily_loss_brake_usd",
+        "updated_at",
+        "updated_by",
+        "effective"
+      ],
+      "properties": {
+        "tier_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "capital_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "risk_bps": {
+          "$ref": "#/$defs/riskBps"
+        },
+        "effective_risk_bps": {
+          "$ref": "#/$defs/riskBps"
+        },
+        "effective_risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "effective_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "level_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "ai_discretion_reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "css_class": {
+          "$ref": "#/$defs/dialCssClass"
+        },
+        "risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "risk_per_trade_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "max_open_trades": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "min_signal_prob": {
+          "$ref": "#/$defs/decimal"
+        },
+        "session_goal_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "soft_goal_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "daily_loss_brake_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updated_by": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "effective": {
+          "$ref": "#/$defs/effectiveParams"
+        }
+      }
+    },
+    "anchorKnot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "risk_bps",
+        "risk_pct",
+        "label",
+        "max_open_trades",
+        "prob_bp",
+        "min_signal_prob",
+        "ref_300k_goal_cents",
+        "ref_300k_loss_cents",
+        "ref_300k_goal_usd",
+        "ref_300k_loss_usd"
+      ],
+      "properties": {
+        "risk_bps": {
+          "$ref": "#/$defs/riskBps"
+        },
+        "risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "max_open_trades": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "prob_bp": {
+          "type": "integer",
+          "minimum": 55,
+          "maximum": 100
+        },
+        "min_signal_prob": {
+          "$ref": "#/$defs/decimal"
+        },
+        "ref_300k_goal_cents": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "ref_300k_loss_cents": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "ref_300k_goal_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "ref_300k_loss_usd": {
+          "$ref": "#/$defs/decimal"
+        }
+      }
+    },
+    "catalogItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "risk_bps",
+        "risk_pct",
+        "label",
+        "css_class",
+        "max_open_trades",
+        "prob_bp",
+        "min_signal_prob",
+        "ref_300k_goal_cents",
+        "ref_300k_loss_cents",
+        "ref_300k_goal_usd",
+        "ref_300k_loss_usd",
+        "goal_pct",
+        "loss_pct",
+        "soft_goal_ratio",
+        "high_risk_zone",
+        "extreme_high_risk_zone"
+      ],
+      "properties": {
+        "risk_bps": {
+          "$ref": "#/$defs/riskBps"
+        },
+        "risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "css_class": {
+          "$ref": "#/$defs/dialCssClass"
+        },
+        "max_open_trades": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "prob_bp": {
+          "type": "integer",
+          "minimum": 55,
+          "maximum": 100
+        },
+        "min_signal_prob": {
+          "$ref": "#/$defs/decimal"
+        },
+        "ref_300k_goal_cents": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "ref_300k_loss_cents": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "ref_300k_goal_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "ref_300k_loss_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "goal_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "loss_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "soft_goal_ratio": {
+          "$ref": "#/$defs/decimal"
+        },
+        "high_risk_zone": {
+          "type": "boolean"
+        },
+        "extreme_high_risk_zone": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

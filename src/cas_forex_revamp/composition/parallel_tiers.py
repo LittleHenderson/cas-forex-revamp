@@ -52,6 +52,12 @@ from cas_forex_revamp.contracts.commands import ActionIntent
 from cas_forex_revamp.contracts.primitives import decimal_value, parse_decimal, utc_time
 from cas_forex_revamp.operator.decisions import DecisionProposal
 from cas_forex_revamp.treasury.profit_sweep import ProfitSweepVault
+from cas_forex_revamp.valve.aggression_dial import (
+    AggressionDialStore,
+    MAX_CONSTITUTIONAL_STOP_RISK_PCT,
+    MIN_CONSTITUTIONAL_VALVE_PROB,
+    resolve_effective_params as resolve_dial_effective_params,
+)
 from cas_forex_revamp.valve.daily_quota import (
     QUOTA_STATUS_LOCKED,
     QUOTA_STATUS_LOSS_TRIPPED,
@@ -226,12 +232,15 @@ class ParallelTierEngine:
         sweep_ratio: Decimal = Decimal("0.50"),
         fx_min_lot: Decimal = MT5_MIN_VOLUME,
         index_min_lot: Decimal = MT5_MIN_VOLUME,
+        aggression_dial: AggressionDialStore | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(db_path, Path):
             db_path = Path(str(db_path))
         if not isinstance(valve_gate, ForexMetaValveGate):
             raise ContractError("valve_gate must be a ForexMetaValveGate")
+        if aggression_dial is not None and not isinstance(aggression_dial, AggressionDialStore):
+            raise ContractError("aggression_dial must be an AggressionDialStore or None")
         db_path.parent.mkdir(parents=True, exist_ok=True)
         apply_verified_directory_mode(db_path.parent, dir_mode=0o700)
         self.db_path = db_path
@@ -245,9 +254,21 @@ class ParallelTierEngine:
         self._lock = RLock()
         self._regime = TrendRegimeDetector()
         self._peak_store = PeakEquityStore(db_path)
+        self._aggression_dial: AggressionDialStore | None = aggression_dial
         self._quotas: dict[str, DailyQuotaGovernanceStore] = {}
         self._vaults: dict[str, ProfitSweepVault] = {}
         self._init_db(sweep_ratio=sweep_ratio)
+
+    @property
+    def aggression_dial(self) -> AggressionDialStore | None:
+        with self._lock:
+            return self._aggression_dial
+
+    def bind_aggression_dial(self, store: AggressionDialStore | None) -> None:
+        if store is not None and not isinstance(store, AggressionDialStore):
+            raise ContractError("aggression_dial must be an AggressionDialStore or None")
+        with self._lock:
+            self._aggression_dial = store
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=5.0, isolation_level=None)
@@ -256,6 +277,18 @@ class ParallelTierEngine:
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
+
+    def _connect_ro(self) -> sqlite3.Connection:
+        ro_uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(ro_uri, uri=True, timeout=5.0, isolation_level=None)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA query_only=ON")
+            return conn
+        except Exception:
+            conn.close()
+            raise
 
     def _init_db(self, *, sweep_ratio: Decimal) -> None:
         with self._lock, closing(self._connect()) as conn:
@@ -403,6 +436,7 @@ class ParallelTierEngine:
         free_margin: Decimal,
         quotes: Mapping[str, tuple[Decimal, Decimal]],
         risk_multiplier: Decimal,
+        tier_risk_pct: Decimal | None = None,
     ) -> tuple[Decimal | None, str | None]:
         stop_dist = abs(entry_price - stop_loss)
         if stop_dist <= Decimal("0") or deployable_equity <= Decimal("0"):
@@ -412,7 +446,17 @@ class ParallelTierEngine:
         min_lot = self._index_min_lot if symbol in INDEX_INSTRUMENTS else self._fx_min_lot
         min_units = csize * min_lot
         step_units = csize * MT5_VOLUME_STEP
-        budget = self._policy.max_stop_risk_amount(deployable_equity) * risk_multiplier
+        policy_cap = self._policy.max_stop_risk_amount(deployable_equity)
+        if tier_risk_pct is not None:
+            clamped_pct = min(
+                tier_risk_pct,
+                MAX_CONSTITUTIONAL_STOP_RISK_PCT,
+                self._policy.max_stop_loss_equity_risk_pct,
+            )
+            base_budget = min((deployable_equity * clamped_pct) / Decimal("100"), policy_cap)
+        else:
+            base_budget = policy_cap
+        budget = base_budget * risk_multiplier
 
         _, quote_ccy = Mt5MarginCalculator.split_symbol(symbol)
         rate = self._calc.conversion_rate(quote_ccy, quotes)
@@ -481,9 +525,27 @@ class ParallelTierEngine:
                 sig_tp = _parse_positive_signal_decimal(raw_tp, "signal.take_profit_price") if raw_tp is not None else None
                 sig_regime = str(signal.get("regime") or "TREND_IGNITION")
 
+        dial_store = self.aggression_dial
+        dial_snap = dial_store.snapshot() if dial_store is not None else None
+        dial_tiers_map = (
+            dial_snap.get("tiers_by_id", {})
+            if isinstance(dial_snap, Mapping) and isinstance(dial_snap.get("tiers_by_id"), Mapping)
+            else {}
+        )
+
         with self._lock, closing(self._connect()) as conn:
             for spec in self._specs:
                 tid = spec.tier_id
+                raw_tier_dial = dial_tiers_map.get(tid)
+                tier_eff: dict[str, Any] | None = (
+                    resolve_dial_effective_params(
+                        int(raw_tier_dial["risk_bps"]),
+                        spec.starting_capital_usd,
+                        ai_discretion_enabled=False,
+                    )
+                    if isinstance(raw_tier_dial, Mapping) and "risk_bps" in raw_tier_dial
+                    else None
+                )
                 pending_closes: list[tuple[str, str, str, Decimal, Decimal]] = []
                 open_unrealized = Decimal("0")
                 used_margin = Decimal("0")
@@ -686,27 +748,78 @@ class ParallelTierEngine:
                             "SELECT * FROM tier_positions WHERE tier_id = ? AND symbol = ? AND side = ? ORDER BY leg_index ASC",
                             (tid, sym, side.value),
                         ).fetchall()
+                        total_open_cnt = int(
+                            conn.execute("SELECT COUNT(*) FROM tier_positions WHERE tier_id = ?", (tid,)).fetchone()[0]
+                        )
                         is_add = len(existing_rows) > 0
                         req_kind = ActionKind.ADD if is_add else ActionKind.OPEN
 
-                        allowed_q, q_reason, q_mult = self._quotas[tid].evaluate_new_risk(
-                            req_kind, now=ts_dt, starting_equity=equity
-                        )
-                        # Strong-trend runner override on ADD when daily profit quota is locked (never bypass loss circuit)
-                        if not allowed_q and q_reason == QUOTA_STATUS_LOCKED and is_add and regime == "STRONG_TREND":
+                        tier_risk_pct_val: Decimal | None = None
+                        tier_min_prob_val: Decimal | None = None
+                        if tier_eff is not None:
+                            tier_risk_pct_val = Decimal(str(tier_eff["risk_pct"]))
+                            tier_min_prob_val = max(
+                                MIN_CONSTITUTIONAL_VALVE_PROB,
+                                Decimal(str(tier_eff["min_signal_prob"])),
+                            )
+                            tier_max_trades = int(tier_eff["max_open_trades"])
+                            tier_goal_usd = Decimal(str(tier_eff["session_goal_usd"]))
+                            tier_soft_usd = Decimal(str(tier_eff["soft_goal_usd"]))
+                            tier_loss_brake_usd = Decimal(str(tier_eff["daily_loss_brake_usd"]))
                             q_snap = self._quotas[tid].snapshot(now=ts_dt, starting_equity=equity)
                             q_pnl = Decimal(str(q_snap["realized_net_pnl_usd"]))
-                            q_max_loss = Decimal(str(q_snap["max_daily_loss_usd"]))
                             q_consec = int(q_snap["consecutive_losses"])
                             q_max_consec = int(q_snap["max_consecutive_losses"])
-                            if q_pnl <= -q_max_loss or q_consec >= q_max_consec:
+                            if q_pnl <= -tier_loss_brake_usd:
+                                allowed_q = False
+                                q_reason = f"DAILY_LOSS_BRAKE ({decimal_text(q_pnl)}<=-{decimal_text(tier_loss_brake_usd)})"
+                                q_mult = Decimal("0")
+                            elif q_consec >= q_max_consec:
+                                allowed_q = False
                                 q_reason = QUOTA_STATUS_LOSS_TRIPPED
+                                q_mult = Decimal("0")
+                            elif q_pnl >= tier_goal_usd and not (is_add and regime == "STRONG_TREND"):
+                                allowed_q = False
+                                q_reason = f"SESSION_GOAL_REACHED ({decimal_text(q_pnl)}>={decimal_text(tier_goal_usd)})"
+                                q_mult = Decimal("0")
+                            elif total_open_cnt >= tier_max_trades:
+                                allowed_q = False
+                                q_reason = f"MAX_OPEN_TRADES_REACHED ({total_open_cnt}>={tier_max_trades})"
+                                q_mult = Decimal("0")
+                            elif q_pnl >= tier_goal_usd and is_add and regime == "STRONG_TREND":
+                                allowed_q = True
+                                q_reason = None
+                                q_mult = Decimal("0.50")
+                            elif q_pnl >= tier_soft_usd:
+                                allowed_q = True
+                                q_reason = None
+                                q_mult = Decimal("0.50")
                             else:
                                 allowed_q = True
-                                q_mult = Decimal("0.50")
+                                q_reason = None
+                                q_mult = Decimal("1.00")
+                        else:
+                            allowed_q, q_reason, q_mult = self._quotas[tid].evaluate_new_risk(
+                                req_kind, now=ts_dt, starting_equity=equity
+                            )
+                            # Strong-trend runner override on ADD when daily profit quota is locked (never bypass loss circuit)
+                            if not allowed_q and q_reason == QUOTA_STATUS_LOCKED and is_add and regime == "STRONG_TREND":
+                                q_snap = self._quotas[tid].snapshot(now=ts_dt, starting_equity=equity)
+                                q_pnl = Decimal(str(q_snap["realized_net_pnl_usd"]))
+                                q_max_loss = Decimal(str(q_snap["max_daily_loss_usd"]))
+                                q_consec = int(q_snap["consecutive_losses"])
+                                q_max_consec = int(q_snap["max_consecutive_losses"])
+                                if q_pnl <= -q_max_loss or q_consec >= q_max_consec:
+                                    q_reason = QUOTA_STATUS_LOSS_TRIPPED
+                                else:
+                                    allowed_q = True
+                                    q_mult = Decimal("0.50")
 
                         if not allowed_q:
-                            skip_reason = f"DAILY_QUOTA ({q_reason})"
+                            if q_reason and q_reason.startswith("MAX_OPEN_TRADES_REACHED"):
+                                skip_reason = q_reason
+                            else:
+                                skip_reason = f"DAILY_QUOTA ({q_reason})"
                         else:
                             qty, sz_err = self._compute_tier_quantity(
                                 tier_id=tid,
@@ -718,6 +831,7 @@ class ParallelTierEngine:
                                 free_margin=free_margin,
                                 quotes=quotes,
                                 risk_multiplier=q_mult,
+                                tier_risk_pct=tier_risk_pct_val,
                             )
                             if qty is None:
                                 skip_reason = sz_err or "SIZING_SKIP"
@@ -838,6 +952,13 @@ class ParallelTierEngine:
                                             else f"{dec.valve_mode}:mlp_score={dec.mlp_score:.6f}<{dec.threshold:.6f}"
                                         )
                                         skip_reason = f"VALVE_REFUSED ({refusal_detail})"
+                                    elif (
+                                        tier_min_prob_val is not None
+                                        and Decimal(f"{dec.mlp_score:.8f}") < tier_min_prob_val
+                                    ):
+                                        skip_reason = (
+                                            f"DIAL_MIN_SIGNAL_PROB (mlp_score={dec.mlp_score:.4f}<{tier_min_prob_val})"
+                                        )
                                     else:
                                         entry_comm = self._entry_commission(sym, qty)
                                         new_ticket = f"{tid}-{uuid.uuid4().hex[:10]}"
@@ -901,7 +1022,14 @@ class ParallelTierEngine:
         return self.snapshot()
 
     def snapshot(self) -> dict[str, Any]:
-        with self._lock, closing(self._connect()) as conn:
+        dial_store = self.aggression_dial
+        dial_snap = dial_store.snapshot() if dial_store is not None else None
+        dial_tiers_map = (
+            dial_snap.get("tiers_by_id", {})
+            if isinstance(dial_snap, Mapping) and isinstance(dial_snap.get("tiers_by_id"), Mapping)
+            else {}
+        )
+        with self._lock, closing(self._connect_ro()) as conn:
             tiers: list[dict[str, Any]] = []
             series: dict[str, list[dict[str, Any]]] = {}
             for spec in self._specs:
@@ -933,7 +1061,7 @@ class ParallelTierEngine:
                 pf = "INF" if (gp > 0 and gl == 0) else (decimal_text((gp / gl).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) if gl > 0 else "0.00")
                 open_cnt = int(conn.execute("SELECT COUNT(*) FROM tier_positions WHERE tier_id = ?", (tid,)).fetchone()[0])
                 v_snap = self._vaults[tid].snapshot()
-                tiers.append({
+                tier_item: dict[str, Any] = {
                     "tier_id": tid,
                     "label": str(acct["label"]),
                     "color_class": str(acct["color_class"]),
@@ -954,7 +1082,32 @@ class ParallelTierEngine:
                     "retained_trading_usd": v_snap["retained_trading_usd"],
                     "last_skip_reason": acct["last_skip_reason"],
                     "updated_at": str(acct["updated_at"]),
-                })
+                }
+                raw_td = dial_tiers_map.get(tid)
+                if isinstance(raw_td, Mapping) and "risk_bps" in raw_td:
+                    td_eff = resolve_dial_effective_params(
+                        int(raw_td["risk_bps"]),
+                        start_v,
+                        ai_discretion_enabled=False,
+                    )
+                    tier_item["aggression_dial"] = {
+                        "tier_id": tid,
+                        "risk_bps": int(td_eff["requested_risk_bps"]),
+                        "risk_pct": str(td_eff["risk_pct"]),
+                        "effective_risk_bps": int(td_eff["effective_risk_bps"]),
+                        "effective_risk_pct": str(td_eff["effective_risk_pct"]),
+                        "effective_label": str(td_eff["effective_label"]),
+                        "css_class": str(td_eff["css_class"]),
+                        "risk_per_trade_usd": str(td_eff["risk_per_trade_usd"]),
+                        "max_open_trades": int(td_eff["max_open_trades"]),
+                        "min_signal_prob": str(td_eff["min_signal_prob"]),
+                        "session_goal_usd": str(td_eff["session_goal_usd"]),
+                        "soft_goal_usd": str(td_eff["soft_goal_usd"]),
+                        "daily_loss_brake_usd": str(td_eff["daily_loss_brake_usd"]),
+                        "updated_at": str(raw_td["updated_at"]),
+                        "updated_by": str(raw_td["updated_by"]),
+                    }
+                tiers.append(tier_item)
                 hist_rows = conn.execute(
                     "SELECT observed_at, equity_usd, growth_pct FROM tier_equity_history WHERE tier_id = ? ORDER BY seq ASC",
                     (tid,),
@@ -967,9 +1120,21 @@ class ParallelTierEngine:
                     }
                     for r in hist_rows[-120:]
                 ]
-            return {
+            out: dict[str, Any] = {
                 "schema": "cas-forex.parallel-tiers/1",
                 "tier_count": len(tiers),
                 "tiers": tiers,
                 "growth_series": series,
             }
+            if isinstance(dial_snap, Mapping):
+                out["aggression_dial"] = {
+                    "schema": str(dial_snap["schema"]),
+                    "scope_id": str(dial_snap["scope_id"]),
+                    "master_risk_bps": int(dial_snap["master_risk_bps"]),
+                    "master_risk_pct": str(dial_snap["master_risk_pct"]),
+                    "ai_discretion_enabled": bool(dial_snap["ai_discretion_enabled"]),
+                    "ai_discretion_ceiling_bps": int(dial_snap["ai_discretion_ceiling_bps"]),
+                    "audit_count": int(dial_snap["audit_count"]),
+                    "audit_head_sha256": str(dial_snap["audit_head_sha256"]),
+                }
+            return out
