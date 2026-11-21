@@ -259,8 +259,22 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
                 )
                 if "/convert/quote" in url:
                     return 200, json.dumps({"trade": {"id": "cb-conv-tx-100", "status": "TRADE_STATUS_CREATED"}}).encode()
-                if "/convert/trade/" in url:
-                    return 200, json.dumps({"trade": {"id": "cb-conv-tx-100", "status": "TRADE_STATUS_COMPLETED"}}).encode()
+                if method == "POST" and "/convert/trade/" in url:
+                    return 200, json.dumps({"trade": {"id": "cb-conv-tx-100", "status": "TRADE_STATUS_PENDING"}}).encode()
+                if method == "GET" and "/convert/trade/" in url:
+                    return 200, json.dumps({
+                        "trade": {
+                            "id": "cb-conv-tx-100",
+                            "status": "TRADE_STATUS_COMPLETED",
+                            "client_reference_id": str(row["conversion_client_ref"]),
+                            "from_currency": "USDC",
+                            "to_currency": "USD",
+                            "from_account": "acct-usdc-1",
+                            "to_account": "acct-usd-1",
+                            "filled_size": "120.00",
+                            "usd_proceeds": "120.00",
+                        }
+                    }).encode()
                 if "/withdrawals/fiat" in url:
                     return 200, json.dumps({"id": "cb-ach-tx-200"}).encode()
                 raise AssertionError(f"Unexpected Coinbase URL: {url}")
@@ -298,21 +312,25 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
             self.assertEqual(out["provider_tx_id"], "cb-ach-tx-200")
 
             # Verify durable journal states observed DURING external I/O:
-            self.assertEqual(len(observed_db_states), 3)
+            self.assertEqual(len(observed_db_states), 4)
             # Quote & commit see CONVERSION_PENDING + WITHDRAWAL_NOT_STARTED committed on disk!
             self.assertEqual(observed_db_states[0][1], CONVERSION_STATUS_PENDING)
             self.assertEqual(observed_db_states[0][2], WITHDRAWAL_STATUS_NOT_STARTED)
             self.assertEqual(observed_db_states[1][1], CONVERSION_STATUS_PENDING)
             self.assertEqual(observed_db_states[1][2], WITHDRAWAL_STATUS_NOT_STARTED)
-            # Withdrawal sees CONVERSION_CONFIRMED + conv_tx_id + WITHDRAWAL_PENDING committed on disk!
-            self.assertEqual(observed_db_states[2][1], CONVERSION_STATUS_CONFIRMED)
-            self.assertEqual(observed_db_states[2][2], WITHDRAWAL_STATUS_PENDING)
+            # Status poll sees CONVERSION_PENDING + conversion_tx_id committed on disk BEFORE confirmation!
+            self.assertEqual(observed_db_states[2][1], CONVERSION_STATUS_PENDING)
+            self.assertEqual(observed_db_states[2][2], WITHDRAWAL_STATUS_NOT_STARTED)
             self.assertEqual(observed_db_states[2][3], "cb-conv-tx-100")
+            # Withdrawal sees CONVERSION_CONFIRMED + conv_tx_id + WITHDRAWAL_PENDING committed on disk!
+            self.assertEqual(observed_db_states[3][1], CONVERSION_STATUS_CONFIRMED)
+            self.assertEqual(observed_db_states[3][2], WITHDRAWAL_STATUS_PENDING)
+            self.assertEqual(observed_db_states[3][3], "cb-conv-tx-100")
 
             # Verify provider idempotency keys transmitted on conversion & withdrawal are DISTINCT!
             conv_ref_quote = str(seen_requests[0][2].get("client_reference_id") or "")
             conv_ref_commit = str(seen_requests[1][2].get("client_reference_id") or "")
-            wd_ref = str(seen_requests[2][2].get("client_reference_id") or "")
+            wd_ref = str(seen_requests[3][2].get("client_reference_id") or "")
             self.assertTrue(conv_ref_quote)
             self.assertEqual(conv_ref_quote, conv_ref_commit)
             self.assertEqual(seen_requests[0][1].get("Idempotency-Key"), conv_ref_quote)
@@ -327,6 +345,7 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
             for expected_ev in (
                 "ACH_OFFRAMP_RESERVED",
                 "ACH_CONVERSION_PENDING",
+                "ACH_CONVERSION_SUBMITTED_PENDING",
                 "ACH_CONVERSION_CONFIRMED",
                 "ACH_WITHDRAWAL_PENDING",
                 "ACH_OFFRAMP_SUBMITTED",
@@ -359,6 +378,21 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
                 seen_forms.append((url, form, str(row["conversion_status"]), str(row["withdrawal_status"])))
                 if "/AddOrder" in url:
                     return 200, json.dumps({"error": [], "result": {"descr": {"order": "sell 90 USDCUSD"}, "txid": ["OKRK-CONV-1"]}}).encode()
+                if "/QueryOrders" in url:
+                    return 200, json.dumps({
+                        "error": [],
+                        "result": {
+                            "OKRK-CONV-1": {
+                                "status": "closed",
+                                "cl_ord_id": str(row["conversion_client_ref"]),
+                                "descr": {"pair": "USDCUSD", "type": "sell", "ordertype": "market"},
+                                "vol": "90.00",
+                                "vol_exec": "90.00",
+                                "cost": "90.00",
+                                "fee": "0.00",
+                            }
+                        },
+                    }).encode()
                 if "/Withdraw" in url:
                     return 200, json.dumps({"error": [], "result": {"refid": "KRK-WD-1"}}).encode()
                 raise AssertionError(f"Unexpected Kraken URL: {url}")
@@ -389,16 +423,20 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
             self.assertEqual(out["status"], "ACH_SUBMITTED")
             self.assertEqual(out["conversion_tx_id"], "OKRK-CONV-1")
             self.assertEqual(out["provider_tx_id"], "KRK-WD-1")
-            self.assertEqual(len(seen_forms), 2)
+            self.assertEqual(len(seen_forms), 3)
             # Phase 1 committed CONVERSION_PENDING before AddOrder and transmitted cl_ord_id
             self.assertEqual(seen_forms[0][2], CONVERSION_STATUS_PENDING)
             self.assertEqual(seen_forms[0][3], WITHDRAWAL_STATUS_NOT_STARTED)
             cl_ord_id = seen_forms[0][1].get("cl_ord_id", "")
             self.assertTrue(cl_ord_id)
-            # Phase 2 committed CONVERSION_CONFIRMED + WITHDRAWAL_PENDING before Withdraw and transmitted distinct client_ref
-            self.assertEqual(seen_forms[1][2], CONVERSION_STATUS_CONFIRMED)
-            self.assertEqual(seen_forms[1][3], WITHDRAWAL_STATUS_PENDING)
-            self.assertEqual(seen_forms[1][1].get("client_ref"), "idem-wd-krk-001")
+            # Phase 1b QueryOrders poll STILL sees CONVERSION_PENDING (never premature CONVERSION_CONFIRMED)
+            self.assertEqual(seen_forms[1][2], CONVERSION_STATUS_PENDING)
+            self.assertEqual(seen_forms[1][3], WITHDRAWAL_STATUS_NOT_STARTED)
+            self.assertEqual(seen_forms[1][1].get("txid"), "OKRK-CONV-1")
+            # Phase 2 committed CONVERSION_CONFIRMED + WITHDRAWAL_PENDING ONLY after terminal full-fill proof
+            self.assertEqual(seen_forms[2][2], CONVERSION_STATUS_CONFIRMED)
+            self.assertEqual(seen_forms[2][3], WITHDRAWAL_STATUS_PENDING)
+            self.assertEqual(seen_forms[2][1].get("client_ref"), "idem-wd-krk-001")
             self.assertNotEqual(cl_ord_id, "idem-wd-krk-001")
             self.assertTrue(bool(vault.verify_audit_chain()["valid"]))
 
@@ -412,13 +450,26 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
                 vault, rec, db_path, pem_path = self._setup_vault(root)
                 state = {"fail_wd": True, "conv_calls": 0, "wd_calls": 0, "wd_refs": []}
 
-                def cb_http(_m: str, url: str, _h: dict[str, str], body: bytes | None, _t: float) -> tuple[int, bytes]:
-                    doc = json.loads((body or b"{}").decode("utf-8"))
+                def cb_http(method: str, url: str, _h: dict[str, str], body: bytes | None, _t: float) -> tuple[int, bytes]:
+                    doc = json.loads((body or b"{}").decode("utf-8")) if body else {}
                     if "/convert/quote" in url:
                         state["conv_calls"] += 1
                         return 200, json.dumps({"trade": {"id": "cb-conv-once"}}).encode()
-                    if "/convert/trade/" in url:
-                        return 200, json.dumps({"trade": {"id": "cb-conv-once", "status": "TRADE_STATUS_COMPLETED"}}).encode()
+                    if method == "POST" and "/convert/trade/" in url:
+                        return 200, json.dumps({"trade": {"id": "cb-conv-once", "status": "TRADE_STATUS_PENDING"}}).encode()
+                    if method == "GET" and "/convert/trade/" in url:
+                        return 200, json.dumps({
+                            "trade": {
+                                "id": "cb-conv-once",
+                                "status": "TRADE_STATUS_COMPLETED",
+                                "from_currency": "USDC",
+                                "to_currency": "USD",
+                                "from_account": "src-1",
+                                "to_account": "usd-1",
+                                "filled_size": "80.00",
+                                "usd_proceeds": "80.00",
+                            }
+                        }).encode()
                     if "/withdrawals/fiat" in url:
                         state["wd_calls"] += 1
                         state["wd_refs"].append(doc.get("client_reference_id"))
@@ -432,6 +483,20 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
                     if "/AddOrder" in url:
                         state["conv_calls"] += 1
                         return 200, json.dumps({"error": [], "result": {"txid": ["OKRK-CONV-ONCE"]}}).encode()
+                    if "/QueryOrders" in url:
+                        return 200, json.dumps({
+                            "error": [],
+                            "result": {
+                                "OKRK-CONV-ONCE": {
+                                    "status": "closed",
+                                    "descr": {"pair": "USDCUSD", "type": "sell", "ordertype": "market"},
+                                    "vol": "80.00",
+                                    "vol_exec": "80.00",
+                                    "cost": "80.00",
+                                    "fee": "0.00",
+                                }
+                            },
+                        }).encode()
                     if "/Withdraw" in url:
                         state["wd_calls"] += 1
                         state["wd_refs"].append(form.get("client_ref"))
@@ -733,13 +798,28 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
                         return 200, json.dumps({"trade": {"id": "cb-conv-r1", "status": "TRADE_STATUS_COMPLETED", "client_reference_id": ref, "amount": "55"}}).encode()
                     if reconcile_resp["mode"] == "missing_id":
                         return 200, json.dumps({"trade": {"status": "TRADE_STATUS_COMPLETED", "client_reference_id": ref}}).encode()
+                    if reconcile_resp["mode"] == "missing_fill_proof":
+                        return 200, json.dumps({
+                            "trades": [{
+                                "id": "cb-conv-r1",
+                                "status": "TRADE_STATUS_COMPLETED",
+                                "client_reference_id": ref,
+                                "from_currency": "USDC",
+                                "to_currency": "USD",
+                                "amount": "110",
+                            }]
+                        }).encode()
                     return 200, json.dumps({
                         "trades": [{
                             "id": "cb-conv-confirmed-77",
                             "status": "TRADE_STATUS_COMPLETED",
                             "client_reference_id": ref,
                             "from_currency": "USDC",
-                            "amount": "110",
+                            "to_currency": "USD",
+                            "from_account": "src-1",
+                            "to_account": "usd-1",
+                            "filled_size": "110.00",
+                            "usd_proceeds": "110.00",
                         }]
                     }).encode()
                 if method == "POST" and "/withdrawals/fiat" in url:
@@ -788,7 +868,7 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
             self.assertEqual(calls["wd_post"], 0)
 
             # Ambiguous / mismatched exchange history responses MUST fail closed and stay frozen!
-            for bad_mode in ("pending", "wrong_ref", "wrong_amount", "missing_id"):
+            for bad_mode in ("pending", "wrong_ref", "wrong_amount", "missing_id", "missing_fill_proof"):
                 reconcile_resp["mode"] = bad_mode
                 with self.assertRaises(OfframpSecurityError):
                     vault.reconcile_conversion_outcome(transfer_id=tid, coinbase_client=cb)
@@ -856,6 +936,21 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
                     if fail_first["flag"]:
                         return 502, b"bad gateway"
                     return 200, json.dumps({"error": [], "result": {"txid": ["OKRK-RETRY-OK"]}}).encode()
+                if "/QueryOrders" in url:
+                    return 200, json.dumps({
+                        "error": [],
+                        "result": {
+                            "OKRK-RETRY-OK": {
+                                "status": "closed",
+                                "cl_ord_id": seen_cl_ord_ids[-1],
+                                "descr": {"pair": "USDCUSD", "type": "sell", "ordertype": "market"},
+                                "vol": "65.00",
+                                "vol_exec": "65.00",
+                                "cost": "65.00",
+                                "fee": "0.00",
+                            }
+                        },
+                    }).encode()
                 if "/Withdraw" in url:
                     return 200, json.dumps({"error": [], "result": {"refid": "KRK-WD-AFTER-NOTEXEC"}}).encode()
                 raise AssertionError(url)
@@ -1038,14 +1133,27 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
             net_calls = {"conv": 0, "wd": 0}
             epoch_state = {"revoked": True}
 
-            def cb_http(_m: str, url: str, _h: dict[str, str], _b: bytes | None, _t: float) -> tuple[int, bytes]:
+            def cb_http(method: str, url: str, _h: dict[str, str], _b: bytes | None, _t: float) -> tuple[int, bytes]:
                 if "/convert/quote" in url:
                     net_calls["conv"] += 1
                     return 200, json.dumps({"trade": {"id": "cb-conv-ep-1"}}).encode()
-                if "/convert/trade/" in url:
+                if method == "POST" and "/convert/trade/" in url:
                     # Simulate token rotation occurring DURING conversion!
                     epoch_state["revoked"] = True
-                    return 200, json.dumps({"trade": {"id": "cb-conv-ep-1", "status": "TRADE_STATUS_COMPLETED"}}).encode()
+                    return 200, json.dumps({"trade": {"id": "cb-conv-ep-1", "status": "TRADE_STATUS_PENDING"}}).encode()
+                if method == "GET" and "/convert/trade/" in url:
+                    return 200, json.dumps({
+                        "trade": {
+                            "id": "cb-conv-ep-1",
+                            "status": "TRADE_STATUS_COMPLETED",
+                            "from_currency": "USDC",
+                            "to_currency": "USD",
+                            "from_account": "src-1",
+                            "to_account": "usd-1",
+                            "filled_size": "100.00",
+                            "usd_proceeds": "100.00",
+                        }
+                    }).encode()
                 if "/withdrawals/fiat" in url:
                     net_calls["wd"] += 1
                     return 200, json.dumps({"id": "cb-ach-ep-1"}).encode()
@@ -1227,7 +1335,7 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
     # 10. Minimal test-double compatibility for convert_to_usd without client_reference_id
     # ------------------------------------------------------------------
     def test_minimal_test_double_convert_to_usd_compatibility(self) -> None:
-        class _MinimalKrakenDouble:
+        class _SubmitOnlyKrakenDouble:
             linked_bank_account_id = "krk-dbl-bank"
 
             def __init__(self) -> None:
@@ -1236,7 +1344,7 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
 
             def convert_to_usd(self, *, pair: str = "USDCUSD", volume: Decimal) -> dict[str, object]:
                 self.conv_calls += 1
-                return {"txid": [f"DBL-CONV-{pair}-{volume}"]}
+                return {"txid": [f"DBL-SUB-{pair}-{volume}"]}
 
             def withdraw_usd_to_linked_bank_ach(
                 self, *, amount_usd: Decimal, client_reference_id: str | None = None
@@ -1244,9 +1352,69 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
                 self.wd_calls += 1
                 return {"refid": f"DBL-WD-{client_reference_id}"}
 
+        class _MinimalKrakenDouble(_SubmitOnlyKrakenDouble):
+            def __init__(self) -> None:
+                super().__init__()
+                self.status_calls = 0
+
+            def convert_to_usd(self, *, pair: str = "USDCUSD", volume: Decimal) -> dict[str, object]:
+                self.conv_calls += 1
+                return {"txid": [f"DBL-CONV-{pair}-{volume}"]}
+
+            def get_conversion_status(
+                self, *, provider_tx_id: str | None = None, client_reference_id: str | None = None
+            ) -> dict[str, object]:
+                self.status_calls += 1
+                tx_id = str(provider_tx_id or "DBL-CONV-USDCUSD-40.00")
+                return {
+                    tx_id: {
+                        "status": "closed",
+                        "cl_ord_id": client_reference_id,
+                        "descr": {"pair": "USDCUSD", "type": "sell", "ordertype": "market"},
+                        "vol": "40.00",
+                        "vol_exec": "40.00",
+                        "cost": "40.00",
+                        "fee": "0.00",
+                    }
+                }
+
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            vault, rec, _, _ = self._setup_vault(root)
+            vault, rec, db_path, _ = self._setup_vault(root)
+            # A double omitting get_conversion_status MUST fail closed and NEVER trigger ACH withdrawal!
+            sub_only = _SubmitOnlyKrakenDouble()
+            prep_fail = vault.prepare_offramp_ach_payout(
+                rail=RAIL_KRAKEN_ACH,
+                amount_usd=D("40.00"),
+                owner_request_id="req-dbl-fail",
+                reason="submit only double must freeze",
+                kraken_client=sub_only,  # type: ignore[arg-type]
+                convert_amount=D("40.00"),
+                kraken_pair="USDCUSD",
+            )
+            tok_fail = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep_fail["intent_sha256"], now=T0)
+            with self.assertRaises(OfframpSecurityError):
+                vault.execute_offramp_ach_payout(
+                    rail=RAIL_KRAKEN_ACH,
+                    amount_usd=D("40.00"),
+                    owner_request_id="req-dbl-fail",
+                    reason="submit only double must freeze",
+                    verifier=rec,
+                    recovery_token=tok_fail,
+                    kraken_client=sub_only,  # type: ignore[arg-type]
+                    convert_amount=D("40.00"),
+                    kraken_pair="USDCUSD",
+                    intent_id=prep_fail["intent_id"],
+                    intent_sha256=prep_fail["intent_sha256"],
+                )
+            self.assertEqual(sub_only.conv_calls, 1)
+            self.assertEqual(sub_only.wd_calls, 0)
+            self.assertEqual(
+                _read_transfer_row(db_path, str(prep_fail["transfer_id"]))["conversion_status"],
+                CONVERSION_STATUS_OUTCOME_UNKNOWN,
+            )
+
+            # Minimal convert_to_usd (without client_reference_id kwarg) + authoritative get_conversion_status succeeds!
             dbl = _MinimalKrakenDouble()
             prep = vault.prepare_offramp_ach_payout(
                 rail=RAIL_KRAKEN_ACH,
@@ -1273,6 +1441,7 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
             )
             self.assertEqual(out["status"], "ACH_SUBMITTED")
             self.assertEqual(dbl.conv_calls, 1)
+            self.assertEqual(dbl.status_calls, 1)
             self.assertEqual(dbl.wd_calls, 1)
 
     # ------------------------------------------------------------------
@@ -1311,6 +1480,7 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
         direct_update_lines: list[int] = []
         direct_commit_lines: list[int] = []
         direct_conv_lines: list[int] = []
+        direct_status_lines: list[int] = []
         direct_wd_lines: list[int] = []
 
         def _walk_without_nested_defs(node: ast.AST) -> None:
@@ -1327,6 +1497,8 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
                         direct_commit_lines.append(child.lineno)
                     elif attr == "convert_to_usd":
                         direct_conv_lines.append(child.lineno)
+                    elif attr == "get_conversion_status":
+                        direct_status_lines.append(child.lineno)
                     elif attr == "withdraw_usd_to_linked_bank_ach":
                         direct_wd_lines.append(child.lineno)
                 _walk_without_nested_defs(child)
@@ -1334,9 +1506,10 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
         _walk_without_nested_defs(exec_fn)
 
         self.assertGreaterEqual(len(direct_conv_lines), 2)
+        self.assertGreaterEqual(len(direct_status_lines), 2)
         self.assertGreaterEqual(len(direct_wd_lines), 2)
 
-        # Every convert_to_usd and every withdraw_usd_to_linked_bank_ach MUST have a direct
+        # Every convert_to_usd, get_conversion_status, and withdraw_usd_to_linked_bank_ach MUST have a direct
         # SQLite UPDATE bank_transfers + conn.commit() strictly BEFORE it in execute_offramp_ach_payout!
         for conv_ln in direct_conv_lines:
             self.assertTrue(
@@ -1347,14 +1520,23 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
                 any(c < conv_ln for c in direct_commit_lines),
                 f"Missing direct conn.commit() before convert_to_usd at line {conv_ln}",
             )
-        for wd_ln in direct_wd_lines:
-            # Must have an UPDATE + commit specifically AFTER conversion calls and BEFORE withdrawal!
+        for st_ln in direct_status_lines:
             self.assertTrue(
-                any(max(direct_conv_lines) < u < wd_ln for u in direct_update_lines),
+                any(max(direct_conv_lines) < u < st_ln for u in direct_update_lines),
+                f"Missing direct UPDATE bank_transfers before get_conversion_status at line {st_ln}",
+            )
+            self.assertTrue(
+                any(max(direct_conv_lines) < c < st_ln for c in direct_commit_lines),
+                f"Missing direct conn.commit() before get_conversion_status at line {st_ln}",
+            )
+        for wd_ln in direct_wd_lines:
+            # Must have an UPDATE + commit specifically AFTER conversion status polling and BEFORE withdrawal!
+            self.assertTrue(
+                any(max(direct_status_lines) < u < wd_ln for u in direct_update_lines),
                 f"Missing Phase 2 direct UPDATE bank_transfers before withdraw_usd_to_linked_bank_ach at line {wd_ln}",
             )
             self.assertTrue(
-                any(max(direct_conv_lines) < c < wd_ln for c in direct_commit_lines),
+                any(max(direct_status_lines) < c < wd_ln for c in direct_commit_lines),
                 f"Missing Phase 2 direct conn.commit() before withdraw_usd_to_linked_bank_ach at line {wd_ln}",
             )
 

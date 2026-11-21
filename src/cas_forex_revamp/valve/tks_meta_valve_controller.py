@@ -105,6 +105,7 @@ INJECTION_MARKERS: tuple[str, ...] = (
 DEFAULT_VALVE_GRANT_TTL_SECONDS = 30.0
 MAX_VALVE_GRANT_TTL_SECONDS = 300.0
 DEFAULT_VALVE_DECISION_TTL_SECONDS = 300.0
+MAX_VALVE_REPLAY_LEDGER_ENTRIES = 16384
 
 RISK_REDUCING_ACTION_KINDS: frozenset[str] = frozenset({"CLOSE", "REDUCE", "AMEND_STOP"})
 RISK_INCREASING_ACTION_KINDS: frozenset[str] = frozenset({"OPEN", "ADD"})
@@ -146,8 +147,19 @@ _sign_valve_payload, _verify_valve_payload = _build_valve_hmac_sealer()
 
 _GRANT_LEDGER_LOCK = RLock()
 _ISSUED_UNCONSUMED_GRANTS: dict[str, tuple[str, datetime]] = {}
-_CONSUMED_GRANT_NONCES: set[str] = set()
-_CONSUMED_DECISION_TARGETS: set[tuple[str, str, str]] = set()
+_CONSUMED_GRANT_NONCES: dict[str, datetime] = {}
+_CONSUMED_DECISION_TARGETS: dict[tuple[str, str, str], datetime] = {}
+
+
+def _prune_valve_replay_ledgers_locked(now_dt: datetime) -> None:
+    """Prune expired entries across all Valve replay ledgers under `_GRANT_LEDGER_LOCK`."""
+    check_dt = utc_time(now_dt, "now")
+    for key in [k for k, (_, exp) in _ISSUED_UNCONSUMED_GRANTS.items() if exp < check_dt]:
+        _ISSUED_UNCONSUMED_GRANTS.pop(key, None)
+    for key in [k for k, exp in _CONSUMED_GRANT_NONCES.items() if exp < check_dt]:
+        _CONSUMED_GRANT_NONCES.pop(key, None)
+    for key in [k for k, exp in _CONSUMED_DECISION_TARGETS.items() if exp < check_dt]:
+        _CONSUMED_DECISION_TARGETS.pop(key, None)
 
 
 def _norm_grant_symbol(raw: Any) -> str:
@@ -720,14 +732,19 @@ def verify_and_consume_valve_order_grant(
             f"checked_at={_iso_utc(check_now)})"
         )
     with _GRANT_LEDGER_LOCK:
+        _prune_valve_replay_ledgers_locked(check_now)
         nonce = grant.grant_nonce
         if nonce in _CONSUMED_GRANT_NONCES:
             raise ValveGrantError("ValveOrderGrant replay refused: single-use grant_nonce already consumed")
         reg = _ISSUED_UNCONSUMED_GRANTS.get(nonce)
         if reg is None or not hmac.compare_digest(reg[0], expected_digest):
             raise ValveGrantError("ValveOrderGrant unknown or already consumed; failing closed")
+        if len(_CONSUMED_GRANT_NONCES) >= MAX_VALVE_REPLAY_LEDGER_ENTRIES:
+            raise ValveGrantError(
+                f"Valve consumed grant replay ledger saturated ({MAX_VALVE_REPLAY_LEDGER_ENTRIES}); failing closed"
+            )
         _ISSUED_UNCONSUMED_GRANTS.pop(nonce, None)
-        _CONSUMED_GRANT_NONCES.add(nonce)
+        _CONSUMED_GRANT_NONCES[nonce] = utc_time(grant.expires_at, "expires_at")
     return grant
 
 
@@ -2290,6 +2307,9 @@ class ForexMetaValveGate:
         decision_sha256: str,
         now: datetime | None,
         ttl_seconds: float,
+        decision_target_key: tuple[str, str, str] | None = None,
+        decision_expires_at: datetime | None = None,
+        decision: ValveDecision | None = None,
     ) -> ValveOrderGrant:
         if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float)):
             raise ValveGrantError("ttl_seconds must be a finite number in (0, 300]")
@@ -2363,12 +2383,31 @@ class ForexMetaValveGate:
             _gate_id=self._gate_id,
         )
         with _GRANT_LEDGER_LOCK:
+            _prune_valve_replay_ledgers_locked(issued_dt)
+            if decision_target_key is not None:
+                if decision_target_key in _CONSUMED_DECISION_TARGETS:
+                    raise ValveGrantError(
+                        f"ValveDecision replay refused for {norm_broker}/{norm_acct}",
+                        decision=decision,
+                    )
+                if len(_CONSUMED_DECISION_TARGETS) >= MAX_VALVE_REPLAY_LEDGER_ENTRIES:
+                    raise ValveGrantError(
+                        f"Valve consumed decision replay ledger saturated ({MAX_VALVE_REPLAY_LEDGER_ENTRIES}); failing closed",
+                        decision=decision,
+                    )
+            if len(_ISSUED_UNCONSUMED_GRANTS) >= MAX_VALVE_REPLAY_LEDGER_ENTRIES:
+                raise ValveGrantError(
+                    f"Valve issued grant ledger saturated ({MAX_VALVE_REPLAY_LEDGER_ENTRIES}); failing closed",
+                    decision=decision,
+                )
+            if decision_target_key is not None:
+                eff_dec_exp = (
+                    utc_time(decision_expires_at, "decision.expires_at")
+                    if decision_expires_at is not None
+                    else (issued_dt + timedelta(seconds=DEFAULT_VALVE_DECISION_TTL_SECONDS))
+                )
+                _CONSUMED_DECISION_TARGETS[decision_target_key] = eff_dec_exp
             _ISSUED_UNCONSUMED_GRANTS[grant_nonce] = (order_digest, expires_dt)
-            if len(_ISSUED_UNCONSUMED_GRANTS) > 8192:
-                cutoff = issued_dt - timedelta(hours=1)
-                stale_keys = [k for k, (_, exp) in _ISSUED_UNCONSUMED_GRANTS.items() if exp < cutoff]
-                for k in stale_keys:
-                    _ISSUED_UNCONSUMED_GRANTS.pop(k, None)
         return grant
 
     def issue_order_grant(
@@ -2429,12 +2468,6 @@ class ForexMetaValveGate:
         norm_broker = str(broker_id or "").strip().upper()
         norm_acct = str(account_id or "").strip()
         target_key = (decision.decision_nonce, norm_broker, norm_acct)
-        with _GRANT_LEDGER_LOCK:
-            if target_key in _CONSUMED_DECISION_TARGETS:
-                raise ValveGrantError(
-                    f"ValveDecision replay refused for {norm_broker}/{norm_acct}", decision=decision
-                )
-            _CONSUMED_DECISION_TARGETS.add(target_key)
         decision_sha = sha256(canonical_bytes(decision.to_dict())).hexdigest()
         return self._mint_and_register_grant(
             broker_id=norm_broker,
@@ -2451,6 +2484,9 @@ class ForexMetaValveGate:
             decision_sha256=decision_sha,
             now=check_now,
             ttl_seconds=ttl_seconds,
+            decision_target_key=target_key,
+            decision_expires_at=decision.expires_at,
+            decision=decision,
         )
 
     def issue_protective_order_grant(

@@ -20,6 +20,7 @@ from cas_forex_revamp.composition.autonomous_trader import (
     AutonomousAiTrader,
 )
 from cas_forex_revamp.composition.live_cockpit_server import safe_broker_routing_payload
+from cas_forex_revamp.composition.state_store import create_owner_only_file_atomic
 from cas_forex_revamp.composition.trend_regime import REGIME_STRONG_TREND
 from cas_forex_revamp.contracts import Side
 from cas_forex_revamp.operator.frontier_backends import FrontierModelRegistry
@@ -230,7 +231,13 @@ class Pr17LiveReadinessAndCloseAccountingTests(unittest.TestCase):
                 ],
                 ttl_seconds=86400,
             )
-            ticket_path.write_text(json.dumps(bundle), encoding="utf-8")
+            create_owner_only_file_atomic(
+                ticket_path.parent,
+                ticket_path.name,
+                json.dumps(bundle).encode("utf-8"),
+                replace_existing=True,
+                label="LIVE auth ticket",
+            )
             live_env = {
                 ENV_EXECUTION_MODE: EXECUTION_MODE_LIVE,
                 ENV_LIVE_ARM_PHRASE: REQUIRED_LIVE_ARM_PHRASE,

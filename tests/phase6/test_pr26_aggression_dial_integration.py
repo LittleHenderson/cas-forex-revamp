@@ -98,7 +98,7 @@ class _StepClock:
         self.now = start
 
     def __call__(self) -> datetime:
-        self.now = self.now + timedelta(milliseconds=100)
+        self.now = self.now + timedelta(milliseconds=25)
         return self.now
 
 
@@ -295,6 +295,7 @@ class Pr26AggressionDialIntegrationTests(unittest.TestCase):
                 sleep=emus[bid].sleep_hook,
                 poll_interval_seconds=0.01,
                 receipt_timeout_seconds=5,
+                clock=clock,
             ),
             oanda_client_factory=lambda e: OandaPracticePaperClient(environ=e, transport=oanda),
             clock=clock,

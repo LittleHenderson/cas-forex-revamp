@@ -141,6 +141,7 @@ __all__ = [
     "Mt5OrderRequest",
     "Mt5PaperBrokerVenue",
     "Mt5Position",
+    "Mt5SnapshotIntegrityError",
     "Mt5SpoolBridgeTransport",
     "Mt5SpoolPaperTerminalEmulator",
     "STATUS_BROKER_OFFLINE",
@@ -159,7 +160,9 @@ __all__ = [
     "VALVE_ADMISSION_PROTOCOL",
     "derive_spool_channel_key",
     "inspect_spool_path_custody",
+    "compute_mt5_market_snapshot_hmac",
     "resolve_spool_key_dir",
+    "sign_mt5_market_snapshot_doc",
     "sign_spool_valve_admission",
     "spool_channel_key_id",
     "verify_spool_path_custody",
@@ -358,6 +361,14 @@ class Mt5TransportError(Mt5BridgeError):
 
 class Mt5PreDispatchTransportError(Mt5TransportError):
     """Explicit pre-dispatch connectivity/read failure strictly before order_send; failover-safe."""
+
+
+class Mt5SnapshotIntegrityError(Mt5TransportError):
+    """Raised when market_ticks.json fails HMAC, channel/login binding, monotonic sequence, or freshness."""
+
+
+class Mt5SpoolReplayError(Mt5TransportError):
+    """Raised when an MT5 spool request_id or monotonic_nonce is replayed."""
 
 
 class Mt5PostFillObservationError(Mt5BridgeError):
@@ -923,6 +934,146 @@ def _spool_hmac_hex(key_bytes: bytes, message: str) -> str:
     return hmac.new(key_bytes, message.encode("utf-8"), sha256).hexdigest()
 
 
+def _canonical_mt5_market_snapshot_input(doc: Mapping[str, Any]) -> str:
+    """Build canonical pipe-delimited market snapshot string matching CasForexMt5Bridge.mq5 PublishMarket()."""
+    for fld in (
+        "protocol",
+        "broker_channel",
+        "channel_key_id",
+        "execution_mode",
+        "server",
+        "account_trade_mode",
+        "observed_at",
+        "snapshot_seq",
+    ):
+        if type(doc.get(fld)) is not str:
+            raise Mt5SnapshotIntegrityError(f"market_ticks.json {fld} must be a string")
+    connected_val = doc.get("connected")
+    if type(connected_val) is not bool:
+        raise Mt5SnapshotIntegrityError("market_ticks.json connected must be a boolean")
+    connected_str = "true" if connected_val else "false"
+    acct = doc.get("account")
+    if type(acct) is not dict:
+        raise Mt5SnapshotIntegrityError("market_ticks.json account must be an object")
+    for fld in ("login", "currency", "balance", "equity", "margin", "margin_free", "leverage"):
+        if type(acct.get(fld)) is not str:
+            raise Mt5SnapshotIntegrityError(f"market_ticks.json account.{fld} must be a string")
+    ticks_raw = doc.get("ticks")
+    if type(ticks_raw) is not list:
+        raise Mt5SnapshotIntegrityError("market_ticks.json ticks must be a list")
+    tick_parts: list[str] = []
+    for item in ticks_raw:
+        if type(item) is not dict:
+            raise Mt5SnapshotIntegrityError("market_ticks.json tick entries must be objects")
+        for fld in ("symbol", "bid", "ask", "time_msc"):
+            if type(item.get(fld)) is not str:
+                raise Mt5SnapshotIntegrityError(f"market_ticks.json tick.{fld} must be a string")
+        tick_parts.append(f"{item['symbol']}:{item['bid']}:{item['ask']}:{item['time_msc']}")
+    ticks_canon = ";".join(tick_parts)
+
+    pos_raw = doc.get("positions")
+    if type(pos_raw) is not list:
+        raise Mt5SnapshotIntegrityError("market_ticks.json positions must be a list")
+    pos_parts: list[str] = []
+    for item in pos_raw:
+        if type(item) is not dict:
+            raise Mt5SnapshotIntegrityError("market_ticks.json position entries must be objects")
+        for fld in ("ticket", "symbol", "side", "volume", "price_open", "sl", "tp", "profit"):
+            if type(item.get(fld)) is not str:
+                raise Mt5SnapshotIntegrityError(f"market_ticks.json position.{fld} must be a string")
+        pos_parts.append(
+            f"{item['ticket']}:{item['symbol']}:{item['side']}:{item['volume']}:"
+            f"{item['price_open']}:{item['sl']}:{item['tp']}:{item['profit']}"
+        )
+    positions_canon = ";".join(pos_parts)
+
+    ticks_sha = sha256(ticks_canon.encode("utf-8")).hexdigest()
+    positions_sha = sha256(positions_canon.encode("utf-8")).hexdigest()
+    return "|".join((
+        doc["protocol"],
+        doc["broker_channel"],
+        doc["channel_key_id"],
+        doc["execution_mode"],
+        doc["server"],
+        doc["account_trade_mode"],
+        connected_str,
+        doc["observed_at"],
+        doc["snapshot_seq"],
+        acct["login"],
+        acct["currency"],
+        acct["balance"],
+        acct["equity"],
+        acct["margin"],
+        acct["margin_free"],
+        acct["leverage"],
+        ticks_sha,
+        positions_sha,
+    ))
+
+
+def compute_mt5_market_snapshot_hmac(doc: Mapping[str, Any], *, channel_key: bytes) -> str:
+    """Compute HMAC-SHA256 hex digest over canonical market_ticks.json fields."""
+    if not isinstance(channel_key, (bytes, bytearray)) or len(channel_key) < 32:
+        raise Mt5TransportError("channel_key must be >= 32 bytes")
+    return _spool_hmac_hex(bytes(channel_key), _canonical_mt5_market_snapshot_input(doc))
+
+
+def sign_mt5_market_snapshot_doc(
+    doc: Mapping[str, Any],
+    *,
+    spool_dir: str | Path | None = None,
+    key_dir: str | Path | None = None,
+    broker_channel: str | None = None,
+    channel_key: bytes | None = None,
+    channel_key_id: str | None = None,
+    snapshot_seq: int | str | None = None,
+    observed_at: datetime | str | None = None,
+    custody_inspector: SpoolCustodyInspector | None = None,
+) -> dict[str, Any]:
+    """Return a copy of a market_ticks.json document signed with per-channel HMAC-SHA256."""
+    out = dict(doc)
+    out.setdefault("protocol", MT5_SPOOL_PROTOCOL)
+    if "connected" not in out:
+        out["connected"] = True
+    out.setdefault("ticks", [])
+    out.setdefault("positions", [])
+    if broker_channel is not None and str(broker_channel).strip():
+        ch = str(broker_channel).strip().lower()
+    elif isinstance(out.get("broker_channel"), str) and out["broker_channel"].strip():
+        ch = out["broker_channel"].strip().lower()
+    elif spool_dir is not None and Path(spool_dir).name.lower() in ("hugosway_mt5", "lhfx_mt5"):
+        ch = Path(spool_dir).name.lower()
+    elif "lhfx" in str(out.get("server", "")).lower():
+        ch = "lhfx_mt5"
+    else:
+        ch = "hugosway_mt5"
+    if ch not in ("hugosway_mt5", "lhfx_mt5"):
+        raise Mt5TransportError(f"unsupported MT5 broker channel {ch!r}")
+    out["broker_channel"] = ch
+    if channel_key is None:
+        if spool_dir is None and key_dir is None:
+            raise Mt5TransportError("sign_mt5_market_snapshot_doc requires spool_dir, key_dir, or channel_key")
+        base_dir = Path(spool_dir) if spool_dir is not None else Path(key_dir or ".")
+        master = _load_or_create_spool_hmac_key(base_dir, key_dir=key_dir, custody_inspector=custody_inspector)
+        eff_key = derive_spool_channel_key(master, ch)
+    else:
+        eff_key = bytes(channel_key)
+    eff_key_id = channel_key_id if channel_key_id is not None else spool_channel_key_id(eff_key, ch)
+    out["channel_key_id"] = eff_key_id
+    if "execution_mode" not in out or not isinstance(out.get("execution_mode"), str):
+        out["execution_mode"] = EXECUTION_MODE_LIVE if out.get("account_trade_mode") == "REAL" else EXECUTION_MODE_DEMO
+    if observed_at is not None:
+        out["observed_at"] = observed_at if isinstance(observed_at, str) else _iso(observed_at)
+    elif not isinstance(out.get("observed_at"), str) or not out["observed_at"].strip():
+        out["observed_at"] = _iso(_utc_now())
+    if snapshot_seq is not None:
+        out["snapshot_seq"] = str(int(snapshot_seq))
+    elif not isinstance(out.get("snapshot_seq"), str) or not str(out.get("snapshot_seq", "")).isdigit():
+        out["snapshot_seq"] = "1"
+    out["snapshot_hmac_sha256"] = compute_mt5_market_snapshot_hmac(out, channel_key=eff_key)
+    return out
+
+
 def derive_spool_channel_key(master_key: bytes, broker_channel: str) -> bytes:
     """Derive an isolated 32-byte per-channel HMAC key: HMAC-SHA256(master_key, f'channel:{broker_channel}')."""
     if not isinstance(master_key, (bytes, bytearray)) or len(master_key) < 32:
@@ -1171,31 +1322,55 @@ class _SpoolReplayLedger:
             data = _read_spool_json(self.path, max_bytes=262_144, custody_inspector=self._custody_inspector)
             if type(data) is not dict:
                 raise Mt5TransportError("corrupted MT5 spool replay ledger")
-            last_nonce = int(str(data.get("last_monotonic_nonce", "0")))
-            seen = [str(x) for x in (data.get("seen_request_ids") or ()) if isinstance(x, str)]
-            return last_nonce, seen[-512:]
+            nonce_raw = data.get("last_monotonic_nonce", "0")
+            if type(nonce_raw) is not str or not nonce_raw.isdigit():
+                raise Mt5TransportError("corrupted MT5 spool replay ledger nonce")
+            last_nonce = int(nonce_raw)
+            if last_nonce < 0:
+                raise Mt5TransportError("corrupted MT5 spool replay ledger negative nonce")
+            seen_raw = data.get("seen_request_ids", [])
+            if type(seen_raw) is not list or any(type(x) is not str for x in seen_raw):
+                raise Mt5TransportError("corrupted MT5 spool replay ledger seen_request_ids")
+            return last_nonce, list(seen_raw[-2048:])
+
+    def _persist_and_verify(
+        self,
+        *,
+        nonce: int,
+        seen: list[str],
+        expected_request_id: str | None = None,
+    ) -> None:
+        _atomic_write_json(
+            self.path,
+            {"last_monotonic_nonce": str(nonce), "seen_request_ids": seen},
+            custody_inspector=self._custody_inspector,
+        )
+        persisted_nonce, persisted_seen = self.load()
+        if persisted_nonce != nonce:
+            raise Mt5TransportError("MT5 replay ledger persistence verification failed (nonce mismatch)")
+        if expected_request_id is not None and expected_request_id not in persisted_seen:
+            raise Mt5TransportError("MT5 replay ledger persistence verification failed (request_id missing)")
 
     def next_nonce(self) -> int:
         with self._lock:
             last_nonce, seen = self.load()
             nxt = last_nonce + 1
-            _atomic_write_json(
-                self.path,
-                {"last_monotonic_nonce": str(nxt), "seen_request_ids": seen[-512:]},
-                custody_inspector=self._custody_inspector,
-            )
+            self._persist_and_verify(nonce=nxt, seen=seen[-512:])
             return nxt
 
     def verify_and_record(self, *, request_id: str, nonce: int) -> None:
         with self._lock:
             last_nonce, seen = self.load()
-            if nonce <= last_nonce or request_id in seen:
-                raise Mt5TransportError(f"MT5 spool replay detected (request_id={request_id}, nonce={nonce} <= {last_nonce})")
-            seen.append(request_id)
-            _atomic_write_json(
-                self.path,
-                {"last_monotonic_nonce": str(nonce), "seen_request_ids": seen[-512:]},
-                custody_inspector=self._custody_inspector,
+            seen_tail = seen[-512:]
+            if nonce <= last_nonce or request_id in seen_tail:
+                raise Mt5SpoolReplayError(
+                    f"MT5 spool replay detected (request_id={request_id}, nonce={nonce} <= {last_nonce})"
+                )
+            seen_tail.append(request_id)
+            self._persist_and_verify(
+                nonce=nonce,
+                seen=seen_tail[-512:],
+                expected_request_id=request_id,
             )
 
     def verify_and_record_global_id(self, *, request_id: str) -> None:
@@ -1203,12 +1378,12 @@ class _SpoolReplayLedger:
         with self._lock:
             last_nonce, seen = self.load()
             if request_id in seen:
-                raise Mt5TransportError(f"MT5 global replay domain duplicate request_id={request_id}")
+                raise Mt5SpoolReplayError(f"MT5 global replay domain duplicate request_id={request_id}")
             seen.append(request_id)
-            _atomic_write_json(
-                self.path,
-                {"last_monotonic_nonce": str(last_nonce), "seen_request_ids": seen[-2048:]},
-                custody_inspector=self._custody_inspector,
+            self._persist_and_verify(
+                nonce=last_nonce,
+                seen=seen[-2048:],
+                expected_request_id=request_id,
             )
 
 
@@ -1263,6 +1438,14 @@ def _atomic_write_bytes(
         elif os.name == "nt" and custody_inspector is None:
             _win32_apply_owner_only_dacl(tmp)
         os.replace(tmp, path)
+        if os.name == "posix":
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(dir_fd)
     except OSError as exc:
         try:
             if tmp.exists():
@@ -2563,6 +2746,10 @@ class Mt5NativePythonTransport:
             raise LiveAuthorizationError(
                 f"LIVE dispatch on {creds.broker_id} refused: missing verified LiveAuthorizationContext"
             )
+        if creds.live_auth_context.key_file_identity is None:
+            raise LiveAuthorizationError(
+                f"LIVE dispatch on {creds.broker_id} refused: LiveAuthorizationContext lacks verified key_file_identity"
+            )
         check_now = self._clock() if now is None else utc_time(now, "now")
         creds.live_auth_context.verify_provenance(
             now=check_now,
@@ -2737,11 +2924,20 @@ class Mt5SpoolBridgeTransport:
         valve_admission_key_file: str | Path | None = None,
         custody_inspector: SpoolCustodyInspector | None = None,
         clock: Callable[[], datetime] | None = None,
+        max_snapshot_age_seconds_demo: float = 15.0,
+        max_snapshot_age_seconds_live: float = 5.0,
+        max_tick_age_ms_demo: int = 60_000,
+        max_tick_age_ms_live: int = 15_000,
+        max_future_skew_seconds: float = 5.0,
     ) -> None:
         if not isinstance(spool_dir, (str, Path)) or not str(spool_dir).strip():
             raise Mt5NotConfiguredError("spool_dir must be a non-empty path")
         if not (0 < receipt_timeout_seconds <= 300) or not (0 < poll_interval_seconds <= 5):
             raise ContractError("receipt timeout must be in (0, 300] s and poll interval in (0, 5] s")
+        if max_snapshot_age_seconds_demo <= 0 or max_snapshot_age_seconds_live <= 0 or max_future_skew_seconds < 0:
+            raise ContractError("snapshot freshness bounds must be positive")
+        if max_tick_age_ms_demo <= 0 or max_tick_age_ms_live <= 0:
+            raise ContractError("tick freshness bounds must be positive")
         self.spool_dir = Path(spool_dir)
         self.key_dir = resolve_spool_key_dir(self.spool_dir, key_dir=key_dir)
         self.valve_key_file = _valve_admission_key_path(
@@ -2749,6 +2945,11 @@ class Mt5SpoolBridgeTransport:
         )
         self._custody_inspector = custody_inspector
         self._clock = clock or _utc_now
+        self._max_snapshot_age_demo = float(max_snapshot_age_seconds_demo)
+        self._max_snapshot_age_live = float(max_snapshot_age_seconds_live)
+        self._max_tick_age_ms_demo = int(max_tick_age_ms_demo)
+        self._max_tick_age_ms_live = int(max_tick_age_ms_live)
+        self._max_future_skew_seconds = float(max_future_skew_seconds)
         self._timeout = float(receipt_timeout_seconds)
         self._poll = float(poll_interval_seconds)
         self._sleep = sleep
@@ -2764,6 +2965,10 @@ class Mt5SpoolBridgeTransport:
         self._global_nonce_ledger = _SpoolReplayLedger(
             self.key_dir / ".global_outbound_nonce.json",
             custody_inspector=custody_inspector,
+        )
+        self._snapshot_seq_lock = threading.RLock()
+        self._snapshot_seq_path = (
+            _spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.snapshot_seq.json"
         )
         self._prepared_nonces: dict[str, int] = {}
 
@@ -2846,6 +3051,10 @@ class Mt5SpoolBridgeTransport:
             raise LiveAuthorizationError(
                 f"LIVE dispatch on {creds.broker_id} refused: missing verified LiveAuthorizationContext"
             )
+        if creds.live_auth_context.key_file_identity is None:
+            raise LiveAuthorizationError(
+                f"LIVE dispatch on {creds.broker_id} refused: LiveAuthorizationContext lacks verified key_file_identity"
+            )
         check_now = self._clock() if now is None else utc_time(now, "now")
         creds.live_auth_context.verify_provenance(
             now=check_now,
@@ -2861,6 +3070,48 @@ class Mt5SpoolBridgeTransport:
             reverify_ticket=True,
         )
 
+    def _verify_and_record_snapshot_seq(self, seq_val: int, mac_hex: str) -> None:
+        with self._snapshot_seq_lock:
+            if os.path.lexists(self._snapshot_seq_path):
+                state = _read_spool_json(
+                    self._snapshot_seq_path,
+                    max_bytes=65536,
+                    custody_inspector=self._custody_inspector,
+                )
+                if type(state) is not dict:
+                    raise Mt5SnapshotIntegrityError("corrupted MT5 consumer snapshot_seq ledger")
+                last_seq_raw = state.get("last_snapshot_seq")
+                last_mac = str(state.get("last_snapshot_hmac", "")).lower()
+                if type(last_seq_raw) is not str or not last_seq_raw.isdigit() or not _HEX64_RE.fullmatch(last_mac):
+                    raise Mt5SnapshotIntegrityError("corrupted MT5 consumer snapshot_seq ledger fields")
+                last_seq = int(last_seq_raw)
+                if seq_val < last_seq:
+                    raise Mt5SnapshotIntegrityError(
+                        f"MT5 market snapshot_seq rollback rejected ({seq_val} < {last_seq})"
+                    )
+                if seq_val == last_seq:
+                    if hmac.compare_digest(mac_hex, last_mac):
+                        return
+                    raise Mt5SnapshotIntegrityError(
+                        f"MT5 market snapshot_seq={seq_val} equivocation rejected"
+                    )
+            _atomic_write_json(
+                self._snapshot_seq_path,
+                {"last_snapshot_seq": str(seq_val), "last_snapshot_hmac": mac_hex},
+                custody_inspector=self._custody_inspector,
+            )
+            reread = _read_spool_json(
+                self._snapshot_seq_path,
+                max_bytes=65536,
+                custody_inspector=self._custody_inspector,
+            )
+            if (
+                type(reread) is not dict
+                or reread.get("last_snapshot_seq") != str(seq_val)
+                or not hmac.compare_digest(str(reread.get("last_snapshot_hmac", "")).lower(), mac_hex)
+            ):
+                raise Mt5SnapshotIntegrityError("MT5 consumer snapshot_seq persistence verification failed")
+
     def _market_doc(self) -> dict[str, Any]:
         path = self.spool_dir / "market_ticks.json"
         try:
@@ -2868,23 +3119,71 @@ class Mt5SpoolBridgeTransport:
         except FileNotFoundError:
             raise Mt5TransportError("market_ticks.json not published yet; is CasForexMt5Bridge EA running?") from None
         if type(doc) is not dict or doc.get("protocol") != MT5_SPOOL_PROTOCOL:
-            raise Mt5TransportError("market_ticks.json protocol mismatch")
-        if "connected" in doc and type(doc["connected"]) is not bool:
-            raise Mt5TransportError("market_ticks.json connected field must be a boolean")
+            raise Mt5SnapshotIntegrityError("market_ticks.json protocol mismatch")
+        if type(doc.get("connected")) is not bool:
+            raise Mt5SnapshotIntegrityError("market_ticks.json connected field must be a boolean")
         creds = self._credentials
+        expected_channel = self._channel_for(creds)
+        doc_channel = str(doc.get("broker_channel", "")).strip().lower()
+        if doc_channel != expected_channel:
+            raise Mt5SnapshotIntegrityError(
+                f"market_ticks.json broker_channel mismatch ({doc_channel!r} != {expected_channel!r})"
+            )
+        channel_key, expected_key_id = self._channel_hmac_key_and_id(creds)
+        if str(doc.get("channel_key_id", "")) != expected_key_id:
+            raise Mt5SnapshotIntegrityError("market_ticks.json channel_key_id mismatch")
+        actual_mac = str(doc.get("snapshot_hmac_sha256", "")).lower()
+        if not _HEX64_RE.fullmatch(actual_mac):
+            raise Mt5SnapshotIntegrityError("market_ticks.json missing or invalid snapshot_hmac_sha256")
+        expected_mac = compute_mt5_market_snapshot_hmac(doc, channel_key=channel_key)
+        if not hmac.compare_digest(expected_mac, actual_mac):
+            raise Mt5SnapshotIntegrityError("market_ticks.json snapshot_hmac_sha256 verification failed")
+
         expected_mode = creds.execution_mode if creds else EXECUTION_MODE_DEMO
         broker_id = creds.broker_id if creds else "MT5"
         reported_mode = doc.get("account_trade_mode")
+        doc_exec_mode = str(doc.get("execution_mode", "")).strip().upper()
         if expected_mode == EXECUTION_MODE_DEMO:
-            if reported_mode != "DEMO":
+            if reported_mode != "DEMO" or doc_exec_mode != EXECUTION_MODE_DEMO:
                 raise LiveBrokerEndpointForbiddenError("MT5 EA reports a non-DEMO account; live/real accounts are forbidden")
             validate_demo_server(broker_id, str(doc.get("server", "")))
         else:
-            if reported_mode != "REAL":
+            if reported_mode != "REAL" or doc_exec_mode != EXECUTION_MODE_LIVE:
                 raise ContractError("LIVE execution mode requires MT5 EA account_trade_mode=REAL")
             validate_mt5_server_name(
                 broker_id, str(doc.get("server", "")), execution_mode=EXECUTION_MODE_LIVE, live_armed=True
             )
+
+        acct = doc.get("account")
+        if type(acct) is not dict:
+            raise Mt5SnapshotIntegrityError("market_ticks.json missing account object")
+        login_raw = acct.get("login")
+        if not isinstance(login_raw, str) or not _LOGIN_RE.fullmatch(login_raw):
+            raise Mt5SnapshotIntegrityError("account.login must be a decimal string")
+        if creds is not None:
+            if login_raw.strip() != str(creds.login):
+                raise Mt5SnapshotIntegrityError("market_ticks.json account.login does not match bound credentials")
+            if str(doc.get("server", "")).strip().casefold() != creds.server.strip().casefold():
+                raise Mt5SnapshotIntegrityError("market_ticks.json server does not match bound credentials")
+
+        try:
+            obs_dt = _parse_iso(doc.get("observed_at"), "observed_at")
+        except Mt5TransportError as exc:
+            raise Mt5SnapshotIntegrityError(str(exc)) from None
+        now_dt = self._clock()
+        age_sec = (now_dt - obs_dt).total_seconds()
+        if age_sec < -self._max_future_skew_seconds:
+            raise Mt5SnapshotIntegrityError("market_ticks.json observed_at exceeds max future clock skew")
+        max_age = self._max_snapshot_age_live if expected_mode == EXECUTION_MODE_LIVE else self._max_snapshot_age_demo
+        if age_sec > max_age:
+            raise Mt5SnapshotIntegrityError(
+                f"market_ticks.json observed_at is stale (age={age_sec:.2f}s > {max_age:.2f}s)"
+            )
+
+        seq_raw = doc.get("snapshot_seq")
+        if type(seq_raw) is not str or not seq_raw.isdigit() or int(seq_raw) <= 0 or str(int(seq_raw)) != seq_raw:
+            raise Mt5SnapshotIntegrityError("market_ticks.json snapshot_seq must be a positive decimal string")
+        self._verify_and_record_snapshot_seq(int(seq_raw), actual_mac)
         return doc
 
     def account_info(self) -> Mt5AccountSnapshot:
@@ -2918,7 +3217,7 @@ class Mt5SpoolBridgeTransport:
             connected=connected,
         )
 
-    def symbol_tick(self, symbol: str) -> Mt5Tick:
+    def symbol_tick(self, symbol: str, *, require_fresh_tick: bool = True) -> Mt5Tick:
         Mt5MarginCalculator.split_symbol(symbol)
         doc = self._market_doc()
         if doc.get("connected", True) is False:
@@ -2928,13 +3227,28 @@ class Mt5SpoolBridgeTransport:
         ticks = doc.get("ticks")
         if type(ticks) is not list:
             raise Mt5TransportError("market_ticks.json missing ticks list")
+        creds = self._credentials
+        expected_mode = creds.execution_mode if creds else EXECUTION_MODE_DEMO
+        max_tick_age_ms = self._max_tick_age_ms_live if expected_mode == EXECUTION_MODE_LIVE else self._max_tick_age_ms_demo
+        now_ms = int(self._clock().timestamp() * 1000)
+        future_ms = int(self._max_future_skew_seconds * 1000)
         for item in ticks:
             if type(item) is dict and isinstance(item.get("symbol"), str) and normalize_market_symbol(item["symbol"]) == symbol:
+                msc_raw = item.get("time_msc")
+                if type(msc_raw) is not str or not msc_raw.isdigit() or int(msc_raw) <= 0:
+                    raise Mt5SnapshotIntegrityError(f"MT5 tick for {symbol} has invalid time_msc")
+                tick_ms = int(msc_raw)
+                if tick_ms > now_ms + future_ms:
+                    raise Mt5SnapshotIntegrityError(f"MT5 tick time_msc for {symbol} exceeds future skew")
+                if require_fresh_tick and (now_ms - tick_ms) > max_tick_age_ms:
+                    raise Mt5SnapshotIntegrityError(
+                        f"MT5 tick for {symbol} is stale (age_ms={now_ms - tick_ms} > {max_tick_age_ms})"
+                    )
                 return Mt5Tick(
                     symbol=symbol,
                     bid=_wire_decimal(item.get("bid"), "bid", positive=True),  # type: ignore[arg-type]
                     ask=_wire_decimal(item.get("ask"), "ask", positive=True),  # type: ignore[arg-type]
-                    time_msc=_ticket_text(item.get("time_msc"), "time_msc"),
+                    time_msc=msc_raw,
                 )
         raise Mt5TransportError(f"no published MT5 tick for {symbol}")
 
@@ -3021,11 +3335,15 @@ class Mt5SpoolBridgeTransport:
                 monotonic_nonce=nonce_val,
                 channel_key_id=request.channel_key_id or expected_key_id,
             )
-        mkt_doc = self._market_doc()
-        obs_raw = mkt_doc.get("observed_at")
-        term_now = _parse_iso(obs_raw, "observed_at") if isinstance(obs_raw, str) and obs_raw.strip() else _utc_now()
-        eff_issued = request.issued_at if request.issued_at is not None else term_now
-        eff_expires = request.expires_at if request.expires_at is not None else (eff_issued + timedelta(seconds=30))
+        if request.issued_at is not None and request.expires_at is not None:
+            eff_issued = request.issued_at
+            eff_expires = request.expires_at
+        else:
+            mkt_doc = self._market_doc()
+            obs_raw = mkt_doc.get("observed_at")
+            term_now = _parse_iso(obs_raw, "observed_at") if isinstance(obs_raw, str) and obs_raw.strip() else _utc_now()
+            eff_issued = request.issued_at if request.issued_at is not None else term_now
+            eff_expires = request.expires_at if request.expires_at is not None else (eff_issued + timedelta(seconds=30))
         return _dc.replace(
             request,
             monotonic_nonce=nonce_val,
@@ -3233,6 +3551,11 @@ class Mt5SpoolPaperTerminalEmulator:
             _spool_meta_root(self.spool_dir) / ".global_emu_replay.json",
             custody_inspector=custody_inspector,
         )
+        self._snapshot_seq_lock = threading.RLock()
+        self._snapshot_seq_path = (
+            _spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.emu_snapshot_seq.json"
+        )
+        self._replay_ledger_healthy: bool = True
         self.connected: bool = connected
         self._simulate_raw_zero_when_offline: bool = False
         self._has_connected_account: bool = bool(connected and balance > Decimal("0"))
@@ -3329,10 +3652,48 @@ class Mt5SpoolPaperTerminalEmulator:
             out_equity = self._last_connected_equity
             out_margin = self._last_connected_margin
             out_free = self._last_connected_margin_free
+        with self._snapshot_seq_lock:
+            last_seq = 0
+            if os.path.lexists(self._snapshot_seq_path):
+                seq_state = _read_spool_json(
+                    self._snapshot_seq_path,
+                    max_bytes=65536,
+                    custody_inspector=self._custody_inspector,
+                )
+                if type(seq_state) is not dict:
+                    raise Mt5TransportError("corrupted emulator snapshot_seq ledger")
+                seq_raw = seq_state.get("last_snapshot_seq", "0")
+                if type(seq_raw) is not str or not seq_raw.isdigit():
+                    raise Mt5TransportError("corrupted emulator snapshot_seq ledger value")
+                last_seq = int(seq_raw)
+            next_seq = last_seq + 1
+            _atomic_write_json(
+                self._snapshot_seq_path,
+                {"last_snapshot_seq": str(next_seq)},
+                custody_inspector=self._custody_inspector,
+            )
+            reread_seq = _read_spool_json(
+                self._snapshot_seq_path,
+                max_bytes=65536,
+                custody_inspector=self._custody_inspector,
+            )
+            if type(reread_seq) is not dict or reread_seq.get("last_snapshot_seq") != str(next_seq):
+                raise Mt5TransportError("emulator snapshot_seq persistence verification failed")
+
+        _, channel_key, key_id = self._channel_hmac_key_and_id()
+        eff_exec_mode = (
+            EXECUTION_MODE_LIVE
+            if str(self.trade_mode).upper() == "REAL"
+            else (EXECUTION_MODE_DEMO if str(self.trade_mode).upper() == "DEMO" else self.execution_mode)
+        )
         now = self._clock()
         time_msc = str(int(now.timestamp() * 1000))
         doc = {
             "protocol": MT5_SPOOL_PROTOCOL,
+            "broker_channel": self.broker_channel,
+            "channel_key_id": key_id,
+            "execution_mode": eff_exec_mode,
+            "snapshot_seq": str(next_seq),
             "connected": bool(self.connected),
             "server": self.server,
             "account_trade_mode": self.trade_mode,
@@ -3372,6 +3733,7 @@ class Mt5SpoolPaperTerminalEmulator:
                 else []
             ),
         }
+        doc["snapshot_hmac_sha256"] = compute_mt5_market_snapshot_hmac(doc, channel_key=channel_key)
         _atomic_write_json(self.spool_dir / "market_ticks.json", doc, custody_inspector=self._custody_inspector)
 
     def _receipt(
@@ -3459,15 +3821,28 @@ class Mt5SpoolPaperTerminalEmulator:
         )
         if not valve_ok:
             return self._receipt(req, "REJECTED", 10017, message=valve_reason[:60])
-        # 7. Per-channel monotonic nonce + global replay domain (Finding [9])
+        # 7. Per-channel monotonic nonce + global replay domain (Finding [9], fail-closed persistence)
+        if not self._replay_ledger_healthy:
+            return self._receipt(req, "REJECTED", 10013, message="replay ledger persistence failed")
         nonce_raw = str(req.get("monotonic_nonce", ""))
         if not nonce_raw.isdigit() or int(nonce_raw) <= 0:
             return self._receipt(req, "REJECTED", 10013, message="invalid monotonic_nonce")
         try:
-            self._global_replay_ledger.verify_and_record_global_id(request_id=req_id)
-            self._replay_ledger.verify_and_record(request_id=req_id, nonce=int(nonce_raw))
-        except Mt5TransportError:
+            _, global_seen = self._global_replay_ledger.load()
+            chan_nonce, chan_seen = self._replay_ledger.load()
+        except (Mt5TransportError, OSError):
+            self._replay_ledger_healthy = False
+            return self._receipt(req, "REJECTED", 10013, message="replay ledger persistence failed")
+        if int(nonce_raw) <= chan_nonce or req_id in chan_seen[-512:] or req_id in global_seen:
             return self._receipt(req, "REJECTED", 10013, message="replayed nonce or request_id")
+        try:
+            self._replay_ledger.verify_and_record(request_id=req_id, nonce=int(nonce_raw))
+            self._global_replay_ledger.verify_and_record_global_id(request_id=req_id)
+        except Mt5SpoolReplayError:
+            return self._receipt(req, "REJECTED", 10013, message="replayed nonce or request_id")
+        except (Mt5TransportError, OSError):
+            self._replay_ledger_healthy = False
+            return self._receipt(req, "REJECTED", 10013, message="replay ledger persistence failed")
         if not self.connected:
             return self._receipt(req, "REJECTED", 10031, message=STATUS_BROKER_OFFLINE)
         action = req["action"]
@@ -4313,7 +4688,7 @@ class Mt5PaperBrokerVenue:
                 raise Mt5MarginRefusalError(f"OPEN volume {decimal_text(lots)} lots exceeds venue cap {decimal_text(self._max_lots)}")
             try:
                 quotes = self._quotes_for(order.symbol)
-            except Mt5PreDispatchTransportError:
+            except (Mt5PreDispatchTransportError, Mt5SnapshotIntegrityError, LiveAuthorizationError, LiveBrokerEndpointForbiddenError):
                 raise
             except (Mt5TransportError, OSError) as exc:
                 raise Mt5PreDispatchTransportError(
@@ -4339,7 +4714,7 @@ class Mt5PaperBrokerVenue:
                     raise Mt5MarginRefusalError("current bid is below the SELL limit price; not sent")
             try:
                 account = self._apply_account_snapshot(self._transport.account_info())
-            except Mt5PreDispatchTransportError:
+            except (Mt5PreDispatchTransportError, Mt5SnapshotIntegrityError, LiveAuthorizationError, LiveBrokerEndpointForbiddenError):
                 raise
             except (Mt5TransportError, OSError) as exc:
                 raise Mt5PreDispatchTransportError(
@@ -4425,7 +4800,7 @@ class Mt5PaperBrokerVenue:
         if hasattr(self._transport, "prepare_request"):
             try:
                 request = self._transport.prepare_request(request)
-            except Mt5PreDispatchTransportError:
+            except (Mt5PreDispatchTransportError, Mt5SnapshotIntegrityError, LiveAuthorizationError, LiveBrokerEndpointForbiddenError):
                 raise
             except (Mt5TransportError, OSError) as exc:
                 raise Mt5PreDispatchTransportError(

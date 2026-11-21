@@ -199,6 +199,7 @@ class _Rig:
             sleep=self.emus[broker_id].sleep_hook,
             poll_interval_seconds=0.01,
             receipt_timeout_seconds=5,
+            clock=self.clock,
         )
 
     def oanda_factory(self, env):

@@ -10,8 +10,8 @@ Deterministic Spot-FX execution engine, **ForexMetaValveGate** safety boundary, 
 - **16-Pair Live Market Stream & Candlestick Cockpit (Phase 6)**:
   - Expands spot-FX coverage across 16 major and cross currency pairs (`EUR/USD`, `GBP/USD`, `USD/JPY`, `USD/CHF`, `AUD/USD`, `USD/CAD`, `NZD/USD`, `EUR/GBP`, `EUR/JPY`, `GBP/JPY`, `EUR/CHF`, `EUR/AUD`, `EUR/CAD`, `AUD/JPY`, `CHF/JPY`, `CAD/JPY`).
   - Zero-dependency strict-CSP SVG candlestick + volume + 14-EMA + live Bid/Ask + Entry/Protective Stop + `ForexMetaValveGate` status chart (`ui/src/chart.mjs`) wired into `01 Operate` with `Single` and `4x Quad` views.
-- **Continuous AI-Agent PR Auto-Merger (`.github/workflows/agent-pr-automerge.yml`)**:
-  - Runs every 15 minutes (`*/15 * * * *`) and immediately after CI completion to verify and squash-merge passing non-draft PRs from authorized repository branches continuously until `docs/REVAMP_COMPLETION_GATE.json` marks `revamp_completed: true`.
+- **Continuous AI-Agent PR Auto-Merger (`scripts/agent_pr_merger.py`; documented template `docs/github-workflows/agent-pr-automerge.yml`, not active `.github/workflows/...`)**:
+  - Runs on `*/15 * * * *` / CI completion to verify and `--match-head-commit` squash-merge passing non-draft PRs only after enforcing immutable GitHub user/App IDs, exact `headRepository.nameWithOwner` matching, SHA-bound owner `APPROVED` review/event verification (labels are intent-only), and provenance-verified paginated checks (`15368` + trusted workflow paths/IDs) until `docs/REVAMP_COMPLETION_GATE.json` marks `revamp_completed: true`.
 
 ## Verification Suites
 

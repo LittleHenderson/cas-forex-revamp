@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import http.client
 import json
+import os
 from pathlib import Path
 import secrets
 import sqlite3
@@ -284,11 +285,17 @@ class TestFinding02TradovateAtomicOsoBracketProtection(unittest.TestCase):
         ) -> dict[str, Any]:
             calls.append((method, endpoint_path))
             if endpoint_path == "order/placeOSO":
-                return {"orderId": 4001, "oso1Id": 4002, "oso2Id": 4003}
-            if endpoint_path == "order/item?id=4002":
-                return {"id": 4002, "action": "Sell", "ordStatus": "Working"}
-            if endpoint_path == "order/item?id=4003":
-                return {"id": 4003, "action": "Sell", "ordStatus": "Working"}
+                self.assertEqual((payload or {}).get("accountId"), "TV-DEMO-5501")
+                self.assertEqual((payload or {}).get("accountSpec"), "TV-DEMO-5501")
+                return {"orderId": 4001, "oso1Id": 4002, "oso2Id": 4003, "accountId": "TV-DEMO-5501"}
+            if endpoint_path.startswith("order/item?") and "id=4002" in endpoint_path:
+                self.assertIn("accountId=TV-DEMO-5501", endpoint_path)
+                self.assertIn("accountSpec=TV-DEMO-5501", endpoint_path)
+                return {"id": 4002, "accountId": "TV-DEMO-5501", "action": "Sell", "ordStatus": "Working"}
+            if endpoint_path.startswith("order/item?") and "id=4003" in endpoint_path:
+                self.assertIn("accountId=TV-DEMO-5501", endpoint_path)
+                self.assertIn("accountSpec=TV-DEMO-5501", endpoint_path)
+                return {"id": 4003, "accountId": "TV-DEMO-5501", "action": "Sell", "ordStatus": "Working"}
             raise AssertionError(f"Unexpected endpoint {endpoint_path}")
 
         def fake_list(
@@ -298,9 +305,13 @@ class TestFinding02TradovateAtomicOsoBracketProtection(unittest.TestCase):
             require_auth: bool = True,
         ) -> list[dict[str, Any]]:
             calls.append((method, endpoint_path))
-            if endpoint_path == "orderVersion/deps?masterid=4002":
+            if endpoint_path.startswith("orderVersion/deps?") and "masterid=4002" in endpoint_path:
+                self.assertIn("accountId=TV-DEMO-5501", endpoint_path)
+                self.assertIn("accountSpec=TV-DEMO-5501", endpoint_path)
                 return [{"orderType": "Stop", "orderQty": 1, "stopPrice": Decimal("19975.25")}]
-            if endpoint_path == "orderVersion/deps?masterid=4003":
+            if endpoint_path.startswith("orderVersion/deps?") and "masterid=4003" in endpoint_path:
+                self.assertIn("accountId=TV-DEMO-5501", endpoint_path)
+                self.assertIn("accountSpec=TV-DEMO-5501", endpoint_path)
                 return [{"orderType": "Limit", "orderQty": 1, "price": Decimal("20060.25")}]
             raise AssertionError(f"Unexpected list endpoint {endpoint_path}")
 
@@ -326,10 +337,11 @@ class TestFinding02TradovateAtomicOsoBracketProtection(unittest.TestCase):
         self.assertEqual(receipt.order_id, "4001")
         self.assertEqual(receipt.stop_loss_order_id, "4002")
         self.assertEqual(receipt.take_profit_order_id, "4003")
-        self.assertIn(("GET", "order/item?id=4002"), calls)
-        self.assertIn(("GET", "orderVersion/deps?masterid=4002"), calls)
-        self.assertIn(("GET", "order/item?id=4003"), calls)
-        self.assertIn(("GET", "orderVersion/deps?masterid=4003"), calls)
+        called_paths = [ep for _, ep in calls]
+        self.assertTrue(any(ep.startswith("order/item?") and "id=4002" in ep for ep in called_paths))
+        self.assertTrue(any(ep.startswith("orderVersion/deps?") and "masterid=4002" in ep for ep in called_paths))
+        self.assertTrue(any(ep.startswith("order/item?") and "id=4003" in ep for ep in called_paths))
+        self.assertTrue(any(ep.startswith("orderVersion/deps?") and "masterid=4003" in ep for ep in called_paths))
 
     def test_https_place_protected_order_refuses_missing_or_mismatched_child_protections(self) -> None:
         base_req = TradovateOrderRequest(
@@ -456,16 +468,23 @@ class TestFinding02TradovateAtomicOsoBracketProtection(unittest.TestCase):
         self.assertEqual(venue_reopened.emergency_close_all(), ())
 
         # Reconciling with broker confirming unprotected working order keeps latch active!
+        transport._order_history.append(
+            {
+                "accountId": transport.account_id,
+                "clOrdId": cl_id,
+                "orderId": "7771",
+                "ordStatus": "Filled",
+                "filledQty": 1,
+            }
+        )
         rec_still_unprot = venue_reopened.reconcile_unknown_outcome(
             cl_ord_id=cl_id,
-            broker_orders=[{"clOrdId": cl_id, "orderId": "7771", "ordStatus": "Filled", "filledQty": 1}],
         )
         self.assertTrue(rec_still_unprot["freeze_active"])
 
         # Once broker confirms order absent / flattened externally with no open position, latch clears.
         rec_clear = venue_reopened.reconcile_unknown_outcome(
             cl_ord_id=cl_id,
-            broker_orders=[{"clOrdId": cl_id, "orderId": "7771", "ordStatus": "Filled", "filledQty": 1}],
             confirm_protection_resolved=True,
         )
         self.assertFalse(rec_clear["freeze_active"])
@@ -511,13 +530,29 @@ class TestFinding02TradovateAtomicOsoBracketProtection(unittest.TestCase):
 
         def fake_json(m: str, ep: str, *, payload: dict[str, Any] | None = None, require_auth: bool = True) -> dict[str, Any]:
             calls.append((m, ep, dict(payload) if payload is not None else None))
-            return {"orderId": 8800 + len(calls)}
+            self.assertEqual((payload or {}).get("accountId"), "TV-DEMO-5501")
+            self.assertEqual((payload or {}).get("accountSpec"), "TV-DEMO-5501")
+            resp_doc: dict[str, Any] = {
+                "orderId": 8800 + len(calls),
+                "accountId": "TV-DEMO-5501",
+                "clOrdId": (payload or {}).get("clOrdId"),
+            }
+            if ep == "order/modifyOrder":
+                resp_doc["ordStatus"] = "Working"
+                resp_doc["stopPrice"] = (payload or {}).get("stopPrice")
+            elif ep == "order/liquidatePosition":
+                resp_doc["ordStatus"] = "Filled"
+                resp_doc["filledQty"] = 1
+            return resp_doc
 
         def fake_list(m: str, ep: str, *, require_auth: bool = True) -> list[dict[str, Any]]:
             calls.append((m, ep, None))
+            self.assertIn("accountId=TV-DEMO-5501", ep)
+            self.assertIn("accountSpec=TV-DEMO-5501", ep)
             return [
                 {
                     "id": "POS-99",
+                    "accountId": "TV-DEMO-5501",
                     "contractCode": "MNQZ6",
                     "rootSymbol": "MNQ",
                     "netPos": 1,
@@ -789,18 +824,25 @@ class TestFinding03TradovateIdempotencyAndOutcomeUnknownFreeze(unittest.TestCase
         emu.set_connected(True)
 
         # 2. Reconciling when broker reports still-ambiguous PendingNew MUST retain latch.
-        ambig_rec = venue2.reconcile_unknown_outcome(
-            cl_ord_id=crashed_cl,
-            broker_orders=[{"clOrdId": crashed_cl, "orderId": "3001", "ordStatus": "PendingNew"}],
+        emu._order_history.clear()
+        emu._order_history.append(
+            {
+                "accountId": emu.account_id,
+                "clOrdId": crashed_cl,
+                "orderId": "3001",
+                "ordStatus": "PendingNew",
+            }
         )
+        ambig_rec = venue2.reconcile_unknown_outcome(cl_ord_id=crashed_cl)
         self.assertTrue(ambig_rec["freeze_active"])
         self.assertTrue(venue2.snapshot()["outcome_unknown_freeze"])
 
         # 3. Reconciling against broker order history confirming filled WITH verified stop + TP clears latch!
-        good_rec = venue2.reconcile_unknown_outcome(
-            cl_ord_id=crashed_cl,
-            broker_orders=[
+        emu._order_history.clear()
+        emu._order_history.extend(
+            [
                 {
+                    "accountId": emu.account_id,
                     "clOrdId": crashed_cl,
                     "orderId": "3001",
                     "oso1Id": "3002",
@@ -809,6 +851,7 @@ class TestFinding03TradovateIdempotencyAndOutcomeUnknownFreeze(unittest.TestCase
                     "filledQty": 1,
                 },
                 {
+                    "accountId": emu.account_id,
                     "id": "3002",
                     "action": "Sell",
                     "orderType": "Stop",
@@ -817,6 +860,7 @@ class TestFinding03TradovateIdempotencyAndOutcomeUnknownFreeze(unittest.TestCase
                     "ordStatus": "Working",
                 },
                 {
+                    "accountId": emu.account_id,
                     "id": "3003",
                     "action": "Sell",
                     "orderType": "Limit",
@@ -824,8 +868,9 @@ class TestFinding03TradovateIdempotencyAndOutcomeUnknownFreeze(unittest.TestCase
                     "price": Decimal("20060.25"),
                     "ordStatus": "Working",
                 },
-            ],
+            ]
         )
+        good_rec = venue2.reconcile_unknown_outcome(cl_ord_id=crashed_cl)
         self.assertFalse(good_rec["freeze_active"])
         self.assertEqual(good_rec["reconciled"][0]["new_status"], "RECONCILED_FILLED_PROTECTED")
         self.assertFalse(venue2.snapshot()["outcome_unknown_freeze"])
@@ -1025,6 +1070,7 @@ class TestFinding06TradovateCryptographicLiveAuthorization(unittest.TestCase):
         )
         ticket_file = self.tmp / "sink_reval.ticket.json"
         ticket_file.write_text(json.dumps(ticket), encoding="utf-8")
+        os.chmod(ticket_file, 0o600)
 
         creds = load_tradovate_credentials(
             {

@@ -132,6 +132,7 @@ __all__ = [
     "DEFAULT_PAPER_STARTING_EQUITY_USD",
     "ENV_LIVE_ARM_PHRASE",
     "ENV_TRADOVATE_ACCOUNT_ID",
+    "ENV_TRADOVATE_ACCOUNT_SPEC",
     "ENV_TRADOVATE_APP_ID",
     "ENV_TRADOVATE_BASE_URL",
     "ENV_TRADOVATE_CID",
@@ -176,6 +177,7 @@ __all__ = [
     "TradovatePosition",
     "TradovateProtectionUnconfirmedError",
     "TradovateQuote",
+    "TradovateReconciliationEvidence",
     "TradovateStaleQuoteError",
     "TradovateStandbyError",
     "TradovateTransport",
@@ -249,6 +251,7 @@ ENV_TRADOVATE_CID = _tradovate_env_var("CID")
 ENV_TRADOVATE_SEC = _tradovate_env_var("SEC")
 ENV_TRADOVATE_BASE_URL = _tradovate_env_var("BASE", "URL")
 ENV_TRADOVATE_ACCOUNT_ID = _tradovate_env_var("ACCOUNT", "ID")
+ENV_TRADOVATE_ACCOUNT_SPEC = _tradovate_env_var("ACCOUNT", "SPEC")
 ENV_LIVE_ARM_PHRASE = "_".join(("CAS", "FOREX", "LIVE", "ARM", "PHRASE"))
 
 _QUANT_2 = Decimal("0.01")
@@ -630,6 +633,39 @@ def _encode_wire_json_bytes(payload: Mapping[str, Any]) -> bytes:
     return _encode_wire_json_str(payload).encode("utf-8")
 
 
+def _parse_utc_timestamp(raw: Any, *, field: str) -> datetime:
+    if isinstance(raw, datetime):
+        if raw.tzinfo is None or raw.utcoffset() is None:
+            raise TradovateTransportError(
+                f"{field} has naive timestamp (UTC timezone required)",
+                ambiguous=True,
+            )
+        return raw.astimezone(timezone.utc)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            raise TradovateTransportError(f"{field} is empty", ambiguous=True)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise TradovateTransportError(
+                f"{field} has unparseable timestamp: {raw!r}",
+                ambiguous=True,
+            ) from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise TradovateTransportError(
+                f"{field} lacks timezone offset: {raw!r}",
+                ambiguous=True,
+            )
+        return parsed.astimezone(timezone.utc)
+    raise TradovateTransportError(
+        f"{field} has invalid timestamp type: {type(raw).__name__}",
+        ambiguous=True,
+    )
+
+
 def _compute_stable_cl_ord_id(
     *,
     account_id: str,
@@ -640,20 +676,22 @@ def _compute_stable_cl_ord_id(
     contracts: int,
     stop_loss_price: Decimal | None,
     take_profit_price: Decimal | None,
+    target_id: str | None = None,
 ) -> str:
-    canonical = "|".join(
-        (
-            "cas-tv-clord/1",
-            account_id.strip(),
-            idempotency_key.strip(),
-            contract_code.strip().upper(),
-            action.strip().upper(),
-            (side or "").strip().upper(),
-            str(contracts),
-            decimal_text(stop_loss_price) if stop_loss_price is not None else "",
-            decimal_text(take_profit_price) if take_profit_price is not None else "",
-        )
-    )
+    parts: list[str] = [
+        "cas-tv-clord/1",
+        account_id.strip(),
+        idempotency_key.strip(),
+        contract_code.strip().upper(),
+        action.strip().upper(),
+        (side or "").strip().upper(),
+        str(contracts),
+        decimal_text(stop_loss_price) if stop_loss_price is not None else "",
+        decimal_text(take_profit_price) if take_profit_price is not None else "",
+    ]
+    if target_id is not None and target_id.strip():
+        parts.append(target_id.strip())
+    canonical = "|".join(parts)
     digest = sha256(canonical.encode("utf-8")).hexdigest()
     return f"cas-tv-{digest[:24]}"
 
@@ -874,6 +912,7 @@ class TradovateCredentials:
     cid: str = ""
     sec: _RedactedSecret | None = None
     bearer_token: _RedactedSecret | None = None
+    account_spec: str = ""
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
@@ -884,6 +923,10 @@ class TradovateCredentials:
             raise ContractError("account_id must be a string")
         _check_no_control_chars(self.account_id, "account_id")
         norm_account_id = self.account_id.strip()
+        if not isinstance(self.account_spec, str):
+            raise ContractError("account_spec must be a string")
+        _check_no_control_chars(self.account_spec, "account_spec")
+        norm_account_spec = self.account_spec.strip()
         if self.live_auth_context is not None and not isinstance(
             self.live_auth_context, LiveAuthorizationContext
         ):
@@ -924,12 +967,17 @@ class TradovateCredentials:
         object.__setattr__(self, "mode", norm_mode)
         object.__setattr__(self, "base_url", canonical_url)
         object.__setattr__(self, "account_id", norm_account_id)
+        object.__setattr__(self, "account_spec", norm_account_spec)
         object.__setattr__(self, "auth_checked_at", checked_at)
         object.__setattr__(
             self,
             "live_arming_verified",
             bool(norm_mode == TRADOVATE_MODE_LIVE and self.live_auth_context is not None),
         )
+
+    @property
+    def effective_account_spec(self) -> str:
+        return self.account_spec.strip() or self.account_id.strip()
 
     def has_api_credentials(self) -> bool:
         return bool(
@@ -1010,6 +1058,7 @@ def load_tradovate_credentials(
         if isinstance(account_id, str) and account_id.strip()
         else str(env.get(ENV_TRADOVATE_ACCOUNT_ID, "")).strip()
     )
+    eff_account_spec = str(env.get(ENV_TRADOVATE_ACCOUNT_SPEC, "")).strip()
     username = str(env.get(ENV_TRADOVATE_USERNAME, "")).strip()
     raw_password = str(env.get(ENV_TRADOVATE_PASSWORD, "")).strip()
     app_id = str(env.get(ENV_TRADOVATE_APP_ID, "")).strip()
@@ -1050,6 +1099,7 @@ def load_tradovate_credentials(
         base_url=raw_base_url,
         live_arming_verified=live_arming_verified,
         account_id=eff_account_id,
+        account_spec=eff_account_spec,
         live_auth_context=eff_ctx,
         live_arm_phrase=eff_phrase,
         auth_checked_at=check_now if mode == TRADOVATE_MODE_LIVE else None,
@@ -1350,6 +1400,7 @@ class TradovatePosition:
     stop_loss_order_id: str | None = None
     take_profit_order_id: str | None = None
     cl_ord_id: str | None = None
+    account_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.contracts) is not int or self.contracts <= 0:
@@ -1390,6 +1441,11 @@ class TradovatePosition:
         )
         object.__setattr__(self, "opened_at", utc_time(self.opened_at, "opened_at"))
         object.__setattr__(self, "updated_at", utc_time(self.updated_at, "updated_at"))
+        if self.account_id is not None:
+            if not isinstance(self.account_id, str) or not self.account_id.strip():
+                raise ContractError("position account_id must be a non-empty string when provided")
+            _check_no_control_chars(self.account_id, "account_id")
+            object.__setattr__(self, "account_id", self.account_id.strip())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1415,6 +1471,7 @@ class TradovatePosition:
             "stop_loss_order_id": self.stop_loss_order_id,
             "take_profit_order_id": self.take_profit_order_id,
             "cl_ord_id": self.cl_ord_id,
+            "account_id": self.account_id,
         }
 
 
@@ -1507,6 +1564,51 @@ class TradovateAccountSnapshot:
             "open_position_count": self.open_position_count,
             "observed_at": _iso_utc(self.observed_at),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class TradovateReconciliationEvidence:
+    """Authoritative account-bound completeness-proven order-history reconciliation evidence."""
+
+    account_id: str
+    orders: tuple[dict[str, Any], ...]
+    observed_cl_ord_ids: frozenset[str]
+    pages_fetched: int
+    complete: bool
+    provider_cursor_exhausted: bool
+    watermark_utc: datetime | None
+    incompleteness_reasons: tuple[str, ...] = ()
+    authoritative_confirmation: bool = False
+    observed_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.account_id, str) or not self.account_id.strip():
+            raise ContractError("reconciliation evidence account_id must be a non-empty string")
+        _check_no_control_chars(self.account_id, "account_id")
+        object.__setattr__(self, "account_id", self.account_id.strip())
+        if type(self.pages_fetched) is not int or self.pages_fetched < 0:
+            raise ContractError("pages_fetched must be a non-negative int")
+        if type(self.complete) is not bool:
+            raise ContractError("complete must be a strict bool")
+        if type(self.provider_cursor_exhausted) is not bool:
+            raise ContractError("provider_cursor_exhausted must be a strict bool")
+        if type(self.authoritative_confirmation) is not bool:
+            raise ContractError("authoritative_confirmation must be a strict bool")
+        if self.watermark_utc is not None:
+            object.__setattr__(self, "watermark_utc", utc_time(self.watermark_utc, "watermark_utc"))
+        if self.observed_at is not None:
+            object.__setattr__(self, "observed_at", utc_time(self.observed_at, "observed_at"))
+        object.__setattr__(self, "orders", tuple(dict(item) for item in self.orders))
+        object.__setattr__(
+            self,
+            "observed_cl_ord_ids",
+            frozenset(str(x).strip() for x in self.observed_cl_ord_ids if str(x).strip()),
+        )
+        object.__setattr__(
+            self,
+            "incompleteness_reasons",
+            tuple(str(r) for r in self.incompleteness_reasons),
+        )
 
 
 @runtime_checkable
@@ -1652,6 +1754,10 @@ class TradovateHttpsTransport:
     @property
     def mode(self) -> str:
         return self._credentials.mode
+
+    @property
+    def account_id(self) -> str:
+        return self._credentials.account_id
 
     def __repr__(self) -> str:
         return (
@@ -1826,15 +1932,225 @@ class TradovateHttpsTransport:
             )
         return list(decoded)
 
+    def _authorized_account_id(self) -> str:
+        acct = (self._credentials.account_id or "").strip()
+        if not acct:
+            if self._credentials.mode == TRADOVATE_MODE_LIVE:
+                raise TradovateLiveLockError(
+                    "LIVE TradovateHttpsTransport requires non-empty authorized account_id"
+                )
+            raise TradovateTransportError(
+                "TradovateHttpsTransport requires non-empty authorized account_id",
+                ambiguous=False,
+            )
+        if any(ch.isspace() or ord(ch) < 32 for ch in acct):
+            raise TradovateEndpointError("Tradovate account_id contains whitespace or control characters")
+        if self._credentials.mode == TRADOVATE_MODE_LIVE:
+            ctx = self._credentials.live_auth_context
+            if not isinstance(ctx, LiveAuthorizationContext) or ctx.account_id.strip() != acct:
+                raise TradovateLiveLockError(
+                    "LIVE TradovateHttpsTransport account_id does not match LiveAuthorizationContext"
+                )
+        return acct
+
+    def _authorized_account_spec(self) -> str:
+        acct = self._authorized_account_id()
+        spec = (self._credentials.account_spec or "").strip() or acct
+        if any(ch.isspace() or ord(ch) < 32 for ch in spec):
+            raise TradovateEndpointError("Tradovate account_spec contains whitespace or control characters")
+        return spec
+
+    def _account_body_fields(self) -> dict[str, Any]:
+        acct = self._authorized_account_id()
+        spec = self._authorized_account_spec()
+        return {
+            "accountId": int(acct) if acct.isdigit() else acct,
+            "accountSpec": spec,
+        }
+
+    def _build_account_endpoint(
+        self,
+        base_path: str,
+        extra_params: Mapping[str, Any] | None = None,
+    ) -> str:
+        acct = self._authorized_account_id()
+        spec = self._authorized_account_spec()
+        query_items: list[tuple[str, str]] = [
+            ("accountId", acct),
+            ("accountSpec", spec),
+        ]
+        if extra_params:
+            for k in sorted(extra_params):
+                v = extra_params[k]
+                if v is not None:
+                    query_items.append((str(k), str(v)))
+        return f"{base_path}?{urllib.parse.urlencode(query_items)}"
+
+    @staticmethod
+    def _extract_record_account_id(
+        record: Mapping[str, Any],
+        *,
+        context: str,
+        expected_account_spec: str | None = None,
+        expected_account_id: str | None = None,
+    ) -> str:
+        raw = record.get("accountId")
+        if isinstance(raw, bool) or raw is None:
+            raise TradovateTransportError(
+                f"Tradovate {context} record missing required accountId",
+                ambiguous=False,
+            )
+        if isinstance(raw, int):
+            if raw <= 0:
+                raise TradovateTransportError(
+                    f"Tradovate {context} record has invalid accountId: {raw!r}",
+                    ambiguous=False,
+                )
+            acct = str(raw)
+        elif isinstance(raw, str):
+            acct = raw.strip()
+            if not acct or any(ch.isspace() or ord(ch) < 32 for ch in acct):
+                raise TradovateTransportError(
+                    f"Tradovate {context} record has invalid accountId: {raw!r}",
+                    ambiguous=False,
+                )
+        else:
+            raise TradovateTransportError(
+                f"Tradovate {context} record has unsupported accountId type: {type(raw).__name__}",
+                ambiguous=False,
+            )
+        if expected_account_spec is not None and record.get("accountSpec") is not None:
+            raw_spec = record.get("accountSpec")
+            if isinstance(raw_spec, bool) or not isinstance(raw_spec, str) or not raw_spec.strip():
+                raise TradovateTransportError(
+                    f"Tradovate {context} record has invalid accountSpec",
+                    ambiguous=False,
+                )
+            if (expected_account_id is None or acct == expected_account_id) and raw_spec.strip() != expected_account_spec:
+                raise TradovateTransportError(
+                    f"Tradovate {context} accountSpec mismatch: expected {expected_account_spec!r}, got {raw_spec.strip()!r}",
+                    ambiguous=False,
+                )
+        return acct
+
+    @staticmethod
+    def _validate_optional_account_fields(
+        record: Mapping[str, Any],
+        *,
+        expected_account_id: str,
+        expected_account_spec: str,
+        context: str,
+    ) -> None:
+        if record.get("accountId") is not None:
+            got_acct = TradovateHttpsTransport._extract_record_account_id(
+                record,
+                context=context,
+                expected_account_spec=expected_account_spec,
+                expected_account_id=expected_account_id,
+            )
+            if got_acct != expected_account_id:
+                raise TradovateTransportError(
+                    f"Tradovate {context} accountId mismatch: expected {expected_account_id!r}, got {got_acct!r}",
+                    ambiguous=True,
+                )
+        elif record.get("accountSpec") is not None:
+            raw_spec = record.get("accountSpec")
+            if isinstance(raw_spec, bool) or not isinstance(raw_spec, str) or raw_spec.strip() != expected_account_spec:
+                raise TradovateTransportError(
+                    f"Tradovate {context} accountSpec mismatch: expected {expected_account_spec!r}, got {raw_spec!r}",
+                    ambiguous=True,
+                )
+
+    def _dispatch_get_orders_page(self, endpoint_path: str) -> dict[str, Any] | list[Any]:
+        raw_overridden = (
+            "_request_json_raw" in self.__dict__
+            or type(self)._request_json_raw is not TradovateHttpsTransport._request_json_raw
+        )
+        if raw_overridden:
+            return self._request_json_raw("GET", endpoint_path)
+        json_overridden = (
+            "_request_json" in self.__dict__
+            or type(self)._request_json is not TradovateHttpsTransport._request_json
+        )
+        if json_overridden:
+            return self._request_json("GET", endpoint_path)
+        list_overridden = (
+            "_request_json_list" in self.__dict__
+            or type(self)._request_json_list is not TradovateHttpsTransport._request_json_list
+        )
+        if list_overridden:
+            return self._request_json_list("GET", endpoint_path)
+        return self._request_json_raw("GET", endpoint_path)
+
+    def _validate_protective_broker_response(
+        self,
+        resp: Mapping[str, Any],
+        *,
+        endpoint: str,
+        expected_cl_ord_id: str | None,
+        expected_account_id: str,
+        expected_account_spec: str,
+        rejected_statuses: frozenset[str],
+        allowed_statuses: frozenset[str] | None = None,
+    ) -> str:
+        if not isinstance(resp, Mapping) or len(resp) == 0:
+            raise TradovateTransportError(
+                f"Tradovate {endpoint} returned empty or non-object response",
+                ambiguous=True,
+            )
+        err_text = resp.get("errorText") or resp.get("failureReason") or resp.get("failureText")
+        if err_text is not None and str(err_text).strip():
+            raise TradovateTransportError(
+                f"Tradovate {endpoint} rejected or failed: {err_text}",
+                ambiguous=True,
+            )
+        self._validate_optional_account_fields(
+            resp,
+            expected_account_id=expected_account_id,
+            expected_account_spec=expected_account_spec,
+            context=endpoint,
+        )
+        if expected_cl_ord_id is not None and resp.get("clOrdId") is not None:
+            got_cl = str(resp.get("clOrdId")).strip()
+            if got_cl != expected_cl_ord_id:
+                raise TradovateTransportError(
+                    f"Tradovate {endpoint} clOrdId mismatch: expected {expected_cl_ord_id!r}, got {got_cl!r}",
+                    ambiguous=True,
+                )
+        raw_oid = resp.get("orderId") if resp.get("orderId") is not None else resp.get("id")
+        try:
+            confirmed_id = _parse_broker_id(raw_oid, "orderId")
+        except TradovateProtectionUnconfirmedError as exc:
+            raise TradovateTransportError(
+                f"Tradovate {endpoint} missing or invalid orderId: {exc}",
+                ambiguous=True,
+            ) from None
+        raw_status = resp.get("ordStatus") if resp.get("ordStatus") is not None else resp.get("status")
+        if raw_status is not None:
+            norm_status = str(raw_status).strip().lower()
+            if not norm_status or norm_status in rejected_statuses:
+                raise TradovateTransportError(
+                    f"Tradovate {endpoint} returned non-success status {raw_status!r}",
+                    ambiguous=True,
+                )
+            if allowed_statuses is not None and norm_status not in allowed_statuses:
+                raise TradovateTransportError(
+                    f"Tradovate {endpoint} returned unexpected status {raw_status!r}",
+                    ambiguous=True,
+                )
+        return confirmed_id
+
     def connect(self) -> None:
         self._require_live_authorization(self._clock())
         if self._bearer_token is not None:
+            self._authorized_account_id()
             self._connected = True
             return
         if not self._credentials.has_api_credentials():
             raise TradovateNotConfiguredError(
                 "Tradovate API credentials (username, password, app_id, cid, sec) are required to connect"
             )
+        self._authorized_account_id()
         password_sec = self._credentials.password
         api_sec = self._credentials.sec
         if password_sec is None or api_sec is None:
@@ -1871,8 +2187,23 @@ class TradovateHttpsTransport:
 
     def account_snapshot(self, *, now_utc: datetime | None = None) -> TradovateAccountSnapshot:
         self._require_connected()
+        expected_acct = self._authorized_account_id()
+        expected_spec = self._authorized_account_spec()
         now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
-        resp = self._request_json("GET", "cashBalance/getcashbalancesnapshot")
+        endpoint = self._build_account_endpoint("cashBalance/getcashbalancesnapshot")
+        resp = self._request_json("GET", endpoint)
+        acct_id = self._extract_record_account_id(
+            resp,
+            context="cashBalance/getcashbalancesnapshot",
+            expected_account_spec=expected_spec,
+            expected_account_id=expected_acct,
+        )
+        if acct_id != expected_acct:
+            raise TradovateTransportError(
+                f"Tradovate cashBalance/getcashbalancesnapshot accountId mismatch: "
+                f"expected {expected_acct!r}, got {acct_id!r}",
+                ambiguous=False,
+            )
         balance = _parse_broker_decimal(resp.get("amount", "0"), "balance_usd")
         open_pnl = _parse_broker_decimal(resp.get("openPnL", "0"), "floating_pnl_usd")
         equity = _q2(balance + open_pnl)
@@ -1881,7 +2212,6 @@ class TradovateHttpsTransport:
         )
         available = _q2(equity - used_margin)
         margin_level = _q2((equity * Decimal("100")) / used_margin) if used_margin > Decimal("0") else None
-        acct_id = str(resp.get("accountId") or self._credentials.account_id or "TRADOVATE-LIVE")
         return TradovateAccountSnapshot(
             account_id=acct_id,
             mode=self._credentials.mode,
@@ -1904,10 +2234,21 @@ class TradovateHttpsTransport:
 
     def positions(self) -> tuple[TradovatePosition, ...]:
         self._require_connected()
+        expected_acct = self._authorized_account_id()
+        expected_spec = self._authorized_account_spec()
         now = self._clock()
-        raw_positions = self._request_json_list("GET", "position/list")
+        endpoint = self._build_account_endpoint("position/list")
+        raw_positions = self._request_json_list("GET", endpoint)
         result: list[TradovatePosition] = []
         for item in raw_positions:
+            item_acct = self._extract_record_account_id(
+                item,
+                context="position/list",
+                expected_account_spec=expected_spec,
+                expected_account_id=expected_acct,
+            )
+            if item_acct != expected_acct:
+                continue
             net_pos_raw = item.get("netPos", 0)
             try:
                 net_pos = _parse_broker_int(net_pos_raw, "netPos")
@@ -1982,17 +2323,283 @@ class TradovateHttpsTransport:
                         if item.get("clOrdId") is not None
                         else None
                     ),
+                    account_id=item_acct,
                 )
             )
         return tuple(result)
 
+    def _filter_account_orders(
+        self,
+        raw_orders: Sequence[Any],
+        *,
+        context: str,
+        expected_acct: str,
+        expected_spec: str,
+    ) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
+        for item in raw_orders:
+            if not isinstance(item, Mapping):
+                raise TradovateTransportError(
+                    f"Tradovate {context} returned non-object order entry",
+                    ambiguous=True,
+                )
+            item_acct = self._extract_record_account_id(
+                item,
+                context=context,
+                expected_account_spec=expected_spec,
+                expected_account_id=expected_acct,
+            )
+            if item_acct != expected_acct:
+                continue
+            filtered.append(dict(item))
+        return filtered
+
     def list_orders(self) -> list[dict[str, Any]]:
-        """Query authoritative Tradovate order list for post-ambiguity reconciliation."""
+        """Query account-bound Tradovate order list, rejecting records missing accountId."""
         self._require_connected()
-        return self._request_json_list("GET", "order/list")
+        expected_acct = self._authorized_account_id()
+        expected_spec = self._authorized_account_spec()
+        endpoint = self._build_account_endpoint("order/list")
+        raw_orders = self._request_json_list("GET", endpoint)
+        return self._filter_account_orders(
+            raw_orders,
+            context="order/list",
+            expected_acct=expected_acct,
+            expected_spec=expected_spec,
+        )
+
+    def list_order_deps(self, *, master_id: str | None = None) -> list[dict[str, Any]]:
+        """Query account-bound Tradovate order/deps, rejecting records missing accountId."""
+        self._require_connected()
+        expected_acct = self._authorized_account_id()
+        expected_spec = self._authorized_account_spec()
+        eff_master = (
+            master_id.strip()
+            if isinstance(master_id, str) and master_id.strip()
+            else expected_acct
+        )
+        if any(ch.isspace() or ch in "?#&/" or ord(ch) < 32 for ch in eff_master):
+            raise TradovateEndpointError(f"Malformed order/deps masterid {master_id!r}")
+        endpoint = self._build_account_endpoint("order/deps", {"masterid": eff_master})
+        raw_orders = self._request_json_list("GET", endpoint)
+        return self._filter_account_orders(
+            raw_orders,
+            context="order/deps",
+            expected_acct=expected_acct,
+            expected_spec=expected_spec,
+        )
+
+    def list_orders_paginated(
+        self,
+        *,
+        page_size: int = 100,
+        max_pages: int = 50,
+        since_utc: datetime | None = None,
+    ) -> TradovateReconciliationEvidence:
+        """Exhaust paginated account-bound order history and emit a completeness proof/watermark."""
+        if type(page_size) is not int or page_size < 1:
+            raise ContractError("page_size must be a positive int")
+        if type(max_pages) is not int or max_pages < 1:
+            raise ContractError("max_pages must be a positive int")
+        checked_since = utc_time(since_utc, "since_utc") if since_utc is not None else None
+        self._require_connected()
+        expected_acct = self._authorized_account_id()
+        expected_spec = self._authorized_account_spec()
+        now = self._clock()
+
+        all_orders: list[dict[str, Any]] = []
+        observed_cl_ord_ids: set[str] = set()
+        seen_cursors: set[str] = set()
+        incompleteness: list[str] = []
+        page_watermarks: list[datetime] = []
+        pages_fetched = 0
+        cursor: str | None = None
+        cursor_exhausted = False
+        explicit_auth_confirm: bool | None = None
+
+        while pages_fetched < max_pages:
+            extra: dict[str, Any] = {"limit": str(page_size)}
+            if cursor is not None:
+                extra["cursor"] = cursor
+            if checked_since is not None:
+                extra["since"] = _iso_utc(checked_since)
+            endpoint = self._build_account_endpoint("order/list", extra)
+            decoded = self._dispatch_get_orders_page(endpoint)
+            pages_fetched += 1
+
+            if isinstance(decoded, list):
+                filtered = self._filter_account_orders(
+                    decoded,
+                    context="order/list",
+                    expected_acct=expected_acct,
+                    expected_spec=expected_spec,
+                )
+                all_orders.extend(filtered)
+                for order_doc in filtered:
+                    cl_val = str(order_doc.get("clOrdId", "")).strip()
+                    if cl_val:
+                        observed_cl_ord_ids.add(cl_val)
+                cursor_exhausted = False
+                explicit_auth_confirm = False
+                incompleteness.append("unpaged_unwatermarked_list_response")
+                break
+
+            if not isinstance(decoded, Mapping):
+                incompleteness.append("malformed_order_history_page")
+                cursor_exhausted = False
+                explicit_auth_confirm = False
+                break
+
+            if decoded.get("accountId") is None:
+                incompleteness.append("missing_envelope_account_id")
+                cursor_exhausted = False
+                explicit_auth_confirm = False
+            else:
+                env_acct = self._extract_record_account_id(
+                    decoded,
+                    context="order/list",
+                    expected_account_spec=expected_spec,
+                    expected_account_id=expected_acct,
+                )
+                if env_acct != expected_acct:
+                    raise TradovateTransportError(
+                        f"Tradovate paginated order/list accountId mismatch: "
+                        f"expected {expected_acct!r}, got {env_acct!r}",
+                        ambiguous=True,
+                    )
+
+            items_raw: Any = None
+            for list_key in ("orders", "items", "data"):
+                if list_key in decoded:
+                    items_raw = decoded.get(list_key)
+                    break
+            if not isinstance(items_raw, list):
+                incompleteness.append("missing_orders_array_in_page")
+                cursor_exhausted = False
+                explicit_auth_confirm = False
+                break
+
+            filtered_page = self._filter_account_orders(
+                items_raw,
+                context="order/list",
+                expected_acct=expected_acct,
+                expected_spec=expected_spec,
+            )
+            all_orders.extend(filtered_page)
+            for order_doc in filtered_page:
+                cl_val = str(order_doc.get("clOrdId", "")).strip()
+                if cl_val:
+                    observed_cl_ord_ids.add(cl_val)
+
+            raw_wm = (
+                decoded.get("watermarkUtc")
+                if decoded.get("watermarkUtc") is not None
+                else (
+                    decoded.get("watermark_utc")
+                    if decoded.get("watermark_utc") is not None
+                    else (decoded.get("asOfUtc") if decoded.get("asOfUtc") is not None else decoded.get("observedAt"))
+                )
+            )
+            if raw_wm is None:
+                incompleteness.append("missing_watermark_utc")
+            else:
+                try:
+                    page_watermarks.append(_parse_utc_timestamp(raw_wm, field="watermark_utc"))
+                except TradovateTransportError:
+                    incompleteness.append("invalid_watermark_utc")
+
+            page_auth = bool(
+                decoded.get("authoritativeConfirmation") is True
+                or decoded.get("authoritativeComplete") is True
+                or decoded.get("confirmedAbsent") is True
+            )
+            explicit_auth_confirm = page_auth if explicit_auth_confirm is None else (explicit_auth_confirm and page_auth)
+
+            if decoded.get("truncated") is True:
+                incompleteness.append("provider_response_truncated")
+                cursor_exhausted = False
+                break
+
+            has_cursor_key = any(k in decoded for k in ("nextCursor", "next_cursor", "cursor"))
+            raw_next_cursor = (
+                decoded.get("nextCursor")
+                if "nextCursor" in decoded
+                else (decoded.get("next_cursor") if "next_cursor" in decoded else decoded.get("cursor"))
+            )
+            next_cursor = (
+                str(raw_next_cursor).strip()
+                if raw_next_cursor is not None and str(raw_next_cursor).strip()
+                else None
+            )
+            has_more_key = ("hasMore" in decoded) or ("has_more" in decoded)
+            has_more_val = decoded.get("hasMore") if "hasMore" in decoded else decoded.get("has_more")
+            if has_more_key and type(has_more_val) is not bool:
+                incompleteness.append("invalid_has_more_flag")
+                cursor_exhausted = False
+                break
+
+            if next_cursor is not None:
+                if next_cursor in seen_cursors:
+                    incompleteness.append("pagination_cursor_cycle")
+                    cursor_exhausted = False
+                    break
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+                continue
+            if has_more_val is True:
+                incompleteness.append("has_more_true_without_next_cursor")
+                cursor_exhausted = False
+                break
+            if (has_more_key and has_more_val is False) or (has_cursor_key and next_cursor is None):
+                cursor_exhausted = True
+                break
+            incompleteness.append("missing_pagination_exhaustion_proof")
+            cursor_exhausted = False
+            break
+        else:
+            incompleteness.append("pagination_max_pages_exceeded")
+            cursor_exhausted = False
+
+        eff_watermark: datetime | None = (
+            min(page_watermarks)
+            if page_watermarks and len(page_watermarks) == pages_fetched and "invalid_watermark_utc" not in incompleteness
+            else None
+        )
+        complete = (
+            pages_fetched >= 1
+            and cursor_exhausted is True
+            and eff_watermark is not None
+            and len(incompleteness) == 0
+        )
+        return TradovateReconciliationEvidence(
+            account_id=expected_acct,
+            orders=tuple(all_orders),
+            observed_cl_ord_ids=frozenset(observed_cl_ord_ids),
+            pages_fetched=pages_fetched,
+            complete=complete,
+            provider_cursor_exhausted=cursor_exhausted,
+            watermark_utc=eff_watermark,
+            incompleteness_reasons=tuple(dict.fromkeys(incompleteness)),
+            authoritative_confirmation=bool(complete and explicit_auth_confirm),
+            observed_at=now,
+        )
+
+    def fetch_reconciliation_evidence(
+        self,
+        *,
+        page_size: int = 100,
+        max_pages: int = 50,
+        since_utc: datetime | None = None,
+    ) -> TradovateReconciliationEvidence:
+        """Fetch structured, paginated, account-bound reconciliation evidence with completeness proof."""
+        return self.list_orders_paginated(
+            page_size=page_size,
+            max_pages=max_pages,
+            since_utc=since_utc,
+        )
 
     def find_orders_by_cl_ord_id(self, cl_ord_id: str) -> list[dict[str, Any]]:
-        """Return broker order records matching an exact stable client order ID."""
+        """Return account-bound broker order records matching an exact stable client order ID."""
         if not isinstance(cl_ord_id, str) or not cl_ord_id.strip():
             raise ContractError("cl_ord_id must be a non-empty string")
         target = cl_ord_id.strip()
@@ -2004,26 +2611,59 @@ class TradovateHttpsTransport:
 
     def _fetch_order_details(self, order_id: str) -> dict[str, Any]:
         """Fetch broker-side order item + latest orderVersion details to verify child protections."""
+        expected_acct = self._authorized_account_id()
+        expected_spec = self._authorized_account_spec()
         cleaned = order_id.strip()
         if not cleaned or any(ch.isspace() or ch in "?#&/" or ord(ch) < 32 for ch in cleaned):
             raise TradovateProtectionUnconfirmedError(
                 f"Cannot query malformed child order ID {order_id!r}"
             )
+        item_endpoint = self._build_account_endpoint("order/item", {"id": cleaned})
         try:
-            item = self._request_json("GET", f"order/item?id={cleaned}")
+            item = self._request_json("GET", item_endpoint)
         except TradovateVenueError as exc:
             raise TradovateProtectionUnconfirmedError(
                 f"Failed to confirm broker child order {cleaned}: {exc}",
                 order_id=cleaned,
             ) from None
+        try:
+            item_acct = self._extract_record_account_id(
+                item,
+                context="order/item",
+                expected_account_spec=expected_spec,
+                expected_account_id=expected_acct,
+            )
+        except TradovateTransportError as exc:
+            raise TradovateProtectionUnconfirmedError(str(exc), order_id=cleaned) from None
+        if item_acct != expected_acct:
+            raise TradovateProtectionUnconfirmedError(
+                f"Broker child order {cleaned} accountId mismatch: expected {expected_acct!r}, got {item_acct!r}",
+                order_id=cleaned,
+            )
         merged = dict(item)
         if merged.get("stopPrice") is None and merged.get("price") is None:
+            deps_endpoint = self._build_account_endpoint("orderVersion/deps", {"masterid": cleaned})
             try:
-                versions = self._request_json_list("GET", f"orderVersion/deps?masterid={cleaned}")
+                versions = self._request_json_list("GET", deps_endpoint)
             except TradovateVenueError:
                 versions = []
             if versions:
                 latest = versions[-1]
+                if latest.get("accountId") is not None:
+                    try:
+                        ver_acct = self._extract_record_account_id(
+                            latest,
+                            context="orderVersion/deps",
+                            expected_account_spec=expected_spec,
+                            expected_account_id=expected_acct,
+                        )
+                    except TradovateTransportError as exc:
+                        raise TradovateProtectionUnconfirmedError(str(exc), order_id=cleaned) from None
+                    if ver_acct != expected_acct:
+                        raise TradovateProtectionUnconfirmedError(
+                            f"Broker orderVersion {cleaned} accountId mismatch: expected {expected_acct!r}, got {ver_acct!r}",
+                            order_id=cleaned,
+                        )
                 for key in ("orderQty", "orderType", "price", "stopPrice", "timeInForce"):
                     if latest.get(key) is not None and merged.get(key) is None:
                         merged[key] = latest[key]
@@ -2063,7 +2703,16 @@ class TradovateHttpsTransport:
         price_keys: tuple[str, ...],
         label: str,
         cl_ord_id: str,
+        expected_account_id: str | None = None,
     ) -> Decimal:
+        if expected_account_id is not None and child_doc.get("accountId") is not None:
+            raw_acct = child_doc.get("accountId")
+            if isinstance(raw_acct, bool) or str(raw_acct).strip() != expected_account_id:
+                raise TradovateProtectionUnconfirmedError(
+                    f"Broker {label} child accountId mismatch: expected {expected_account_id!r}, got {raw_acct!r}",
+                    cl_ord_id=cl_ord_id,
+                    order_id=expected_order_id,
+                )
         raw_id = child_doc.get("orderId") if child_doc.get("orderId") is not None else child_doc.get("id")
         if raw_id is not None and str(raw_id).strip() != expected_order_id:
             raise TradovateProtectionUnconfirmedError(
@@ -2152,6 +2801,8 @@ class TradovateHttpsTransport:
         self._require_connected()
         now = self._clock()
         self._require_live_authorization(now)
+        expected_acct = self._authorized_account_id()
+        expected_spec = self._authorized_account_spec()
 
         if request.side not in ("BUY", "SELL"):
             raise TradovateOrderError("OPEN_BRACKET requires side 'BUY' or 'SELL'")
@@ -2195,10 +2846,7 @@ class TradovateHttpsTransport:
             "isAutomated": True,
             "bracket1": bracket1,
         }
-        if self._credentials.account_id:
-            payload["accountSpec"] = self._credentials.account_id
-            if self._credentials.account_id.isdigit():
-                payload["accountId"] = int(self._credentials.account_id)
+        payload.update(self._account_body_fields())
         if request.take_profit_price is not None:
             payload["bracket2"] = {
                 "action": protective_action,
@@ -2222,6 +2870,25 @@ class TradovateHttpsTransport:
                 )
             raise TradovateProtectionUnconfirmedError(
                 f"Tradovate placeOSO refused or failed without confirmed protection: {err_text}",
+                cl_ord_id=cl_ord_id,
+                request_id=request.request_id,
+            )
+
+        if resp.get("accountId") is not None and (
+            isinstance(resp.get("accountId"), bool)
+            or str(resp.get("accountId")).strip() != expected_acct
+        ):
+            raise TradovateProtectionUnconfirmedError(
+                f"Tradovate placeOSO accountId mismatch: expected {expected_acct!r}, got {resp.get('accountId')!r}",
+                cl_ord_id=cl_ord_id,
+                request_id=request.request_id,
+            )
+        if resp.get("accountSpec") is not None and (
+            isinstance(resp.get("accountSpec"), bool)
+            or str(resp.get("accountSpec")).strip() != expected_spec
+        ):
+            raise TradovateProtectionUnconfirmedError(
+                f"Tradovate placeOSO accountSpec mismatch: expected {expected_spec!r}, got {resp.get('accountSpec')!r}",
                 cl_ord_id=cl_ord_id,
                 request_id=request.request_id,
             )
@@ -2258,6 +2925,7 @@ class TradovateHttpsTransport:
             price_keys=("stopPrice", "stop_price", "stopLossPrice"),
             label="stop-loss (oso1)",
             cl_ord_id=cl_ord_id,
+            expected_account_id=expected_acct,
         )
 
         oso2_id: str | None = None
@@ -2286,6 +2954,7 @@ class TradovateHttpsTransport:
                 price_keys=("price", "limitPrice", "takeProfitPrice"),
                 label="take-profit (oso2)",
                 cl_ord_id=cl_ord_id,
+                expected_account_id=expected_acct,
             )
 
         # NEVER synthesize fill_price or filled_contracts from request inputs.
@@ -2375,26 +3044,71 @@ class TradovateHttpsTransport:
             return self.place_protected_order(request)
 
         self._require_live_authorization(now)
+        expected_acct = self._authorized_account_id()
+        expected_spec = self._authorized_account_spec()
 
         if request.action is FuturesOrderAction.AMEND_STOP:
             if not request.order_id or request.stop_loss_price is None or request.contracts <= 0:
                 raise TradovateOrderError(
                     "LIVE AMEND_STOP requires order_id, stop_loss_price, and contracts >= 1"
                 )
+            cl_ord_id = (request.cl_ord_id or "").strip()
+            if not cl_ord_id:
+                raise TradovateOrderError("LIVE AMEND_STOP requires a stable cl_ord_id idempotency key")
             mod_payload: dict[str, Any] = {
                 "orderId": int(request.order_id) if request.order_id.isdigit() else request.order_id,
                 "orderQty": request.contracts,
                 "orderType": "Stop",
                 "stopPrice": request.stop_loss_price,
+                "clOrdId": cl_ord_id,
                 "isAutomated": True,
             }
-            if request.cl_ord_id:
-                mod_payload["clOrdId"] = request.cl_ord_id
+            mod_payload.update(self._account_body_fields())
             resp = self._request_json("POST", "order/modifyOrder", payload=mod_payload)
-            confirmed_id = _parse_broker_id(resp.get("orderId", request.order_id), "orderId")
+            confirmed_id = self._validate_protective_broker_response(
+                resp,
+                endpoint="order/modifyOrder",
+                expected_cl_ord_id=cl_ord_id,
+                expected_account_id=expected_acct,
+                expected_account_spec=expected_spec,
+                rejected_statuses=frozenset(
+                    {"rejected", "expired", "canceled", "cancelled", "suspended", "voided", "error", "failed", "pendingnew", "pending_new"}
+                ),
+                allowed_statuses=frozenset(
+                    {"working", "accepted", "modified", "amended", "active", "filled", "completed"}
+                ),
+            )
+            confirmed_sl = request.stop_loss_price
+            if resp.get("stopPrice") is not None:
+                try:
+                    confirmed_sl = _parse_broker_decimal(resp.get("stopPrice"), "stopPrice", positive=True)
+                except ContractError as exc:
+                    raise TradovateTransportError(
+                        f"Tradovate order/modifyOrder invalid stopPrice: {exc}",
+                        ambiguous=True,
+                    ) from None
+                if confirmed_sl != request.stop_loss_price:
+                    raise TradovateTransportError(
+                        f"Tradovate order/modifyOrder stopPrice mismatch: "
+                        f"expected {decimal_text(request.stop_loss_price)}, got {decimal_text(confirmed_sl)}",
+                        ambiguous=True,
+                    )
+            if resp.get("orderQty") is not None:
+                try:
+                    confirmed_qty = _parse_broker_int(resp.get("orderQty"), "orderQty", positive=True)
+                except ContractError as exc:
+                    raise TradovateTransportError(
+                        f"Tradovate order/modifyOrder invalid orderQty: {exc}",
+                        ambiguous=True,
+                    ) from None
+                if confirmed_qty != request.contracts:
+                    raise TradovateTransportError(
+                        f"Tradovate order/modifyOrder orderQty mismatch: expected {request.contracts}, got {confirmed_qty}",
+                        ambiguous=True,
+                    )
             return TradovateOrderReceipt(
                 request_id=request.request_id,
-                cl_ord_id=request.cl_ord_id,
+                cl_ord_id=cl_ord_id,
                 action=request.action,
                 accepted=True,
                 status="AMENDED",
@@ -2407,7 +3121,7 @@ class TradovateHttpsTransport:
                 side=request.side,
                 filled_contracts=request.contracts,
                 fill_price=None,
-                stop_loss_price=request.stop_loss_price,
+                stop_loss_price=confirmed_sl,
                 take_profit_price=request.take_profit_price,
                 commission_usd=Decimal("0.00"),
                 realized_pnl_usd=Decimal("0.00"),
@@ -2419,15 +3133,24 @@ class TradovateHttpsTransport:
         if request.action is FuturesOrderAction.CANCEL_ORDER:
             if not request.order_id:
                 raise TradovateOrderError("LIVE CANCEL_ORDER requires order_id")
-            resp = self._request_json(
-                "POST",
-                "order/cancelOrder",
-                payload={
-                    "orderId": int(request.order_id) if request.order_id.isdigit() else request.order_id,
-                    "isAutomated": True,
-                },
+            cancel_payload: dict[str, Any] = {
+                "orderId": int(request.order_id) if request.order_id.isdigit() else request.order_id,
+                "isAutomated": True,
+            }
+            cancel_payload.update(self._account_body_fields())
+            if request.cl_ord_id:
+                cancel_payload["clOrdId"] = request.cl_ord_id
+            resp = self._request_json("POST", "order/cancelOrder", payload=cancel_payload)
+            confirmed_id = self._validate_protective_broker_response(
+                resp,
+                endpoint="order/cancelOrder",
+                expected_cl_ord_id=request.cl_ord_id,
+                expected_account_id=expected_acct,
+                expected_account_spec=expected_spec,
+                rejected_statuses=frozenset(
+                    {"rejected", "expired", "suspended", "error", "failed", "pendingnew", "pending_new"}
+                ),
             )
-            confirmed_id = _parse_broker_id(resp.get("orderId", request.order_id), "orderId")
             return TradovateOrderReceipt(
                 request_id=request.request_id,
                 cl_ord_id=request.cl_ord_id,
@@ -2454,22 +3177,71 @@ class TradovateHttpsTransport:
         if request.action is FuturesOrderAction.CLOSE_POSITION:
             if not request.contract_code:
                 raise TradovateOrderError("LIVE CLOSE_POSITION requires contract_code")
+            cl_ord_id = (request.cl_ord_id or "").strip()
+            if not cl_ord_id:
+                raise TradovateOrderError("LIVE CLOSE_POSITION requires a stable cl_ord_id idempotency key")
             liq_payload: dict[str, Any] = {
                 "symbol": request.contract_code,
                 "admin": False,
+                "clOrdId": cl_ord_id,
                 "isAutomated": True,
             }
-            if self._credentials.account_id:
-                liq_payload["accountSpec"] = self._credentials.account_id
-                if self._credentials.account_id.isdigit():
-                    liq_payload["accountId"] = int(self._credentials.account_id)
-            if request.cl_ord_id:
-                liq_payload["clOrdId"] = request.cl_ord_id
+            liq_payload.update(self._account_body_fields())
             resp = self._request_json("POST", "order/liquidatePosition", payload=liq_payload)
-            confirmed_id = _parse_broker_id(resp.get("orderId"), "orderId")
+            confirmed_id = self._validate_protective_broker_response(
+                resp,
+                endpoint="order/liquidatePosition",
+                expected_cl_ord_id=cl_ord_id,
+                expected_account_id=expected_acct,
+                expected_account_spec=expected_spec,
+                rejected_statuses=frozenset(
+                    {"rejected", "expired", "canceled", "cancelled", "suspended", "voided", "error", "failed", "pendingnew", "pending_new", "working"}
+                ),
+                allowed_statuses=frozenset({"filled", "completed", "closed"}),
+            )
+            if resp.get("symbol") is not None and str(resp.get("symbol")).strip().upper() != request.contract_code:
+                raise TradovateTransportError(
+                    f"Tradovate order/liquidatePosition symbol mismatch: "
+                    f"expected {request.contract_code!r}, got {resp.get('symbol')!r}",
+                    ambiguous=True,
+                )
+            raw_filled_qty = (
+                resp.get("filledQty")
+                if resp.get("filledQty") is not None
+                else (resp.get("cumQty") if resp.get("cumQty") is not None else resp.get("fillQty"))
+            )
+            if raw_filled_qty is not None:
+                try:
+                    filled_contracts = _parse_broker_int(raw_filled_qty, "filledQty", positive=True)
+                except ContractError as exc:
+                    raise TradovateTransportError(
+                        f"Tradovate order/liquidatePosition invalid filledQty: {exc}",
+                        ambiguous=True,
+                    ) from None
+                if request.contracts > 0 and filled_contracts > request.contracts:
+                    raise TradovateTransportError(
+                        f"Tradovate order/liquidatePosition filledQty ({filled_contracts}) exceeds {request.contracts}",
+                        ambiguous=True,
+                    )
+            else:
+                filled_contracts = request.contracts
+            raw_fill_price = (
+                resp.get("fillPrice")
+                if resp.get("fillPrice") is not None
+                else (resp.get("avgPx") if resp.get("avgPx") is not None else resp.get("avgFillPrice"))
+            )
+            confirmed_fill_price: Decimal | None = None
+            if raw_fill_price is not None:
+                try:
+                    confirmed_fill_price = _parse_broker_decimal(raw_fill_price, "fillPrice", positive=True)
+                except ContractError as exc:
+                    raise TradovateTransportError(
+                        f"Tradovate order/liquidatePosition invalid fillPrice: {exc}",
+                        ambiguous=True,
+                    ) from None
             return TradovateOrderReceipt(
                 request_id=request.request_id,
-                cl_ord_id=request.cl_ord_id,
+                cl_ord_id=cl_ord_id,
                 action=request.action,
                 accepted=True,
                 status="CLOSED",
@@ -2479,8 +3251,8 @@ class TradovateHttpsTransport:
                 root_symbol=request.root_symbol,
                 cas_symbol=request.cas_symbol,
                 side=request.side,
-                filled_contracts=request.contracts,
-                fill_price=None,
+                filled_contracts=filled_contracts,
+                fill_price=confirmed_fill_price,
                 stop_loss_price=None,
                 take_profit_price=None,
                 commission_usd=Decimal("0.00"),
@@ -2493,11 +3265,24 @@ class TradovateHttpsTransport:
         if request.action is FuturesOrderAction.EMERGENCY_CLOSE_ALL:
             open_positions = self.positions()
             closed_qty = 0
-            last_order_id = f"EMERGENCY-{request.request_id}"
+            last_order_id: str | None = None
+            leg_errors: list[str] = []
+            base_key = (request.cl_ord_id or request.request_id).strip()
             for idx, pos in enumerate(open_positions, start=1):
+                leg_cl_ord_id = _compute_stable_cl_ord_id(
+                    account_id=expected_acct,
+                    idempotency_key=f"{base_key}:leg:{idx}:{pos.position_id}",
+                    contract_code=pos.contract_code,
+                    action=FuturesOrderAction.CLOSE_POSITION.value,
+                    side=pos.side,
+                    contracts=pos.contracts,
+                    stop_loss_price=None,
+                    take_profit_price=None,
+                    target_id=pos.position_id,
+                )
                 close_req = TradovateOrderRequest(
                     request_id=f"{request.request_id}-{idx}",
-                    cl_ord_id=f"{request.cl_ord_id}-{idx}" if request.cl_ord_id else None,
+                    cl_ord_id=leg_cl_ord_id,
                     action=FuturesOrderAction.CLOSE_POSITION,
                     contract_code=pos.contract_code,
                     root_symbol=pos.root_symbol,
@@ -2508,16 +3293,25 @@ class TradovateHttpsTransport:
                     client_tag=request.client_tag or "EMERGENCY_CLOSE_ALL",
                     created_at=now,
                 )
-                rec = self.send_order(close_req)
-                closed_qty += rec.filled_contracts
-                last_order_id = rec.order_id
+                try:
+                    rec = self.send_order(close_req)
+                    closed_qty += rec.filled_contracts
+                    last_order_id = rec.order_id
+                except Exception as exc:
+                    leg_errors.append(f"{pos.position_id}({leg_cl_ord_id}): {type(exc).__name__}: {exc}")
+            if leg_errors:
+                raise TradovateTransportError(
+                    f"Tradovate EMERGENCY_CLOSE_ALL failed on {len(leg_errors)}/{len(open_positions)} leg(s): "
+                    + "; ".join(leg_errors),
+                    ambiguous=True,
+                )
             return TradovateOrderReceipt(
                 request_id=request.request_id,
                 cl_ord_id=request.cl_ord_id,
                 action=request.action,
                 accepted=True,
                 status="EMERGENCY_CLOSED",
-                order_id=last_order_id,
+                order_id=last_order_id or "",
                 position_id=None,
                 contract_code="",
                 root_symbol="",
@@ -2693,6 +3487,7 @@ class TradovateMicroFuturesPaperEmulator:
             stop_loss_order_id=pos.stop_loss_order_id,
             take_profit_order_id=pos.take_profit_order_id,
             cl_ord_id=pos.cl_ord_id,
+            account_id=self._account_id,
         )
 
     def _current_equity_unlocked(self) -> tuple[Decimal, Decimal, Decimal]:
@@ -2718,7 +3513,17 @@ class TradovateMicroFuturesPaperEmulator:
         reason: str,
         request_id: str,
         now: datetime,
+        cl_ord_id: str | None = None,
     ) -> TradovateOrderReceipt:
+        cleaned_cl: str | None = None
+        if cl_ord_id is not None:
+            cleaned_cl = cl_ord_id.strip()
+            if not cleaned_cl:
+                raise TradovateOrderError("cl_ord_id cannot be empty")
+            if cleaned_cl in self._seen_cl_ord_ids:
+                raise TradovateOrderError(
+                    f"Duplicate clOrdId {cleaned_cl!r} refused in paper emulator"
+                )
         pos = self._positions.get(position_id)
         if pos is None:
             raise TradovateOrderError(f"Unknown open position_id: {position_id!r}")
@@ -2756,13 +3561,34 @@ class TradovateMicroFuturesPaperEmulator:
         self._total_commissions_usd = _q2(self._total_commissions_usd + commission)
         del self._positions[position_id]
         self._current_equity_unlocked()
+        ord_id = self._next_order_id()
+        if cleaned_cl is not None:
+            self._seen_cl_ord_ids.add(cleaned_cl)
+        self._order_history.append(
+            {
+                "accountId": self._account_id,
+                "accountSpec": self._account_id,
+                "orderId": ord_id,
+                "clOrdId": cleaned_cl,
+                "positionId": pos.position_id,
+                "symbol": pos.contract_code,
+                "action": "Sell" if pos.side == "BUY" else "Buy",
+                "orderType": "Market",
+                "orderQty": pos.contracts,
+                "filledQty": pos.contracts,
+                "fillPrice": decimal_text(fill_px),
+                "ordStatus": "Filled",
+                "executedAt": _iso_utc(now),
+            }
+        )
 
         return TradovateOrderReceipt(
             request_id=request_id,
+            cl_ord_id=cleaned_cl,
             action=action,
             accepted=True,
             status=status,
-            order_id=self._next_order_id(),
+            order_id=ord_id,
             position_id=pos.position_id,
             contract_code=pos.contract_code,
             root_symbol=pos.root_symbol,
@@ -2914,11 +3740,21 @@ class TradovateMicroFuturesPaperEmulator:
         new_stop_loss_price: Decimal,
         *,
         request_id: str | None = None,
+        cl_ord_id: str | None = None,
         now_utc: datetime | None = None,
     ) -> TradovateOrderReceipt:
         now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
         with self._lock:
             self._require_connected()
+            cleaned_cl: str | None = None
+            if cl_ord_id is not None:
+                cleaned_cl = cl_ord_id.strip()
+                if not cleaned_cl:
+                    raise TradovateOrderError("cl_ord_id cannot be empty")
+                if cleaned_cl in self._seen_cl_ord_ids:
+                    raise TradovateOrderError(
+                        f"Duplicate clOrdId {cleaned_cl!r} refused in paper emulator"
+                    )
             pos = self._positions.get(position_id)
             if pos is None:
                 raise TradovateOrderError(f"Unknown open position_id: {position_id!r}")
@@ -2928,12 +3764,32 @@ class TradovateMicroFuturesPaperEmulator:
             )
             pos.stop_loss_price = aligned_sl
             pos.updated_at = now
+            ord_id = self._next_order_id()
+            if cleaned_cl is not None:
+                self._seen_cl_ord_ids.add(cleaned_cl)
+            self._order_history.append(
+                {
+                    "accountId": self._account_id,
+                    "accountSpec": self._account_id,
+                    "orderId": ord_id,
+                    "clOrdId": cleaned_cl,
+                    "positionId": pos.position_id,
+                    "symbol": pos.contract_code,
+                    "action": "Sell" if pos.side == "BUY" else "Buy",
+                    "orderType": "Stop",
+                    "orderQty": pos.contracts,
+                    "stopPrice": decimal_text(aligned_sl),
+                    "ordStatus": "Working",
+                    "executedAt": _iso_utc(now),
+                }
+            )
             return TradovateOrderReceipt(
-                request_id=request_id or f"amend-{position_id}-{self._order_seq + 1}",
+                request_id=request_id or f"amend-{position_id}-{self._order_seq}",
+                cl_ord_id=cleaned_cl,
                 action=FuturesOrderAction.AMEND_STOP,
                 accepted=True,
                 status="AMENDED",
-                order_id=self._next_order_id(),
+                order_id=ord_id,
                 position_id=pos.position_id,
                 contract_code=pos.contract_code,
                 root_symbol=pos.root_symbol,
@@ -2957,6 +3813,7 @@ class TradovateMicroFuturesPaperEmulator:
         exit_price: Decimal | None = None,
         reason: str = "MANUAL_CLOSE",
         request_id: str | None = None,
+        cl_ord_id: str | None = None,
         now_utc: datetime | None = None,
     ) -> TradovateOrderReceipt:
         now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
@@ -2970,6 +3827,7 @@ class TradovateMicroFuturesPaperEmulator:
                 reason=reason,
                 request_id=request_id or f"close-{position_id}-{self._order_seq + 1}",
                 now=now,
+                cl_ord_id=cl_ord_id,
             )
 
     def emergency_close_all(
@@ -3009,7 +3867,77 @@ class TradovateMicroFuturesPaperEmulator:
     def list_orders(self) -> list[dict[str, Any]]:
         with self._lock:
             self._require_connected()
-            return [dict(item) for item in self._order_history]
+            return [
+                {**dict(item), "accountId": item.get("accountId", self._account_id)}
+                for item in self._order_history
+            ]
+
+    def list_orders_paginated(
+        self,
+        *,
+        page_size: int = 100,
+        max_pages: int = 50,
+        since_utc: datetime | None = None,
+    ) -> TradovateReconciliationEvidence:
+        if type(page_size) is not int or page_size < 1:
+            raise ContractError("page_size must be a positive int")
+        if type(max_pages) is not int or max_pages < 1:
+            raise ContractError("max_pages must be a positive int")
+        if since_utc is not None:
+            utc_time(since_utc, "since_utc")
+        with self._lock:
+            self._require_connected()
+            now = self._clock()
+            items = [
+                {**dict(item), "accountId": item.get("accountId", self._account_id)}
+                for item in self._order_history
+            ]
+            total_pages = max(1, (len(items) + page_size - 1) // page_size)
+            if total_pages > max_pages:
+                sliced = items[: max_pages * page_size]
+                observed = frozenset(
+                    str(x.get("clOrdId", "")).strip() for x in sliced if str(x.get("clOrdId", "")).strip()
+                )
+                return TradovateReconciliationEvidence(
+                    account_id=self._account_id,
+                    orders=tuple(sliced),
+                    observed_cl_ord_ids=observed,
+                    pages_fetched=max_pages,
+                    complete=False,
+                    provider_cursor_exhausted=False,
+                    watermark_utc=now,
+                    incompleteness_reasons=("pagination_max_pages_exceeded",),
+                    authoritative_confirmation=False,
+                    observed_at=now,
+                )
+            observed = frozenset(
+                str(x.get("clOrdId", "")).strip() for x in items if str(x.get("clOrdId", "")).strip()
+            )
+            return TradovateReconciliationEvidence(
+                account_id=self._account_id,
+                orders=tuple(items),
+                observed_cl_ord_ids=observed,
+                pages_fetched=total_pages,
+                complete=True,
+                provider_cursor_exhausted=True,
+                watermark_utc=now,
+                incompleteness_reasons=(),
+                authoritative_confirmation=True,
+                observed_at=now,
+            )
+
+    def fetch_reconciliation_evidence(
+        self,
+        *,
+        page_size: int = 100,
+        max_pages: int = 50,
+        since_utc: datetime | None = None,
+    ) -> TradovateReconciliationEvidence:
+        return self.list_orders_paginated(
+            page_size=page_size,
+            max_pages=max_pages,
+            since_utc=since_utc,
+        )
 
     def find_orders_by_cl_ord_id(self, cl_ord_id: str) -> list[dict[str, Any]]:
         if not isinstance(cl_ord_id, str) or not cl_ord_id.strip():
@@ -3139,6 +4067,8 @@ class TradovateMicroFuturesPaperEmulator:
             self._seen_cl_ord_ids.add(cl_ord_id)
             self._submitted_oso_payloads.append(oso_payload)
             history_entry: dict[str, Any] = {
+                "accountId": self._account_id,
+                "accountSpec": self._account_id,
                 "orderId": ord_id,
                 "oso1Id": sl_ord_id,
                 "oso2Id": tp_ord_id,
@@ -3232,6 +4162,7 @@ class TradovateMicroFuturesPaperEmulator:
                 request.position_id,
                 request.stop_loss_price,
                 request_id=request.request_id,
+                cl_ord_id=request.cl_ord_id,
                 now_utc=now,
             )
 
@@ -3242,6 +4173,7 @@ class TradovateMicroFuturesPaperEmulator:
                 request.position_id,
                 reason=request.client_tag or "CLOSE_POSITION",
                 request_id=request.request_id,
+                cl_ord_id=request.cl_ord_id,
                 now_utc=now,
             )
 
@@ -3610,6 +4542,22 @@ class TradovateMicroFuturesVenue:
                 clock=self._clock,
             )
 
+        if not self._account_id and isinstance(
+            self._transport, (TradovateMicroFuturesPaperEmulator, TradovateHttpsTransport)
+        ):
+            self._account_id = self._transport.account_id
+        elif (
+            self._account_id
+            and isinstance(self._transport, (TradovateMicroFuturesPaperEmulator, TradovateHttpsTransport))
+            and self._transport.account_id
+            and self._account_id != self._transport.account_id
+        ):
+            raise TradovateTransportError(
+                f"Transport account_id ({self._transport.account_id!r}) mismatches "
+                f"authorized account_id ({self._account_id!r})",
+                ambiguous=False,
+            )
+
         self._init_schema()
 
     def __repr__(self) -> str:
@@ -3654,6 +4602,97 @@ class TradovateMicroFuturesVenue:
         )
 
     # -- SQLite connections (RW for mutations, strict ?mode=ro for snapshots) --
+
+    def _authorized_account_id(self) -> str:
+        acct = (self._account_id or "").strip()
+        if not acct:
+            if isinstance(self._transport, TradovateMicroFuturesPaperEmulator):
+                acct = self._transport.account_id
+            else:
+                t_acct = getattr(self._transport, "account_id", None)
+                if isinstance(t_acct, str) and t_acct.strip():
+                    acct = t_acct.strip()
+        if not acct:
+            if self._mode == TRADOVATE_MODE_LIVE:
+                raise TradovateLiveLockError(
+                    "LIVE TradovateMicroFuturesVenue requires non-empty authorized account_id"
+                )
+            raise TradovateTransportError(
+                "TradovateMicroFuturesVenue requires non-empty authorized account_id",
+                ambiguous=False,
+            )
+        if any(ch.isspace() or ord(ch) < 32 for ch in acct):
+            raise TradovateEndpointError("Tradovate account_id contains whitespace or control characters")
+        if self._mode == TRADOVATE_MODE_LIVE:
+            ctx = self._live_auth_context
+            if not isinstance(ctx, LiveAuthorizationContext) or ctx.account_id.strip() != acct:
+                raise TradovateLiveLockError(
+                    "LIVE TradovateMicroFuturesVenue account_id mismatches LiveAuthorizationContext"
+                )
+        if isinstance(self._transport, TradovateMicroFuturesPaperEmulator) and self._transport.account_id != acct:
+            raise TradovateTransportError(
+                f"Paper emulator account_id ({self._transport.account_id!r}) mismatches authorized account_id ({acct!r})",
+                ambiguous=False,
+            )
+        if isinstance(self._transport, TradovateHttpsTransport):
+            t_https_acct = self._transport._authorized_account_id()
+            if t_https_acct != acct:
+                raise TradovateTransportError(
+                    f"HTTPS transport account_id ({t_https_acct!r}) mismatches authorized account_id ({acct!r})",
+                    ambiguous=False,
+                )
+        return acct
+
+    @staticmethod
+    def _validate_account_snapshot(
+        acct: TradovateAccountSnapshot,
+        *,
+        expected_account_id: str,
+    ) -> TradovateAccountSnapshot:
+        if not isinstance(acct, TradovateAccountSnapshot):
+            raise TradovateTransportError(
+                "Transport returned non-TradovateAccountSnapshot object",
+                ambiguous=False,
+            )
+        got = (acct.account_id or "").strip()
+        if not got:
+            raise TradovateTransportError(
+                "Tradovate account_snapshot missing required account_id",
+                ambiguous=False,
+            )
+        if got != expected_account_id:
+            raise TradovateTransportError(
+                f"Tradovate account_snapshot account_id mismatch: "
+                f"expected {expected_account_id!r}, got {got!r}",
+                ambiguous=False,
+            )
+        return acct
+
+    @staticmethod
+    def _validate_positions_ownership(
+        positions: tuple[TradovatePosition, ...],
+        *,
+        expected_account_id: str,
+    ) -> tuple[TradovatePosition, ...]:
+        for pos in positions:
+            if not isinstance(pos, TradovatePosition):
+                raise TradovateTransportError(
+                    "Transport returned non-TradovatePosition object",
+                    ambiguous=False,
+                )
+            got = pos.account_id.strip() if isinstance(pos.account_id, str) else ""
+            if not got:
+                raise TradovateTransportError(
+                    f"Tradovate position {pos.position_id!r} missing required account_id",
+                    ambiguous=False,
+                )
+            if got != expected_account_id:
+                raise TradovateTransportError(
+                    f"Tradovate position {pos.position_id!r} account_id mismatch: "
+                    f"expected {expected_account_id!r}, got {got!r}",
+                    ambiguous=False,
+                )
+        return positions
 
     def _connect_rw(self) -> sqlite3.Connection:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3732,7 +4771,11 @@ class TradovateMicroFuturesVenue:
         initial_peak = Decimal("0.00")
         if self._transport.is_connected():
             try:
-                snap = self._transport.account_snapshot(now_utc=now)
+                auth_acct = self._authorized_account_id()
+                snap = self._validate_account_snapshot(
+                    self._transport.account_snapshot(now_utc=now),
+                    expected_account_id=auth_acct,
+                )
                 initial_peak = snap.peak_equity_usd
             except TradovateVenueError:
                 initial_peak = Decimal("0.00")
@@ -4023,7 +5066,11 @@ class TradovateMicroFuturesVenue:
 
             peak_candidate = Decimal("0.00")
             if self._transport.is_connected():
-                acct = self._transport.account_snapshot(now_utc=now)
+                expected_acct = target_account_id or self._authorized_account_id()
+                acct = self._validate_account_snapshot(
+                    self._transport.account_snapshot(now_utc=now),
+                    expected_account_id=expected_acct,
+                )
                 peak_candidate = max(acct.peak_equity_usd, acct.equity_usd)
 
             with closing(self._connect_rw()) as conn:
@@ -4473,8 +5520,15 @@ class TradovateMicroFuturesVenue:
                 )
 
             # 4. Observe account & enforce <= 10.00% portfolio drawdown brake
-            acct = self._transport.account_snapshot(now_utc=now)
-            open_positions = self._transport.positions()
+            auth_acct = self._authorized_account_id()
+            acct = self._validate_account_snapshot(
+                self._transport.account_snapshot(now_utc=now),
+                expected_account_id=auth_acct,
+            )
+            open_positions = self._validate_positions_ownership(
+                self._transport.positions(),
+                expected_account_id=auth_acct,
+            )
             with closing(self._connect_rw()) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
@@ -4888,68 +5942,260 @@ class TradovateMicroFuturesVenue:
             )
             receipt_json = canonical_bytes(receipt.to_dict()).decode("utf-8")
 
-            with closing(self._connect_rw()) as conn:
-                conn.execute("BEGIN IMMEDIATE")
+            try:
+                with closing(self._connect_rw()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        conn.execute(
+                            "UPDATE mutation_journal SET status = ?, receipt_json = ?, updated_at = ? "
+                            "WHERE request_id = ?",
+                            (receipt.status, receipt_json, _iso_utc(receipt.executed_at), request_id),
+                        )
+                        self._append_audit_unlocked(
+                            conn,
+                            event_type="ORDER_BRACKET_OPENED",
+                            entity_id=request_id,
+                            payload={
+                                "receipt": receipt.to_dict(),
+                                "quote_observed_at": _iso_utc(quote_observed_at),
+                                "valve_mode": valve_decision.valve_mode,
+                                "valve_score": decimal_text(valve_score_dec),
+                                "valve_weights_sha256": valve_decision.weights_sha256,
+                            },
+                            occurred_at=receipt.executed_at,
+                        )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                        raise
+            except Exception as exc:
+                detail = f"POST_EFFECT_JOURNAL_FAILURE ({type(exc).__name__}): {exc}"
                 try:
-                    conn.execute(
-                        "UPDATE mutation_journal SET status = ?, receipt_json = ?, updated_at = ? "
-                        "WHERE request_id = ?",
-                        (receipt.status, receipt_json, _iso_utc(receipt.executed_at), request_id),
+                    self._record_unresolved_latch(
+                        request_id=request_id,
+                        cl_ord_id=cl_ord_id,
+                        status=MUTATION_STATUS_OUTCOME_UNKNOWN,
+                        event_type="ORDER_OUTCOME_UNKNOWN",
+                        detail=detail,
+                        now=self._clock(),
+                        order_id=receipt.order_id,
                     )
-                    self._append_audit_unlocked(
-                        conn,
-                        event_type="ORDER_BRACKET_OPENED",
-                        entity_id=request_id,
-                        payload={
-                            "receipt": receipt.to_dict(),
-                            "quote_observed_at": _iso_utc(quote_observed_at),
-                            "valve_mode": valve_decision.valve_mode,
-                            "valve_score": decimal_text(valve_score_dec),
-                            "valve_weights_sha256": valve_decision.weights_sha256,
-                        },
-                        occurred_at=receipt.executed_at,
-                    )
-                    conn.execute("COMMIT")
                 except Exception:
-                    conn.execute("ROLLBACK")
-                    raise
+                    pass
+                raise TradovateOutcomeUnknownError(
+                    f"Tradovate post-effect journal failure for clOrdId={cl_ord_id} ({detail}); "
+                    "venue frozen until reconcile_unknown_outcome() verifies broker history",
+                    cl_ord_id=cl_ord_id,
+                    request_id=request_id,
+                ) from None
 
             return receipt
 
     # -- Explicit Broker-History Reconciliation (Findings [2] & [3]) --
+
+    def _normalize_reconciliation_evidence(
+        self,
+        raw_evidence: Any,
+        *,
+        expected_account_id: str,
+        now: datetime,
+    ) -> tuple[TradovateReconciliationEvidence, bool]:
+        if isinstance(raw_evidence, TradovateReconciliationEvidence):
+            filtered: list[dict[str, Any]] = []
+            for item in raw_evidence.orders:
+                raw_acct = item.get("accountId")
+                if isinstance(raw_acct, bool) or raw_acct is None or not str(raw_acct).strip():
+                    raise TradovateTransportError(
+                        "Reconciliation order item missing required accountId",
+                        ambiguous=True,
+                    )
+                if str(raw_acct).strip() == expected_account_id:
+                    filtered.append(dict(item))
+            if raw_evidence.account_id != expected_account_id:
+                return (
+                    TradovateReconciliationEvidence(
+                        account_id=raw_evidence.account_id,
+                        orders=tuple(filtered),
+                        observed_cl_ord_ids=frozenset(
+                            str(o.get("clOrdId", "")).strip()
+                            for o in filtered
+                            if str(o.get("clOrdId", "")).strip()
+                        ),
+                        pages_fetched=raw_evidence.pages_fetched,
+                        complete=False,
+                        provider_cursor_exhausted=raw_evidence.provider_cursor_exhausted,
+                        watermark_utc=raw_evidence.watermark_utc,
+                        incompleteness_reasons=raw_evidence.incompleteness_reasons + ("account_id_mismatch",),
+                        authoritative_confirmation=False,
+                        observed_at=raw_evidence.observed_at or now,
+                    ),
+                    True,
+                )
+            return (
+                TradovateReconciliationEvidence(
+                    account_id=raw_evidence.account_id,
+                    orders=tuple(filtered),
+                    observed_cl_ord_ids=frozenset(
+                        str(o.get("clOrdId", "")).strip()
+                        for o in filtered
+                        if str(o.get("clOrdId", "")).strip()
+                    ),
+                    pages_fetched=raw_evidence.pages_fetched,
+                    complete=raw_evidence.complete,
+                    provider_cursor_exhausted=raw_evidence.provider_cursor_exhausted,
+                    watermark_utc=raw_evidence.watermark_utc,
+                    incompleteness_reasons=raw_evidence.incompleteness_reasons,
+                    authoritative_confirmation=raw_evidence.authoritative_confirmation,
+                    observed_at=raw_evidence.observed_at or now,
+                ),
+                True,
+            )
+
+        if isinstance(raw_evidence, Mapping):
+            raw_acct = raw_evidence.get("account_id") if raw_evidence.get("account_id") is not None else raw_evidence.get("accountId")
+            acct_str = str(raw_acct).strip() if raw_acct is not None and not isinstance(raw_acct, bool) else ""
+            orders_raw = raw_evidence.get("orders")
+            if not isinstance(orders_raw, Sequence) or isinstance(orders_raw, (str, bytes)):
+                raise TradovateTransportError("Malformed reconciliation evidence orders sequence", ambiguous=True)
+            filtered_m: list[dict[str, Any]] = []
+            for item in orders_raw:
+                if not isinstance(item, Mapping):
+                    raise TradovateTransportError("Malformed order item in reconciliation evidence", ambiguous=True)
+                i_acct = item.get("accountId")
+                if isinstance(i_acct, bool) or i_acct is None or not str(i_acct).strip():
+                    raise TradovateTransportError("Reconciliation order item missing required accountId", ambiguous=True)
+                if str(i_acct).strip() == expected_account_id:
+                    filtered_m.append(dict(item))
+            raw_wm = raw_evidence.get("watermark_utc") if raw_evidence.get("watermark_utc") is not None else raw_evidence.get("watermarkUtc")
+            wm_dt = _parse_utc_timestamp(raw_wm, field="watermark_utc") if raw_wm is not None else None
+            pages_val = raw_evidence.get("pages_fetched", 0)
+            pages_int = int(pages_val) if type(pages_val) is int and pages_val >= 0 else 0
+            comp_val = bool(raw_evidence.get("complete") is True)
+            exh_val = bool(raw_evidence.get("provider_cursor_exhausted") is True)
+            auth_val = bool(raw_evidence.get("authoritative_confirmation") is True)
+            reasons = list(raw_evidence.get("incompleteness_reasons") or ())
+            if not acct_str or acct_str != expected_account_id:
+                comp_val = False
+                auth_val = False
+                reasons.append("account_id_mismatch")
+            return (
+                TradovateReconciliationEvidence(
+                    account_id=acct_str or expected_account_id,
+                    orders=tuple(filtered_m),
+                    observed_cl_ord_ids=frozenset(
+                        str(o.get("clOrdId", "")).strip()
+                        for o in filtered_m
+                        if str(o.get("clOrdId", "")).strip()
+                    ),
+                    pages_fetched=pages_int,
+                    complete=comp_val,
+                    provider_cursor_exhausted=exh_val,
+                    watermark_utc=wm_dt,
+                    incompleteness_reasons=tuple(str(r) for r in reasons),
+                    authoritative_confirmation=auth_val,
+                    observed_at=now,
+                ),
+                True,
+            )
+
+        raise TradovateTransportError(
+            f"Unsupported reconciliation evidence type: {type(raw_evidence).__name__}",
+            ambiguous=True,
+        )
+
+    def _fetch_transport_reconciliation_evidence(
+        self,
+        *,
+        expected_account_id: str,
+        since_utc: datetime | None,
+        now: datetime,
+    ) -> tuple[TradovateReconciliationEvidence, bool]:
+        fetch_fn = getattr(self._transport, "fetch_reconciliation_evidence", None)
+        pag_fn = getattr(self._transport, "list_orders_paginated", None)
+        # If subclass overrides list_orders_paginated without overriding fetch_reconciliation_evidence,
+        # prefer list_orders_paginated directly when fetch_reconciliation_evidence isn't overridden.
+        if callable(pag_fn) and callable(fetch_fn):
+            raw_ev = fetch_fn(since_utc=since_utc)
+            return self._normalize_reconciliation_evidence(
+                raw_ev, expected_account_id=expected_account_id, now=now
+            )
+        if callable(fetch_fn):
+            raw_ev = fetch_fn(since_utc=since_utc)
+            return self._normalize_reconciliation_evidence(
+                raw_ev, expected_account_id=expected_account_id, now=now
+            )
+        if callable(pag_fn):
+            raw_ev = pag_fn(since_utc=since_utc)
+            return self._normalize_reconciliation_evidence(
+                raw_ev, expected_account_id=expected_account_id, now=now
+            )
+
+        lister = getattr(self._transport, "list_orders", None)
+        if callable(lister):
+            raw_list = lister()
+            if not isinstance(raw_list, Sequence) or isinstance(raw_list, (str, bytes)):
+                raise TradovateTransportError("Transport list_orders() returned non-sequence", ambiguous=True)
+            filtered_orders: list[dict[str, Any]] = []
+            for item in raw_list:
+                if not isinstance(item, Mapping):
+                    raise TradovateTransportError("Transport list_orders() item is not a mapping", ambiguous=True)
+                raw_acct = item.get("accountId")
+                if isinstance(raw_acct, bool) or raw_acct is None or not str(raw_acct).strip():
+                    raise TradovateTransportError("Transport list_orders() item missing required accountId", ambiguous=True)
+                if str(raw_acct).strip() == expected_account_id:
+                    filtered_orders.append(dict(item))
+            return (
+                TradovateReconciliationEvidence(
+                    account_id=expected_account_id,
+                    orders=tuple(filtered_orders),
+                    observed_cl_ord_ids=frozenset(
+                        str(o.get("clOrdId", "")).strip()
+                        for o in filtered_orders
+                        if str(o.get("clOrdId", "")).strip()
+                    ),
+                    pages_fetched=1,
+                    complete=False,
+                    provider_cursor_exhausted=False,
+                    watermark_utc=None,
+                    incompleteness_reasons=("unpaged_unwatermarked_transport",),
+                    authoritative_confirmation=False,
+                    observed_at=now,
+                ),
+                False,
+            )
+
+        raise TradovateOutcomeUnknownError(
+            "Transport does not expose broker order-history lookup; freeze latch retained",
+        )
 
     def reconcile_unknown_outcome(
         self,
         *,
         cl_ord_id: str | None = None,
         request_id: str | None = None,
-        broker_orders: Sequence[Mapping[str, Any]] | None = None,
         confirm_protection_resolved: bool = False,
         now_utc: datetime | None = None,
     ) -> dict[str, Any]:
-        """Reconcile OUTCOME_UNKNOWN / PROTECTION_UNCONFIRMED latches against broker order history.
+        """Reconcile OUTCOME_UNKNOWN / PROTECTION_UNCONFIRMED latches against authoritative account-bound history.
 
-        Queries broker orders by exact ``clOrdId`` (via ``broker_orders`` or the
-        transport's ``find_orders_by_cl_ord_id`` / ``list_orders``) and releases
-        the durable venue freeze latch ONLY once every unresolved mutation reaches
-        a broker-confirmed terminal or fully-protected state.
+        Requires connected transport and completeness-proven, account-bound,
+        watermarked paginated order history (plus two consistent observations or
+        explicit authoritative confirmation) before clearing an absence latch.
+        Never accepts raw untrusted caller-supplied order lists.
         """
         now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
         ts_str = _iso_utc(now)
         if type(confirm_protection_resolved) is not bool:
             raise ContractError("confirm_protection_resolved must be a strict bool")
-        if broker_orders is not None:
-            if isinstance(broker_orders, (str, bytes)) or not isinstance(broker_orders, Sequence):
-                raise ContractError("broker_orders must be a sequence of order mappings")
-            if any(not isinstance(item, Mapping) for item in broker_orders):
-                raise ContractError("every item in broker_orders must be a Mapping")
 
         with self._lock:
+            auth_acct = self._authorized_account_id()
             with closing(self._connect_rw()) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     rows = conn.execute(
-                        "SELECT seq, request_id, cl_ord_id, contract_code, status, request_json "
+                        "SELECT seq, request_id, cl_ord_id, action, contract_code, status, request_json, created_at "
                         "FROM mutation_journal WHERE status IN (?, ?, ?) ORDER BY seq ASC",
                         _UNRESOLVED_MUTATION_STATUSES,
                     ).fetchall()
@@ -4973,14 +6219,90 @@ class TradovateMicroFuturesVenue:
                     f"No unresolved mutation matching cl_ord_id={cl_ord_id!r}, request_id={request_id!r}"
                 )
 
+            if not targets:
+                with closing(self._connect_ro()) as conn:
+                    remaining_unresolved = self._query_unresolved_mutations_unlocked(conn)
+                    remaining_latches = self._query_active_latches_unlocked(conn)
+                return {
+                    "reconciled": [],
+                    "remaining_unresolved_count": len(remaining_unresolved),
+                    "remaining_active_latch_count": len(remaining_latches),
+                    "freeze_active": bool(remaining_unresolved or remaining_latches),
+                    "reconciled_at": ts_str,
+                }
+
+            if not self._transport.is_connected():
+                raise TradovateOutcomeUnknownError(
+                    "Transport disconnected during reconcile_unknown_outcome(); freeze latch retained"
+                )
+
+            submitted_times: list[datetime] = []
+            for row in targets:
+                try:
+                    submitted_times.append(
+                        _parse_utc_timestamp(str(row["created_at"]), field="mutation_journal.created_at")
+                    )
+                except TradovateTransportError:
+                    pass
+            earliest_submitted = min(submitted_times) if submitted_times else None
+
+            try:
+                ev1, ev1_paginated = self._fetch_transport_reconciliation_evidence(
+                    expected_account_id=auth_acct,
+                    since_utc=earliest_submitted,
+                    now=now,
+                )
+                open_positions: tuple[TradovatePosition, ...] = ()
+                if confirm_protection_resolved or isinstance(
+                    self._transport, TradovateMicroFuturesPaperEmulator
+                ):
+                    open_positions = self._validate_positions_ownership(
+                        self._transport.positions(),
+                        expected_account_id=auth_acct,
+                    )
+            except TradovateOutcomeUnknownError:
+                raise
+            except Exception as exc:
+                raise TradovateOutcomeUnknownError(
+                    f"Broker history lookup failed during reconciliation ({type(exc).__name__}: {exc}); "
+                    "freeze latch retained"
+                ) from None
+
+            ev2: TradovateReconciliationEvidence | None = None
+            ev2_paginated = False
+            ev2_error: str | None = None
+            needs_second_observation = False
+            if ev1_paginated and ev1.complete and not ev1.authoritative_confirmation:
+                for row in targets:
+                    r_cl_chk = str(row["cl_ord_id"]).strip() if row["cl_ord_id"] is not None else ""
+                    if r_cl_chk and r_cl_chk not in ev1.observed_cl_ord_ids:
+                        needs_second_observation = True
+                        break
+            if needs_second_observation:
+                try:
+                    ev2, ev2_paginated = self._fetch_transport_reconciliation_evidence(
+                        expected_account_id=auth_acct,
+                        since_utc=earliest_submitted,
+                        now=now,
+                    )
+                except Exception as exc:
+                    ev2_error = f"{type(exc).__name__}: {exc}"
+
             reconciled_results: list[dict[str, Any]] = []
             for row in targets:
                 r_req = str(row["request_id"])
                 r_cl = str(row["cl_ord_id"]).strip() if row["cl_ord_id"] is not None else ""
                 r_contract = str(row["contract_code"])
                 orig_req = json.loads(str(row["request_json"]))
+                orig_action = str(orig_req.get("action") or row["action"] or "").strip().upper()
                 req_sl = orig_req.get("stop_loss_price")
                 req_tp = orig_req.get("take_profit_price")
+                try:
+                    orig_submitted_at = _parse_utc_timestamp(
+                        str(row["created_at"]), field="mutation_journal.created_at"
+                    )
+                except TradovateTransportError:
+                    orig_submitted_at = now
 
                 if not r_cl:
                     raise TradovateOutcomeUnknownError(
@@ -4988,51 +6310,65 @@ class TradovateMicroFuturesVenue:
                         request_id=r_req,
                     )
 
-                if broker_orders is not None:
-                    matched = [
-                        dict(o) for o in broker_orders if str(o.get("clOrdId", "")).strip() == r_cl
+                active_ev = ev1
+                matched = [
+                    dict(o)
+                    for o in ev1.orders
+                    if str(o.get("clOrdId", "")).strip() == r_cl
+                    and str(o.get("accountId", "")).strip() == auth_acct
+                ]
+                if not matched and ev2 is not None:
+                    matched_2 = [
+                        dict(o)
+                        for o in ev2.orders
+                        if str(o.get("clOrdId", "")).strip() == r_cl
+                        and str(o.get("accountId", "")).strip() == auth_acct
                     ]
-                else:
-                    if not self._transport.is_connected():
-                        raise TradovateOutcomeUnknownError(
-                            "Transport disconnected during reconcile_unknown_outcome(); freeze latch retained",
-                            cl_ord_id=r_cl,
-                            request_id=r_req,
-                        )
-                    finder = getattr(self._transport, "find_orders_by_cl_ord_id", None)
-                    lister = getattr(self._transport, "list_orders", None)
-                    try:
-                        if callable(finder):
-                            matched = [dict(o) for o in finder(r_cl)]
-                        elif callable(lister):
-                            matched = [
-                                dict(o)
-                                for o in lister()
-                                if str(o.get("clOrdId", "")).strip() == r_cl
-                            ]
-                        else:
-                            raise TradovateOutcomeUnknownError(
-                                "Transport does not expose broker order-history lookup; freeze latch retained",
-                                cl_ord_id=r_cl,
-                                request_id=r_req,
-                            )
-                    except TradovateOutcomeUnknownError:
-                        raise
-                    except Exception as exc:
-                        raise TradovateOutcomeUnknownError(
-                            f"Broker history lookup failed during reconciliation ({type(exc).__name__}: {exc}); "
-                            "freeze latch retained",
-                            cl_ord_id=r_cl,
-                            request_id=r_req,
-                        ) from None
+                    if matched_2:
+                        matched = matched_2
+                        active_ev = ev2
 
                 new_status: str
                 resolved = False
                 reason_code: str
                 if not matched:
-                    new_status = "RECONCILED_ABSENT"
-                    resolved = True
-                    reason_code = "CONFIRMED_ABSENT_IN_BROKER_HISTORY"
+                    open_cl_hit = any((p.cl_ord_id or "").strip() == r_cl for p in open_positions)
+                    absence_reasons: list[str] = []
+                    if not ev1_paginated:
+                        absence_reasons.append("unpaged_history")
+                    if ev1.account_id != auth_acct:
+                        absence_reasons.append("account_id_mismatch")
+                    if not ev1.complete:
+                        absence_reasons.extend(ev1.incompleteness_reasons or ("incomplete_history",))
+                    if not ev1.provider_cursor_exhausted:
+                        absence_reasons.append("cursor_not_exhausted")
+                    if ev1.watermark_utc is None:
+                        absence_reasons.append("missing_watermark_utc")
+                    elif ev1.watermark_utc < orig_submitted_at:
+                        absence_reasons.append("watermark_before_submission")
+                    if open_cl_hit:
+                        absence_reasons.append("matching_open_position_present")
+                    if not absence_reasons and not ev1.authoritative_confirmation:
+                        if ev2_error is not None:
+                            absence_reasons.append("second_observation_failed")
+                        elif ev2 is None or not ev2_paginated:
+                            absence_reasons.append("missing_second_observation")
+                        elif not ev2.complete or not ev2.provider_cursor_exhausted or ev2.account_id != auth_acct:
+                            absence_reasons.extend(ev2.incompleteness_reasons or ("second_observation_incomplete",))
+                        elif ev2.watermark_utc is None or ev2.watermark_utc < orig_submitted_at:
+                            absence_reasons.append("second_observation_watermark_invalid")
+                        elif r_cl in ev2.observed_cl_ord_ids:
+                            absence_reasons.append("second_observation_inconsistent")
+
+                    if not absence_reasons:
+                        new_status = "RECONCILED_ABSENT"
+                        resolved = True
+                        reason_code = "CONFIRMED_ABSENT_WITH_COMPLETENESS_PROOF"
+                    else:
+                        new_status = MUTATION_STATUS_OUTCOME_UNKNOWN
+                        resolved = False
+                        dedup_reasons = list(dict.fromkeys(absence_reasons))
+                        reason_code = f"ABSENCE_UNPROVEN:{','.join(dedup_reasons)}"
                 else:
                     order_doc = matched[-1]
                     ord_status = str(order_doc.get("ordStatus") or order_doc.get("status") or "").strip().lower()
@@ -5043,9 +6379,55 @@ class TradovateMicroFuturesVenue:
                         filled_qty = -1
 
                     if ord_status in ("rejected", "canceled", "cancelled", "expired") and filled_qty == 0:
-                        new_status = "RECONCILED_REJECTED"
-                        resolved = True
-                        reason_code = f"CONFIRMED_{ord_status.upper()}_ZERO_FILL"
+                        if orig_action == FuturesOrderAction.CANCEL_ORDER.value and ord_status in ("canceled", "cancelled"):
+                            new_status = "RECONCILED_CANCELLED"
+                            resolved = True
+                            reason_code = "CONFIRMED_ORDER_CANCELLED"
+                        else:
+                            new_status = "RECONCILED_REJECTED"
+                            resolved = True
+                            reason_code = f"CONFIRMED_{ord_status.upper()}_ZERO_FILL"
+                    elif orig_action == FuturesOrderAction.AMEND_STOP.value:
+                        if ord_status in ("working", "accepted", "modified", "amended", "active", "filled", "completed"):
+                            stop_ok = True
+                            if req_sl is not None and order_doc.get("stopPrice") is not None:
+                                try:
+                                    stop_ok = (
+                                        _parse_broker_decimal(order_doc.get("stopPrice"), "stopPrice", positive=True)
+                                        == Decimal(str(req_sl))
+                                    )
+                                except (ContractError, InvalidOperation):
+                                    stop_ok = False
+                            if stop_ok:
+                                new_status = "RECONCILED_AMENDED"
+                                resolved = True
+                                reason_code = "CONFIRMED_STOP_AMENDED_IN_BROKER_HISTORY"
+                            else:
+                                new_status = MUTATION_STATUS_OUTCOME_UNKNOWN
+                                resolved = False
+                                reason_code = "AMEND_STOP_PRICE_MISMATCH_IN_HISTORY"
+                        else:
+                            new_status = MUTATION_STATUS_OUTCOME_UNKNOWN
+                            resolved = False
+                            reason_code = f"AMEND_STOP_STILL_AMBIGUOUS_{ord_status.upper() or 'MISSING_STATUS'}"
+                    elif orig_action in (FuturesOrderAction.CLOSE_POSITION.value, FuturesOrderAction.EMERGENCY_CLOSE_ALL.value):
+                        if ord_status in ("filled", "completed", "closed") and filled_qty != 0:
+                            new_status = "RECONCILED_CLOSED"
+                            resolved = True
+                            reason_code = "CONFIRMED_POSITION_CLOSED_IN_BROKER_HISTORY"
+                        else:
+                            new_status = MUTATION_STATUS_OUTCOME_UNKNOWN
+                            resolved = False
+                            reason_code = f"CLOSE_STILL_AMBIGUOUS_{ord_status.upper() or 'MISSING_STATUS'}"
+                    elif orig_action == FuturesOrderAction.CANCEL_ORDER.value:
+                        if ord_status in ("canceled", "cancelled", "filled", "completed"):
+                            new_status = "RECONCILED_CANCELLED"
+                            resolved = True
+                            reason_code = "CONFIRMED_ORDER_CANCELLED"
+                        else:
+                            new_status = MUTATION_STATUS_OUTCOME_UNKNOWN
+                            resolved = False
+                            reason_code = f"CANCEL_STILL_AMBIGUOUS_{ord_status.upper() or 'MISSING_STATUS'}"
                     elif ord_status in (
                         "filled",
                         "working",
@@ -5057,9 +6439,7 @@ class TradovateMicroFuturesVenue:
                         req_side = str(orig_req.get("side") or "").strip().upper()
                         expected_prot_action = "sell" if req_side == "BUY" else ("buy" if req_side == "SELL" else "")
                         req_qty = orig_req.get("contracts")
-                        all_history_orders: list[Mapping[str, Any]] = (
-                            list(broker_orders) if broker_orders is not None else []
-                        )
+                        all_history_orders = list(active_ev.orders)
 
                         def _find_child_doc(
                             parent_doc: Mapping[str, Any],
@@ -5069,11 +6449,15 @@ class TradovateMicroFuturesVenue:
                             for iname in inline_names:
                                 cand = parent_doc.get(iname)
                                 if isinstance(cand, Mapping):
+                                    if cand.get("accountId") is not None and str(cand.get("accountId")).strip() != auth_acct:
+                                        return None
                                     return cand
                             cid = str(child_id_val).strip() if child_id_val is not None else ""
                             if not cid:
                                 return None
                             for entry in all_history_orders:
+                                if str(entry.get("accountId", "")).strip() != auth_acct:
+                                    continue
                                 eid = entry.get("orderId") if entry.get("orderId") is not None else entry.get("id")
                                 if eid is not None and str(eid).strip() == cid:
                                     return entry
@@ -5082,6 +6466,8 @@ class TradovateMicroFuturesVenue:
                                 try:
                                     fetched = fetcher(cid)
                                     if isinstance(fetched, Mapping):
+                                        if str(fetched.get("accountId", "")).strip() != auth_acct:
+                                            return None
                                         return fetched
                                 except TradovateVenueError:
                                     return None
@@ -5093,6 +6479,8 @@ class TradovateMicroFuturesVenue:
                             px_keys: tuple[str, ...],
                         ) -> bool:
                             if not isinstance(cdoc, Mapping) or expected_px_str is None:
+                                return False
+                            if cdoc.get("accountId") is not None and str(cdoc.get("accountId")).strip() != auth_acct:
                                 return False
                             c_status = str(cdoc.get("ordStatus") or cdoc.get("status") or "").strip().lower()
                             if c_status in ("rejected", "canceled", "cancelled", "expired", "suspended"):
@@ -5150,11 +6538,7 @@ class TradovateMicroFuturesVenue:
                             resolved = True
                             reason_code = "CONFIRMED_FILLED_WITH_VERIFIED_PROTECTION"
                         elif confirm_protection_resolved:
-                            open_same = False
-                            if self._transport.is_connected():
-                                open_same = any(
-                                    p.contract_code == r_contract for p in self._transport.positions()
-                                )
+                            open_same = any(p.contract_code == r_contract for p in open_positions)
                             if not open_same:
                                 new_status = "RECONCILED_CLOSED_EXTERNALLY"
                                 resolved = True
@@ -5175,10 +6559,16 @@ class TradovateMicroFuturesVenue:
                 rec_doc = {
                     "request_id": r_req,
                     "cl_ord_id": r_cl,
+                    "action": orig_action,
+                    "account_id": auth_acct,
                     "new_status": new_status,
                     "resolved": resolved,
                     "reason": reason_code,
                     "matched_order_count": len(matched),
+                    "pages_fetched": active_ev.pages_fetched,
+                    "evidence_complete": active_ev.complete,
+                    "provider_cursor_exhausted": active_ev.provider_cursor_exhausted,
+                    "watermark_utc": _iso_utc(active_ev.watermark_utc) if active_ev.watermark_utc is not None else None,
                     "reconciled_at": ts_str,
                 }
                 rec_json = canonical_bytes(rec_doc).decode("utf-8")
@@ -5229,7 +6619,52 @@ class TradovateMicroFuturesVenue:
                 "reconciled_at": ts_str,
             }
 
-    # -- Protective Actions (ALWAYS ALLOWED regardless of standby/drawdown/valve) --
+    # -- Protective Actions (ALWAYS ALLOWED; Durably Idempotent & Pre-Journaled) --
+
+    @staticmethod
+    def _validate_protective_receipt(
+        raw_receipt: Any,
+        *,
+        expected_action: FuturesOrderAction,
+        expected_cl_ord_id: str,
+        expected_stop_loss_price: Decimal | None = None,
+    ) -> str | None:
+        if not isinstance(raw_receipt, TradovateOrderReceipt):
+            return "Transport returned non-TradovateOrderReceipt object"
+        if not raw_receipt.accepted:
+            return f"Broker did not accept protective {expected_action.value} (status={raw_receipt.status!r})"
+        norm_status = str(raw_receipt.status or "").strip().upper()
+        if not norm_status or norm_status in (
+            "REJECTED",
+            "EXPIRED",
+            "CANCELED",
+            "CANCELLED",
+            "SUSPENDED",
+            "VOIDED",
+            "ERROR",
+            "FAILED",
+            "PENDING_NEW",
+            "PENDINGNEW",
+        ):
+            return f"Broker returned non-success protective status {raw_receipt.status!r}"
+        if expected_action is FuturesOrderAction.CLOSE_POSITION and norm_status == "WORKING":
+            return "Broker close returned non-terminal WORKING status"
+        if not isinstance(raw_receipt.order_id, str) or not raw_receipt.order_id.strip():
+            return "Broker protective receipt missing confirmed order_id"
+        if raw_receipt.cl_ord_id is not None and raw_receipt.cl_ord_id.strip() != expected_cl_ord_id:
+            return (
+                f"Broker protective receipt cl_ord_id ({raw_receipt.cl_ord_id!r}) != "
+                f"requested ({expected_cl_ord_id!r})"
+            )
+        if expected_action is FuturesOrderAction.AMEND_STOP and expected_stop_loss_price is not None:
+            if raw_receipt.stop_loss_price != expected_stop_loss_price:
+                return (
+                    f"Broker amended stop_loss_price ({raw_receipt.stop_loss_price}) != "
+                    f"requested ({expected_stop_loss_price})"
+                )
+        if expected_action is FuturesOrderAction.CLOSE_POSITION and raw_receipt.filled_contracts <= 0:
+            return "Broker close receipt reported filled_contracts <= 0"
+        return None
 
     def amend_stop(
         self,
@@ -5237,23 +6672,56 @@ class TradovateMicroFuturesVenue:
         new_stop_loss_price: Decimal,
         *,
         reason: str = "PROTECTIVE_AMEND_STOP",
+        idempotency_key: str | None = None,
         now_utc: datetime | None = None,
     ) -> TradovateOrderReceipt:
-        """Protective stop amendment (e.g. break-even / trail). ALWAYS ALLOWED."""
+        """Protective stop amendment (e.g. break-even / trail). ALWAYS ALLOWED & pre-journaled."""
         now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+                raise ContractError("idempotency_key must be a non-empty string when provided")
+            _check_no_control_chars(idempotency_key, "idempotency_key")
+
         with self._lock:
             if not self._transport.is_connected():
                 raise TradovateTransportError("Tradovate transport is disconnected")
-            open_pos = next((p for p in self._transport.positions() if p.position_id == position_id), None)
+            auth_acct = self._authorized_account_id()
+            open_positions = self._validate_positions_ownership(
+                self._transport.positions(),
+                expected_account_id=auth_acct,
+            )
+            open_pos = next((p for p in open_positions if p.position_id == position_id), None)
             if open_pos is None:
                 raise TradovateOrderError(f"Unknown open position_id: {position_id!r}")
+            if (open_pos.account_id or "").strip() != auth_acct:
+                raise TradovateTransportError(
+                    f"Position {position_id!r} account mismatch (expected {auth_acct!r})",
+                    ambiguous=False,
+                )
+            if isinstance(self._transport, TradovateHttpsTransport) and not open_pos.stop_loss_order_id:
+                raise TradovateOrderError(
+                    f"Open position {position_id!r} lacks confirmed stop_loss_order_id"
+                )
             aligned_sl = align_price_to_tick(
                 open_pos.root_symbol,
                 _exact_decimal(new_stop_loss_price, "new_stop_loss_price", positive=True),
             )
             request_id = self._next_request_id("amend")
+            stable_key = idempotency_key.strip() if idempotency_key is not None else request_id
+            cl_ord_id = _compute_stable_cl_ord_id(
+                account_id=auth_acct,
+                idempotency_key=stable_key,
+                contract_code=open_pos.contract_code,
+                action=FuturesOrderAction.AMEND_STOP.value,
+                side=open_pos.side,
+                contracts=open_pos.contracts,
+                stop_loss_price=aligned_sl,
+                take_profit_price=open_pos.take_profit_price,
+                target_id=f"{position_id}:{open_pos.stop_loss_order_id or ''}",
+            )
             order_req = TradovateOrderRequest(
                 request_id=request_id,
+                cl_ord_id=cl_ord_id,
                 action=FuturesOrderAction.AMEND_STOP,
                 contract_code=open_pos.contract_code,
                 root_symbol=open_pos.root_symbol,
@@ -5261,33 +6729,262 @@ class TradovateMicroFuturesVenue:
                 side=open_pos.side,
                 contracts=open_pos.contracts,
                 stop_loss_price=aligned_sl,
+                take_profit_price=open_pos.take_profit_price,
                 position_id=position_id,
                 order_id=open_pos.stop_loss_order_id,
                 client_tag=reason,
                 created_at=now,
             )
-            receipt = self._transport.send_order(order_req)
-            self._persist_protective_mutation(order_req, receipt, event_type="PROTECTIVE_STOP_AMENDED")
+            req_json = canonical_bytes(order_req.to_dict()).decode("utf-8")
+            ts_str = _iso_utc(now)
+
+            with closing(self._connect_rw()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    dup_row = conn.execute(
+                        "SELECT request_id, status FROM mutation_journal WHERE cl_ord_id = ?",
+                        (cl_ord_id,),
+                    ).fetchone()
+                    if dup_row is not None:
+                        dup_status = str(dup_row["status"])
+                        conn.execute("COMMIT")
+                        if dup_status in _UNRESOLVED_MUTATION_STATUSES:
+                            raise TradovateOutcomeUnknownError(
+                                f"Duplicate protective clOrdId {cl_ord_id!r} already in unresolved state {dup_status!r}",
+                                cl_ord_id=cl_ord_id,
+                                request_id=str(dup_row["request_id"]),
+                            )
+                        raise TradovateOrderError(
+                            f"Duplicate idempotent protective clOrdId {cl_ord_id!r} already committed "
+                            f"(request_id={dup_row['request_id']}, status={dup_status})"
+                        )
+                    conn.execute(
+                        "INSERT INTO mutation_journal "
+                        "(request_id, cl_ord_id, action, contract_code, root_symbol, cas_symbol, status, "
+                        "request_json, receipt_json, error_detail, reconciled_at, reconciliation_json, "
+                        "created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
+                        (
+                            request_id,
+                            cl_ord_id,
+                            order_req.action.value,
+                            order_req.contract_code,
+                            order_req.root_symbol,
+                            order_req.cas_symbol,
+                            MUTATION_STATUS_PENDING,
+                            req_json,
+                            ts_str,
+                            ts_str,
+                        ),
+                    )
+                    conn.execute("COMMIT")
+                except (TradovateOutcomeUnknownError, TradovateOrderError):
+                    raise
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+
+            try:
+                raw_receipt = self._transport.send_order(order_req)
+            except LiveAuthorizationError as exc:
+                with closing(self._connect_rw()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        conn.execute(
+                            "UPDATE mutation_journal SET status = ?, error_detail = ?, updated_at = ? "
+                            "WHERE request_id = ?",
+                            ("REFUSED_LIVE_AUTH", str(exc), _iso_utc(self._clock()), request_id),
+                        )
+                        self._append_audit_unlocked(
+                            conn,
+                            event_type="PROTECTIVE_REFUSED_LIVE_AUTH",
+                            entity_id=request_id,
+                            payload={"cl_ord_id": cl_ord_id, "error": str(exc)},
+                            occurred_at=self._clock(),
+                        )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                        raise
+                raise
+            except Exception as exc:
+                http_status = getattr(exc, "http_status", None)
+                detail = f"AMBIGUOUS_PROTECTIVE_AMEND_OUTCOME ({type(exc).__name__}): {exc}"
+                self._record_unresolved_latch(
+                    request_id=request_id,
+                    cl_ord_id=cl_ord_id,
+                    status=MUTATION_STATUS_OUTCOME_UNKNOWN,
+                    event_type="PROTECTIVE_OUTCOME_UNKNOWN",
+                    detail=detail,
+                    now=self._clock(),
+                )
+                raise TradovateOutcomeUnknownError(
+                    f"Tradovate protective amend outcome unknown for clOrdId={cl_ord_id} ({detail}); "
+                    "safety freeze engaged until reconciled",
+                    cl_ord_id=cl_ord_id,
+                    request_id=request_id,
+                    http_status=http_status,
+                ) from None
+
+            failure = self._validate_protective_receipt(
+                raw_receipt,
+                expected_action=FuturesOrderAction.AMEND_STOP,
+                expected_cl_ord_id=cl_ord_id,
+                expected_stop_loss_price=aligned_sl,
+            )
+            if failure is not None:
+                self._record_unresolved_latch(
+                    request_id=request_id,
+                    cl_ord_id=cl_ord_id,
+                    status=MUTATION_STATUS_OUTCOME_UNKNOWN,
+                    event_type="PROTECTIVE_OUTCOME_UNKNOWN",
+                    detail=failure,
+                    now=self._clock(),
+                    order_id=getattr(raw_receipt, "order_id", None) if isinstance(raw_receipt, TradovateOrderReceipt) else None,
+                )
+                raise TradovateOutcomeUnknownError(
+                    f"Tradovate protective amend failed validation for clOrdId={cl_ord_id} ({failure}); "
+                    "safety freeze engaged until reconciled",
+                    cl_ord_id=cl_ord_id,
+                    request_id=request_id,
+                )
+
+            receipt = TradovateOrderReceipt(
+                request_id=raw_receipt.request_id,
+                cl_ord_id=cl_ord_id,
+                action=raw_receipt.action,
+                accepted=raw_receipt.accepted,
+                status=raw_receipt.status,
+                order_id=raw_receipt.order_id,
+                stop_loss_order_id=raw_receipt.stop_loss_order_id or raw_receipt.order_id,
+                take_profit_order_id=raw_receipt.take_profit_order_id,
+                protection_confirmed=raw_receipt.protection_confirmed,
+                position_id=raw_receipt.position_id or position_id,
+                contract_code=raw_receipt.contract_code or open_pos.contract_code,
+                root_symbol=raw_receipt.root_symbol or open_pos.root_symbol,
+                cas_symbol=raw_receipt.cas_symbol or open_pos.cas_symbol,
+                side=raw_receipt.side or open_pos.side,
+                filled_contracts=raw_receipt.filled_contracts,
+                fill_price=raw_receipt.fill_price,
+                stop_loss_price=raw_receipt.stop_loss_price,
+                take_profit_price=raw_receipt.take_profit_price,
+                commission_usd=raw_receipt.commission_usd,
+                realized_pnl_usd=raw_receipt.realized_pnl_usd,
+                net_pnl_usd=raw_receipt.net_pnl_usd,
+                reason=raw_receipt.reason,
+                executed_at=raw_receipt.executed_at,
+            )
+            rec_json = canonical_bytes(receipt.to_dict()).decode("utf-8")
+            try:
+                with closing(self._connect_rw()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        conn.execute(
+                            "UPDATE mutation_journal SET status = ?, receipt_json = ?, updated_at = ? "
+                            "WHERE request_id = ?",
+                            (receipt.status, rec_json, _iso_utc(receipt.executed_at), request_id),
+                        )
+                        self._append_audit_unlocked(
+                            conn,
+                            event_type="PROTECTIVE_STOP_AMENDED",
+                            entity_id=request_id,
+                            payload={"receipt": receipt.to_dict()},
+                            occurred_at=receipt.executed_at,
+                        )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                        raise
+            except Exception as exc:
+                detail = f"POST_EFFECT_AMEND_JOURNAL_FAILURE ({type(exc).__name__}): {exc}"
+                try:
+                    self._record_unresolved_latch(
+                        request_id=request_id,
+                        cl_ord_id=cl_ord_id,
+                        status=MUTATION_STATUS_OUTCOME_UNKNOWN,
+                        event_type="PROTECTIVE_OUTCOME_UNKNOWN",
+                        detail=detail,
+                        now=self._clock(),
+                        order_id=receipt.order_id,
+                    )
+                except Exception:
+                    pass
+                raise TradovateOutcomeUnknownError(
+                    f"Tradovate post-amend journal failure for clOrdId={cl_ord_id} ({detail}); "
+                    "safety freeze engaged until reconciled",
+                    cl_ord_id=cl_ord_id,
+                    request_id=request_id,
+                ) from None
             return receipt
+
+    def amend_protective_brackets(
+        self,
+        position_id: str,
+        new_stop_loss_price: Decimal,
+        *,
+        reason: str = "PROTECTIVE_AMEND_BRACKETS",
+        idempotency_key: str | None = None,
+        now_utc: datetime | None = None,
+    ) -> TradovateOrderReceipt:
+        """Alias for durable pre-journaled protective bracket/stop amendment. ALWAYS ALLOWED."""
+        return self.amend_stop(
+            position_id,
+            new_stop_loss_price,
+            reason=reason,
+            idempotency_key=idempotency_key,
+            now_utc=now_utc,
+        )
 
     def close_position(
         self,
         position_id: str,
         *,
         reason: str = "PROTECTIVE_CLOSE_POSITION",
+        idempotency_key: str | None = None,
         now_utc: datetime | None = None,
     ) -> TradovateOrderReceipt:
-        """Protective single-position close. ALWAYS ALLOWED."""
+        """Protective single-position close. ALWAYS ALLOWED & durably pre-journaled."""
         now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+                raise ContractError("idempotency_key must be a non-empty string when provided")
+            _check_no_control_chars(idempotency_key, "idempotency_key")
+
         with self._lock:
             if not self._transport.is_connected():
                 raise TradovateTransportError("Tradovate transport is disconnected")
-            open_pos = next((p for p in self._transport.positions() if p.position_id == position_id), None)
+            auth_acct = self._authorized_account_id()
+            open_positions = self._validate_positions_ownership(
+                self._transport.positions(),
+                expected_account_id=auth_acct,
+            )
+            open_pos = next((p for p in open_positions if p.position_id == position_id), None)
             if open_pos is None:
                 raise TradovateOrderError(f"Unknown open position_id: {position_id!r}")
+            if (open_pos.account_id or "").strip() != auth_acct:
+                raise TradovateTransportError(
+                    f"Position {position_id!r} account mismatch (expected {auth_acct!r})",
+                    ambiguous=False,
+                )
             request_id = self._next_request_id("close")
+            stable_key = idempotency_key.strip() if idempotency_key is not None else request_id
+            cl_ord_id = _compute_stable_cl_ord_id(
+                account_id=auth_acct,
+                idempotency_key=stable_key,
+                contract_code=open_pos.contract_code,
+                action=FuturesOrderAction.CLOSE_POSITION.value,
+                side=open_pos.side,
+                contracts=open_pos.contracts,
+                stop_loss_price=None,
+                take_profit_price=None,
+                target_id=position_id,
+            )
             order_req = TradovateOrderRequest(
                 request_id=request_id,
+                cl_ord_id=cl_ord_id,
                 action=FuturesOrderAction.CLOSE_POSITION,
                 contract_code=open_pos.contract_code,
                 root_symbol=open_pos.root_symbol,
@@ -5298,83 +6995,428 @@ class TradovateMicroFuturesVenue:
                 client_tag=reason,
                 created_at=now,
             )
-            receipt = self._transport.send_order(order_req)
-            self._persist_protective_mutation(order_req, receipt, event_type="PROTECTIVE_POSITION_CLOSED")
+            req_json = canonical_bytes(order_req.to_dict()).decode("utf-8")
+            ts_str = _iso_utc(now)
+
+            with closing(self._connect_rw()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    dup_row = conn.execute(
+                        "SELECT request_id, status FROM mutation_journal WHERE cl_ord_id = ?",
+                        (cl_ord_id,),
+                    ).fetchone()
+                    if dup_row is not None:
+                        dup_status = str(dup_row["status"])
+                        conn.execute("COMMIT")
+                        if dup_status in _UNRESOLVED_MUTATION_STATUSES:
+                            raise TradovateOutcomeUnknownError(
+                                f"Duplicate close clOrdId {cl_ord_id!r} already in unresolved state {dup_status!r}",
+                                cl_ord_id=cl_ord_id,
+                                request_id=str(dup_row["request_id"]),
+                            )
+                        raise TradovateOrderError(
+                            f"Duplicate idempotent close clOrdId {cl_ord_id!r} already committed "
+                            f"(request_id={dup_row['request_id']}, status={dup_status})"
+                        )
+                    conn.execute(
+                        "INSERT INTO mutation_journal "
+                        "(request_id, cl_ord_id, action, contract_code, root_symbol, cas_symbol, status, "
+                        "request_json, receipt_json, error_detail, reconciled_at, reconciliation_json, "
+                        "created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
+                        (
+                            request_id,
+                            cl_ord_id,
+                            order_req.action.value,
+                            order_req.contract_code,
+                            order_req.root_symbol,
+                            order_req.cas_symbol,
+                            MUTATION_STATUS_PENDING,
+                            req_json,
+                            ts_str,
+                            ts_str,
+                        ),
+                    )
+                    conn.execute("COMMIT")
+                except (TradovateOutcomeUnknownError, TradovateOrderError):
+                    raise
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+
+            try:
+                raw_receipt = self._transport.send_order(order_req)
+            except LiveAuthorizationError as exc:
+                with closing(self._connect_rw()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        conn.execute(
+                            "UPDATE mutation_journal SET status = ?, error_detail = ?, updated_at = ? "
+                            "WHERE request_id = ?",
+                            ("REFUSED_LIVE_AUTH", str(exc), _iso_utc(self._clock()), request_id),
+                        )
+                        self._append_audit_unlocked(
+                            conn,
+                            event_type="PROTECTIVE_REFUSED_LIVE_AUTH",
+                            entity_id=request_id,
+                            payload={"cl_ord_id": cl_ord_id, "error": str(exc)},
+                            occurred_at=self._clock(),
+                        )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                        raise
+                raise
+            except Exception as exc:
+                http_status = getattr(exc, "http_status", None)
+                detail = f"AMBIGUOUS_PROTECTIVE_CLOSE_OUTCOME ({type(exc).__name__}): {exc}"
+                self._record_unresolved_latch(
+                    request_id=request_id,
+                    cl_ord_id=cl_ord_id,
+                    status=MUTATION_STATUS_OUTCOME_UNKNOWN,
+                    event_type="PROTECTIVE_OUTCOME_UNKNOWN",
+                    detail=detail,
+                    now=self._clock(),
+                )
+                raise TradovateOutcomeUnknownError(
+                    f"Tradovate protective close outcome unknown for clOrdId={cl_ord_id} ({detail}); "
+                    "safety freeze engaged until reconciled",
+                    cl_ord_id=cl_ord_id,
+                    request_id=request_id,
+                    http_status=http_status,
+                ) from None
+
+            failure = self._validate_protective_receipt(
+                raw_receipt,
+                expected_action=FuturesOrderAction.CLOSE_POSITION,
+                expected_cl_ord_id=cl_ord_id,
+            )
+            if failure is not None:
+                self._record_unresolved_latch(
+                    request_id=request_id,
+                    cl_ord_id=cl_ord_id,
+                    status=MUTATION_STATUS_OUTCOME_UNKNOWN,
+                    event_type="PROTECTIVE_OUTCOME_UNKNOWN",
+                    detail=failure,
+                    now=self._clock(),
+                    order_id=getattr(raw_receipt, "order_id", None) if isinstance(raw_receipt, TradovateOrderReceipt) else None,
+                )
+                raise TradovateOutcomeUnknownError(
+                    f"Tradovate protective close failed validation for clOrdId={cl_ord_id} ({failure}); "
+                    "safety freeze engaged until reconciled",
+                    cl_ord_id=cl_ord_id,
+                    request_id=request_id,
+                )
+
+            receipt = TradovateOrderReceipt(
+                request_id=raw_receipt.request_id,
+                cl_ord_id=cl_ord_id,
+                action=raw_receipt.action,
+                accepted=raw_receipt.accepted,
+                status=raw_receipt.status,
+                order_id=raw_receipt.order_id,
+                position_id=raw_receipt.position_id or position_id,
+                contract_code=raw_receipt.contract_code or open_pos.contract_code,
+                root_symbol=raw_receipt.root_symbol or open_pos.root_symbol,
+                cas_symbol=raw_receipt.cas_symbol or open_pos.cas_symbol,
+                side=raw_receipt.side or open_pos.side,
+                filled_contracts=raw_receipt.filled_contracts,
+                fill_price=raw_receipt.fill_price,
+                stop_loss_price=raw_receipt.stop_loss_price,
+                take_profit_price=raw_receipt.take_profit_price,
+                commission_usd=raw_receipt.commission_usd,
+                realized_pnl_usd=raw_receipt.realized_pnl_usd,
+                net_pnl_usd=raw_receipt.net_pnl_usd,
+                reason=raw_receipt.reason,
+                executed_at=raw_receipt.executed_at,
+            )
+            rec_json = canonical_bytes(receipt.to_dict()).decode("utf-8")
+            try:
+                peak_candidate = Decimal("0.00")
+                if isinstance(self._transport, TradovateMicroFuturesPaperEmulator) and self._transport.is_connected():
+                    acct = self._validate_account_snapshot(
+                        self._transport.account_snapshot(now_utc=receipt.executed_at),
+                        expected_account_id=auth_acct,
+                    )
+                    peak_candidate = max(acct.peak_equity_usd, acct.equity_usd)
+                with closing(self._connect_rw()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        conn.execute(
+                            "UPDATE mutation_journal SET status = ?, receipt_json = ?, updated_at = ? "
+                            "WHERE request_id = ?",
+                            (receipt.status, rec_json, _iso_utc(receipt.executed_at), request_id),
+                        )
+                        if peak_candidate > Decimal("0.00"):
+                            self._update_peak_equity_unlocked(conn, peak_candidate, receipt.executed_at)
+                        self._append_audit_unlocked(
+                            conn,
+                            event_type="PROTECTIVE_POSITION_CLOSED",
+                            entity_id=request_id,
+                            payload={"receipt": receipt.to_dict()},
+                            occurred_at=receipt.executed_at,
+                        )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                        raise
+            except Exception as exc:
+                detail = f"POST_EFFECT_CLOSE_JOURNAL_FAILURE ({type(exc).__name__}): {exc}"
+                try:
+                    self._record_unresolved_latch(
+                        request_id=request_id,
+                        cl_ord_id=cl_ord_id,
+                        status=MUTATION_STATUS_OUTCOME_UNKNOWN,
+                        event_type="PROTECTIVE_OUTCOME_UNKNOWN",
+                        detail=detail,
+                        now=self._clock(),
+                        order_id=receipt.order_id,
+                    )
+                except Exception:
+                    pass
+                raise TradovateOutcomeUnknownError(
+                    f"Tradovate post-close journal failure for clOrdId={cl_ord_id} ({detail}); "
+                    "safety freeze engaged until reconciled",
+                    cl_ord_id=cl_ord_id,
+                    request_id=request_id,
+                ) from None
             return receipt
 
     def emergency_close_all(
         self,
         *,
         reason: str = "PROTECTIVE_EMERGENCY_CLOSE_ALL",
+        idempotency_key: str | None = None,
         now_utc: datetime | None = None,
     ) -> tuple[TradovateOrderReceipt, ...]:
-        """Protective emergency flatten of all open positions. ALWAYS ALLOWED."""
+        """Protective emergency flatten of all open positions with independent per-leg journaling."""
         now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+                raise ContractError("idempotency_key must be a non-empty string when provided")
+            _check_no_control_chars(idempotency_key, "idempotency_key")
+
         with self._lock:
             if not self._transport.is_connected():
                 raise TradovateTransportError("Tradovate transport is disconnected")
-            open_positions = self._transport.positions()
-            receipts: list[TradovateOrderReceipt] = []
-            if isinstance(self._transport, TradovateMicroFuturesPaperEmulator):
-                base_req_id = self._next_request_id("emergency")
-                receipts.extend(
-                    self._transport.emergency_close_all(
-                        reason=reason,
-                        request_id=base_req_id,
-                        now_utc=now,
-                    )
+            auth_acct = self._authorized_account_id()
+            open_positions = self._validate_positions_ownership(
+                self._transport.positions(),
+                expected_account_id=auth_acct,
+            )
+            base_req_id = self._next_request_id("emergency")
+            if not open_positions:
+                self._record_audit_event(
+                    event_type="PROTECTIVE_EMERGENCY_CLOSE_EMPTY",
+                    entity_id=base_req_id,
+                    payload={"account_id": auth_acct, "reason": str(reason)},
+                    now=now,
                 )
-                for r in receipts:
-                    req = TradovateOrderRequest(
-                        request_id=r.request_id,
-                        action=FuturesOrderAction.EMERGENCY_CLOSE_ALL,
-                        contract_code=r.contract_code,
-                        root_symbol=r.root_symbol,
-                        cas_symbol=r.cas_symbol,
-                        side=r.side,
-                        contracts=r.filled_contracts,
-                        position_id=r.position_id,
-                        client_tag=reason,
-                        created_at=now,
-                    )
-                    self._persist_protective_mutation(req, r, event_type="PROTECTIVE_EMERGENCY_CLOSE")
-                if not receipts:
-                    empty_req = TradovateOrderRequest(
-                        request_id=base_req_id,
-                        action=FuturesOrderAction.EMERGENCY_CLOSE_ALL,
-                        contract_code="",
-                        root_symbol="",
-                        cas_symbol="",
-                        client_tag=reason,
-                        created_at=now,
-                    )
-                    empty_receipt = TradovateOrderReceipt(
-                        request_id=base_req_id,
-                        action=FuturesOrderAction.EMERGENCY_CLOSE_ALL,
-                        accepted=True,
-                        status="EMERGENCY_CLOSED",
-                        order_id=f"ORD-EMPTY-{base_req_id}",
-                        position_id=None,
-                        contract_code="",
-                        root_symbol="",
-                        cas_symbol="",
-                        side=None,
-                        filled_contracts=0,
-                        fill_price=None,
-                        stop_loss_price=None,
-                        take_profit_price=None,
-                        commission_usd=Decimal("0.00"),
-                        realized_pnl_usd=Decimal("0.00"),
-                        net_pnl_usd=Decimal("0.00"),
-                        reason="NO_OPEN_POSITIONS",
-                        executed_at=now,
-                    )
-                    self._persist_protective_mutation(
-                        empty_req, empty_receipt, event_type="PROTECTIVE_EMERGENCY_CLOSE"
-                    )
-            else:
-                for pos in open_positions:
-                    receipts.append(self.close_position(pos.position_id, reason=reason, now_utc=now))
+                return ()
+
+            base_key = idempotency_key.strip() if idempotency_key is not None else base_req_id
+            receipts: list[TradovateOrderReceipt] = []
+            leg_failures: list[tuple[str, str, str]] = []
+
+            for pos in open_positions:
+                leg_req_id = self._next_request_id("emerg")
+                leg_cl_ord_id = _compute_stable_cl_ord_id(
+                    account_id=auth_acct,
+                    idempotency_key=f"{base_key}:leg:{pos.position_id}",
+                    contract_code=pos.contract_code,
+                    action=FuturesOrderAction.CLOSE_POSITION.value,
+                    side=pos.side,
+                    contracts=pos.contracts,
+                    stop_loss_price=None,
+                    take_profit_price=None,
+                    target_id=pos.position_id,
+                )
+                leg_req = TradovateOrderRequest(
+                    request_id=leg_req_id,
+                    cl_ord_id=leg_cl_ord_id,
+                    action=FuturesOrderAction.CLOSE_POSITION,
+                    contract_code=pos.contract_code,
+                    root_symbol=pos.root_symbol,
+                    cas_symbol=pos.cas_symbol,
+                    side=pos.side,
+                    contracts=pos.contracts,
+                    position_id=pos.position_id,
+                    client_tag=reason,
+                    created_at=now,
+                )
+                leg_req_json = canonical_bytes(leg_req.to_dict()).decode("utf-8")
+                ts_str = _iso_utc(now)
+
+                skip_leg = False
+                with closing(self._connect_rw()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        dup_row = conn.execute(
+                            "SELECT request_id, status FROM mutation_journal WHERE cl_ord_id = ?",
+                            (leg_cl_ord_id,),
+                        ).fetchone()
+                        if dup_row is not None:
+                            dup_status = str(dup_row["status"])
+                            conn.execute("COMMIT")
+                            leg_failures.append(
+                                (
+                                    str(dup_row["request_id"]),
+                                    leg_cl_ord_id,
+                                    f"duplicate clOrdId already in status {dup_status!r}",
+                                )
+                            )
+                            skip_leg = True
+                        else:
+                            conn.execute(
+                                "INSERT INTO mutation_journal "
+                                "(request_id, cl_ord_id, action, contract_code, root_symbol, cas_symbol, status, "
+                                "request_json, receipt_json, error_detail, reconciled_at, reconciliation_json, "
+                                "created_at, updated_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
+                                (
+                                    leg_req_id,
+                                    leg_cl_ord_id,
+                                    leg_req.action.value,
+                                    leg_req.contract_code,
+                                    leg_req.root_symbol,
+                                    leg_req.cas_symbol,
+                                    MUTATION_STATUS_PENDING,
+                                    leg_req_json,
+                                    ts_str,
+                                    ts_str,
+                                ),
+                            )
+                            conn.execute("COMMIT")
+                    except Exception:
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                        raise
+
+                if skip_leg:
+                    continue
+
+                try:
+                    raw_leg = self._transport.send_order(leg_req)
+                except Exception as exc:
+                    detail = f"AMBIGUOUS_EMERGENCY_LEG_OUTCOME ({type(exc).__name__}): {exc}"
+                    try:
+                        self._record_unresolved_latch(
+                            request_id=leg_req_id,
+                            cl_ord_id=leg_cl_ord_id,
+                            status=MUTATION_STATUS_OUTCOME_UNKNOWN,
+                            event_type="PROTECTIVE_OUTCOME_UNKNOWN",
+                            detail=detail,
+                            now=self._clock(),
+                        )
+                    except Exception:
+                        pass
+                    leg_failures.append((leg_req_id, leg_cl_ord_id, detail))
+                    continue
+
+                leg_err = self._validate_protective_receipt(
+                    raw_leg,
+                    expected_action=FuturesOrderAction.CLOSE_POSITION,
+                    expected_cl_ord_id=leg_cl_ord_id,
+                )
+                if leg_err is not None:
+                    try:
+                        self._record_unresolved_latch(
+                            request_id=leg_req_id,
+                            cl_ord_id=leg_cl_ord_id,
+                            status=MUTATION_STATUS_OUTCOME_UNKNOWN,
+                            event_type="PROTECTIVE_OUTCOME_UNKNOWN",
+                            detail=leg_err,
+                            now=self._clock(),
+                            order_id=getattr(raw_leg, "order_id", None) if isinstance(raw_leg, TradovateOrderReceipt) else None,
+                        )
+                    except Exception:
+                        pass
+                    leg_failures.append((leg_req_id, leg_cl_ord_id, leg_err))
+                    continue
+
+                leg_receipt = TradovateOrderReceipt(
+                    request_id=raw_leg.request_id,
+                    cl_ord_id=leg_cl_ord_id,
+                    action=raw_leg.action,
+                    accepted=raw_leg.accepted,
+                    status=raw_leg.status,
+                    order_id=raw_leg.order_id,
+                    position_id=raw_leg.position_id or pos.position_id,
+                    contract_code=raw_leg.contract_code or pos.contract_code,
+                    root_symbol=raw_leg.root_symbol or pos.root_symbol,
+                    cas_symbol=raw_leg.cas_symbol or pos.cas_symbol,
+                    side=raw_leg.side or pos.side,
+                    filled_contracts=raw_leg.filled_contracts,
+                    fill_price=raw_leg.fill_price,
+                    stop_loss_price=raw_leg.stop_loss_price,
+                    take_profit_price=raw_leg.take_profit_price,
+                    commission_usd=raw_leg.commission_usd,
+                    realized_pnl_usd=raw_leg.realized_pnl_usd,
+                    net_pnl_usd=raw_leg.net_pnl_usd,
+                    reason=raw_leg.reason,
+                    executed_at=raw_leg.executed_at,
+                )
+                leg_rec_json = canonical_bytes(leg_receipt.to_dict()).decode("utf-8")
+                try:
+                    peak_candidate = Decimal("0.00")
+                    if isinstance(self._transport, TradovateMicroFuturesPaperEmulator) and self._transport.is_connected():
+                        acct = self._validate_account_snapshot(
+                            self._transport.account_snapshot(now_utc=leg_receipt.executed_at),
+                            expected_account_id=auth_acct,
+                        )
+                        peak_candidate = max(acct.peak_equity_usd, acct.equity_usd)
+                    with closing(self._connect_rw()) as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        try:
+                            conn.execute(
+                                "UPDATE mutation_journal SET status = ?, receipt_json = ?, updated_at = ? "
+                                "WHERE request_id = ?",
+                                (leg_receipt.status, leg_rec_json, _iso_utc(leg_receipt.executed_at), leg_req_id),
+                            )
+                            if peak_candidate > Decimal("0.00"):
+                                self._update_peak_equity_unlocked(conn, peak_candidate, leg_receipt.executed_at)
+                            self._append_audit_unlocked(
+                                conn,
+                                event_type="PROTECTIVE_EMERGENCY_CLOSE",
+                                entity_id=leg_req_id,
+                                payload={"receipt": leg_receipt.to_dict()},
+                                occurred_at=leg_receipt.executed_at,
+                            )
+                            conn.execute("COMMIT")
+                        except Exception:
+                            if conn.in_transaction:
+                                conn.execute("ROLLBACK")
+                            raise
+                except Exception as exc:
+                    detail = f"POST_EFFECT_EMERGENCY_LEG_JOURNAL_FAILURE ({type(exc).__name__}): {exc}"
+                    try:
+                        self._record_unresolved_latch(
+                            request_id=leg_req_id,
+                            cl_ord_id=leg_cl_ord_id,
+                            status=MUTATION_STATUS_OUTCOME_UNKNOWN,
+                            event_type="PROTECTIVE_OUTCOME_UNKNOWN",
+                            detail=detail,
+                            now=self._clock(),
+                            order_id=leg_receipt.order_id,
+                        )
+                    except Exception:
+                        pass
+                    leg_failures.append((leg_req_id, leg_cl_ord_id, detail))
+                    continue
+
+                receipts.append(leg_receipt)
+
+            if leg_failures:
+                summary = "; ".join(f"{rid}({cid}): {msg}" for rid, cid, msg in leg_failures)
+                raise TradovateOutcomeUnknownError(
+                    f"Tradovate emergency_close_all left {len(leg_failures)}/{len(open_positions)} "
+                    f"leg(s) unresolved ({summary}); safety freeze engaged until reconciled",
+                    cl_ord_id=leg_failures[0][1],
+                    request_id=leg_failures[0][0],
+                )
             return tuple(receipts)
 
     def process_market_quote(
@@ -5392,10 +7434,12 @@ class TradovateMicroFuturesVenue:
                 raise TradovateTransportError(
                     "process_market_quote() is supported only with TradovateMicroFuturesPaperEmulator"
                 )
+            auth_acct = self._authorized_account_id()
             triggered = self._transport.set_quote(symbol, bid, ask, observed_at=now)
             for r in triggered:
                 req = TradovateOrderRequest(
                     request_id=r.request_id,
+                    cl_ord_id=r.cl_ord_id,
                     action=r.action,
                     contract_code=r.contract_code,
                     root_symbol=r.root_symbol,
@@ -5406,7 +7450,9 @@ class TradovateMicroFuturesVenue:
                     client_tag=r.reason,
                     created_at=r.executed_at,
                 )
-                self._persist_protective_mutation(req, r, event_type=f"OCO_{r.status}")
+                self._persist_protective_mutation(
+                    req, r, event_type=f"OCO_{r.status}", expected_account_id=auth_acct
+                )
             return triggered
 
     def _persist_protective_mutation(
@@ -5415,24 +7461,28 @@ class TradovateMicroFuturesVenue:
         receipt: TradovateOrderReceipt,
         *,
         event_type: str,
+        expected_account_id: str | None = None,
     ) -> None:
         req_json = canonical_bytes(order_req.to_dict()).decode("utf-8")
         rec_json = canonical_bytes(receipt.to_dict()).decode("utf-8")
         ts_str = _iso_utc(receipt.executed_at)
         peak_candidate = Decimal("0.00")
         if self._transport.is_connected():
-            acct = self._transport.account_snapshot(now_utc=receipt.executed_at)
+            raw_acct = self._transport.account_snapshot(now_utc=receipt.executed_at)
+            eff_acct = expected_account_id or self._authorized_account_id()
+            acct = self._validate_account_snapshot(raw_acct, expected_account_id=eff_acct)
             peak_candidate = max(acct.peak_equity_usd, acct.equity_usd)
         with closing(self._connect_rw()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.execute(
                     "INSERT INTO mutation_journal "
-                    "(request_id, action, contract_code, root_symbol, cas_symbol, status, "
+                    "(request_id, cl_ord_id, action, contract_code, root_symbol, cas_symbol, status, "
                     "request_json, receipt_json, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         order_req.request_id,
+                        order_req.cl_ord_id,
                         order_req.action.value,
                         order_req.contract_code,
                         order_req.root_symbol,
@@ -5455,7 +7505,8 @@ class TradovateMicroFuturesVenue:
                 )
                 conn.execute("COMMIT")
             except Exception:
-                conn.execute("ROLLBACK")
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
                 raise
 
     # -- Strictly 0-Write Read-Only Snapshot & SHA-256 Audit Chain Verification --
@@ -5524,7 +7575,11 @@ class TradovateMicroFuturesVenue:
         effective_peak = stored_peak
 
         if connected:
-            acct = self._transport.account_snapshot(now_utc=now)
+            auth_acct = self._authorized_account_id()
+            acct = self._validate_account_snapshot(
+                self._transport.account_snapshot(now_utc=now),
+                expected_account_id=auth_acct,
+            )
             effective_peak = _q2(max(stored_peak, acct.peak_equity_usd, acct.equity_usd))
             eff_dd = compute_drawdown_pct(acct.equity_usd, effective_peak)
             drawdown_str = decimal_text(_q4(eff_dd))
@@ -5532,7 +7587,11 @@ class TradovateMicroFuturesVenue:
             account_dict = acct.to_dict()
             account_dict["peak_equity_usd"] = decimal_text(effective_peak)
             account_dict["drawdown_pct"] = drawdown_str
-            positions_list = [p.to_dict() for p in self._transport.positions()]
+            verified_positions = self._validate_positions_ownership(
+                self._transport.positions(),
+                expected_account_id=auth_acct,
+            )
+            positions_list = [p.to_dict() for p in verified_positions]
             conn_status = (
                 CONNECTION_STATUS_STANDBY if not self._enabled else CONNECTION_STATUS_CONNECTED
             )

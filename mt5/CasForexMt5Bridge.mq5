@@ -50,6 +50,9 @@ bool     g_hmac_key_loaded = false;
 uchar    g_valve_key[];
 bool     g_valve_key_loaded = false;
 string   g_global_seen_ids[];
+bool     g_replay_ledger_healthy      = false;
+ulong    g_snapshot_seq               = 0;
+bool     g_snapshot_seq_loaded        = false;
 double   g_last_connected_balance     = 0.0;
 double   g_last_connected_equity      = 0.0;
 double   g_last_connected_margin      = 0.0;
@@ -213,6 +216,8 @@ bool ConstTimeHexEquals(string a, string b)
 
 string Sha256Hex(const string text)
   {
+   if(StringLen(text) == 0)
+      return("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
    uchar data[];
    uchar key[];
    uchar digest[];
@@ -223,6 +228,30 @@ string Sha256Hex(const string text)
    if(CryptEncode(CRYPT_HASH_SHA256, data, key, digest) <= 0)
       return("");
    return(BytesToHex(digest));
+  }
+
+string TrimAll(string value)
+  {
+   StringReplace(value, "\r", "");
+   StringReplace(value, "\n", "");
+   StringTrimLeft(value);
+   StringTrimRight(value);
+   return(value);
+  }
+
+bool IsDigitsOnly(string value)
+  {
+   value = TrimAll(value);
+   int len = StringLen(value);
+   if(len == 0)
+      return(false);
+   for(int i = 0; i < len; i++)
+     {
+      ushort ch = StringGetCharacter(value, i);
+      if(ch < '0' || ch > '9')
+         return(false);
+     }
+   return(true);
   }
 
 string NormalizeLowerTrim(string value)
@@ -418,18 +447,22 @@ bool VerifyValveAdmission(const string text)
    return(ConstTimeHexEquals(expected_sig, adm_sig));
   }
 
-void LoadGlobalReplayDomain()
+bool LoadGlobalReplayDomain()
   {
    ArrayResize(g_global_seen_ids, 0);
    string fname = RootSpoolPath(".global_ea_seen.txt");
+   if(!FileIsExist(fname, CommonFlag()))
+      return(true);
    int h = FileOpen(fname, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
    if(h == INVALID_HANDLE)
-      return;
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   ulong fsz = FileSize(h);
    while(!FileIsEnding(h))
      {
-      string line = FileReadString(h);
-      StringTrimLeft(line);
-      StringTrimRight(line);
+      string line = TrimAll(FileReadString(h));
       if(StringLen(line) > 0)
         {
          int n = ArraySize(g_global_seen_ids);
@@ -438,11 +471,21 @@ void LoadGlobalReplayDomain()
         }
      }
    FileClose(h);
+   if(fsz > 0 && ArraySize(g_global_seen_ids) == 0)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   return(true);
   }
 
 bool IsGlobalReplayIdSeen(const string req_id)
   {
-   LoadGlobalReplayDomain();
+   if(!LoadGlobalReplayDomain())
+     {
+      g_replay_ledger_healthy = false;
+      return(true);
+     }
    int n = ArraySize(g_global_seen_ids);
    for(int i = 0; i < n; i++)
      {
@@ -452,46 +495,258 @@ bool IsGlobalReplayIdSeen(const string req_id)
    return(false);
   }
 
-void RecordGlobalReplayId(const string req_id)
+bool RecordGlobalReplayId(const string req_id)
   {
-   int n = ArraySize(g_global_seen_ids);
-   ArrayResize(g_global_seen_ids, n + 1);
-   g_global_seen_ids[n] = req_id;
+   if(StringLen(req_id) == 0)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   if(!LoadGlobalReplayDomain())
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   int existing_n = ArraySize(g_global_seen_ids);
+   for(int i = 0; i < existing_n; i++)
+     {
+      if(g_global_seen_ids[i] == req_id)
+         return(false);
+     }
+   ArrayResize(g_global_seen_ids, existing_n + 1);
+   g_global_seen_ids[existing_n] = req_id;
    int start = (ArraySize(g_global_seen_ids) > 2048) ? (ArraySize(g_global_seen_ids) - 2048) : 0;
    string fname = RootSpoolPath(".global_ea_seen.txt");
-   int h = FileOpen(fname, FILE_WRITE | FILE_TXT | FILE_ANSI | CommonFlag());
-   if(h != INVALID_HANDLE)
+   string tmp = RootSpoolPath(".global_ea_seen.txt.tmp");
+   int h = FileOpen(tmp, FILE_WRITE | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(h == INVALID_HANDLE)
      {
-      for(int i = start; i < ArraySize(g_global_seen_ids); i++)
-         FileWriteString(h, g_global_seen_ids[i] + "\n");
-      FileFlush(h);
-      FileClose(h);
+      ArrayResize(g_global_seen_ids, existing_n);
+      g_replay_ledger_healthy = false;
+      return(false);
      }
+   bool write_ok = true;
+   for(int i = start; i < ArraySize(g_global_seen_ids); i++)
+     {
+      if(FileWriteString(h, g_global_seen_ids[i] + "\n") == 0)
+        {
+         write_ok = false;
+         break;
+        }
+     }
+   FileFlush(h);
+   FileClose(h);
+   if(!write_ok)
+     {
+      FileDelete(tmp, CommonFlag());
+      ArrayResize(g_global_seen_ids, existing_n);
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   bool moved = false;
+   for(int attempt = 0; attempt < 6; attempt++)
+     {
+      if(FileMove(tmp, CommonFlag(), fname, CommonFlag() | FILE_REWRITE))
+        {
+         moved = true;
+         break;
+        }
+      Sleep(8);
+     }
+   if(!moved)
+     {
+      FileDelete(tmp, CommonFlag());
+      ArrayResize(g_global_seen_ids, existing_n);
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   int rh = FileOpen(fname, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(rh == INVALID_HANDLE)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   bool verified = false;
+   while(!FileIsEnding(rh))
+     {
+      string line = TrimAll(FileReadString(rh));
+      if(line == req_id)
+         verified = true;
+     }
+   FileClose(rh);
+   if(!verified)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   return(true);
   }
 
-void LoadReplayNonceLedger()
-  {
-   string raw = ReadText(RootSpoolPath("." + InpBrokerChannel + ".ea_nonce.txt"));
-   StringTrimLeft(raw);
-   StringTrimRight(raw);
-   if(StringLen(raw) > 0)
-     {
-      ulong saved = (ulong)StringToInteger(raw);
-      if(saved > g_last_monotonic_nonce)
-         g_last_monotonic_nonce = saved;
-     }
-  }
-
-void SaveReplayNonceLedger(const ulong nonce_val)
+bool LoadReplayNonceLedger()
   {
    string fname = RootSpoolPath("." + InpBrokerChannel + ".ea_nonce.txt");
-   int h = FileOpen(fname, FILE_WRITE | FILE_TXT | FILE_ANSI | CommonFlag());
-   if(h != INVALID_HANDLE)
+   if(!FileIsExist(fname, CommonFlag()))
+      return(true);
+   int h = FileOpen(fname, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(h == INVALID_HANDLE)
      {
-      FileWriteString(h, IntegerToString((long)nonce_val));
-      FileFlush(h);
-      FileClose(h);
+      g_replay_ledger_healthy = false;
+      return(false);
      }
+   string raw = "";
+   while(!FileIsEnding(h))
+      raw += FileReadString(h);
+   FileClose(h);
+   raw = TrimAll(raw);
+   if(!IsDigitsOnly(raw))
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   ulong saved = (ulong)StringToInteger(raw);
+   if(saved == 0 || IntegerToString((long)saved) != raw)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   if(saved > g_last_monotonic_nonce)
+      g_last_monotonic_nonce = saved;
+   return(true);
+  }
+
+bool SaveReplayNonceLedger(const ulong nonce_val)
+  {
+   if(nonce_val == 0)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   string payload = IntegerToString((long)nonce_val);
+   string fname = RootSpoolPath("." + InpBrokerChannel + ".ea_nonce.txt");
+   string tmp = RootSpoolPath("." + InpBrokerChannel + ".ea_nonce.txt.tmp");
+   int h = FileOpen(tmp, FILE_WRITE | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(h == INVALID_HANDLE)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   uint written = FileWriteString(h, payload);
+   FileFlush(h);
+   FileClose(h);
+   if(written == 0)
+     {
+      FileDelete(tmp, CommonFlag());
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   bool moved = false;
+   for(int attempt = 0; attempt < 6; attempt++)
+     {
+      if(FileMove(tmp, CommonFlag(), fname, CommonFlag() | FILE_REWRITE))
+        {
+         moved = true;
+         break;
+        }
+      Sleep(8);
+     }
+   if(!moved)
+     {
+      FileDelete(tmp, CommonFlag());
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   int rh = FileOpen(fname, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(rh == INVALID_HANDLE)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   string reread = "";
+   while(!FileIsEnding(rh))
+      reread += FileReadString(rh);
+   FileClose(rh);
+   reread = TrimAll(reread);
+   if(!IsDigitsOnly(reread) || (ulong)StringToInteger(reread) != nonce_val || IntegerToString((long)nonce_val) != reread)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   return(true);
+  }
+
+bool LoadSnapshotSeq()
+  {
+   string fname = RootSpoolPath("." + InpBrokerChannel + ".ea_snapshot_seq.txt");
+   if(!FileIsExist(fname, CommonFlag()))
+     {
+      g_snapshot_seq_loaded = true;
+      return(true);
+     }
+   int h = FileOpen(fname, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(h == INVALID_HANDLE)
+      return(false);
+   string raw = "";
+   while(!FileIsEnding(h))
+      raw += FileReadString(h);
+   FileClose(h);
+   raw = TrimAll(raw);
+   if(!IsDigitsOnly(raw))
+      return(false);
+   ulong saved = (ulong)StringToInteger(raw);
+   if(saved == 0 || IntegerToString((long)saved) != raw)
+      return(false);
+   if(saved > g_snapshot_seq)
+      g_snapshot_seq = saved;
+   g_snapshot_seq_loaded = true;
+   return(true);
+  }
+
+bool AdvanceAndPersistSnapshotSeq()
+  {
+   if(!g_snapshot_seq_loaded && !LoadSnapshotSeq())
+      return(false);
+   ulong next_seq = g_snapshot_seq + 1;
+   string payload = IntegerToString((long)next_seq);
+   string fname = RootSpoolPath("." + InpBrokerChannel + ".ea_snapshot_seq.txt");
+   string tmp = RootSpoolPath("." + InpBrokerChannel + ".ea_snapshot_seq.txt.tmp");
+   int h = FileOpen(tmp, FILE_WRITE | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(h == INVALID_HANDLE)
+      return(false);
+   uint written = FileWriteString(h, payload);
+   FileFlush(h);
+   FileClose(h);
+   if(written == 0)
+     {
+      FileDelete(tmp, CommonFlag());
+      return(false);
+     }
+   bool moved = false;
+   for(int attempt = 0; attempt < 6; attempt++)
+     {
+      if(FileMove(tmp, CommonFlag(), fname, CommonFlag() | FILE_REWRITE))
+        {
+         moved = true;
+         break;
+        }
+      Sleep(8);
+     }
+   if(!moved)
+     {
+      FileDelete(tmp, CommonFlag());
+      return(false);
+     }
+   int rh = FileOpen(fname, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(rh == INVALID_HANDLE)
+      return(false);
+   string reread = "";
+   while(!FileIsEnding(rh))
+      reread += FileReadString(rh);
+   FileClose(rh);
+   reread = TrimAll(reread);
+   if(!IsDigitsOnly(reread) || (ulong)StringToInteger(reread) != next_seq || IntegerToString((long)next_seq) != reread)
+      return(false);
+   g_snapshot_seq = next_seq;
+   return(true);
   }
 
 bool VerifyLiveTicketGuard(const string server)
@@ -729,15 +984,25 @@ void ExecuteRequest(const string request_id, const string text)
       return;
      }
 
+   if(!g_replay_ledger_healthy || !LoadReplayNonceLedger() || !LoadGlobalReplayDomain())
+     {
+      g_replay_ledger_healthy = false;
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "replay ledger persistence failed"));
+      return;
+     }
    ulong req_nonce = (ulong)StringToInteger(nonce_s);
    if(req_nonce == 0 || req_nonce <= g_last_monotonic_nonce || IsGlobalReplayIdSeen(request_id))
      {
       WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "replayed nonce or request_id"));
       return;
      }
+   if(!SaveReplayNonceLedger(req_nonce) || !RecordGlobalReplayId(request_id))
+     {
+      g_replay_ledger_healthy = false;
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10013, "0", "0", "0", "0", "0", "0", "replay ledger persistence failed"));
+      return;
+     }
    g_last_monotonic_nonce = req_nonce;
-   SaveReplayNonceLedger(req_nonce);
-   RecordGlobalReplayId(request_id);
 
    if(TerminalInfoInteger(TERMINAL_CONNECTED) == 0)
      {
@@ -940,6 +1205,13 @@ void PublishCandles()
 
 void PublishMarket()
   {
+   if(!g_hmac_key_loaded)
+      g_hmac_key_loaded = LoadSpoolHmacKey();
+   if(!g_hmac_key_loaded || StringLen(g_channel_key_id) != 16)
+     {
+      Print("CasForexMt5Bridge: refusing unsigned PublishMarket (spool HMAC key unavailable).");
+      return;
+     }
    bool   connected        = (TerminalInfoInteger(TERMINAL_CONNECTED) != 0);
    double live_balance     = AccountInfoDouble(ACCOUNT_BALANCE);
    double live_equity      = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -961,15 +1233,9 @@ void PublishMarket()
    double out_equity      = connected ? live_equity      : (g_has_connected_account ? g_last_connected_equity      : 0.0);
    double out_margin      = connected ? live_margin      : (g_has_connected_account ? g_last_connected_margin      : 0.0);
    double out_margin_free = connected ? live_margin_free : (g_has_connected_account ? g_last_connected_margin_free : 0.0);
-   string json = StringFormat(
-      "{\"protocol\":\"%s\",\"connected\":%s,\"server\":\"%s\",\"account_trade_mode\":\"%s\",\"observed_at\":\"%s\",\"account\":{"
-      "\"login\":\"%s\",\"currency\":\"%s\",\"balance\":\"%s\",\"equity\":\"%s\",\"margin\":\"%s\",\"margin_free\":\"%s\",\"leverage\":\"%s\"},\"ticks\":[",
-      SPOOL_PROTOCOL, connected ? "true" : "false", SafeText(AccountInfoString(ACCOUNT_SERVER)), AccountTradeModeLabel(), IsoNowUtc(),
-      IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)), AccountInfoString(ACCOUNT_CURRENCY),
-      DoubleToString(out_balance, 2), DoubleToString(out_equity, 2),
-      DoubleToString(out_margin, 2), DoubleToString(out_margin_free, 2),
-      IntegerToString(AccountInfoInteger(ACCOUNT_LEVERAGE)));
 
+   string ticks_json  = "";
+   string ticks_canon = "";
    bool first = true;
    if(connected)
      {
@@ -979,14 +1245,18 @@ void PublishMarket()
          MqlTick tick;
          if(!SymbolInfoTick(bsym, tick) || tick.bid <= 0.0 || tick.ask < tick.bid)
             continue;
-         json += StringFormat("%s{\"symbol\":\"%s\",\"bid\":\"%s\",\"ask\":\"%s\",\"time_msc\":\"%s\"}",
-                              first ? "" : ",", g_symbols[i], Price(bsym, tick.bid), Price(bsym, tick.ask),
-                              IntegerToString((long)tick.time_msc));
+         string bid_s = Price(bsym, tick.bid);
+         string ask_s = Price(bsym, tick.ask);
+         string msc_s = IntegerToString((long)tick.time_msc);
+         ticks_json += StringFormat("%s{\"symbol\":\"%s\",\"bid\":\"%s\",\"ask\":\"%s\",\"time_msc\":\"%s\"}",
+                                    first ? "" : ",", g_symbols[i], bid_s, ask_s, msc_s);
+         ticks_canon += (first ? "" : ";") + g_symbols[i] + ":" + bid_s + ":" + ask_s + ":" + msc_s;
          first = false;
         }
      }
-   json += "],\"positions\":[";
 
+   string positions_json  = "";
+   string positions_canon = "";
    first = true;
    if(connected)
      {
@@ -999,14 +1269,63 @@ void PublishMarket()
          string side = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
          double psl = PositionGetDouble(POSITION_SL);
          double ptp = PositionGetDouble(POSITION_TP);
-         json += StringFormat("%s{\"ticket\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":\"%s\",\"price_open\":\"%s\",\"sl\":\"%s\",\"tp\":\"%s\",\"profit\":\"%s\"}",
-                              first ? "" : ",", IntegerToString((long)ticket), CasSymbol(bsym), side,
-                              DoubleToString(PositionGetDouble(POSITION_VOLUME), 2), Price(bsym, PositionGetDouble(POSITION_PRICE_OPEN)),
-                              (psl > 0.0) ? Price(bsym, psl) : "0", (ptp > 0.0) ? Price(bsym, ptp) : "0", DoubleToString(PositionGetDouble(POSITION_PROFIT), 2));
+         string tkt_s  = IntegerToString((long)ticket);
+         string csym_s = CasSymbol(bsym);
+         string vol_s  = DoubleToString(PositionGetDouble(POSITION_VOLUME), 2);
+         string open_s = Price(bsym, PositionGetDouble(POSITION_PRICE_OPEN));
+         string sl_s   = (psl > 0.0) ? Price(bsym, psl) : "0";
+         string tp_s   = (ptp > 0.0) ? Price(bsym, ptp) : "0";
+         string prof_s = DoubleToString(PositionGetDouble(POSITION_PROFIT), 2);
+         positions_json += StringFormat("%s{\"ticket\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":\"%s\",\"price_open\":\"%s\",\"sl\":\"%s\",\"tp\":\"%s\",\"profit\":\"%s\"}",
+                                        first ? "" : ",", tkt_s, csym_s, side, vol_s, open_s, sl_s, tp_s, prof_s);
+         positions_canon += (first ? "" : ";") + tkt_s + ":" + csym_s + ":" + side + ":" + vol_s + ":" + open_s + ":" + sl_s + ":" + tp_s + ":" + prof_s;
          first = false;
         }
      }
-   json += "]}";
+
+   if(!AdvanceAndPersistSnapshotSeq())
+     {
+      Print("CasForexMt5Bridge: refusing PublishMarket (snapshot_seq persistence failed).");
+      return;
+     }
+
+   string execution_mode  = InpLiveExecutionMode ? "LIVE" : "DEMO";
+   string server          = SafeText(AccountInfoString(ACCOUNT_SERVER));
+   string trade_mode      = AccountTradeModeLabel();
+   string connected_str   = connected ? "true" : "false";
+   string observed_at     = IsoNowUtc();
+   string snapshot_seq_str = IntegerToString((long)g_snapshot_seq);
+   string login           = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+   string currency        = AccountInfoString(ACCOUNT_CURRENCY);
+   string balance         = DoubleToString(out_balance, 2);
+   string equity          = DoubleToString(out_equity, 2);
+   string margin          = DoubleToString(out_margin, 2);
+   string margin_free     = DoubleToString(out_margin_free, 2);
+   string leverage        = IntegerToString(AccountInfoInteger(ACCOUNT_LEVERAGE));
+
+   string ticks_sha     = Sha256Hex(ticks_canon);
+   string positions_sha = Sha256Hex(positions_canon);
+   if(StringLen(ticks_sha) != 64 || StringLen(positions_sha) != 64)
+      return;
+   string snapshot_msg = SPOOL_PROTOCOL + "|" + InpBrokerChannel + "|" + g_channel_key_id + "|" + execution_mode + "|" +
+                         server + "|" + trade_mode + "|" + connected_str + "|" + observed_at + "|" + snapshot_seq_str + "|" +
+                         login + "|" + currency + "|" + balance + "|" + equity + "|" + margin + "|" + margin_free + "|" +
+                         leverage + "|" + ticks_sha + "|" + positions_sha;
+   string snapshot_mac = HmacSha256Hex(g_hmac_key, snapshot_msg);
+   if(StringLen(snapshot_mac) != 64)
+      return;
+
+   string json = StringFormat(
+      "{\"protocol\":\"%s\",\"broker_channel\":\"%s\",\"channel_key_id\":\"%s\",\"execution_mode\":\"%s\",\"snapshot_seq\":\"%s\","
+      "\"connected\":%s,\"server\":\"%s\",\"account_trade_mode\":\"%s\",\"observed_at\":\"%s\",\"account\":{"
+      "\"login\":\"%s\",\"currency\":\"%s\",\"balance\":\"%s\",\"equity\":\"%s\",\"margin\":\"%s\",\"margin_free\":\"%s\",\"leverage\":\"%s\"},\"ticks\":[",
+      SPOOL_PROTOCOL, InpBrokerChannel, g_channel_key_id, execution_mode, snapshot_seq_str,
+      connected_str, server, trade_mode, observed_at,
+      login, currency, balance, equity, margin, margin_free, leverage);
+   json += ticks_json;
+   json += "],\"positions\":[";
+   json += positions_json;
+   json += StringFormat("],\"snapshot_hmac_sha256\":\"%s\"}", snapshot_mac);
    WriteAtomic("market_ticks.json", json);
    g_last_publish = TimeCurrent();
   }
@@ -1038,8 +1357,10 @@ int OnInit()
    FolderCreate(SpoolDir(), CommonFlag());
    g_hmac_key_loaded = LoadSpoolHmacKey();
    g_valve_key_loaded = LoadValveAdmissionKey();
-   LoadReplayNonceLedger();
-   LoadGlobalReplayDomain();
+   bool nonce_ok = LoadReplayNonceLedger();
+   bool domain_ok = LoadGlobalReplayDomain();
+   g_replay_ledger_healthy = (nonce_ok && domain_ok);
+   LoadSnapshotSeq();
    g_mode_ok = true;
    ReportInterruptedRequests();
    PublishMarket();

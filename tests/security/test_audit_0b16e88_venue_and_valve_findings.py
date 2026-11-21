@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import unittest
 from typing import Any
 
+from cas_forex_revamp.composition.state_store import create_owner_only_file_atomic
 from cas_forex_revamp.contracts import ActionKind, ContractError, Side
 from cas_forex_revamp.valve.tks_meta_valve_controller import (
     ForexMetaValveGate,
@@ -462,7 +463,13 @@ class Audit0b16e88VenueAndValveSecurityTests(unittest.TestCase):
                 issued_at=T0,
             )
             tkt_path = root / "mt5_live_ticket.json"
-            tkt_path.write_text(json.dumps(mt5_tkt), encoding="utf-8")
+            create_owner_only_file_atomic(
+                tkt_path.parent,
+                tkt_path.name,
+                json.dumps(mt5_tkt).encode("utf-8"),
+                replace_existing=True,
+                label="LIVE auth ticket",
+            )
             live_env = {
                 ENV_EXECUTION_MODE: EXECUTION_MODE_LIVE,
                 ENV_LIVE_ARM_PHRASE: REQUIRED_LIVE_ARM_PHRASE,

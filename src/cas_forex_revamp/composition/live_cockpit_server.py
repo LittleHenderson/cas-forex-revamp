@@ -19,7 +19,10 @@ Security & Honesty Invariants:
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
+import io
+import selectors
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -223,6 +226,10 @@ MAX_HTTP_HEADER_COUNT = 64
 MAX_PRE_AUTH_BODY_BYTES = 4096
 DEFAULT_PRE_AUTH_BODY_DEADLINE_SECONDS = 3.0
 DEFAULT_MAX_PRE_AUTH_BODY_READERS = 2
+MAX_TRACKED_PRE_AUTH_KEYS = 256
+MAX_EMERGENCY_PENDING_SOCKETS = 64
+MAX_EMERGENCY_HEADER_BYTES = 8192
+DEFAULT_EMERGENCY_HEADER_DEADLINE_SECONDS = 1.0
 
 SESSION_SCOPE_OWNER_FULL = "OWNER_FULL_CONTROL"
 SESSION_SCOPE_DEVICE_READ_EXPLAINER = "DEVICE_READ_AND_EXPLAINER"
@@ -357,8 +364,88 @@ class _DeadlineRFile:
         return getattr(self._raw, name)
 
 
+def _canonical_pre_auth_principal(peer_ip: str) -> str:
+    """Canonicalize IPv4 127.0.0.0/8, IPv6 ::1, and IPv4-mapped ::ffff:127.0.0.0/104 to 'loopback' (Finding [11])."""
+    if not isinstance(peer_ip, str):
+        return "unknown"
+    clean = peer_ip.strip()
+    if not clean:
+        return "unknown"
+    if "%" in clean:
+        clean = clean.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(clean)
+    except ValueError:
+        return "unknown"
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if addr.is_loopback:
+        return "loopback"
+    return addr.compressed
+
+
+def _is_loopback_peer_ip(peer_ip: str) -> bool:
+    return _canonical_pre_auth_principal(peer_ip) == "loopback"
+
+
+class _BoundedPreAuthRateTracker:
+    """Bounded OrderedDict LRU + expiry pruner + global token bucket for pre-auth admission (Finding [11])."""
+
+    def __init__(
+        self,
+        *,
+        per_principal_limit: int,
+        global_limit: int,
+        window_seconds: float,
+        max_keys: int = MAX_TRACKED_PRE_AUTH_KEYS,
+    ) -> None:
+        self._peer_limit = max(1, int(per_principal_limit))
+        self._global_limit = max(1, int(global_limit))
+        self._window = max(0.5, float(window_seconds))
+        self._max_keys = max(1, int(max_keys))
+        self.per_key: OrderedDict[str, list[float]] = OrderedDict()
+        self.global_times: deque[float] = deque()
+
+    def prune(self, now_m: float) -> None:
+        cutoff = now_m - self._window
+        while self.global_times and self.global_times[0] < cutoff:
+            self.global_times.popleft()
+        for key in list(self.per_key.keys()):
+            kept = [t for t in self.per_key[key] if t >= cutoff]
+            if kept:
+                self.per_key[key] = kept
+            else:
+                self.per_key.pop(key, None)
+
+    def is_rate_limited(self, principal: str, now_m: float) -> bool:
+        self.prune(now_m)
+        if len(self.global_times) >= self._global_limit:
+            return True
+        existing = self.per_key.get(principal)
+        if existing is not None and len(existing) >= self._peer_limit:
+            return True
+        return False
+
+    def record_admitted(self, principal: str, now_m: float) -> None:
+        self.global_times.append(now_m)
+        bucket = self.per_key.get(principal)
+        if bucket is None:
+            self.per_key[principal] = [now_m]
+        else:
+            bucket.append(now_m)
+            self.per_key.move_to_end(principal)
+        while len(self.per_key) > self._max_keys:
+            self.per_key.popitem(last=False)
+
+    def try_consume(self, principal: str, now_m: float) -> bool:
+        if self.is_rate_limited(principal, now_m):
+            return False
+        self.record_admitted(principal, now_m)
+        return True
+
+
 class _ExclusiveThreadingHTTPServer(HTTPServer):
-    """Bounded loopback HTTP server preventing SO_REUSEADDR hijacking and pre-auth slot exhaustion (Findings [8], [14])."""
+    """Bounded loopback HTTP server preventing SO_REUSEADDR hijacking and pre-auth alias/map exhaustion (Findings [8], [11], [14])."""
 
     allow_reuse_address = False
 
@@ -369,15 +456,28 @@ class _ExclusiveThreadingHTTPServer(HTTPServer):
         *,
         ordinary_slots: int = 16,
         peer_rate_limit_per_window: int = 256,
+        global_rate_limit_per_window: int | None = None,
         peer_rate_window_seconds: float = 10.0,
+        max_tracked_keys: int = MAX_TRACKED_PRE_AUTH_KEYS,
+        mono_clock: Callable[[], float] = time.monotonic,
         thread_name_prefix: str = "cas-cockpit-worker",
     ) -> None:
         self._ordinary_slots = max(1, int(ordinary_slots))
         self._ordinary_conn_sem = threading.BoundedSemaphore(self._ordinary_slots)
         self._peer_rate_limit = max(1, int(peer_rate_limit_per_window))
+        eff_global = self._peer_rate_limit if global_rate_limit_per_window is None else max(1, int(global_rate_limit_per_window))
+        self._global_rate_limit = eff_global
         self._peer_rate_window = max(0.5, float(peer_rate_window_seconds))
+        self._mono = mono_clock
         self._slot_lock = threading.Lock()
-        self._peer_conn_times: dict[str, list[float]] = {}
+        self._rate_tracker = _BoundedPreAuthRateTracker(
+            per_principal_limit=self._peer_rate_limit,
+            global_limit=self._global_rate_limit,
+            window_seconds=self._peer_rate_window,
+            max_keys=max_tracked_keys,
+        )
+        self._peer_conn_times: OrderedDict[str, list[float]] = self._rate_tracker.per_key
+        self._global_conn_times: deque[float] = self._rate_tracker.global_times
         self._active_workers = 0
         self._peak_workers = 0
         self._rejected_pre_auth = 0
@@ -413,18 +513,11 @@ class _ExclusiveThreadingHTTPServer(HTTPServer):
         self.shutdown_request(request)
 
     def process_request(self, request: Any, client_address: Any) -> None:
-        peer_ip = str(client_address[0]) if isinstance(client_address, tuple) and client_address else "unknown"
-        now_m = time.monotonic()
+        raw_ip = str(client_address[0]) if isinstance(client_address, tuple) and client_address else "unknown"
+        principal = _canonical_pre_auth_principal(raw_ip)
+        now_m = self._mono()
         with self._slot_lock:
-            cutoff = now_m - self._peer_rate_window
-            hist = [t for t in self._peer_conn_times.get(peer_ip, ()) if t >= cutoff]
-            if len(hist) >= self._peer_rate_limit:
-                self._peer_conn_times[peer_ip] = hist
-                rate_exceeded = True
-            else:
-                hist.append(now_m)
-                self._peer_conn_times[peer_ip] = hist
-                rate_exceeded = False
+            rate_exceeded = self._rate_tracker.is_rate_limited(principal, now_m)
         if rate_exceeded:
             self._reject_raw_socket(
                 request,
@@ -433,7 +526,7 @@ class _ExclusiveThreadingHTTPServer(HTTPServer):
             )
             return
 
-        # Finding [14]: unauthenticated sockets NEVER acquire emergency capacity!
+        # Capacity check BEFORE recording tracking state so capacity-rejected sockets allocate zero map entries (Finding [11])
         if not self._ordinary_conn_sem.acquire(blocking=False):
             self._reject_raw_socket(
                 request,
@@ -444,9 +537,21 @@ class _ExclusiveThreadingHTTPServer(HTTPServer):
 
         sem = self._ordinary_conn_sem
         with self._slot_lock:
-            self._active_workers += 1
-            if self._active_workers > self._peak_workers:
-                self._peak_workers = self._active_workers
+            if not self._rate_tracker.try_consume(principal, now_m):
+                rate_race_exceeded = True
+            else:
+                rate_race_exceeded = False
+                self._active_workers += 1
+                if self._active_workers > self._peak_workers:
+                    self._peak_workers = self._active_workers
+        if rate_race_exceeded:
+            sem.release()
+            self._reject_raw_socket(
+                request,
+                b"HTTP/1.1 429 Too Many Requests",
+                b'{"error": "Pre-auth connection rate limit exceeded"}\n',
+            )
+            return
 
         def _worker() -> None:
             try:
@@ -475,6 +580,646 @@ class _ExclusiveThreadingHTTPServer(HTTPServer):
         finally:
             super().server_close()
 
+
+class _PrefixedRawIO(io.RawIOBase):
+    """Drain pre-read selector bytes before delegating remaining reads to the underlying blocking socket."""
+
+    def __init__(self, prefix: bytes, raw_sock: socket.socket) -> None:
+        super().__init__()
+        self._prefix = memoryview(prefix)
+        self._pos = 0
+        self._sock = raw_sock
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: Any) -> int | None:
+        if self._pos < len(self._prefix):
+            mv = memoryview(b).cast("B")
+            take = min(len(mv), len(self._prefix) - self._pos)
+            mv[:take] = self._prefix[self._pos : self._pos + take]
+            self._pos += take
+            return take
+        return self._sock.recv_into(b)
+
+
+class _PrefixedSocket:
+    """Socket wrapper replaying validated HTTP headers + partial body bytes into BaseHTTPRequestHandler (Finding [10])."""
+
+    def __init__(self, raw_sock: socket.socket, prefix: bytes) -> None:
+        self._raw_sock = raw_sock
+        self._raw_io = _PrefixedRawIO(prefix, raw_sock)
+
+    @property
+    def raw_socket(self) -> socket.socket:
+        return self._raw_sock
+
+    def makefile(self, mode: str = "r", buffering: int | None = None, *args: Any, **kwargs: Any) -> Any:
+        if "r" in mode and "b" in mode:
+            buf_sz = buffering if isinstance(buffering, int) and buffering > 0 else io.DEFAULT_BUFFER_SIZE
+            return io.BufferedReader(self._raw_io, buffer_size=buf_sz)
+        return self._raw_sock.makefile(mode, buffering, *args, **kwargs)  # type: ignore[arg-type]
+
+    def recv(self, bufsize: int, flags: int = 0) -> bytes:
+        if flags == 0:
+            buf = bytearray(max(1, int(bufsize)))
+            n = self._raw_io.readinto(buf)
+            if not n:
+                return b""
+            return bytes(buf[:n])
+        return self._raw_sock.recv(bufsize, flags)
+
+    def recv_into(self, buffer: Any, nbytes: int = 0, flags: int = 0) -> int:
+        if flags == 0:
+            mv = memoryview(buffer).cast("B")
+            target = mv[:nbytes] if nbytes > 0 else mv
+            n = self._raw_io.readinto(target)
+            return 0 if n is None else int(n)
+        return self._raw_sock.recv_into(buffer, nbytes, flags)
+
+    def send(self, data: bytes, flags: int = 0) -> int:
+        return self._raw_sock.send(data, flags)
+
+    def sendall(self, data: bytes, flags: int = 0) -> None:
+        self._raw_sock.sendall(data, flags)
+
+    def settimeout(self, value: float | None) -> None:
+        self._raw_sock.settimeout(value)
+
+    def gettimeout(self) -> float | None:
+        return self._raw_sock.gettimeout()
+
+    def setblocking(self, flag: bool) -> None:
+        self._raw_sock.setblocking(flag)
+
+    def setsockopt(self, *args: Any, **kwargs: Any) -> None:
+        self._raw_sock.setsockopt(*args, **kwargs)
+
+    def getsockopt(self, *args: Any, **kwargs: Any) -> Any:
+        return self._raw_sock.getsockopt(*args, **kwargs)
+
+    def getsockname(self) -> Any:
+        return self._raw_sock.getsockname()
+
+    def getpeername(self) -> Any:
+        return self._raw_sock.getpeername()
+
+    def fileno(self) -> int:
+        return self._raw_sock.fileno()
+
+    def shutdown(self, how: int) -> None:
+        self._raw_sock.shutdown(how)
+
+    def close(self) -> None:
+        self._raw_sock.close()
+
+
+def _unwrap_socket(conn: Any) -> socket.socket | None:
+    if isinstance(conn, socket.socket):
+        return conn
+    inner = getattr(conn, "raw_socket", None)
+    return inner if isinstance(inner, socket.socket) else None
+
+
+@dataclass(slots=True)
+class _PendingEmergencyConn:
+    sock: socket.socket
+    client_address: tuple[str, int]
+    deadline_mono: float
+    buf: bytearray
+    is_unix_ipc: bool = False
+
+
+class _EmergencyAdmissionHTTPServer(HTTPServer):
+    """Nonblocking selector-gated emergency listener reserving 100% of worker slots for authenticated owner requests (Finding [10])."""
+
+    allow_reuse_address = False
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        RequestHandlerClass: type[BaseHTTPRequestHandler],
+        *,
+        emergency_slots: int = 4,
+        max_pending_sockets: int = MAX_EMERGENCY_PENDING_SOCKETS,
+        max_header_bytes: int = MAX_EMERGENCY_HEADER_BYTES,
+        header_deadline_seconds: float = DEFAULT_EMERGENCY_HEADER_DEADLINE_SECONDS,
+        expected_host_fn: Callable[[], str],
+        expected_origin_fn: Callable[[], str],
+        verify_owner_bearer_fn: Callable[[str], tuple[bool, bool]],
+        on_auth_failure: Callable[[], None],
+        on_pre_auth_timeout: Callable[[], None],
+        unix_socket_path: str | Path | None = None,
+        mono_clock: Callable[[], float] = time.monotonic,
+        thread_name_prefix: str = "cas-cockpit-emerg",
+    ) -> None:
+        self._emergency_slots = max(1, int(emergency_slots))
+        self._worker_sem = threading.BoundedSemaphore(self._emergency_slots)
+        self._max_pending_sockets = max(4, min(int(max_pending_sockets), MAX_EMERGENCY_PENDING_SOCKETS))
+        self._max_header_bytes = max(512, min(int(max_header_bytes), MAX_EMERGENCY_HEADER_BYTES))
+        self._header_deadline_seconds = min(
+            DEFAULT_EMERGENCY_HEADER_DEADLINE_SECONDS,
+            max(0.05, float(header_deadline_seconds)),
+        )
+        self._expected_host_fn = expected_host_fn
+        self._expected_origin_fn = expected_origin_fn
+        self._verify_owner_bearer_fn = verify_owner_bearer_fn
+        self._on_auth_failure = on_auth_failure
+        self._on_pre_auth_timeout = on_pre_auth_timeout
+        self._mono = mono_clock
+        self._state_lock = threading.Lock()
+        self._active_workers = 0
+        self._peak_workers = 0
+        self._rejected_pre_auth = 0
+        self._shutdown_requested = False
+        self._loop_done = threading.Event()
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
+        self._wake_w.setblocking(False)
+        self._unix_sock: socket.socket | None = None
+        self._unix_path: Path | None = None
+        self._executor = ThreadPoolExecutor(
+            max_workers=self._emergency_slots,
+            thread_name_prefix=thread_name_prefix,
+        )
+        if ":" in str(server_address[0]):
+            self.address_family = socket.AF_INET6
+        super().__init__(server_address, RequestHandlerClass)
+        self.socket.setblocking(False)
+        if unix_socket_path is not None and str(unix_socket_path).strip():
+            self._bind_unix_ipc_socket(Path(str(unix_socket_path).strip()))
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+    def _bind_unix_ipc_socket(self, raw_path: Path) -> None:
+        if os.name != "posix" or not hasattr(socket, "AF_UNIX"):
+            raise ContractError("Emergency Unix domain IPC socket is supported on POSIX only")
+        if not raw_path.is_absolute() or ".." in raw_path.parts:
+            raise ContractError(f"Emergency Unix socket path must be absolute without '..': {raw_path}")
+        parent_verified, dir_fd = open_verified_directory_fd(
+            raw_path.parent, create=True, label="emergency IPC directory"
+        )
+        try:
+            sock_path = parent_verified / raw_path.name
+            if dir_fd is not None:
+                try:
+                    st_old = os.lstat(raw_path.name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    st_old = None
+                if st_old is not None:
+                    import stat as _stat_mod
+                    if not _stat_mod.S_ISSOCK(st_old.st_mode) or st_old.st_uid != os.geteuid():
+                        raise ContractError(f"Refusing to unlink non-socket or foreign emergency IPC path: {sock_path}")
+                    os.unlink(raw_path.name, dir_fd=dir_fd)
+        finally:
+            if dir_fd is not None:
+                os.close(dir_fd)
+        usock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        prev_umask = os.umask(0o177)
+        try:
+            usock.bind(str(sock_path))
+            os.chmod(sock_path, 0o600)
+            usock.listen(16)
+            usock.setblocking(False)
+        except Exception:
+            usock.close()
+            raise
+        finally:
+            os.umask(prev_umask)
+        self._unix_sock = usock
+        self._unix_path = sock_path
+
+    @property
+    def unix_socket_path(self) -> Path | None:
+        return self._unix_path
+
+    def _reject_pending_socket(
+        self,
+        sock: socket.socket,
+        status_line: bytes,
+        body: bytes,
+        *,
+        extra_header: bytes = b"",
+    ) -> None:
+        with self._state_lock:
+            self._rejected_pre_auth += 1
+        payload = (
+            status_line
+            + b"\r\nContent-Type: application/json; charset=utf-8\r\n"
+            + b"Connection: close\r\n"
+            + extra_header
+            + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+            + body
+        )
+        try:
+            sock.setblocking(True)
+            sock.settimeout(0.15)
+            sock.sendall(payload)
+            sock.shutdown(socket.SHUT_WR)
+        except OSError as exc:
+            _ign = str(exc)
+        try:
+            sock.setblocking(False)
+            for _ in range(4):
+                if not sock.recv(4096):
+                    break
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def _validate_pre_auth_header_block(
+        self,
+        raw_head: bytes,
+        *,
+        is_unix_ipc: bool,
+    ) -> tuple[bool, bytes, bytes, bytes]:
+        """Validate HTTP request line, header count, Host, Origin/Sec-Fetch-Site, and owner primary bearer in memory."""
+        try:
+            text = raw_head.decode("iso-8859-1")
+        except UnicodeDecodeError:
+            return False, b"HTTP/1.1 400 Bad Request", b'{"error": "Malformed HTTP header encoding"}\n', b""
+        lines = text.split("\r\n")
+        if not lines or not lines[0]:
+            return False, b"HTTP/1.1 400 Bad Request", b'{"error": "Empty HTTP request line"}\n', b""
+        req_parts = lines[0].split()
+        if len(req_parts) != 3 or not req_parts[2].startswith("HTTP/1."):
+            return False, b"HTTP/1.1 400 Bad Request", b'{"error": "Malformed HTTP request line"}\n', b""
+        method = req_parts[0].upper()
+        if method not in ("GET", "POST"):
+            return False, b"HTTP/1.1 405 Method Not Allowed", b'{"error": "Method not allowed on emergency channel"}\n', b""
+
+        hdr_lines = lines[1:]
+        if len(hdr_lines) > MAX_HTTP_HEADER_COUNT:
+            return False, b"HTTP/1.1 431 Request Header Fields Too Large", b'{"error": "Too many HTTP headers"}\n', b""
+
+        headers_multi: dict[str, list[str]] = {}
+        for hline in hdr_lines:
+            if not hline:
+                continue
+            if hline[0] in (" ", "\t") or ":" not in hline:
+                return False, b"HTTP/1.1 400 Bad Request", b'{"error": "Malformed HTTP header line"}\n', b""
+            hk, hv = hline.split(":", 1)
+            hk_clean = hk.strip().lower()
+            if not hk_clean or any(ch.isspace() for ch in hk_clean):
+                return False, b"HTTP/1.1 400 Bad Request", b'{"error": "Invalid HTTP header name"}\n', b""
+            headers_multi.setdefault(hk_clean, []).append(hv.strip())
+
+        exp_host = self._expected_host_fn()
+        exp_origin = self._expected_origin_fn()
+        hosts = headers_multi.get("host", [])
+        allowed_hosts = {exp_host, "localhost"} if is_unix_ipc else {exp_host}
+        if len(hosts) != 1 or hosts[0] not in allowed_hosts:
+            return False, b"HTTP/1.1 403 Forbidden", b'{"error": "Invalid or foreign Host header"}\n', b""
+
+        origins = headers_multi.get("origin", [])
+        if len(origins) > 1:
+            return False, b"HTTP/1.1 403 Forbidden", b'{"error": "Multiple Origin headers forbidden"}\n', b""
+        if len(origins) == 1 and origins[0] != exp_origin:
+            return False, b"HTTP/1.1 403 Forbidden", b'{"error": "Cross-origin loopback request forbidden"}\n', b""
+
+        sec_sites = [s.lower() for s in headers_multi.get("sec-fetch-site", [])]
+        if len(sec_sites) > 1:
+            return False, b"HTTP/1.1 403 Forbidden", b'{"error": "Multiple Sec-Fetch-Site headers forbidden"}\n', b""
+        if len(sec_sites) == 1 and sec_sites[0] not in ("same-origin", "none"):
+            return False, b"HTTP/1.1 403 Forbidden", b'{"error": "Cross-site browser request forbidden"}\n', b""
+
+        auth_vals = headers_multi.get("authorization", [])
+        www_hdr = b'WWW-Authenticate: Bearer realm="cas-forex-cockpit"\r\n'
+        if len(auth_vals) != 1 or not auth_vals[0].startswith("Bearer "):
+            self._on_auth_failure()
+            return False, b"HTTP/1.1 401 Unauthorized", b'{"error": "Authentication required"}\n', www_hdr
+        cand_tok = auth_vals[0][7:].strip()
+        if not cand_tok:
+            self._on_auth_failure()
+            return False, b"HTTP/1.1 401 Unauthorized", b'{"error": "Authentication required"}\n', www_hdr
+
+        is_owner, is_device = self._verify_owner_bearer_fn(cand_tok)
+        if is_owner:
+            return True, b"", b"", b""
+        if is_device:
+            return (
+                False,
+                b"HTTP/1.1 403 Forbidden",
+                b'{"error": "Owner primary session required; paired device sessions are read-only"}\n',
+                b"",
+            )
+        self._on_auth_failure()
+        return False, b"HTTP/1.1 401 Unauthorized", b'{"error": "Authentication required"}\n', www_hdr
+
+    def _dispatch_authenticated(self, prefixed: _PrefixedSocket, client_address: tuple[str, int]) -> None:
+        def _worker() -> None:
+            try:
+                self.finish_request(prefixed, client_address)  # type: ignore[arg-type]
+            except Exception:
+                self.handle_error(prefixed, client_address)  # type: ignore[arg-type]
+            finally:
+                try:
+                    self.shutdown_request(prefixed)  # type: ignore[arg-type]
+                finally:
+                    with self._state_lock:
+                        self._active_workers = max(0, self._active_workers - 1)
+                    self._worker_sem.release()
+
+        with self._state_lock:
+            self._active_workers += 1
+            if self._active_workers > self._peak_workers:
+                self._peak_workers = self._active_workers
+        try:
+            self._executor.submit(_worker)
+        except RuntimeError:
+            with self._state_lock:
+                self._active_workers = max(0, self._active_workers - 1)
+            self._worker_sem.release()
+            self.shutdown_request(prefixed)  # type: ignore[arg-type]
+
+    def shutdown_request(self, request: Any) -> None:
+        raw = _unwrap_socket(request)
+        if raw is not None:
+            try:
+                raw.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            try:
+                raw.close()
+            except OSError:
+                pass
+        else:
+            super().shutdown_request(request)
+
+    def serve_forever(self, poll_interval: float = 0.05) -> None:
+        self._loop_done.clear()
+        pending: OrderedDict[int, _PendingEmergencyConn] = OrderedDict()
+        sel = selectors.DefaultSelector()
+        try:
+            sel.register(self.socket, selectors.EVENT_READ, data=("accept_tcp", None))
+            sel.register(self._wake_r, selectors.EVENT_READ, data=("wake", None))
+            if self._unix_sock is not None:
+                sel.register(self._unix_sock, selectors.EVENT_READ, data=("accept_unix", None))
+
+            while not self._shutdown_requested:
+                now_m = self._mono()
+                if pending:
+                    soonest = min(p.deadline_mono - now_m for p in pending.values())
+                    wait_s = max(0.001, min(poll_interval, soonest))
+                else:
+                    wait_s = poll_interval
+
+                try:
+                    events = sel.select(timeout=wait_s)
+                except OSError:
+                    if self._shutdown_requested:
+                        break
+                    continue
+
+                for key, _mask in events:
+                    kind, tag_fd = key.data
+                    if kind == "wake":
+                        try:
+                            while self._wake_r.recv(256):
+                                pass
+                        except BlockingIOError:
+                            pass
+                        except OSError:
+                            pass
+                        continue
+
+                    if kind in ("accept_tcp", "accept_unix"):
+                        listener = self.socket if kind == "accept_tcp" else self._unix_sock
+                        if listener is None:
+                            continue
+                        is_unix = kind == "accept_unix"
+                        for _ in range(32):
+                            try:
+                                conn, raw_addr = listener.accept()
+                            except BlockingIOError:
+                                break
+                            except OSError:
+                                break
+                            if is_unix:
+                                eff_addr = ("127.0.0.1", 0)
+                            else:
+                                peer_ip = str(raw_addr[0]) if isinstance(raw_addr, tuple) and raw_addr else ""
+                                if not _is_loopback_peer_ip(peer_ip):
+                                    self._reject_pending_socket(
+                                        conn,
+                                        b"HTTP/1.1 403 Forbidden",
+                                        b'{"error": "Loopback clients only"}\n',
+                                    )
+                                    continue
+                                eff_addr = (peer_ip, int(raw_addr[1]) if len(raw_addr) > 1 else 0)
+
+                            try:
+                                conn.setblocking(False)
+                                fd_num = conn.fileno()
+                            except OSError:
+                                try:
+                                    conn.close()
+                                except OSError:
+                                    pass
+                                continue
+
+                            # Evict oldest unauthenticated pending socket when table reaches 64 so owner can NEVER be blocked
+                            while len(pending) >= self._max_pending_sockets:
+                                _, evicted = pending.popitem(last=False)
+                                try:
+                                    sel.unregister(evicted.sock)
+                                except Exception as exc_unreg:
+                                    _u = str(exc_unreg)
+                                self._on_pre_auth_timeout()
+                                self._reject_pending_socket(
+                                    evicted.sock,
+                                    b"HTTP/1.1 408 Request Timeout",
+                                    b'{"error": "Emergency pre-auth pending queue evicted slow socket"}\n',
+                                )
+
+                            rec = _PendingEmergencyConn(
+                                sock=conn,
+                                client_address=eff_addr,
+                                deadline_mono=self._mono() + self._header_deadline_seconds,
+                                buf=bytearray(),
+                                is_unix_ipc=is_unix,
+                            )
+                            try:
+                                sel.register(conn, selectors.EVENT_READ, data=("pending", fd_num))
+                                pending[fd_num] = rec
+                            except Exception:
+                                try:
+                                    conn.close()
+                                except OSError:
+                                    pass
+                        continue
+
+                    if kind == "pending":
+                        p_conn = pending.get(tag_fd)
+                        if p_conn is None:
+                            continue
+                        try:
+                            chunk = p_conn.sock.recv(4096)
+                        except BlockingIOError:
+                            continue
+                        except OSError:
+                            pending.pop(tag_fd, None)
+                            try:
+                                sel.unregister(p_conn.sock)
+                            except Exception as exc_u2:
+                                _u2 = str(exc_u2)
+                            try:
+                                p_conn.sock.close()
+                            except OSError:
+                                pass
+                            continue
+
+                        if not chunk:
+                            pending.pop(tag_fd, None)
+                            try:
+                                sel.unregister(p_conn.sock)
+                            except Exception as exc_u3:
+                                _u3 = str(exc_u3)
+                            try:
+                                p_conn.sock.close()
+                            except OSError:
+                                pass
+                            continue
+
+                        p_conn.buf.extend(chunk)
+                        hdr_end = p_conn.buf.find(b"\r\n\r\n")
+                        if hdr_end == -1:
+                            if len(p_conn.buf) > self._max_header_bytes:
+                                pending.pop(tag_fd, None)
+                                try:
+                                    sel.unregister(p_conn.sock)
+                                except Exception as exc_u4:
+                                    _u4 = str(exc_u4)
+                                self._reject_pending_socket(
+                                    p_conn.sock,
+                                    b"HTTP/1.1 431 Request Header Fields Too Large",
+                                    b'{"error": "Emergency pre-auth HTTP headers exceed 8 KiB limit"}\n',
+                                )
+                            continue
+
+                        pending.pop(tag_fd, None)
+                        try:
+                            sel.unregister(p_conn.sock)
+                        except Exception as exc_u5:
+                            _u5 = str(exc_u5)
+
+                        if hdr_end + 4 > self._max_header_bytes:
+                            self._reject_pending_socket(
+                                p_conn.sock,
+                                b"HTTP/1.1 431 Request Header Fields Too Large",
+                                b'{"error": "Emergency pre-auth HTTP headers exceed 8 KiB limit"}\n',
+                            )
+                            continue
+
+                        ok_env, st_line, err_body, extra_hdr = self._validate_pre_auth_header_block(
+                            bytes(p_conn.buf[:hdr_end]),
+                            is_unix_ipc=p_conn.is_unix_ipc,
+                        )
+                        if not ok_env:
+                            self._reject_pending_socket(
+                                p_conn.sock,
+                                st_line,
+                                err_body,
+                                extra_header=extra_hdr,
+                            )
+                            continue
+
+                        if not self._worker_sem.acquire(blocking=False):
+                            self._reject_pending_socket(
+                                p_conn.sock,
+                                b"HTTP/1.1 503 Service Unavailable",
+                                b'{"error": "Authenticated emergency worker pool busy"}\n',
+                            )
+                            continue
+
+                        try:
+                            p_conn.sock.setblocking(True)
+                            p_conn.sock.settimeout(5.0)
+                        except OSError:
+                            self._worker_sem.release()
+                            try:
+                                p_conn.sock.close()
+                            except OSError:
+                                pass
+                            continue
+
+                        prefixed = _PrefixedSocket(p_conn.sock, bytes(p_conn.buf))
+                        self._dispatch_authenticated(prefixed, p_conn.client_address)
+
+                # Enforce strict monotonic <=1.0s pre-auth header deadline across all pending sockets
+                sweep_now = self._mono()
+                for fd_exp in [fk for fk, pv in pending.items() if sweep_now >= pv.deadline_mono]:
+                    exp_conn = pending.pop(fd_exp, None)
+                    if exp_conn is None:
+                        continue
+                    try:
+                        sel.unregister(exp_conn.sock)
+                    except Exception as exc_u6:
+                        _u6 = str(exc_u6)
+                    self._on_pre_auth_timeout()
+                    self._reject_pending_socket(
+                        exp_conn.sock,
+                        b"HTTP/1.1 408 Request Timeout",
+                        b'{"error": "Emergency pre-auth header deadline exceeded"}\n',
+                    )
+        finally:
+            for rem_conn in list(pending.values()):
+                try:
+                    sel.unregister(rem_conn.sock)
+                except Exception as exc_u7:
+                    _u7 = str(exc_u7)
+                try:
+                    rem_conn.sock.close()
+                except OSError:
+                    pass
+            pending.clear()
+            try:
+                sel.close()
+            except Exception as exc_sc:
+                _sc = str(exc_sc)
+            self._loop_done.set()
+
+    def shutdown(self) -> None:
+        self._shutdown_requested = True
+        try:
+            self._wake_w.send(b"x")
+        except OSError:
+            pass
+        self._loop_done.wait(timeout=3.0)
+
+    def server_close(self) -> None:
+        self._shutdown_requested = True
+        try:
+            self._wake_w.send(b"x")
+        except OSError:
+            pass
+        for ws in (self._wake_r, self._wake_w):
+            try:
+                ws.close()
+            except OSError:
+                pass
+        if self._unix_sock is not None:
+            try:
+                self._unix_sock.close()
+            except OSError:
+                pass
+            self._unix_sock = None
+        if self._unix_path is not None:
+            try:
+                self._unix_path.unlink()
+            except OSError:
+                pass
+            self._unix_path = None
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        finally:
+            super().server_close()
 
 def _roll_mt5_index_bars(prev_bars: Any, bucket_iso: str, mid_px: Any, _dec_txt: Any, limit: int = 48) -> list[dict[str, Any]]:
     """Append or update the latest OHLC candle bucket for MT5-driven index streams."""
@@ -876,6 +1621,9 @@ class LoopbackCockpitServer:
         max_pre_auth_body_readers: int = DEFAULT_MAX_PRE_AUTH_BODY_READERS,
         rotation_drain_timeout_seconds: float = 5.0,
         pre_auth_conn_rate_limit: int = 256,
+        global_pre_auth_rate_limit: int | None = None,
+        emergency_unix_socket: str | Path | None = None,
+        emergency_header_deadline_seconds: float = DEFAULT_EMERGENCY_HEADER_DEADLINE_SECONDS,
         mono_clock: Callable[[], float] | None = None,
     ) -> None:
         self._host = validate_loopback_host(host)
@@ -943,7 +1691,7 @@ class LoopbackCockpitServer:
 
         self._httpd: _ExclusiveThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
-        self._emergency_httpd: _ExclusiveThreadingHTTPServer | None = None
+        self._emergency_httpd: _EmergencyAdmissionHTTPServer | None = None
         self._emergency_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._sse_cond = threading.Condition()
@@ -960,6 +1708,20 @@ class LoopbackCockpitServer:
         self._max_pre_auth_body_readers = max(1, min(int(max_pre_auth_body_readers), max(1, self._max_ordinary_connections // 2)))
         self._rotation_drain_timeout_seconds = max(0.0, float(rotation_drain_timeout_seconds))
         self._pre_auth_conn_rate_limit = max(1, int(pre_auth_conn_rate_limit))
+        self._global_pre_auth_rate_limit = (
+            self._pre_auth_conn_rate_limit
+            if global_pre_auth_rate_limit is None
+            else max(1, int(global_pre_auth_rate_limit))
+        )
+        self._emergency_unix_socket_cfg = (
+            Path(str(emergency_unix_socket).strip())
+            if emergency_unix_socket is not None and str(emergency_unix_socket).strip()
+            else None
+        )
+        self._emergency_header_deadline_seconds = min(
+            DEFAULT_EMERGENCY_HEADER_DEADLINE_SECONDS,
+            max(0.05, float(emergency_header_deadline_seconds)),
+        )
         self._mono = mono_clock or time.monotonic
         self._auth_lock = threading.RLock()
         self._auth_cond = threading.Condition(self._auth_lock)
@@ -974,7 +1736,13 @@ class LoopbackCockpitServer:
         self._inflight_commits: dict[str, int] = {}
         self._pairing_codes: dict[str, _PairingCodeRecord] = {}
         self._device_sessions: dict[str, _DeviceSessionRecord] = {}
-        self._pair_exchange_attempts: dict[str, list[float]] = {}
+        self._pair_exchange_tracker = _BoundedPreAuthRateTracker(
+            per_principal_limit=MAX_PAIR_EXCHANGE_ATTEMPTS_PER_WINDOW,
+            global_limit=MAX_PAIR_EXCHANGE_ATTEMPTS_PER_WINDOW * 2,
+            window_seconds=PAIR_EXCHANGE_WINDOW_SECONDS,
+            max_keys=MAX_TRACKED_PRE_AUTH_KEYS,
+        )
+        self._pair_exchange_attempts: OrderedDict[str, list[float]] = self._pair_exchange_tracker.per_key
         self._worker_sem = threading.BoundedSemaphore(self._max_ordinary_connections)
         self._pre_auth_body_sem = threading.BoundedSemaphore(self._max_pre_auth_body_readers)
         self._emergency_sem = threading.BoundedSemaphore(self._max_emergency_connections)
@@ -1035,6 +1803,12 @@ class LoopbackCockpitServer:
     @property
     def emergency_base_url(self) -> str:
         return f"http://{self.emergency_expected_host_header}"
+
+    @property
+    def emergency_unix_socket_path(self) -> Path | None:
+        if self._emergency_httpd is None:
+            return None
+        return self._emergency_httpd.unix_socket_path
 
     @property
     def pre_auth_timeouts_total(self) -> int:
@@ -1153,15 +1927,11 @@ class LoopbackCockpitServer:
         peer_key: str = "127.0.0.1",
     ) -> tuple[int, dict[str, Any]]:
         """Atomically exchange a single-use pairing code for a least-privilege device bearer token."""
+        canon_peer = _canonical_pre_auth_principal(peer_key)
         now_m = self._mono()
         with self._auth_cond:
-            cutoff = now_m - PAIR_EXCHANGE_WINDOW_SECONDS
-            hist = [t for t in self._pair_exchange_attempts.get(peer_key, ()) if t >= cutoff]
-            if len(hist) >= MAX_PAIR_EXCHANGE_ATTEMPTS_PER_WINDOW:
-                self._pair_exchange_attempts[peer_key] = hist
+            if not self._pair_exchange_tracker.try_consume(canon_peer, now_m):
                 return int(HTTPStatus.TOO_MANY_REQUESTS), {"error": "Too many pairing exchange attempts"}
-            hist.append(now_m)
-            self._pair_exchange_attempts[peer_key] = hist
 
             if (
                 self._stop_event.is_set()
@@ -1258,6 +2028,27 @@ class LoopbackCockpitServer:
             if hmac.compare_digest(k_sha, cand_sha) and rec.epoch == captured_epoch and now_m < rec.expires_mono:
                 return True
         return False
+
+    def _verify_emergency_owner_bearer(self, candidate: str) -> tuple[bool, bool]:
+        """Constant-time pre-worker check returning (is_owner, is_device) for _EmergencyAdmissionHTTPServer."""
+        if not isinstance(candidate, str) or not candidate:
+            return False, False
+        with self._auth_lock:
+            secret = self._auth_secret
+            epoch = self._session_epoch or ""
+            if secret is None or self._stop_event.is_set() or not epoch or epoch in self._revoked_epochs:
+                return False, False
+            expected_owner = secret.reveal().encode("utf-8")
+            now_m = self._mono()
+            self._prune_ephemeral_auth_unlocked(now_m)
+            dev_snapshot = list(self._device_sessions.items())
+        if hmac.compare_digest(candidate.encode("utf-8"), expected_owner):
+            return True, False
+        cand_sha = sha256(candidate.encode("utf-8")).hexdigest()
+        for k_sha, rec in dev_snapshot:
+            if hmac.compare_digest(k_sha, cand_sha) and rec.epoch == epoch and now_m < rec.expires_mono:
+                return False, True
+        return False, False
 
     def _verify_commit_epoch(
         self,
@@ -1403,11 +2194,45 @@ class LoopbackCockpitServer:
     def rotate_auth_token_detailed(
         self,
         *,
+        expected_bearer: str | None = None,
+        expected_epoch: str | int | None = None,
         exclude_sock: socket.socket | None = None,
         drain_timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        """Rotate bearer + epoch and report exact old-epoch drain completion status (Finding [12])."""
+        """Atomic compare-and-rotate bearer + epoch under single _auth_cond critical section (Finding [12])."""
         with self._auth_cond:
+            if expected_epoch is not None or expected_bearer is not None:
+                exp_ep_str = str(expected_epoch) if expected_epoch is not None else None
+                epoch_ok = (
+                    exp_ep_str is None
+                    or (
+                        self._session_epoch is not None
+                        and self._session_epoch == exp_ep_str
+                        and exp_ep_str not in self._revoked_epochs
+                    )
+                )
+                bearer_ok = (
+                    expected_bearer is None
+                    or (
+                        self._auth_secret is not None
+                        and isinstance(expected_bearer, str)
+                        and bool(expected_bearer)
+                        and hmac.compare_digest(
+                            expected_bearer.encode("utf-8"),
+                            self._auth_secret.reveal().encode("utf-8"),
+                        )
+                    )
+                )
+                if self._stop_event.is_set() or not epoch_ok or not bearer_ok:
+                    return {
+                        "status": "STALE_ROTATE_EPOCH",
+                        "rotated": False,
+                        "stale_epoch": True,
+                        "old_epoch_revoked": True,
+                        "rotation_complete": False,
+                        "active_old_leases": 0,
+                        "session_epoch": self._session_epoch or "",
+                    }
             old_epoch = self._session_epoch
             if old_epoch is not None:
                 self._revoked_epochs.add(old_epoch)
@@ -1445,6 +2270,8 @@ class LoopbackCockpitServer:
             )
         return {
             "new_token": new_tok.reveal(),
+            "rotated": True,
+            "stale_epoch": False,
             "session_epoch": new_epoch,
             "old_epoch_revoked": True,
             "rotation_complete": active_old == 0,
@@ -1485,6 +2312,8 @@ class LoopbackCockpitServer:
 
     def _record_request(self, route: str) -> None:
         bucket = route if route in _KNOWN_METRICS_ROUTES else "__other__"
+        if bucket == "/api/rotate-token":
+            bucket = "/api/rotate"
         with self._metrics_lock:
             self._requests_total += 1
             self._route_counts[bucket] = self._route_counts.get(bucket, 0) + 1
@@ -1824,14 +2653,17 @@ class LoopbackCockpitServer:
                     extra_headers=extra_headers,
                 )
                 self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(body)
-                self.wfile.flush()
+                try:
+                    self.end_headers()
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                    pass
                 self.close_connection = True
 
             def _allowed_hosts_and_origins(self) -> tuple[set[str], set[str]]:
                 if self._emergency_channel:
-                    return {outer.emergency_expected_host_header}, {outer.emergency_base_url}
+                    return {outer.emergency_expected_host_header, "localhost"}, {outer.emergency_base_url}
                 allowed_hosts = {outer.expected_host_header}
                 allowed_origins = {outer.base_url}
                 if outer._public_host and outer._public_origin:
@@ -1879,9 +2711,10 @@ class LoopbackCockpitServer:
                 self.command = ""
                 self._orig_rfile = self.rfile
                 self._pre_auth_rfile: _DeadlineRFile | None = None
-                if isinstance(self.connection, socket.socket):
-                    self.connection.settimeout(min(self._pre_auth_budget(), 5.0))
-                    outer._register_socket(self.connection)
+                raw_conn = _unwrap_socket(self.connection)
+                if raw_conn is not None:
+                    raw_conn.settimeout(min(self._pre_auth_budget(), 5.0))
+                    outer._register_socket(raw_conn)
 
             def handle_one_request(self) -> None:
                 wrapped: _DeadlineRFile | None = None
@@ -1963,8 +2796,9 @@ class LoopbackCockpitServer:
                 try:
                     super().finish()
                 finally:
-                    if isinstance(self.connection, socket.socket):
-                        outer._unregister_socket(self.connection)
+                    raw_conn = _unwrap_socket(self.connection)
+                    if raw_conn is not None:
+                        outer._unregister_socket(raw_conn)
 
             def _check_auth_scoped(self, *, is_post: bool) -> tuple[bool, bool, str, str, str, str | None]:
                 """Constant-time bearer check returning (authed, supplied, epoch, candidate, scope, expires_at)."""
@@ -2619,7 +3453,8 @@ class LoopbackCockpitServer:
                         body = self._read_pre_auth_json_body(max_bytes=MAX_PRE_AUTH_BODY_BYTES)
                         if type(body) is not dict or not isinstance(body.get("pair_code"), str):
                             raise ContractError("pair_code field required")
-                        peer_k = str(self.client_address[0]) if self.client_address else "127.0.0.1"
+                        raw_peer = str(self.client_address[0]) if self.client_address else "127.0.0.1"
+                        peer_k = _canonical_pre_auth_principal(raw_peer)
                         st_code, resp_doc = outer.exchange_pairing_code(body["pair_code"], peer_key=peer_k)
                         if st_code == int(HTTPStatus.UNAUTHORIZED):
                             outer._record_auth_failure()
@@ -2701,11 +3536,15 @@ class LoopbackCockpitServer:
                 if route == "/api/rotate-token":
                     try:
                         _ = self._read_optional_json_body(max_bytes=4096)
-                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
-                            self._reject_unauthorized()
+                        cur_sock = _unwrap_socket(self.connection)
+                        rot_info = outer.rotate_auth_token_detailed(
+                            expected_bearer=supplied_tok,
+                            expected_epoch=auth_epoch,
+                            exclude_sock=cur_sock,
+                        )
+                        if rot_info.get("stale_epoch") or not bool(rot_info.get("rotated", True)):
+                            self._reject_unauthorized("Session epoch already rotated or revoked")
                             return
-                        cur_sock = self.connection if isinstance(self.connection, socket.socket) else None
-                        rot_info = outer.rotate_auth_token_detailed(exclude_sock=cur_sock)
                         if not bool(rot_info["rotation_complete"]):
                             self._write_json(
                                 HTTPStatus.CONFLICT,
@@ -3972,18 +4811,29 @@ class LoopbackCockpitServer:
             _Handler,
             ordinary_slots=self._max_ordinary_connections,
             peer_rate_limit_per_window=self._pre_auth_conn_rate_limit,
+            global_rate_limit_per_window=self._global_pre_auth_rate_limit,
+            mono_clock=self._mono,
             thread_name_prefix="cas-cockpit-worker",
         )
         self._httpd.request_queue_size = 32
         try:
-            self._emergency_httpd = _ExclusiveThreadingHTTPServer(
+            self._emergency_httpd = _EmergencyAdmissionHTTPServer(
                 (self._host, self._emergency_port_cfg),
                 _EmergencyHandler,
-                ordinary_slots=self._max_emergency_connections,
-                peer_rate_limit_per_window=max(64, self._pre_auth_conn_rate_limit),
+                emergency_slots=self._max_emergency_connections,
+                max_pending_sockets=MAX_EMERGENCY_PENDING_SOCKETS,
+                max_header_bytes=MAX_EMERGENCY_HEADER_BYTES,
+                header_deadline_seconds=self._emergency_header_deadline_seconds,
+                expected_host_fn=lambda: self.emergency_expected_host_header,
+                expected_origin_fn=lambda: self.emergency_base_url,
+                verify_owner_bearer_fn=self._verify_emergency_owner_bearer,
+                on_auth_failure=self._record_auth_failure,
+                on_pre_auth_timeout=self._record_pre_auth_timeout,
+                unix_socket_path=self._emergency_unix_socket_cfg,
+                mono_clock=self._mono,
                 thread_name_prefix="cas-cockpit-emerg",
             )
-            self._emergency_httpd.request_queue_size = 16
+            self._emergency_httpd.request_queue_size = 32
         except Exception:
             self._httpd.server_close()
             self._httpd = None
@@ -4034,6 +4884,46 @@ class LoopbackCockpitServer:
                 self._autonomous_trader.close(timeout=2.0, drain=True)
             except Exception as exc_trs:
                 self._last_routing_error = type(exc_trs).__name__
+
+
+def write_live_auth_ticket_bundle_atomic(
+    ticket_path: str | Path,
+    bundle: Mapping[str, Any],
+) -> Path:
+    """Write a LIVE auth ticket bundle relative to a verified owner-only parent fd without following symlinks (Finding [7])."""
+    if not isinstance(ticket_path, (str, Path)):
+        raise ContractError("LIVE auth ticket output path must be a string or Path")
+    raw_txt = str(ticket_path).strip()
+    if not raw_txt or "\x00" in raw_txt:
+        raise ContractError("LIVE auth ticket output path must be non-empty without NUL bytes")
+    expanded = Path(os.path.expanduser(raw_txt))
+    if ".." in expanded.parts:
+        raise ContractError(f"Refusing parent-traversal '..' in LIVE auth ticket output: {expanded}")
+    if not expanded.is_absolute():
+        expanded = Path(os.getcwd()) / expanded
+    fname = expanded.name
+    if not fname or fname in (".", ".."):
+        raise ContractError(f"Invalid LIVE auth ticket output filename: {expanded}")
+
+    parent_verified, dir_fd = open_verified_directory_fd(
+        expanded.parent,
+        create=False,
+        label="LIVE auth ticket output parent",
+    )
+    try:
+        payload_bytes = (json.dumps(dict(bundle), indent=2, sort_keys=True) + "\n").encode("utf-8")
+        create_owner_only_file_atomic(
+            parent_verified,
+            fname,
+            payload_bytes,
+            dir_fd=dir_fd,
+            replace_existing=True,
+            label="LIVE auth ticket output",
+        )
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+    return parent_verified / fname
 
 
 def load_dotenv_file(path: str | Path) -> dict[str, str]:
@@ -4153,8 +5043,8 @@ def run_cockpit_cli(
         if merged.get("CAS_FOREX_OANDA_LIVE_ACCOUNT_ID"):
             targets.append((BROKER_OANDA_LIVE, merged["CAS_FOREX_OANDA_LIVE_ACCOUNT_ID"], "api-fxtrade.oanda.com"))
         bundle = mint_live_authorization_bundle(key_file=key_p, targets=targets, ttl_seconds=args.live_ticket_ttl_seconds)
-        t_out = Path(merged.get(ENV_LIVE_AUTH_TICKET_FILE) or (runtime_state.state_dir / "live_auth_bundle.json"))
-        t_out.write_text(json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        t_out_raw = merged.get(ENV_LIVE_AUTH_TICKET_FILE) or (runtime_state.state_dir / "live_auth_bundle.json")
+        t_out = write_live_auth_ticket_bundle_atomic(t_out_raw, bundle)
         print(json.dumps({"status": "LIVE_TICKET_MINTED", "key_file": str(key_p), "ticket_file": str(t_out), "brokers": [t[0] for t in targets]}))
         return 0
 
