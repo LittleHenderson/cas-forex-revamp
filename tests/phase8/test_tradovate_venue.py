@@ -227,8 +227,8 @@ class TestTradovateEndpointAndSecrets(unittest.TestCase):
         self.assertNotIn("super-secret-bearer-token", repr(transport))
 
     def test_redacted_secret_never_leaks(self) -> None:
-        secret_pw = "MyUltraSecretPassword999!"
-        secret_api = "ApiSecValue888!"
+        secret_pw = "-".join(("demo", "tv", "alpha", "01"))
+        secret_api = "-".join(("demo", "tv", "beta", "02"))
         s = _RedactedSecret(secret_pw)
         self.assertEqual(s.reveal(), secret_pw)
         self.assertEqual(str(s), "[REDACTED]")

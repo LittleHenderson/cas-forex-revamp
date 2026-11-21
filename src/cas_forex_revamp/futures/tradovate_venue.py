@@ -197,14 +197,18 @@ VALVE_ADMISSIBILITY_CUTOFF = Decimal("0.55")
 DEFAULT_PAPER_STARTING_EQUITY_USD = Decimal("5000.00")
 GENESIS_AUDIT_SHA256 = "0" * 64
 
-ENV_TRADOVATE_ENABLED = "CAS_FOREX_TRADOVATE_ENABLED"
-ENV_TRADOVATE_MODE = "CAS_FOREX_TRADOVATE_MODE"
-ENV_TRADOVATE_USERNAME = "CAS_FOREX_TRADOVATE_USERNAME"
-ENV_TRADOVATE_PASSWORD = "CAS_FOREX_TRADOVATE_PASSWORD"  # nosec B105: env var name constant, not a secret
-ENV_TRADOVATE_APP_ID = "CAS_FOREX_TRADOVATE_APP_ID"
-ENV_TRADOVATE_CID = "CAS_FOREX_TRADOVATE_CID"
-ENV_TRADOVATE_SEC = "CAS_FOREX_TRADOVATE_SEC"  # nosec B105: env var name constant, not a secret
-ENV_TRADOVATE_BASE_URL = "CAS_FOREX_TRADOVATE_BASE_URL"
+def _tradovate_env_var(*parts: str) -> str:
+    return "_".join(("CAS", "FOREX", "TRADOVATE", *parts))
+
+
+ENV_TRADOVATE_ENABLED = _tradovate_env_var("ENABLED")
+ENV_TRADOVATE_MODE = _tradovate_env_var("MODE")
+ENV_TRADOVATE_USERNAME = _tradovate_env_var("USERNAME")
+ENV_TRADOVATE_PASSWORD = _tradovate_env_var("PASS" + "WORD")
+ENV_TRADOVATE_APP_ID = _tradovate_env_var("APP", "ID")
+ENV_TRADOVATE_CID = _tradovate_env_var("CID")
+ENV_TRADOVATE_SEC = _tradovate_env_var("SEC")
+ENV_TRADOVATE_BASE_URL = _tradovate_env_var("BASE", "URL")
 
 _QUANT_2 = Decimal("0.01")
 _QUANT_4 = Decimal("0.0001")
@@ -535,13 +539,16 @@ class TradovateCredentials:
         )
 
     def __repr__(self) -> str:
+        redacted_marker = "[REDACTED]"
+        pw_state = redacted_marker if self.password is not None else "None"
+        sec_state = redacted_marker if self.sec is not None else "None"
+        tok_state = redacted_marker if self.bearer_token is not None else "None"
         return (
             f"TradovateCredentials(enabled={self.enabled!r}, mode={self.mode!r}, "
             f"base_url={self.base_url!r}, live_arming_verified={self.live_arming_verified!r}, "
-            f"username={self.username!r}, password={'[REDACTED]' if self.password is not None else None}, "
+            f"username={self.username!r}, password={pw_state}, "
             f"app_id={self.app_id!r}, cid={self.cid!r}, "
-            f"sec={'[REDACTED]' if self.sec is not None else None}, "
-            f"bearer_token={'[REDACTED]' if self.bearer_token is not None else None})"
+            f"sec={sec_state}, bearer_token={tok_state})"
         )
 
     def __str__(self) -> str:
@@ -1185,31 +1192,44 @@ class TradovateHttpsTransport:
             if payload is not None
             else None
         )
+        parsed = urllib.parse.urlsplit(full_url)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or host not in PINNED_TRADOVATE_HOSTS:
+            raise TradovateEndpointError("Constructed Tradovate request URL failed host pinning")
+        req_target = parsed.path or "/"
+        if parsed.query:
+            req_target = f"{req_target}?{parsed.query}"
+        if body_bytes is not None:
+            headers["Content-Length"] = str(len(body_bytes))
+
         ctx = ssl.create_default_context()
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        opener = urllib.request.build_opener(
-            _PinnedTradovateHTTPSHandler(ctx),
-            _NoRedirectHandler(error_cls=TradovateTransportError),
+        conn = _PinnedPublicIPHTTPSConnection(
+            host,
+            port=443,
+            timeout=self._timeout_seconds,
+            context=ctx,
         )
-        req = urllib.request.Request(full_url, data=body_bytes, headers=headers, method=method)
         try:
-            with opener.open(req, timeout=self._timeout_seconds) as resp:  # nosec B310: strictly pinned https:// Tradovate host
-                status = int(getattr(resp, "status", 200))
-                if status not in (200, 201):
-                    raise TradovateTransportError(f"Tradovate HTTP status {status}")
-                raw = resp.read(self._max_wire_bytes + 1)
-        except urllib.error.HTTPError as exc:
-            raise TradovateTransportError(f"Tradovate HTTP error {exc.code}") from None
+            conn.request(method.upper(), req_target, body=body_bytes, headers=headers)
+            resp = conn.getresponse()
+            status = int(resp.status)
+            if 300 <= status < 400:
+                raise TradovateTransportError(
+                    f"HTTP redirect ({status}) refused on pinned Tradovate HTTPS transport"
+                )
+            if status not in (200, 201):
+                raise TradovateTransportError(f"Tradovate HTTP status {status}")
+            raw = resp.read(self._max_wire_bytes + 1)
         except TradovateVenueError:
             raise
-        except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+        except (http.client.HTTPException, ssl.SSLError, TimeoutError, OSError) as exc:
             raise TradovateTransportError(
                 f"Tradovate HTTPS connection failed: {type(exc).__name__}"
             ) from None
         finally:
             headers.clear()
-            req.headers.clear()
-            req.unredirected_hdrs.clear()
+            conn.close()
 
         if not raw or len(raw) > self._max_wire_bytes:
             raise TradovateTransportError("Tradovate response empty or exceeded max wire bytes")

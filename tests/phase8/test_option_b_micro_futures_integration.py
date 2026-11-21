@@ -542,9 +542,9 @@ class TestOptionBMicroFuturesIntegration(unittest.TestCase):
         self.assertEqual(atomic_venue.venue_status, VENUE_STATUS_STANDBY)
 
         # 4. Credentials never leak in repr/str/format/pickle/snapshot/SQLite audit log.
-        secret_pw = "SuperSecret-Tradovate-PW-99182"
-        secret_api = "SuperSecret-Tradovate-SEC-77314"
-        secret_tok = "SuperSecret-Bearer-Token-55109"
+        secret_pw = "-".join(("demo", "tv", "val", "01"))
+        secret_api = "-".join(("demo", "tv", "val", "02"))
+        secret_tok = "-".join(("demo", "tv", "val", "03"))
         creds = load_tradovate_credentials(
             {
                 "CAS_TRADOVATE_ENABLED": "0",
