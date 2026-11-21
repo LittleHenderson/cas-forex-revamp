@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import unittest
 import urllib.parse
 
+from cas_forex_revamp.composition.state_store import create_owner_only_file_atomic
 from cas_forex_revamp.contracts import ActionKind, ContractError, Side
 from cas_forex_revamp.valve.tks_meta_valve_controller import (
     DEFAULT_MAX_DRAWDOWN_PCT,
@@ -862,7 +863,13 @@ class AuditEfb2bf4VenueSecurityTests(unittest.TestCase):
                 issued_at=T0,
             )
             ticket_path = root / "live_bundle.json"
-            ticket_path.write_text(json.dumps(bundle), encoding="utf-8")
+            create_owner_only_file_atomic(
+                ticket_path.parent,
+                ticket_path.name,
+                json.dumps(bundle).encode("utf-8"),
+                replace_existing=True,
+                label="LIVE auth ticket",
+            )
             live_env = {
                 ENV_EXECUTION_MODE: EXECUTION_MODE_LIVE,
                 ENV_LIVE_ARM_PHRASE: REQUIRED_LIVE_ARM_PHRASE,
@@ -974,7 +981,13 @@ class AuditEfb2bf4VenueSecurityTests(unittest.TestCase):
                 ttl_seconds=120,
                 issued_at=clock(),
             )
-            ticket_path.write_text(json.dumps(bundle2), encoding="utf-8")
+            create_owner_only_file_atomic(
+                ticket_path.parent,
+                ticket_path.name,
+                json.dumps(bundle2).encode("utf-8"),
+                replace_existing=True,
+                label="LIVE auth ticket",
+            )
             oanda_client.refresh_live_authorization(live_env, now=clock())
             _f6_cls_grant = _f6_gate.issue_protective_order_grant(
                 broker_id=BROKER_OANDA_LIVE, account_id="001-001-live-01", server="api-fxtrade.oanda.com",

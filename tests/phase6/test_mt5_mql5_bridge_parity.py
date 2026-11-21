@@ -52,6 +52,7 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
     Mt5OutcomeUnknownError,
     Mt5PaperBrokerVenue,
     Mt5PreDispatchTransportError,
+    Mt5SnapshotIntegrityError,
     Mt5SpoolBridgeTransport,
     Mt5SpoolPaperTerminalEmulator,
     Mt5TransportError,
@@ -65,6 +66,7 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
     _spool_hmac_hex,
     _status_for_retcode,
     derive_spool_channel_key,
+    sign_mt5_market_snapshot_doc,
     sign_spool_valve_admission,
     spool_channel_key_id,
     normalize_market_symbol,
@@ -110,7 +112,7 @@ def _clear_valve(order: OrderIntent, *, now: datetime | None = None) -> ValveDec
 
 
 def _grant_for_req(req: Mt5OrderRequest, *, broker_id: str = BROKER_HUGOSWAY_MT5, login: int = 7001234, server: str = "Hugosway-Demo", now: datetime | None = None):
-    eff_now = datetime.now(timezone.utc) if now is None else now
+    eff_now = T0 if now is None else now
     if req.action in ("CLOSE", "REDUCE", "AMEND_STOP"):
         return DEFAULT_VALVE_GATE.issue_protective_order_grant(
             broker_id=broker_id,
@@ -382,7 +384,8 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
             )
             emu.publish_market()
             transport = Mt5SpoolBridgeTransport(
-                spool_dir, sleep=emu.sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=2.0
+                spool_dir, sleep=emu.sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=2.0,
+                clock=lambda: T0,
             )
             transport.connect(Mt5Credentials(BROKER_HUGOSWAY_MT5, 7001234, "Hugosway-Demo"))
             signed_order_req = sign_spool_valve_admission(transport.prepare_request(order_req), spool_dir=spool_dir)
@@ -532,7 +535,8 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
             )
             emu.publish_market()
             transport = Mt5SpoolBridgeTransport(
-                spool_dir, sleep=emu.sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=1.0
+                spool_dir, sleep=emu.sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=1.0,
+                clock=lambda: T0,
             )
             transport.connect(Mt5Credentials(BROKER_HUGOSWAY_MT5, 7001234, "Hugosway-Demo"))
             expired_req = Mt5OrderRequest(
@@ -570,7 +574,8 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
 
             # Timeout / interrupted request triggers fail-closed Mt5OutcomeUnknownError (no retry)
             no_reply_transport = Mt5SpoolBridgeTransport(
-                spool_dir, sleep=lambda _s: None, poll_interval_seconds=0.005, receipt_timeout_seconds=0.01
+                spool_dir, sleep=lambda _s: None, poll_interval_seconds=0.005, receipt_timeout_seconds=0.01,
+                clock=lambda: T0,
             )
             no_reply_transport.connect(Mt5Credentials(BROKER_HUGOSWAY_MT5, 7001234, "Hugosway-Demo"))
             timeout_req = Mt5OrderRequest(
@@ -649,7 +654,8 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
             emu_l.publish_market()
 
             t_h = Mt5SpoolBridgeTransport(
-                root / "hugosway_mt5", sleep=emu_h.sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=2.0
+                root / "hugosway_mt5", sleep=emu_h.sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=2.0,
+                clock=lambda: T0,
             )
             t_h.connect(Mt5Credentials(BROKER_HUGOSWAY_MT5, 7001234, "Hugosway-Demo"))
 
@@ -755,7 +761,8 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
 
             journal_h = Mt5MutationJournal(db_path=fo_root / "journal_h.sqlite3")
             t_h_19 = Mt5SpoolBridgeTransport(
-                fo_root / "hugosway_mt5", sleep=_hugo_no_money_sleep, poll_interval_seconds=0.01, receipt_timeout_seconds=2.0
+                fo_root / "hugosway_mt5", sleep=_hugo_no_money_sleep, poll_interval_seconds=0.01, receipt_timeout_seconds=2.0,
+                clock=lambda: T0,
             )
             venue_h = Mt5PaperBrokerVenue(
                 broker_id=BROKER_HUGOSWAY_MT5,
@@ -815,6 +822,7 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                     sleep=_hugo_no_money_sleep if b == BROKER_HUGOSWAY_MT5 else emu_fl.sleep_hook,
                     poll_interval_seconds=0.01,
                     receipt_timeout_seconds=2.0,
+                    clock=lambda: T0,
                 ),
                 oanda_client_factory=lambda e: OandaPracticePaperClient(
                     environ=e,
@@ -860,6 +868,7 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                 sleep=emu.sleep_hook,
                 poll_interval_seconds=0.01,
                 receipt_timeout_seconds=2.0,
+                clock=lambda: T0,
             )
             tr.connect(Mt5Credentials(BROKER_HUGOSWAY_MT5, 7001234, "Hugosway-Demo"))
             with ThreadPoolExecutor(max_workers=12) as pool:
@@ -884,6 +893,7 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                 sleep=emu.sleep_hook,
                 poll_interval_seconds=0.01,
                 receipt_timeout_seconds=2.0,
+                clock=lambda: T0,
             )
             creds = Mt5Credentials(BROKER_HUGOSWAY_MT5, 7001234, "Hugosway-Demo")
             tr.connect(creds)
@@ -972,6 +982,7 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
                 sleep=emu.sleep_hook,
                 poll_interval_seconds=0.01,
                 receipt_timeout_seconds=2.0,
+                clock=lambda: T0,
             )
             creds = Mt5Credentials(BROKER_HUGOSWAY_MT5, 7001234, "Hugosway-Demo")
             snap_on = tr.connect(creds)
@@ -1021,16 +1032,25 @@ class Mt5Mql5BridgeParityTests(unittest.TestCase):
             self.assertEqual(rcpt_off.retcode, 10031)
             self.assertEqual(rcpt_off.message, STATUS_BROKER_OFFLINE)
 
-            # Backward-compatible pre-PR27 market_ticks.json without "connected" defaults to True
+            # Under Finding [8], missing/unsigned or non-boolean "connected" fails closed
             emu.set_connected(True)
             emu.publish_market()
             legacy_doc = json.loads((spool_h / "market_ticks.json").read_text(encoding="utf-8"))
+            next_seq = int(legacy_doc["snapshot_seq"]) + 1
             del legacy_doc["connected"]
             (spool_h / "market_ticks.json").write_text(json.dumps(legacy_doc) + "\n", encoding="utf-8")
+            with self.assertRaises(Mt5SnapshotIntegrityError):
+                tr.account_info()
+
+            # Signed "connected": True restores clean online snapshot verification
+            signed_online = sign_mt5_market_snapshot_doc(
+                dict(legacy_doc, connected=True), spool_dir=spool_h, snapshot_seq=next_seq, observed_at=T0
+            )
+            (spool_h / "market_ticks.json").write_text(json.dumps(signed_online) + "\n", encoding="utf-8")
             self.assertIs(tr.account_info().connected, True)
 
             # Non-boolean "connected" fails closed
-            bad_doc = dict(legacy_doc, connected="false")
+            bad_doc = dict(signed_online, connected="false", snapshot_seq=str(next_seq + 1))
             (spool_h / "market_ticks.json").write_text(json.dumps(bad_doc) + "\n", encoding="utf-8")
             with self.assertRaises(Mt5TransportError):
                 tr.account_info()

@@ -213,22 +213,26 @@ class SecurityAudit14FindingsTests(unittest.TestCase):
         pr_doc = {
             "number": 99,
             "title": "Test Agent PR",
+            "state": "OPEN",
+            "baseRefName": "main",
             "headRefName": "feat/test",
             "headRefOid": "a" * 40,
+            "headRepository": {"nameWithOwner": "LittleHenderson/cas-forex-revamp"},
             "headRepositoryOwner": {"login": "LittleHenderson"},
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
             "isDraft": False,
             "labels": [{"name": "agent-pr"}],
-            "author": {"login": "LittleHenderson"},
+            "author": {"id": 98265490, "login": "LittleHenderson"},
         }
+        approved_rev = {"id": 1, "state": "APPROVED", "commit_id": "a" * 40, "user": {"id": 98265490, "login": "LittleHenderson"}}
         empty_cr = {"check_runs": []}
         def fake_subp_run(cmd, **_kw):
             if len(cmd) >= 3 and cmd[1] == "show":
                 return subprocess.CompletedProcess(cmd, 0, stdout='{"revamp_completed": false}', stderr="")
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         with patch.object(agent_pr_merger.subprocess, "run", side_effect=fake_subp_run):
-            with patch.object(agent_pr_merger, "gh_json", side_effect=[[pr_doc], empty_cr]):
+            with patch.object(agent_pr_merger, "gh_json", side_effect=[[pr_doc], [approved_rev], empty_cr]):
                 buf = []
                 with patch("builtins.print", side_effect=lambda s: buf.append(s)):
                     rc = agent_pr_merger.main()
@@ -249,7 +253,7 @@ class SecurityAudit14FindingsTests(unittest.TestCase):
                 clock=lambda: T0,
             )
             emu.publish_market()
-            tr = Mt5SpoolBridgeTransport(spool, sleep=emu.sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=2)
+            tr = Mt5SpoolBridgeTransport(spool, sleep=emu.sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=2, clock=lambda: T0)
             creds = load_mt5_credentials(BROKER_HUGOSWAY_MT5, {
                 "CAS_FOREX_HUGOSWAY_MT5_LOGIN": "7001234",
                 "CAS_FOREX_HUGOSWAY_MT5_PASSWORD": SYNTH_PASS,
@@ -280,7 +284,7 @@ class SecurityAudit14FindingsTests(unittest.TestCase):
             from types import SimpleNamespace
             from cas_forex_revamp.valve.tks_meta_valve_controller import load_default_forex_valve_gate as _ld_gate
             _g7 = _ld_gate()
-            _now7 = datetime.now(timezone.utc)
+            _now7 = T0
             _ord7 = _mbb.OrderIntent(
                 order_id=bound.request_id, action_ref=f"act-{bound.request_id}", kind=_mbb.ActionKind.OPEN,
                 symbol=bound.symbol, quantity_units=bound.volume_lots * Decimal("100000"),

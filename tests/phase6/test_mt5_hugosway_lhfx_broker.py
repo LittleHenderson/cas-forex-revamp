@@ -47,6 +47,7 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
     Mt5OutcomeUnknownError,
     Mt5PaperBrokerVenue,
     Mt5SpoolBridgeTransport,
+    sign_mt5_market_snapshot_doc,
     Mt5SpoolPaperTerminalEmulator,
     Mt5TransportError,
     Mt5ValveClearanceError,
@@ -697,7 +698,8 @@ class SpoolBridgeTransportTests(unittest.TestCase):
                 Mt5SpoolBridgeTransport(tmp).connect(creds)
             leveraged = json.loads(json.dumps(base))
             leveraged["account"]["leverage"] = "1000"
-            path.write_text(json.dumps(leveraged), encoding="ascii")
+            signed_leveraged = sign_mt5_market_snapshot_doc(leveraged, spool_dir=tmp, snapshot_seq=1)
+            path.write_text(json.dumps(signed_leveraged), encoding="ascii")
             with self.assertRaises(Mt5MarginRefusalError):
                 Mt5SpoolBridgeTransport(tmp).connect(creds)
 
@@ -1282,8 +1284,8 @@ class Mql5BridgeSourceContractTests(unittest.TestCase):
     def test_cas_forex_mt5_bridge_all_receipt_json_calls_pass_11_typed_args(self) -> None:
         mq5_path = REPO_ROOT / "mt5" / "CasForexMt5Bridge.mq5"
         src = mq5_path.read_text(encoding="utf-8")
-        _, calls = self._assert_receipt_json_contract(src, expected_min_calls=16)
-        self.assertEqual(len(calls), 16)
+        _, calls = self._assert_receipt_json_contract(src, expected_min_calls=18)
+        self.assertEqual(len(calls), 18)
 
     def test_receipt_json_contract_catches_10_arg_and_untyped_number_regressions(self) -> None:
         sig_header = (

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import urllib.request
 
 from cas_forex_revamp.composition.live_cockpit_server import LoopbackCockpitServer, load_dotenv_file, run_cockpit_cli
+from cas_forex_revamp.composition.state_store import create_owner_only_file_atomic
 from cas_forex_revamp.contracts import ActionKind, ContractError, Side
 from cas_forex_revamp.valve.tks_meta_valve_controller import load_default_forex_valve_gate
 from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter, OandaQuoteTruthOracle
@@ -79,7 +80,7 @@ class _FakeClock:
         self.t = datetime(2026, 11, 16, 12, 0, 0, tzinfo=timezone.utc)
 
     def __call__(self) -> datetime:
-        self.t += timedelta(seconds=1)
+        self.t += timedelta(milliseconds=50)
         return self.t
 
 
@@ -222,7 +223,13 @@ def _ensure_live_ticket_files(root_dir: str, *, issued_at: datetime | None = Non
         ttl_seconds=86400,
         issued_at=issued_at,
     )
-    ticket_path.write_text(json.dumps(bundle), encoding="utf-8")
+    create_owner_only_file_atomic(
+        ticket_path.parent,
+        ticket_path.name,
+        json.dumps(bundle).encode("utf-8"),
+        replace_existing=True,
+        label="LIVE auth ticket",
+    )
     return str(key_path), str(ticket_path)
 
 
@@ -562,15 +569,18 @@ class DualModeBrokerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as auth_td:
             auth_key = provision_live_auth_key(Path(auth_td) / "live.key")
             auth_ticket = Path(auth_td) / "live_ticket.json"
-            auth_ticket.write_text(
+            create_owner_only_file_atomic(
+                auth_ticket.parent,
+                auth_ticket.name,
                 json.dumps(
                     mint_live_authorization_bundle(
                         key_file=auth_key,
                         targets=[(BROKER_LHFX_MT5, "122590", "LHFXSA-Trade")],
                         ttl_seconds=86400,
                     )
-                ),
-                encoding="utf-8",
+                ).encode("utf-8"),
+                replace_existing=True,
+                label="LIVE auth ticket",
             )
             live_creds = load_mt5_credentials(
                 BROKER_LHFX_MT5,

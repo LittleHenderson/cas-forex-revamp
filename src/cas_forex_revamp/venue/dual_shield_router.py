@@ -81,6 +81,7 @@ from .mt5_broker_bridge import (
     Mt5Position,
     Mt5PostFillObservationError,
     Mt5PreDispatchTransportError,
+    Mt5SnapshotIntegrityError,
     Mt5SpoolBridgeTransport,
     Mt5Tick,
     Mt5TransportError,
@@ -1232,12 +1233,22 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
     def venues(self) -> dict[str, Mt5PaperBrokerVenue | OandaPracticeFallbackVenue]:
         return dict(self._venues)
 
-    def _sync_mt5_venues_nonblocking(self) -> None:
+    def _sync_mt5_venues_nonblocking(self, *, raise_on_mt5_integrity: bool = False) -> set[str]:
+        unverified_mt5: set[str] = set()
         for broker_id, venue in self._venues.items():
             if isinstance(venue, Mt5PaperBrokerVenue):
                 if isinstance(venue._transport, Mt5SpoolBridgeTransport):
                     try:
                         venue.probe()
+                    except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
+                        raise
+                    except Mt5SnapshotIntegrityError:
+                        unverified_mt5.add(broker_id)
+                        self._status[broker_id] = "SNAPSHOT_UNVERIFIED"
+                        self._failures[broker_id] = "SNAPSHOT_INTEGRITY_FAILED"
+                        if raise_on_mt5_integrity:
+                            raise
+                        continue
                     except (ContractError, OSError):
                         pass
                 if venue.is_offline:
@@ -1261,6 +1272,26 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             next((b for b in self.priority_order if b in self._venues), None),
         )
         self._active = None if first_online is None else self._venues[first_online]
+        return unverified_mt5
+
+    def _probe_mt5_fresh(self, *, symbol: str | None = None) -> None:
+        """Refresh MT5 account & tick freshness immediately before new-risk admission; fail closed on integrity errors."""
+        for venue in self._venues.values():
+            if not isinstance(venue, Mt5PaperBrokerVenue):
+                continue
+            try:
+                venue.probe()
+            except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError, Mt5SnapshotIntegrityError):
+                raise
+            except (Mt5TransportError, ContractError, OSError):
+                continue
+            if symbol is not None and not venue.is_offline and isinstance(venue._transport, Mt5SpoolBridgeTransport):
+                try:
+                    venue._transport.symbol_tick(symbol, require_fresh_tick=True)
+                except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError, Mt5SnapshotIntegrityError):
+                    raise
+                except (Mt5PreDispatchTransportError, Mt5TransportError, ContractError, OSError):
+                    continue
 
     def is_broker_offline(self, broker_id: str) -> bool:
         venue = self._venues.get(broker_id)
@@ -1661,8 +1692,13 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 return True
         return False
 
-    def equities(self, *, require_fresh_oanda: bool = False) -> dict[str, Decimal]:
-        self._sync_mt5_venues_nonblocking()
+    def equities(
+        self,
+        *,
+        require_fresh_oanda: bool = False,
+        require_fresh_mt5: bool = False,
+    ) -> dict[str, Decimal]:
+        unverified_mt5 = self._sync_mt5_venues_nonblocking(raise_on_mt5_integrity=require_fresh_mt5)
         out: dict[str, Decimal] = {}
         online_out: dict[str, Decimal] = {}
         has_cold_offline_zero = False
@@ -1670,6 +1706,10 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             venue = self._venues.get(broker_id)
             value: Decimal | None = None
             if isinstance(venue, Mt5PaperBrokerVenue):
+                if broker_id in unverified_mt5:
+                    value = self._last_equity.get(broker_id, self._attestations.get(broker_id, Decimal("0")))
+                    out[broker_id] = value
+                    continue
                 if venue.is_offline:
                     last_conn = venue.last_connected_account
                     if last_conn is not None and (
@@ -1718,27 +1758,36 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             out[broker_id] = value
             if not self.is_broker_offline(broker_id) and (venue is not None or value > Decimal("0")):
                 online_out[broker_id] = value
-        now_ts = self._clock()
-        total = self.barbell.total_equity(out)
-        if not has_cold_offline_zero and total > Decimal("0"):
-            self._peak_store.observe_equity(
-                self._drawdown_scope_id,
-                current_equity=total,
-                opening_balance=self._initial_peak_equity if self._initial_peak_equity is not None else total,
-                now=now_ts,
-            )
-        online_total = self.barbell.total_equity(online_out)
-        if online_out and online_total > Decimal("0"):
-            self._peak_store.observe_equity(
-                self._online_drawdown_scope_id(online_out.keys()),
-                current_equity=online_total,
-                opening_balance=online_total,
-                now=now_ts,
-            )
+        if not unverified_mt5:
+            now_ts = self._clock()
+            total = self.barbell.total_equity(out)
+            if not has_cold_offline_zero and total > Decimal("0"):
+                self._peak_store.observe_equity(
+                    self._drawdown_scope_id,
+                    current_equity=total,
+                    opening_balance=self._initial_peak_equity if self._initial_peak_equity is not None else total,
+                    now=now_ts,
+                )
+            online_total = self.barbell.total_equity(online_out)
+            if online_out and online_total > Decimal("0"):
+                self._peak_store.observe_equity(
+                    self._online_drawdown_scope_id(online_out.keys()),
+                    current_equity=online_total,
+                    opening_balance=online_total,
+                    now=now_ts,
+                )
         return out
 
-    def online_equities(self, *, require_fresh_oanda: bool = False) -> dict[str, Decimal]:
-        eq_map = self.equities(require_fresh_oanda=require_fresh_oanda)
+    def online_equities(
+        self,
+        *,
+        require_fresh_oanda: bool = False,
+        require_fresh_mt5: bool = False,
+    ) -> dict[str, Decimal]:
+        eq_map = self.equities(
+            require_fresh_oanda=require_fresh_oanda,
+            require_fresh_mt5=require_fresh_mt5,
+        )
         out: dict[str, Decimal] = {}
         for broker_id, val in eq_map.items():
             if self.is_broker_offline(broker_id):
@@ -1911,8 +1960,9 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         )
         # Finding [1]: Barbell-wide unresolved-mutation latch checked before ANY new risk across every venue & symbol.
         self.assert_no_unresolved_mutations(context="OPEN")
-        # Finding [3]: Refresh OANDA NAV & margin immediately before every new-risk admission; fail closed if stale/failed.
+        # Finding [3] & [8]: Refresh OANDA + MT5 snapshots & ticks immediately before admission; fail closed.
         self._probe_oanda_fresh()
+        self._probe_mt5_fresh(symbol=order.symbol)
         if order.symbol in INDEX_INSTRUMENTS:
             oracle, reference = self._index_reference_quotes(order.symbol)
         else:
@@ -1925,7 +1975,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             )
         rbid, rask = reference[order.symbol]
         entry = rask if order.side is Side.BUY else rbid
-        equities = self.equities(require_fresh_oanda=True)
+        equities = self.equities(require_fresh_oanda=True, require_fresh_mt5=True)
         eff_curr, eff_pk, _ = self.effective_drawdown_state(equities=equities)
         self.barbell.require_drawdown(current_equity=eff_curr, peak_equity=eff_pk)
         risk = self.barbell.stop_loss_risk(
@@ -1935,7 +1985,11 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             stop_price=order.stop_price,  # type: ignore[arg-type]
             quotes=reference,
         )
-        online_eq = self.online_equities(require_fresh_oanda=True)
+        online_eq = {
+            b: v
+            for b, v in equities.items()
+            if not self.is_broker_offline(b) and (b in self._venues or v > Decimal("0"))
+        }
         cap = self.barbell.require_stop_risk(risk, online_eq)
         trail: list[dict[str, Any]] = []
         verdicts: list[QuoteTruthVerdict] = []
@@ -1947,6 +2001,8 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 continue
             try:
                 venue.probe()
+            except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError, Mt5SnapshotIntegrityError):
+                raise
             except (Mt5TransportError, OSError) as exc:
                 self._status[broker_id] = "DISCONNECTED"
                 self._record(trail, broker_id, "DISCONNECTED", type(exc).__name__)
@@ -1959,7 +2015,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             self._status[broker_id] = "ACTIVE"
             if self._failures.get(broker_id) == STATUS_BROKER_OFFLINE:
                 self._failures.pop(broker_id, None)
-            equities = self.equities(require_fresh_oanda=True)
+            equities = self.equities(require_fresh_oanda=True, require_fresh_mt5=True)
 
             def margin_guard(check: Mt5MarginCheck, _account: Mt5AccountSnapshot, _b: str = broker_id) -> None:
                 self.barbell.require_sleeve(_b, equities=equities, used_margin_after=check.used_margin_after)
@@ -2044,7 +2100,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         if required > available:
             self._record(trail, self._oanda_broker_id, "MARGIN_REFUSED", "safe-harbor margin unavailable")
             raise Mt5MarginRefusalError("OANDA safe harbor lacks margin for this order at 1:50")
-        fresh_equities = self.equities(require_fresh_oanda=True)
+        fresh_equities = self.equities(require_fresh_oanda=True, require_fresh_mt5=True)
         sh_curr, sh_pk, _ = self.effective_drawdown_state(equities=fresh_equities)
         self.barbell.require_drawdown(current_equity=sh_curr, peak_equity=sh_pk)
         self.barbell.require_sleeve(

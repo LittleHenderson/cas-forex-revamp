@@ -524,6 +524,7 @@ class TestCockpitApiContractsAndSse(unittest.TestCase):
                 sleep=emus[bid].sleep_hook,
                 poll_interval_seconds=0.01,
                 receipt_timeout_seconds=5,
+                clock=lambda: T0,
             ),
             oanda_client_factory=lambda e: OandaPracticePaperClient(environ=e, transport=oanda),
             clock=lambda: T0,

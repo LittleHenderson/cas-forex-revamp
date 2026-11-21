@@ -16,7 +16,6 @@ import json
 import os
 from pathlib import Path
 import secrets
-import stat
 from typing import Any
 
 from cas_forex_revamp.contracts import ContractError
@@ -113,6 +112,23 @@ def _arm_confirmation_matches(candidate: Any) -> bool:
     )
 
 
+def _format_file_identity(ident: tuple[int, int] | None) -> str:
+    if ident is None:
+        return ""
+    return f"{int(ident[0])}:{int(ident[1])}"
+
+
+def _valid_file_identity(ident: Any) -> bool:
+    return (
+        isinstance(ident, tuple)
+        and len(ident) == 2
+        and type(ident[0]) is int
+        and type(ident[1]) is int
+        and ident[0] >= 0
+        and ident[1] >= 0
+    )
+
+
 def _canonical_context_seal_input(
     *,
     broker_id: str,
@@ -125,9 +141,12 @@ def _canonical_context_seal_input(
     arm_phrase_verified: bool,
     ticket_nonce: str,
     key_file_text: str,
+    key_file_identity: tuple[int, int] | None = None,
+    ticket_file_text: str = "",
+    ticket_file_identity: tuple[int, int] | None = None,
 ) -> str:
     return "|".join((
-        "cas-forex-live-ctx/2",
+        "cas-forex-live-ctx/3",
         broker_id,
         account_id,
         server.strip(),
@@ -138,6 +157,9 @@ def _canonical_context_seal_input(
         "ARMED" if arm_phrase_verified else "UNARMED",
         ticket_nonce,
         key_file_text,
+        _format_file_identity(key_file_identity),
+        ticket_file_text,
+        _format_file_identity(ticket_file_identity),
     ))
 
 
@@ -158,9 +180,12 @@ class LiveAuthorizationContext:
     expires_at: datetime
     ticket_sha256: str
     arm_phrase_verified: bool = False
+    key_file_identity: tuple[int, int] | None = field(default=None, repr=False, compare=False)
+    ticket_file_identity: tuple[int, int] | None = field(default=None, repr=False, compare=False)
     _provenance_seal: str = field(default="", repr=False, compare=False)
     _mint_token: object = field(default=None, repr=False, compare=False)
     _key_file: Path | None = field(default=None, repr=False, compare=False)
+    _ticket_file: Path | None = field(default=None, repr=False, compare=False)
     _ticket_json: str | None = field(default=None, repr=False, compare=False)
     _ticket_nonce: str = field(default="", repr=False, compare=False)
 
@@ -189,10 +214,19 @@ class LiveAuthorizationContext:
             raise LiveAuthorizationError("LiveAuthorizationContext ticket_sha256 must be lowercase hex")
         if not isinstance(self._ticket_nonce, str) or len(self._ticket_nonce.strip()) < 16:
             raise LiveAuthorizationError("LiveAuthorizationContext requires a valid ticket nonce")
+        if self.key_file_identity is not None and not _valid_file_identity(self.key_file_identity):
+            raise LiveAuthorizationError("LiveAuthorizationContext key_file_identity must be (st_dev, st_ino)")
+        if self.ticket_file_identity is not None and not _valid_file_identity(self.ticket_file_identity):
+            raise LiveAuthorizationError("LiveAuthorizationContext ticket_file_identity must be (st_dev, st_ino)")
+        if self._key_file is not None and self.key_file_identity is None:
+            raise LiveAuthorizationError("LiveAuthorizationContext requires key_file_identity when _key_file is bound")
+        if self._ticket_file is not None and self.ticket_file_identity is None:
+            raise LiveAuthorizationError("LiveAuthorizationContext requires ticket_file_identity when _ticket_file is bound")
         self._verify_seal_only()
 
     def _seal_payload(self) -> str:
         key_txt = "" if self._key_file is None else str(self._key_file)
+        ticket_txt = "" if self._ticket_file is None else str(self._ticket_file)
         return _canonical_context_seal_input(
             broker_id=self.broker_id,
             account_id=self.account_id,
@@ -204,6 +238,9 @@ class LiveAuthorizationContext:
             arm_phrase_verified=self.arm_phrase_verified,
             ticket_nonce=self._ticket_nonce,
             key_file_text=key_txt,
+            key_file_identity=self.key_file_identity,
+            ticket_file_text=ticket_txt,
+            ticket_file_identity=self.ticket_file_identity,
         )
 
     def _verify_seal_only(self) -> None:
@@ -230,21 +267,52 @@ class LiveAuthorizationContext:
             raise LiveAuthorizationError(
                 f"LIVE authorization for {self.broker_id} lacks verified arm confirmation"
             )
-        if reverify_ticket and self._key_file is not None and self._ticket_json is not None:
-            verified = _verify_live_ticket_internal(
-                self._ticket_json,
-                key_file=self._key_file,
-                expected_broker_id=self.broker_id,
-                expected_account_login=self.account_id,
-                expected_server=self.server,
-                now=now,
-                check_time_window=(now is not None),
-            )
-            canonical_raw = json.dumps(
-                dict(verified), ensure_ascii=True, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-            if not hmac.compare_digest(sha256(canonical_raw).hexdigest(), self.ticket_sha256.lower()):
-                raise LiveAuthorizationError("LIVE authorization ticket digest mismatch during sink re-verification")
+        if reverify_ticket:
+            if self._key_file is not None:
+                _, actual_key_ident = _load_live_auth_key_with_identity(self._key_file)
+                if self.key_file_identity is None or actual_key_ident != self.key_file_identity:
+                    raise LiveAuthorizationError(
+                        "LIVE authorization key file identity changed since context minting; refusing dispatch"
+                    )
+            if self._ticket_file is not None:
+                if self._key_file is None:
+                    raise LiveAuthorizationError("LIVE authorization ticket file re-verification requires bound key_file")
+                reread_ticket, actual_ticket_ident = _read_ticket_file_with_identity(self._ticket_file)
+                if self.ticket_file_identity is None or actual_ticket_ident != self.ticket_file_identity:
+                    raise LiveAuthorizationError(
+                        "LIVE authorization ticket file identity changed since context minting; refusing dispatch"
+                    )
+                verified_disk = _verify_live_ticket_internal(
+                    reread_ticket,
+                    key_file=self._key_file,
+                    expected_broker_id=self.broker_id,
+                    expected_account_login=self.account_id,
+                    expected_server=self.server,
+                    now=now,
+                    check_time_window=(now is not None),
+                )
+                canonical_disk = json.dumps(
+                    dict(verified_disk), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+                if not hmac.compare_digest(sha256(canonical_disk).hexdigest(), self.ticket_sha256.lower()):
+                    raise LiveAuthorizationError(
+                        "LIVE authorization ticket file digest mismatch during sink re-verification"
+                    )
+            if self._key_file is not None and self._ticket_json is not None:
+                verified = _verify_live_ticket_internal(
+                    self._ticket_json,
+                    key_file=self._key_file,
+                    expected_broker_id=self.broker_id,
+                    expected_account_login=self.account_id,
+                    expected_server=self.server,
+                    now=now,
+                    check_time_window=(now is not None),
+                )
+                canonical_raw = json.dumps(
+                    dict(verified), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+                if not hmac.compare_digest(sha256(canonical_raw).hexdigest(), self.ticket_sha256.lower()):
+                    raise LiveAuthorizationError("LIVE authorization ticket digest mismatch during sink re-verification")
 
     def assert_valid_at(
         self,
@@ -301,6 +369,9 @@ def _mint_verified_context(
     verified_ticket: Mapping[str, str],
     *,
     key_file: Path | None = None,
+    key_file_identity: tuple[int, int] | None = None,
+    ticket_file: Path | None = None,
+    ticket_file_identity: tuple[int, int] | None = None,
     arm_phrase_verified: bool = False,
 ) -> LiveAuthorizationContext:
     canonical_json = json.dumps(
@@ -315,6 +386,7 @@ def _mint_verified_context(
     ticket_sha256 = sha256(canonical_json.encode("utf-8")).hexdigest()
     ticket_nonce = str(verified_ticket.get("nonce", "")).strip()
     key_txt = "" if key_file is None else str(key_file)
+    ticket_txt = "" if ticket_file is None else str(ticket_file)
     seal = _seal_context_payload(
         _canonical_context_seal_input(
             broker_id=broker_id,
@@ -327,6 +399,9 @@ def _mint_verified_context(
             arm_phrase_verified=bool(arm_phrase_verified),
             ticket_nonce=ticket_nonce,
             key_file_text=key_txt,
+            key_file_identity=key_file_identity,
+            ticket_file_text=ticket_txt,
+            ticket_file_identity=ticket_file_identity,
         )
     )
     return LiveAuthorizationContext(
@@ -338,9 +413,12 @@ def _mint_verified_context(
         expires_at=expires_at,
         ticket_sha256=ticket_sha256,
         arm_phrase_verified=bool(arm_phrase_verified),
+        key_file_identity=key_file_identity,
+        ticket_file_identity=ticket_file_identity,
         _provenance_seal=seal,
         _mint_token=_MINT_SENTINEL,
         _key_file=key_file,
+        _ticket_file=ticket_file,
         _ticket_json=canonical_json,
         _ticket_nonce=ticket_nonce,
     )
@@ -369,11 +447,18 @@ class _RedactedLiveKey:
         return "[REDACTED_LIVE_AUTH_KEY]"
 
 
-def _is_symlink_or_reparse(path: Path, st: os.stat_result) -> bool:
-    if stat.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) != 0:
-        return True
-    is_junc = getattr(path, "is_junction", None)
-    return bool(callable(is_junc) and is_junc())
+def _split_verified_path(file_path: str | Path, *, label: str) -> tuple[Path, str]:
+    if not isinstance(file_path, (str, Path)) or not str(file_path).strip():
+        raise LiveAuthTicketError(f"{label} path must be a non-empty path")
+    raw = str(file_path).strip()
+    if "\x00" in raw:
+        raise LiveAuthTicketError(f"{label} path contains NUL byte")
+    target = Path(raw)
+    if not target.is_absolute():
+        raise LiveAuthTicketError(f"Refusing relative {label} path; an absolute path is required: {target}")
+    if ".." in target.parts or not target.name or target.name in (".", ".."):
+        raise LiveAuthTicketError(f"Invalid {label} path: {target}")
+    return target.parent, target.name
 
 
 def _canonical_ticket_message(fields: Mapping[str, Any]) -> str:
@@ -392,60 +477,108 @@ def _canonical_ticket_message(fields: Mapping[str, Any]) -> str:
 
 def provision_live_auth_key(key_file: str | Path) -> Path:
     """Create a cryptographically random 32-byte owner-only (`0o600`) LIVE auth HMAC key file."""
-    target = Path(key_file)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if os.name == "posix":
-        pst = os.lstat(target.parent)
-        if not _is_symlink_or_reparse(target.parent, pst) and stat.S_ISDIR(pst.st_mode):
-            os.chmod(target.parent, 0o700)  # nosec B103: verified non-symlink S_ISDIR owner-only key directory
-    if os.path.lexists(target):
-        st = os.lstat(target)
-        if _is_symlink_or_reparse(target, st) or not stat.S_ISREG(st.st_mode):
-            raise LiveAuthTicketError(f"Refusing non-regular or symlink LIVE auth key path: {target}")
-        load_live_auth_key(target)
-        return target
-    raw = (secrets.token_bytes(32).hex() + "\n").encode("ascii")
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_BINARY", 0)
+    from cas_forex_revamp.composition.state_store import (
+        create_owner_only_file_atomic,
+        open_verified_directory_fd,
     )
-    fd = os.open(target, flags, 0o600)
+
+    parent_dir, filename = _split_verified_path(key_file, label="LIVE auth key")
+    target = parent_dir / filename
     try:
-        os.write(fd, raw)
-        os.fsync(fd)
+        verified_parent, dir_fd = open_verified_directory_fd(
+            parent_dir, create=True, label="parent of LIVE auth key"
+        )
+    except LiveAuthTicketError:
+        raise
+    except (ContractError, OSError) as exc:
+        raise LiveAuthTicketError(str(exc)) from exc
+    try:
+        exists = False
+        if dir_fd is not None:
+            try:
+                os.lstat(filename, dir_fd=dir_fd)
+                exists = True
+            except FileNotFoundError:
+                exists = False
+        else:
+            exists = os.path.lexists(verified_parent / filename)
+        if exists:
+            _load_live_auth_key_with_identity(target, dir_fd=dir_fd)
+            return target
+        raw = (secrets.token_bytes(32).hex() + "\n").encode("ascii")
+        try:
+            create_owner_only_file_atomic(
+                verified_parent,
+                filename,
+                raw,
+                replace_existing=False,
+                label="LIVE auth key",
+            )
+        except LiveAuthTicketError:
+            raise
+        except (ContractError, OSError) as exc:
+            raise LiveAuthTicketError(str(exc)) from exc
+        return target
     finally:
-        os.close(fd)
-    if os.name == "posix":
-        os.chmod(target, 0o600)  # nosec B103: owner-only 0o600 key verified on newly created regular fd
-    return target
+        if dir_fd is not None:
+            os.close(dir_fd)
+
+
+def _load_live_auth_key_with_identity(
+    key_file: str | Path,
+    *,
+    dir_fd: int | None = None,
+) -> tuple[_RedactedLiveKey, tuple[int, int]]:
+    from cas_forex_revamp.composition.state_store import verify_and_read_owner_only_file
+
+    if not isinstance(key_file, (str, Path)) or not str(key_file).strip():
+        raise LiveAuthTicketError(f"{ENV_LIVE_AUTH_KEY_FILE} is required for LIVE real-money mode")
+    parent_dir, filename = _split_verified_path(key_file, label="LIVE auth key")
+    try:
+        raw_data, file_identity = verify_and_read_owner_only_file(
+            parent_dir,
+            filename,
+            dir_fd=dir_fd,
+            max_bytes=4096,
+            label="LIVE auth key",
+        )
+    except LiveAuthTicketError:
+        raise
+    except (ContractError, OSError) as exc:
+        raise LiveAuthTicketError(str(exc)) from exc
+    raw_bytes = raw_data.strip()
+    if len(raw_bytes) == 64 and all(b in b"0123456789abcdefABCDEF" for b in raw_bytes):
+        return _RedactedLiveKey(bytes.fromhex(raw_bytes.decode("ascii"))), file_identity
+    if len(raw_bytes) < 32:
+        raise LiveAuthTicketError("LIVE auth key material must be >= 32 bytes (or 64 hex chars)")
+    return _RedactedLiveKey(raw_bytes), file_identity
 
 
 def load_live_auth_key(key_file: str | Path) -> _RedactedLiveKey:
-    """Load owner-only LIVE auth key file; rejects symlinks, weak perms (`& 0o077`), and <32B keys."""
-    if not isinstance(key_file, (str, Path)) or not str(key_file).strip():
-        raise LiveAuthTicketError(f"{ENV_LIVE_AUTH_KEY_FILE} is required for LIVE real-money mode")
-    target = Path(str(key_file).strip())
-    if not os.path.lexists(target):
-        raise LiveAuthTicketError(f"LIVE auth key file missing: {target}")
-    st = os.lstat(target)
-    if _is_symlink_or_reparse(target, st) or not stat.S_ISREG(st.st_mode):
-        raise LiveAuthTicketError(f"Refusing non-regular or symlink LIVE auth key file: {target}")
-    if os.name == "posix" and (st.st_mode & 0o077) != 0:
-        raise LiveAuthTicketError(
-            f"LIVE auth key file has unsafe group/world permissions ({oct(stat.S_IMODE(st.st_mode))}); require 0o600/0o400"
+    """Load owner-only LIVE auth key file via descriptor-relative O_NOFOLLOW; rejects symlinks, weak perms, and <32B keys."""
+    key, _ = _load_live_auth_key_with_identity(key_file)
+    return key
+
+
+def _read_ticket_file_with_identity(ticket_file: str | Path) -> tuple[str, tuple[int, int]]:
+    from cas_forex_revamp.composition.state_store import verify_and_read_owner_only_file
+
+    parent_dir, filename = _split_verified_path(ticket_file, label="LIVE auth ticket")
+    try:
+        raw_bytes, file_identity = verify_and_read_owner_only_file(
+            parent_dir,
+            filename,
+            max_bytes=65536,
+            label="LIVE auth ticket",
         )
-    if st.st_size > 4096:
-        raise LiveAuthTicketError("LIVE auth key file exceeds 4096 bytes")
-    raw_bytes = target.read_bytes().strip()
-    if len(raw_bytes) == 64 and all(b in b"0123456789abcdefABCDEF" for b in raw_bytes):
-        return _RedactedLiveKey(bytes.fromhex(raw_bytes.decode("ascii")))
-    if len(raw_bytes) < 32:
-        raise LiveAuthTicketError("LIVE auth key material must be >= 32 bytes (or 64 hex chars)")
-    return _RedactedLiveKey(raw_bytes)
+    except LiveAuthTicketError:
+        raise
+    except (ContractError, OSError) as exc:
+        raise LiveAuthTicketError(str(exc)) from exc
+    try:
+        return raw_bytes.decode("utf-8"), file_identity
+    except UnicodeDecodeError as exc:
+        raise LiveAuthTicketError("LIVE auth ticket file is not valid UTF-8") from exc
 
 
 def _iso_utc(dt: datetime) -> str:
@@ -620,10 +753,12 @@ def verify_live_authorization_ticket(
     )
 
 
-def verify_live_authorization_context(
+def _verify_live_authorization_context_with_identities(
     ticket: Mapping[str, Any] | str,
     *,
     key_file: str | Path,
+    ticket_file: Path | None = None,
+    ticket_file_identity: tuple[int, int] | None = None,
     expected_broker_id: str | None = None,
     expected_account_login: str | int | None = None,
     expected_server: str | None = None,
@@ -631,7 +766,7 @@ def verify_live_authorization_context(
     require_arm_phrase: bool = False,
     now: datetime | None = None,
 ) -> tuple[dict[str, str], LiveAuthorizationContext]:
-    """Cryptographically verify a LIVE ticket and mint an opaque sealed LiveAuthorizationContext."""
+    _, key_identity = _load_live_auth_key_with_identity(key_file)
     verified = verify_live_authorization_ticket(
         ticket,
         key_file=key_file,
@@ -646,7 +781,14 @@ def verify_live_authorization_context(
     if live_arm_phrase is not None and str(live_arm_phrase).strip() and not arm_ok:
         raise LiveAuthorizationError("LIVE authorization arm confirmation phrase mismatch")
     key_path = Path(str(key_file).strip())
-    ctx = _mint_verified_context(verified, key_file=key_path, arm_phrase_verified=arm_ok)
+    ctx = _mint_verified_context(
+        verified,
+        key_file=key_path,
+        key_file_identity=key_identity,
+        ticket_file=ticket_file,
+        ticket_file_identity=ticket_file_identity,
+        arm_phrase_verified=arm_ok,
+    )
     ctx.assert_valid_at(
         now,
         expected_broker_id=expected_broker_id,
@@ -658,26 +800,60 @@ def verify_live_authorization_context(
     return verified, ctx
 
 
-def _read_environ_live_inputs(environ: Mapping[str, str] | None) -> tuple[str, str | Mapping[str, Any]]:
+def verify_live_authorization_context(
+    ticket: Mapping[str, Any] | str,
+    *,
+    key_file: str | Path,
+    ticket_file: str | Path | None = None,
+    expected_broker_id: str | None = None,
+    expected_account_login: str | int | None = None,
+    expected_server: str | None = None,
+    live_arm_phrase: str | None = None,
+    require_arm_phrase: bool = False,
+    now: datetime | None = None,
+) -> tuple[dict[str, str], LiveAuthorizationContext]:
+    """Cryptographically verify a LIVE ticket and mint an opaque sealed LiveAuthorizationContext."""
+    eff_ticket_path: Path | None = None
+    eff_ticket_ident: tuple[int, int] | None = None
+    eff_ticket: Mapping[str, Any] | str = ticket
+    if ticket_file is not None and str(ticket_file).strip():
+        t_text, eff_ticket_ident = _read_ticket_file_with_identity(ticket_file)
+        eff_ticket_path = Path(str(ticket_file).strip())
+        eff_ticket = t_text
+    return _verify_live_authorization_context_with_identities(
+        eff_ticket,
+        key_file=key_file,
+        ticket_file=eff_ticket_path,
+        ticket_file_identity=eff_ticket_ident,
+        expected_broker_id=expected_broker_id,
+        expected_account_login=expected_account_login,
+        expected_server=expected_server,
+        live_arm_phrase=live_arm_phrase,
+        require_arm_phrase=require_arm_phrase,
+        now=now,
+    )
+
+
+def _read_environ_live_inputs_with_identity(
+    environ: Mapping[str, str] | None,
+) -> tuple[str, str | Mapping[str, Any], Path | None, tuple[int, int] | None]:
     if environ is None:
         raise LiveAuthTicketError(f"{ENV_LIVE_AUTH_KEY_FILE} is required for LIVE mode")
     key_file = str(environ.get(ENV_LIVE_AUTH_KEY_FILE, "")).strip()
     ticket_file = str(environ.get(ENV_LIVE_AUTH_TICKET_FILE, "")).strip()
     inline_ticket = str(environ.get(ENV_LIVE_AUTH_TICKET, "")).strip()
     if ticket_file:
-        tpath = Path(ticket_file)
-        if not os.path.lexists(tpath):
-            raise LiveAuthTicketError(f"LIVE auth ticket file missing: {tpath}")
-        tst = os.lstat(tpath)
-        if _is_symlink_or_reparse(tpath, tst) or not stat.S_ISREG(tst.st_mode):
-            raise LiveAuthTicketError(f"Refusing non-regular or symlink LIVE auth ticket file: {tpath}")
-        raw_ticket: str | Mapping[str, Any] = tpath.read_text(encoding="utf-8")
-    elif inline_ticket:
-        raw_ticket = inline_ticket
-    else:
-        raise LiveAuthTicketError(
-            f"LIVE mode requires {ENV_LIVE_AUTH_TICKET_FILE} or {ENV_LIVE_AUTH_TICKET} signed with {ENV_LIVE_AUTH_KEY_FILE}"
-        )
+        raw_ticket, ticket_identity = _read_ticket_file_with_identity(ticket_file)
+        return key_file, raw_ticket, Path(ticket_file), ticket_identity
+    if inline_ticket:
+        return key_file, inline_ticket, None, None
+    raise LiveAuthTicketError(
+        f"LIVE mode requires {ENV_LIVE_AUTH_TICKET_FILE} or {ENV_LIVE_AUTH_TICKET} signed with {ENV_LIVE_AUTH_KEY_FILE}"
+    )
+
+
+def _read_environ_live_inputs(environ: Mapping[str, str] | None) -> tuple[str, str | Mapping[str, Any]]:
+    key_file, raw_ticket, _, _ = _read_environ_live_inputs_with_identity(environ)
     return key_file, raw_ticket
 
 
@@ -745,15 +921,17 @@ def verify_live_environ_authorization_context(
     now: datetime | None = None,
 ) -> tuple[dict[str, str], LiveAuthorizationContext]:
     """Verify LIVE env ticket and return both verified ticket dict and opaque LiveAuthorizationContext."""
-    key_file, raw_ticket = _read_environ_live_inputs(environ)
+    key_file, raw_ticket, ticket_path, ticket_identity = _read_environ_live_inputs_with_identity(environ)
     eff_arm = (
         live_arm_phrase
         if live_arm_phrase is not None
         else (str(environ.get(_ENV_LIVE_ARM_CONFIRMATION, "")).strip() if environ is not None else None)
     )
-    return verify_live_authorization_context(
+    return _verify_live_authorization_context_with_identities(
         raw_ticket,
         key_file=key_file,
+        ticket_file=ticket_path,
+        ticket_file_identity=ticket_identity,
         expected_broker_id=expected_broker_id,
         expected_account_login=expected_account_login,
         expected_server=expected_server,

@@ -577,7 +577,7 @@ class ProfitExpansionTests(unittest.TestCase):
             gate = load_default_forex_valve_gate()
             router = DualShieldBrokerRouter(
                 environ=env, valve_gate=gate,
-                transport_factory=lambda b, m, r: Mt5SpoolBridgeTransport(Path(r) / b.lower(), sleep=(emu_h if b == BROKER_HUGOSWAY_MT5 else emu_l).sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=5),
+                transport_factory=lambda b, m, r: Mt5SpoolBridgeTransport(Path(r) / b.lower(), sleep=(emu_h if b == BROKER_HUGOSWAY_MT5 else emu_l).sleep_hook, poll_interval_seconds=0.01, receipt_timeout_seconds=5, clock=lambda: T0),
                 oanda_client_factory=lambda e: OandaPracticePaperClient(environ=e, transport=lambda *_a: b'{"account":{"balance":"80000","NAV":"80000","marginAvailable":"80000"}}'),
                 clock=lambda: T0,
             )

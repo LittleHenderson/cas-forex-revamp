@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -72,24 +72,125 @@ def _is_symlink_or_reparse(path: Path, st: os.stat_result) -> bool:
     return bool(callable(is_junc) and is_junc())
 
 
-def _windows_sid_and_dacl_info(path: Path) -> tuple[str, list[str]]:
-    """Query Windows owner SID and ACCESS_ALLOWED DACL SIDs via advapi32 (no subprocess)."""
+_WIN_READ_CONTROL = 0x00020000
+_WIN_WRITE_DAC = 0x00040000
+_WIN_FILE_SHARE_ALL = 0x00000007
+_WIN_OPEN_EXISTING = 3
+_WIN_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_WIN_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_WIN_SE_FILE_OBJECT = 1
+_WIN_OWNER_SECURITY_INFORMATION = 0x00000001
+_WIN_DACL_SECURITY_INFORMATION = 0x00000004
+_WIN_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_WIN_SE_DACL_PRESENT = 0x0004
+_WIN_ACE_TYPE_ACCESS_ALLOWED = 0
+_WIN_ACE_TYPE_ACCESS_DENIED = 1
+_WIN_OBJECT_INHERIT_ACE = 0x01
+_WIN_CONTAINER_INHERIT_ACE = 0x02
+_WIN_INHERIT_ONLY_ACE = 0x08
+_WIN_INHERIT_PROPAGATION_FLAGS = _WIN_OBJECT_INHERIT_ACE | _WIN_CONTAINER_INHERIT_ACE | _WIN_INHERIT_ONLY_ACE
+_WIN_OWNER_RIGHTS_SID = "S-1-3-4"
+
+
+def _open_windows_no_reparse_handle(path: Path, desired_access: int) -> int:
+    """Open a Win32 handle with FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS and reject reparse points."""
+    import ctypes.wintypes as wt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wt.LPCWSTR,
+        wt.DWORD,
+        wt.DWORD,
+        ctypes.c_void_p,
+        wt.DWORD,
+        wt.DWORD,
+        wt.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = wt.BOOL
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wt.DWORD),
+            ("ftCreationTime", wt.FILETIME),
+            ("ftLastAccessTime", wt.FILETIME),
+            ("ftLastWriteTime", wt.FILETIME),
+            ("dwVolumeSerialNumber", wt.DWORD),
+            ("nFileSizeHigh", wt.DWORD),
+            ("nFileSizeLow", wt.DWORD),
+            ("nNumberOfLinks", wt.DWORD),
+            ("nFileIndexHigh", wt.DWORD),
+            ("nFileIndexLow", wt.DWORD),
+        ]
+
+    kernel32.GetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wt.BOOL
+
+    invalid_ptr = ctypes.c_void_p(-1).value
+    flags = _WIN_FILE_FLAG_OPEN_REPARSE_POINT | _WIN_FILE_FLAG_BACKUP_SEMANTICS
+    raw_h = kernel32.CreateFileW(
+        str(path),
+        desired_access,
+        _WIN_FILE_SHARE_ALL,
+        None,
+        _WIN_OPEN_EXISTING,
+        flags,
+        None,
+    )
+    if raw_h is None or int(raw_h) == invalid_ptr or int(raw_h) == -1:
+        err = ctypes.get_last_error()
+        if err in (2, 3):
+            raise FileNotFoundError(f"Windows path not found (err={err}): {path}")
+        raise ContractError(f"Windows CreateFileW failed for {path} (err={err})")
+    handle_int = int(raw_h)
+    info = _ByHandleFileInformation()
+    if not kernel32.GetFileInformationByHandle(ctypes.c_void_p(handle_int), ctypes.byref(info)):
+        err = ctypes.get_last_error()
+        kernel32.CloseHandle(ctypes.c_void_p(handle_int))
+        raise ContractError(f"Windows GetFileInformationByHandle failed for {path} (err={err})")
+    if bool(info.dwFileAttributes & _WIN_FILE_ATTRIBUTE_REPARSE_POINT):
+        kernel32.CloseHandle(ctypes.c_void_p(handle_int))
+        raise ContractError(f"Refusing symlink or reparse point on Windows handle check: {path}")
+    return handle_int
+
+
+def _windows_sid_and_dacl_info(
+    path_or_handle: Path | int,
+) -> tuple[str, bool, bool, list[tuple[int, int, int, str]]]:
+    """Query Windows owner SID, DACL presence/NULL flags, and full ACE list via handle-based GetSecurityInfo."""
     import ctypes.wintypes as wt
 
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
-    advapi32.GetNamedSecurityInfoW.argtypes = [
-        wt.LPCWSTR, wt.DWORD, wt.DWORD,
-        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+    advapi32.GetSecurityInfo.argtypes = [
+        ctypes.c_void_p,
+        wt.DWORD,
+        wt.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_void_p),
     ]
-    advapi32.GetNamedSecurityInfoW.restype = wt.DWORD
+    advapi32.GetSecurityInfo.restype = wt.DWORD
+    advapi32.GetSecurityDescriptorControl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wt.WORD),
+        ctypes.POINTER(wt.DWORD),
+    ]
+    advapi32.GetSecurityDescriptorControl.restype = wt.BOOL
     advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.LPWSTR)]
     advapi32.ConvertSidToStringSidW.restype = wt.BOOL
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = wt.BOOL
     advapi32.GetAclInformation.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, wt.DWORD]
     advapi32.GetAclInformation.restype = wt.BOOL
     advapi32.GetAce.argtypes = [ctypes.c_void_p, wt.DWORD, ctypes.POINTER(ctypes.c_void_p)]
@@ -101,10 +202,12 @@ def _windows_sid_and_dacl_info(path: Path) -> tuple[str, list[str]]:
     class _AceHeader(ctypes.Structure):
         _fields_ = [("AceType", wt.BYTE), ("AceFlags", wt.BYTE), ("AceSize", wt.WORD)]
 
-    class _AccessAllowedAce(ctypes.Structure):
+    class _StandardAce(ctypes.Structure):
         _fields_ = [("Header", _AceHeader), ("Mask", wt.DWORD), ("SidStart", wt.DWORD)]
 
     def _sid_str(psid: ctypes.c_void_p) -> str:
+        if not psid.value:
+            return ""
         pstr = wt.LPWSTR()
         if not advapi32.ConvertSidToStringSidW(psid, ctypes.byref(pstr)):
             raise ContractError(f"Windows SID conversion failed (err={ctypes.get_last_error()})")
@@ -113,32 +216,64 @@ def _windows_sid_and_dacl_info(path: Path) -> tuple[str, list[str]]:
         finally:
             kernel32.LocalFree(pstr)
 
+    owned_handle: int | None = None
+    if isinstance(path_or_handle, int) and not isinstance(path_or_handle, bool):
+        handle_val = path_or_handle
+    else:
+        owned_handle = _open_windows_no_reparse_handle(Path(path_or_handle), _WIN_READ_CONTROL)
+        handle_val = owned_handle
+
     p_owner = ctypes.c_void_p()
     p_dacl = ctypes.c_void_p()
     p_sd = ctypes.c_void_p()
-    rc = advapi32.GetNamedSecurityInfoW(
-        str(path), 1, 0x00000001 | 0x00000004,
-        ctypes.byref(p_owner), None, ctypes.byref(p_dacl), None, ctypes.byref(p_sd),
-    )
-    if rc != 0:
-        raise ContractError(f"Windows GetNamedSecurityInfoW failed for {path} (rc={rc})")
     try:
-        owner_sid = _sid_str(p_owner)
-        allowed_sids: list[str] = []
-        if p_dacl.value:
-            info = _AclSizeInfo()
-            if not advapi32.GetAclInformation(p_dacl, ctypes.byref(info), ctypes.sizeof(info), 2):
-                raise ContractError(f"Windows GetAclInformation failed for {path}")
-            for idx in range(info.AceCount):
-                p_ace = ctypes.c_void_p()
-                if advapi32.GetAce(p_dacl, idx, ctypes.byref(p_ace)):
+        rc = advapi32.GetSecurityInfo(
+            ctypes.c_void_p(handle_val),
+            _WIN_SE_FILE_OBJECT,
+            _WIN_OWNER_SECURITY_INFORMATION | _WIN_DACL_SECURITY_INFORMATION,
+            ctypes.byref(p_owner),
+            None,
+            ctypes.byref(p_dacl),
+            None,
+            ctypes.byref(p_sd),
+        )
+        if rc != 0:
+            raise ContractError(f"Windows GetSecurityInfo failed for {path_or_handle} (rc={rc})")
+        try:
+            owner_sid = _sid_str(p_owner)
+            sd_ctrl = wt.WORD(0)
+            sd_rev = wt.DWORD(0)
+            if not advapi32.GetSecurityDescriptorControl(p_sd, ctypes.byref(sd_ctrl), ctypes.byref(sd_rev)):
+                raise ContractError(
+                    f"Windows GetSecurityDescriptorControl failed for {path_or_handle} (err={ctypes.get_last_error()})"
+                )
+            dacl_present = bool(sd_ctrl.value & _WIN_SE_DACL_PRESENT)
+            dacl_is_null = (not dacl_present) or (not bool(p_dacl.value))
+            aces: list[tuple[int, int, int, str]] = []
+            if dacl_present and not dacl_is_null:
+                info = _AclSizeInfo()
+                if not advapi32.GetAclInformation(p_dacl, ctypes.byref(info), ctypes.sizeof(info), 2):
+                    raise ContractError(f"Windows GetAclInformation failed for {path_or_handle}")
+                for idx in range(info.AceCount):
+                    p_ace = ctypes.c_void_p()
+                    if not advapi32.GetAce(p_dacl, idx, ctypes.byref(p_ace)) or not p_ace.value:
+                        raise ContractError(f"Windows GetAce failed at index {idx} for {path_or_handle}")
                     hdr = ctypes.cast(p_ace, ctypes.POINTER(_AceHeader)).contents
-                    if hdr.AceType == 0:  # ACCESS_ALLOWED_ACE_TYPE
-                        sid_addr = p_ace.value + _AccessAllowedAce.SidStart.offset
-                        allowed_sids.append(_sid_str(ctypes.c_void_p(sid_addr)))
-        return owner_sid, allowed_sids
+                    ace_type = int(hdr.AceType)
+                    ace_flags = int(hdr.AceFlags)
+                    if ace_type in (_WIN_ACE_TYPE_ACCESS_ALLOWED, _WIN_ACE_TYPE_ACCESS_DENIED):
+                        std_ace = ctypes.cast(p_ace, ctypes.POINTER(_StandardAce)).contents
+                        sid_addr = p_ace.value + _StandardAce.SidStart.offset
+                        aces.append((ace_type, ace_flags, int(std_ace.Mask), _sid_str(ctypes.c_void_p(sid_addr))))
+                    else:
+                        aces.append((ace_type, ace_flags, 0xFFFFFFFF, f"<UNSUPPORTED_ACE_TYPE:{ace_type}>"))
+            return owner_sid, dacl_present, dacl_is_null, aces
+        finally:
+            if p_sd.value:
+                kernel32.LocalFree(p_sd)
     finally:
-        kernel32.LocalFree(p_sd)
+        if owned_handle is not None:
+            kernel32.CloseHandle(ctypes.c_void_p(owned_handle))
 
 
 def _windows_current_user_sid() -> str:
@@ -177,18 +312,187 @@ def _windows_current_user_sid() -> str:
         kernel32.CloseHandle(tok)
 
 
-def verify_windows_owner_and_dacl(path: Path, *, label: str = "state path") -> None:
-    """Enforce owner SID and restrictive DACL on Windows (rejecting Everyone/Users/Authenticated Users/Guests)."""
+def _evaluate_windows_security_descriptor(
+    owner_sid: str,
+    cur_sid: str,
+    dacl_present: bool,
+    dacl_is_null: bool,
+    aces: Sequence[tuple[int, int, int, str]],
+    label: str = "state path",
+    path: str | Path = "",
+) -> None:
+    """Pure-Python fail-closed evaluator for Windows owner SID, DACL presence, ACE types, masks & inheritance (Finding [5])."""
+    clean_owner = str(owner_sid or "").strip()
+    clean_cur = str(cur_sid or "").strip()
+    if not clean_owner or not clean_cur:
+        raise ContractError(f"Refusing {label} with empty Windows owner/current SID: {path}")
+    if not dacl_present or dacl_is_null:
+        raise ContractError(f"Refusing {label} with missing or NULL Windows DACL: {path}")
+    if clean_owner != clean_cur and clean_owner not in _WIN_PRIVILEGED_OWNER_SIDS:
+        raise ContractError(f"Refusing {label} owned by foreign Windows SID {clean_owner}: {path}")
+
+    trusted_sids = frozenset({clean_owner, clean_cur, *tuple(_WIN_PRIVILEGED_OWNER_SIDS)})
+    denied_direct: dict[str, int] = {}
+    denied_inherit: dict[str, int] = {}
+    trusted_allow_count = 0
+
+    for raw_entry in aces:
+        if not isinstance(raw_entry, tuple) or len(raw_entry) != 4:
+            raise ContractError(f"Refusing {label} with malformed Windows ACE tuple: {path}")
+        ace_type, ace_flags, access_mask, raw_sid = raw_entry
+        if type(ace_type) is bool or not isinstance(ace_type, int):
+            raise ContractError(f"Refusing {label} with invalid Windows ACE type {ace_type!r}: {path}")
+        if ace_type not in (_WIN_ACE_TYPE_ACCESS_ALLOWED, _WIN_ACE_TYPE_ACCESS_DENIED):
+            raise ContractError(f"Refusing {label} with unsupported Windows ACE type {ace_type}: {path}")
+        flags = int(ace_flags) & 0xFF
+        mask = int(access_mask) & 0xFFFFFFFF
+        sid_str = str(raw_sid or "").strip()
+        if not sid_str:
+            raise ContractError(f"Refusing {label} with empty ACE SID: {path}")
+        # S-1-3-4 (OWNER RIGHTS) resolves dynamically in Windows SeAccessCheck to the verified object owner_sid
+        eff_sid = clean_owner if sid_str == _WIN_OWNER_RIGHTS_SID else sid_str
+
+        applies_directly = not bool(flags & _WIN_INHERIT_ONLY_ACE)
+        propagates_inherit = bool(flags & _WIN_INHERIT_PROPAGATION_FLAGS)
+
+        if ace_type == _WIN_ACE_TYPE_ACCESS_DENIED:
+            if applies_directly:
+                denied_direct[eff_sid] = denied_direct.get(eff_sid, 0) | mask
+            if propagates_inherit:
+                denied_inherit[eff_sid] = denied_inherit.get(eff_sid, 0) | mask
+        else:
+            eff_direct = (mask & ~denied_direct.get(eff_sid, 0)) if applies_directly else 0
+            eff_inherit = (mask & ~denied_inherit.get(eff_sid, 0)) if propagates_inherit else 0
+            if eff_sid not in trusted_sids:
+                if eff_direct != 0 or eff_inherit != 0:
+                    raise ContractError(
+                        f"Refusing {label} with permissive Windows DACL for untrusted principal {sid_str} "
+                        f"(direct=0x{eff_direct:08x}, inherit=0x{eff_inherit:08x}): {path}"
+                    )
+            else:
+                if eff_direct != 0:
+                    trusted_allow_count += 1
+
+    if trusted_allow_count <= 0:
+        raise ContractError(f"Refusing {label} with empty Windows DACL or zero effective trusted allow ACEs: {path}")
+
+
+def _apply_windows_protected_owner_dacl(path_or_handle: Path | int, *, is_dir: bool) -> None:
+    """Apply an explicit protected owner-only DACL (D:P + SYSTEM + Administrators + current user) on Windows."""
     if os.name != "nt":
         return
-    owner_sid, allowed_sids = _windows_sid_and_dacl_info(path)
-    cur_sid = _windows_current_user_sid()
-    if owner_sid != cur_sid and owner_sid not in _WIN_PRIVILEGED_OWNER_SIDS:
-        raise ContractError(f"Refusing {label} owned by foreign Windows SID {owner_sid}: {path}")
-    bad = [s for s in allowed_sids if s in _WIN_UNTRUSTED_BROAD_SIDS]
-    if bad:
-        raise ContractError(f"Refusing {label} with permissive Windows DACL for {bad}: {path}")
+    import ctypes.wintypes as wt
 
+    cur_sid = _windows_current_user_sid()
+    if not cur_sid.startswith("S-1-"):
+        raise ContractError(f"Invalid current Windows SID {cur_sid!r}")
+    if is_dir:
+        sddl = f"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{cur_sid})"
+    else:
+        sddl = f"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{cur_sid})"
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wt.LPCWSTR,
+        wt.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wt.ULONG),
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wt.BOOL
+    advapi32.GetSecurityDescriptorDacl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wt.BOOL),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wt.BOOL),
+    ]
+    advapi32.GetSecurityDescriptorDacl.restype = wt.BOOL
+    advapi32.SetSecurityInfo.argtypes = [
+        ctypes.c_void_p,
+        wt.DWORD,
+        wt.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    advapi32.SetSecurityInfo.restype = wt.DWORD
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = wt.BOOL
+
+    p_sd = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(p_sd), None):
+        raise ContractError(f"Windows SDDL conversion failed (err={ctypes.get_last_error()})")
+    try:
+        dacl_present = wt.BOOL(0)
+        dacl_defaulted = wt.BOOL(0)
+        p_dacl = ctypes.c_void_p()
+        if not advapi32.GetSecurityDescriptorDacl(
+            p_sd, ctypes.byref(dacl_present), ctypes.byref(p_dacl), ctypes.byref(dacl_defaulted)
+        ) or not dacl_present.value or not p_dacl.value:
+            raise ContractError("Windows GetSecurityDescriptorDacl failed for protected owner SDDL")
+
+        owned_handle: int | None = None
+        if isinstance(path_or_handle, int) and not isinstance(path_or_handle, bool):
+            handle_val = path_or_handle
+        else:
+            owned_handle = _open_windows_no_reparse_handle(
+                Path(path_or_handle), _WIN_WRITE_DAC | _WIN_READ_CONTROL
+            )
+            handle_val = owned_handle
+        try:
+            rc = advapi32.SetSecurityInfo(
+                ctypes.c_void_p(handle_val),
+                _WIN_SE_FILE_OBJECT,
+                _WIN_DACL_SECURITY_INFORMATION | _WIN_PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                p_dacl,
+                None,
+            )
+            if rc != 0:
+                raise ContractError(f"Windows SetSecurityInfo failed for {path_or_handle} (rc={rc})")
+        finally:
+            if owned_handle is not None:
+                kernel32.CloseHandle(ctypes.c_void_p(owned_handle))
+    finally:
+        if p_sd.value:
+            kernel32.LocalFree(p_sd)
+
+
+def verify_windows_owner_and_dacl(
+    path: Path,
+    *,
+    label: str = "state path",
+    ignore_missing: bool = False,
+) -> None:
+    """Enforce owner SID and strict owner-only DACL on Windows via handle-based GetSecurityInfo (Finding [5])."""
+    if os.name != "nt":
+        return
+    try:
+        info = _windows_sid_and_dacl_info(path)
+    except FileNotFoundError as exc:
+        if ignore_missing:
+            return
+        raise ContractError(f"Missing {label} during Windows DACL verification: {path}") from exc
+    cur_sid = _windows_current_user_sid()
+    if len(info) == 2:
+        # Backwards compatibility if a legacy test mocks _windows_sid_and_dacl_info -> (owner_sid, allowed_sids)
+        legacy_owner, legacy_sids = info  # type: ignore[misc]
+        synth_aces = [(_WIN_ACE_TYPE_ACCESS_ALLOWED, 0, 0x1F01FF, str(s)) for s in legacy_sids]
+        if not synth_aces:
+            synth_aces = [(_WIN_ACE_TYPE_ACCESS_ALLOWED, 0, 0x1F01FF, str(legacy_owner))]
+        _evaluate_windows_security_descriptor(
+            str(legacy_owner), cur_sid, True, False, synth_aces, label=label, path=path
+        )
+        return
+    owner_sid, dacl_present, dacl_is_null, aces = info
+    _evaluate_windows_security_descriptor(
+        owner_sid, cur_sid, dacl_present, dacl_is_null, aces, label=label, path=path
+    )
 
 def _verify_posix_ancestor_stat(st: os.stat_result, euid: int, path_label: str) -> None:
     if not stat.S_ISDIR(st.st_mode):
@@ -263,6 +567,11 @@ def _audit_directory_children_custody(
                 raise ContractError(
                     f"Refusing hard-linked child entry {entry.name!r} (nlink={cst.st_nlink}) in {label}"
                 )
+            verify_windows_owner_and_dacl(
+                cpath,
+                label=f"child {entry.name!r} in {label}",
+                ignore_missing=entry.name.endswith(("-wal", "-shm", "-journal")),
+            )
 
 
 def verify_non_symlink_sqlite_target(
@@ -310,14 +619,23 @@ def verify_non_symlink_sqlite_target(
         else:
             for cname in candidates:
                 cpath = parent_dir / cname
+                is_sidecar = cname != db_name
                 if os.path.lexists(cpath):
-                    cst = os.lstat(cpath)
+                    try:
+                        cst = os.lstat(cpath)
+                    except FileNotFoundError:
+                        if is_sidecar:
+                            continue
+                        raise
                     if _is_symlink_or_reparse(cpath, cst) or not stat.S_ISREG(cst.st_mode):
                         raise ContractError(f"Refusing symlink/reparse or non-regular {label} artifact: {cpath}")
                     if cst.st_nlink > 1:
                         raise ContractError(f"Refusing hard-linked {label} artifact (nlink={cst.st_nlink}): {cpath}")
-                    if cname == db_name:
-                        verify_windows_owner_and_dacl(cpath, label=label)
+                    verify_windows_owner_and_dacl(
+                        cpath,
+                        label=f"{label} ({cname})",
+                        ignore_missing=is_sidecar,
+                    )
     finally:
         if dir_fd is not None:
             os.close(dir_fd)
@@ -416,7 +734,12 @@ def open_verified_sqlite_connection(
                     if (int(st_post_w.st_dev), int(st_post_w.st_ino)) != expected_id:
                         raise ContractError(f"{label} file identity changed during SQLite open: {target}")
                 if not read_only:
+                    _apply_windows_protected_owner_dacl(target, is_dir=False)
                     verify_windows_owner_and_dacl(target, label=label)
+                for sc in (f"{db_name}-wal", f"{db_name}-shm", f"{db_name}-journal"):
+                    sc_p = parent_dir / sc
+                    if os.path.lexists(sc_p):
+                        verify_windows_owner_and_dacl(sc_p, label=f"{label} sidecar {sc}", ignore_missing=True)
             return conn
         except Exception:
             conn.close()
@@ -511,6 +834,7 @@ def open_verified_directory_fd(
             st = os.lstat(cur)
             if _is_symlink_or_reparse(cur, st) or not stat.S_ISDIR(st.st_mode):
                 raise ContractError(f"Refusing symlink/reparse or non-directory component in {label}: {cur}")
+            created_now = False
         else:
             if not create:
                 raise ContractError(f"Missing {label} component: {cur}")
@@ -518,9 +842,13 @@ def open_verified_directory_fd(
             st = os.lstat(cur)
             if _is_symlink_or_reparse(cur, st) or not stat.S_ISDIR(st.st_mode):
                 raise ContractError(f"Created {label} component invalid: {cur}")
+            _apply_windows_protected_owner_dacl(cur, is_dir=True)
+            created_now = True
         if is_leaf:
             verify_windows_owner_and_dacl(cur, label=label)
             _audit_directory_children_custody(cur, dir_fd=None, label=label)
+            if create and not created_now:
+                _apply_windows_protected_owner_dacl(cur, is_dir=True)
     if len(parts) == 1:
         verify_windows_owner_and_dacl(cur, label=label)
         _audit_directory_children_custody(cur, dir_fd=None, label=label)
@@ -593,6 +921,24 @@ def verify_and_read_owner_only_file(
         os.close(fd)
 
 
+def read_owner_only_file_no_follow(
+    parent_dir: Path,
+    filename: str,
+    *,
+    dir_fd: int | None = None,
+    label: str = "secret file",
+    max_bytes: int = 65536,
+) -> tuple[bytes, tuple[int, int]]:
+    """Descriptor-relative O_NOFOLLOW owner-only file reader (alias for verify_and_read_owner_only_file)."""
+    return verify_and_read_owner_only_file(
+        parent_dir,
+        filename,
+        dir_fd=dir_fd,
+        label=label,
+        max_bytes=max_bytes,
+    )
+
+
 def create_owner_only_file_atomic(
     parent_dir: Path,
     filename: str,
@@ -613,9 +959,27 @@ def create_owner_only_file_atomic(
             _, opened_dir_fd = open_verified_directory_fd(parent_dir, create=True, label=f"parent of {label}")
             use_fd = opened_dir_fd
         try:
+            try:
+                st_existing = os.lstat(filename, dir_fd=use_fd)
+            except FileNotFoundError:
+                st_existing = None
+            if st_existing is not None:
+                if not replace_existing:
+                    raise ContractError(f"Refusing to overwrite existing {label}: {filename!r}")
+                if stat.S_ISLNK(st_existing.st_mode) or not stat.S_ISREG(st_existing.st_mode):
+                    raise ContractError(
+                        f"Refusing to replace symlink or non-regular {label}: {parent_dir / filename}"
+                    )
+                if st_existing.st_uid != euid:
+                    raise ContractError(
+                        f"Refusing to replace foreign-owned {label} (uid={st_existing.st_uid}): {parent_dir / filename}"
+                    )
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
             target_name = filename if not replace_existing else f".{filename}.tmp.{secrets.token_hex(8)}"
-            fd = os.open(target_name, flags, 0o600, dir_fd=use_fd)
+            try:
+                fd = os.open(target_name, flags, 0o600, dir_fd=use_fd)
+            except OSError as exc:
+                raise ContractError(f"Unable to create {label} {filename!r} safely: {exc}") from exc
             try:
                 os.fchmod(fd, 0o600)
                 st = os.fstat(fd)
@@ -636,6 +1000,22 @@ def create_owner_only_file_atomic(
                 raise
             os.close(fd)
             if replace_existing:
+                try:
+                    st_pre_rep = os.lstat(filename, dir_fd=use_fd)
+                except FileNotFoundError:
+                    st_pre_rep = None
+                if st_pre_rep is not None and (
+                    stat.S_ISLNK(st_pre_rep.st_mode)
+                    or not stat.S_ISREG(st_pre_rep.st_mode)
+                    or st_pre_rep.st_uid != euid
+                ):
+                    try:
+                        os.unlink(target_name, dir_fd=use_fd)
+                    except OSError as exc_rm:
+                        _rm_err = str(exc_rm)
+                    raise ContractError(
+                        f"Refusing atomic replace over symlink, directory, or foreign {label}: {parent_dir / filename}"
+                    )
                 os.replace(target_name, filename, src_dir_fd=use_fd, dst_dir_fd=use_fd)
                 os.fsync(use_fd)
         finally:
@@ -644,9 +1024,21 @@ def create_owner_only_file_atomic(
         return
 
     open_verified_directory_fd(parent_dir, create=True, label=f"parent of {label}")
+    dest_path = parent_dir / filename
+    if os.path.lexists(dest_path):
+        if not replace_existing:
+            raise ContractError(f"Refusing to overwrite existing {label}: {dest_path}")
+        st_dest = os.lstat(dest_path)
+        if _is_symlink_or_reparse(dest_path, st_dest) or not stat.S_ISREG(st_dest.st_mode):
+            raise ContractError(f"Refusing to replace symlink/reparse or non-regular {label}: {dest_path}")
+        verify_windows_owner_and_dacl(dest_path, label=label)
+
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     target_path = parent_dir / (filename if not replace_existing else f".{filename}.tmp.{secrets.token_hex(8)}")
-    fd = os.open(str(target_path), flags, 0o600)
+    try:
+        fd = os.open(str(target_path), flags, 0o600)
+    except OSError as exc:
+        raise ContractError(f"Unable to create {label} safely at {target_path}: {exc}") from exc
     try:
         view = memoryview(content)
         while view:
@@ -662,9 +1054,22 @@ def create_owner_only_file_atomic(
                 _cleanup_err = str(exc)  # best-effort temp unlink
         raise
     os.close(fd)
-    verify_windows_owner_and_dacl(target_path, label=label)
-    if replace_existing:
-        os.replace(str(target_path), str(parent_dir / filename))
+    try:
+        _apply_windows_protected_owner_dacl(target_path, is_dir=False)
+        verify_windows_owner_and_dacl(target_path, label=label)
+        if replace_existing:
+            if os.path.lexists(dest_path):
+                st_dest2 = os.lstat(dest_path)
+                if _is_symlink_or_reparse(dest_path, st_dest2) or not stat.S_ISREG(st_dest2.st_mode):
+                    raise ContractError(f"Refusing atomic replace over symlink/reparse or directory {label}: {dest_path}")
+            os.replace(str(target_path), str(dest_path))
+    except Exception:
+        if target_path.exists():
+            try:
+                target_path.unlink()
+            except OSError as exc_u:
+                _u_err = str(exc_u)
+        raise
 
 
 def ensure_secure_state_directory(
@@ -1101,6 +1506,10 @@ def initialize_shared_runtime_state(
                 if st_db.st_nlink != 1:
                     raise ContractError(f"Refusing hard-linked state DB: {db_path}")
                 verify_windows_owner_and_dacl(db_path, label="state DB")
+            for sc_n in (f"{db_name}-wal", f"{db_name}-shm", f"{db_name}-journal"):
+                sc_full = sdir / sc_n
+                if os.path.lexists(sc_full):
+                    verify_windows_owner_and_dacl(sc_full, label=f"state DB sidecar {sc_n}", ignore_missing=True)
             expected_id = None
 
         conn = sqlite3.connect(str(db_path), timeout=10.0, isolation_level=None)
@@ -1109,6 +1518,9 @@ def initialize_shared_runtime_state(
                 st_post = os.lstat(db_name, dir_fd=held_dir_fd)
                 if (int(st_post.st_dev), int(st_post.st_ino)) != expected_id:
                     raise ContractError("State DB inode changed during open (possible path-replacement race)")
+            if os.name == "nt":
+                _apply_windows_protected_owner_dacl(db_path, is_dir=False)
+                verify_windows_owner_and_dacl(db_path, label="state DB")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=FULL")
             row = conn.execute("PRAGMA quick_check").fetchone()

@@ -28,6 +28,7 @@ import socket
 import sqlite3
 import stat
 from threading import RLock
+import time
 from typing import Any
 import urllib.error
 import urllib.parse
@@ -65,6 +66,114 @@ WITHDRAWAL_STATUS_NOT_STARTED = "WITHDRAWAL_NOT_STARTED"
 WITHDRAWAL_STATUS_PENDING = "WITHDRAWAL_PENDING"
 WITHDRAWAL_STATUS_SUBMITTED = "WITHDRAWAL_SUBMITTED"
 WITHDRAWAL_STATUS_OUTCOME_UNKNOWN = "WITHDRAWAL_OUTCOME_UNKNOWN"
+
+DEFAULT_CONVERSION_POLL_ATTEMPTS = 5
+DEFAULT_CONVERSION_POLL_INTERVAL_SECONDS = 0.0
+
+_COINBASE_SUBMISSION_STATUSES = frozenset(
+    {
+        "CREATED",
+        "STARTED",
+        "PENDING",
+        "SUBMITTED",
+        "ACCEPTED",
+        "PROCESSING",
+        "OPEN",
+        "TRADE_STATUS_CREATED",
+        "TRADE_STATUS_STARTED",
+        "TRADE_STATUS_PENDING",
+        "TRADE_STATUS_PROCESSING",
+        "TRADE_STATUS_COMPLETED",
+        "COMPLETED",
+        "SETTLED",
+        "FILLED",
+    }
+)
+_KRAKEN_SUBMISSION_STATUSES = frozenset(
+    {
+        "PENDING",
+        "OPEN",
+        "SUBMITTED",
+        "ACCEPTED",
+        "NEW",
+        "CLOSED",
+        "FILLED",
+        "COMPLETED",
+    }
+)
+_COINBASE_TERMINAL_CONFIRMED_STATUSES = frozenset(
+    {"COMPLETED", "TRADE_STATUS_COMPLETED", "SETTLED", "FILLED"}
+)
+_KRAKEN_TERMINAL_CONFIRMED_STATUSES = frozenset({"CLOSED", "FILLED", "COMPLETED"})
+_COINBASE_NOT_EXECUTED_STATUSES = frozenset(
+    {
+        "NOT_EXECUTED",
+        "NOT_FOUND_DEFINITIVE",
+        "CANCELLED",
+        "CANCELED",
+        "REJECTED",
+        "EXPIRED",
+        "FAILED",
+        "FAILED_NOT_EXECUTED",
+        "TRADE_STATUS_CANCELED",
+        "TRADE_STATUS_FAILED",
+        "TRADE_STATUS_EXPIRED",
+    }
+)
+_KRAKEN_NOT_EXECUTED_STATUSES = frozenset(
+    {
+        "NOT_EXECUTED",
+        "NOT_FOUND_DEFINITIVE",
+        "CANCELLED",
+        "CANCELED",
+        "REJECTED",
+        "EXPIRED",
+        "FAILED",
+        "FAILED_NOT_EXECUTED",
+    }
+)
+_IN_PROGRESS_CONVERSION_STATUSES = frozenset(
+    {
+        "CREATED",
+        "STARTED",
+        "PENDING",
+        "OPEN",
+        "PROCESSING",
+        "SUBMITTED",
+        "ACCEPTED",
+        "NEW",
+        "PARTIAL",
+        "PARTIALLY_FILLED",
+        "TRADE_STATUS_CREATED",
+        "TRADE_STATUS_STARTED",
+        "TRADE_STATUS_PENDING",
+        "TRADE_STATUS_PROCESSING",
+    }
+)
+_KRAKEN_PAIR_CANON = {
+    "USDCUSD": "USDCUSD",
+    "USDC/USD": "USDCUSD",
+    "USDCZUSD": "USDCUSD",
+    "USDTUSD": "USDTUSD",
+    "USDT/USD": "USDTUSD",
+    "USDTZUSD": "USDTUSD",
+    "XBTUSD": "XBTUSD",
+    "XBT/USD": "XBTUSD",
+    "XXBTZUSD": "XBTUSD",
+    "XXBTUSD": "XBTUSD",
+    "BTCUSD": "XBTUSD",
+    "BTC/USD": "XBTUSD",
+    "ETHUSD": "ETHUSD",
+    "ETH/USD": "ETHUSD",
+    "XETHZUSD": "ETHUSD",
+    "XETHUSD": "ETHUSD",
+}
+_KRAKEN_BASE_ASSETS_BY_PAIR = {
+    "USDCUSD": frozenset({"USDC"}),
+    "USDTUSD": frozenset({"USDT"}),
+    "XBTUSD": frozenset({"XBT", "BTC", "XXBT"}),
+    "ETHUSD": frozenset({"ETH", "XETH"}),
+}
 
 COINBASE_API_HOST = "api.coinbase.com"
 KRAKEN_API_HOST = "api.kraken.com"
@@ -332,9 +441,14 @@ class CoinbaseOfframpClient:
         *,
         client_reference_id: str | None = None,
         conversion_tx_id: str | None = None,
+        provider_tx_id: str | None = None,
     ) -> dict[str, Any]:
         """Read-only Coinbase conversion history lookup by trade ID or client_reference_id."""
-        clean_tx = str(conversion_tx_id or "").strip()
+        tx_a = str(conversion_tx_id or "").strip()
+        tx_b = str(provider_tx_id or "").strip()
+        if tx_a and tx_b and tx_a != tx_b:
+            raise ContractError("Conflicting conversion_tx_id and provider_tx_id")
+        clean_tx = tx_a or tx_b
         clean_ref = str(client_reference_id or "").strip()
         if clean_tx:
             return self._call(
@@ -562,9 +676,14 @@ class KrakenOfframpClient:
         *,
         client_reference_id: str | None = None,
         conversion_tx_id: str | None = None,
+        provider_tx_id: str | None = None,
     ) -> dict[str, Any]:
         """Read-only Kraken order history lookup by txid or cl_ord_id for conversion reconciliation."""
-        clean_tx = str(conversion_tx_id or "").strip()
+        tx_a = str(conversion_tx_id or "").strip()
+        tx_b = str(provider_tx_id or "").strip()
+        if tx_a and tx_b and tx_a != tx_b:
+            raise ContractError("Conflicting conversion_tx_id and provider_tx_id")
+        clean_tx = tx_a or tx_b
         clean_ref = str(client_reference_id or "").strip()
         if clean_tx:
             return self._private_post("/0/private/QueryOrders", {"txid": clean_tx})
@@ -593,6 +712,7 @@ class KrakenOfframpClient:
         volume: Decimal,
         client_reference_id: str | None = None,
     ) -> dict[str, Any]:
+        """Submit a Kraken USD market sell order; AddOrder returns a submission ack only, never terminal fill proof."""
         decimal_value(volume, "volume", positive=True)
         clean_pair = str(pair).strip().upper()
         if clean_pair not in ("USDCUSD", "USDTUSD", "XBTUSD", "ETHUSD"):
@@ -642,6 +762,9 @@ class ProfitSweepVault:
         initial_capital_usd: Decimal | None = None,
         environ: Mapping[str, str] | None = None,
         clock: Callable[[], datetime] | None = None,
+        conversion_poll_attempts: int = DEFAULT_CONVERSION_POLL_ATTEMPTS,
+        conversion_poll_interval_seconds: float = DEFAULT_CONVERSION_POLL_INTERVAL_SECONDS,
+        conversion_poll_sleep: Callable[[float], None] | None = None,
     ) -> None:
         if not isinstance(db_path, Path):
             db_path = Path(str(db_path))
@@ -668,7 +791,20 @@ class ProfitSweepVault:
         _ensure_owner_dir(db_path.parent)
         self.db_path = db_path
         self.scope_id = identifier(scope_id, "scope_id")
+        if type(conversion_poll_attempts) is not int or conversion_poll_attempts < 1 or conversion_poll_attempts > 30:
+            raise ContractError("conversion_poll_attempts must be an integer in [1, 30]")
+        if (
+            isinstance(conversion_poll_interval_seconds, bool)
+            or not isinstance(conversion_poll_interval_seconds, (int, float))
+            or not (0.0 <= float(conversion_poll_interval_seconds) <= 10.0)
+        ):
+            raise ContractError("conversion_poll_interval_seconds must be in [0.0, 10.0]")
+        if conversion_poll_sleep is not None and not callable(conversion_poll_sleep):
+            raise ContractError("conversion_poll_sleep must be callable")
         self._clock = clock or _utc_now
+        self._conversion_poll_attempts = conversion_poll_attempts
+        self._conversion_poll_interval_seconds = float(conversion_poll_interval_seconds)
+        self._conversion_poll_sleep = conversion_poll_sleep or time.sleep
         self._lock = RLock()
         self._in_flight_transfers: set[str] = set()
         self._init_db(
@@ -751,6 +887,7 @@ class ProfitSweepVault:
                     conversion_status TEXT NOT NULL DEFAULT 'NOT_REQUIRED',
                     conversion_client_ref TEXT,
                     conversion_tx_id TEXT,
+                    conversion_realized_usd_text TEXT,
                     conversion_spec_json TEXT,
                     conversion_error_detail TEXT,
                     withdrawal_status TEXT NOT NULL DEFAULT 'WITHDRAWAL_NOT_STARTED',
@@ -827,6 +964,8 @@ class ProfitSweepVault:
                 conn.execute("ALTER TABLE bank_transfers ADD COLUMN conversion_client_ref TEXT")
             if "conversion_tx_id" not in bt_cols:
                 conn.execute("ALTER TABLE bank_transfers ADD COLUMN conversion_tx_id TEXT")
+            if "conversion_realized_usd_text" not in bt_cols:
+                conn.execute("ALTER TABLE bank_transfers ADD COLUMN conversion_realized_usd_text TEXT")
             if "conversion_spec_json" not in bt_cols:
                 conn.execute("ALTER TABLE bank_transfers ADD COLUMN conversion_spec_json TEXT")
             if "conversion_error_detail" not in bt_cols:
@@ -2115,33 +2254,78 @@ class ProfitSweepVault:
         return False
 
     @staticmethod
-    def _extract_conversion_tx_id(*, rail: str, response: Any) -> str:
-        """Extract and validate a confirmed conversion transaction ID; return empty string on ambiguous/unconfirmed payloads."""
+    def _extract_record_client_ref(record: Mapping[str, Any]) -> str:
+        """Extract a single unambiguous client reference (client_reference_id/cl_ord_id/userref) from a record."""
+        refs: list[str] = []
+        for key in ("client_reference_id", "conversion_client_ref", "cl_ord_id", "userref"):
+            if key not in record:
+                continue
+            val = record.get(key)
+            if val is None or isinstance(val, bool):
+                continue
+            s = str(val).strip()
+            if s:
+                refs.append(s)
+        if not refs:
+            return ""
+        if len(set(refs)) > 1:
+            return "__CONFLICT__"
+        return refs[0]
+
+    @staticmethod
+    def _extract_record_tx_id(record: Mapping[str, Any], *, inferred_tx_id: str = "") -> str:
+        """Extract an unambiguous provider conversion transaction ID from a record or key."""
+        found: list[str] = []
+        for key in ("conversion_tx_id", "trade_id", "txid", "id", "order_id"):
+            raw_tx = record.get(key)
+            if raw_tx is None or isinstance(raw_tx, bool):
+                continue
+            if isinstance(raw_tx, (list, tuple)):
+                items = [item.strip() for item in raw_tx if isinstance(item, str) and item.strip()]
+                if len(items) > 1:
+                    return "__CONFLICT__"
+                if len(items) == 1:
+                    found.append(items[0])
+            elif isinstance(raw_tx, str) and raw_tx.strip():
+                found.append(raw_tx.strip())
+        clean_inferred = str(inferred_tx_id or "").strip()
+        if clean_inferred:
+            found.append(clean_inferred)
+        if not found:
+            return ""
+        if len(set(found)) > 1:
+            return "__CONFLICT__"
+        return found[0]
+
+    @classmethod
+    def _extract_conversion_tx_id(
+        cls,
+        *,
+        rail: str,
+        response: Any,
+        expected_client_ref: str | None = None,
+    ) -> str:
+        """Extract a conversion SUBMISSION acknowledgement ID using a strict allowlist.
+
+        Submission acknowledgements ONLY allow transitioning to ``CONVERSION_PENDING``;
+        they NEVER confirm terminal full-fill settlement or authorize ACH withdrawal.
+        """
         if not isinstance(response, Mapping):
             return ""
-        ambiguous_or_failed = {
-            "FAILED",
-            "ERROR",
-            "CANCELLED",
-            "CANCELED",
-            "REJECTED",
-            "EXPIRED",
-            "PENDING",
-            "OPEN",
-            "UNKNOWN",
-            "PROCESSING",
-            "TRADE_STATUS_PENDING",
-            "TRADE_STATUS_FAILED",
-            "TRADE_STATUS_CANCELED",
-            "TRADE_STATUS_EXPIRED",
-            "UNSPECIFIED",
-        }
+        if response.get("error") or response.get("errors"):
+            return ""
+        clean_exp_ref = str(expected_client_ref or "").strip()
         if rail == RAIL_COINBASE_ACH:
             trade_obj = response.get("trade") if isinstance(response.get("trade"), Mapping) else response
             for status_holder in (trade_obj, response):
                 raw_st = status_holder.get("status")
                 if raw_st is not None and str(raw_st).strip():
-                    if str(raw_st).strip().upper() in ambiguous_or_failed:
+                    if str(raw_st).strip().upper() not in _COINBASE_SUBMISSION_STATUSES:
+                        return ""
+            if clean_exp_ref:
+                for holder in (trade_obj, response):
+                    sub_ref = cls._extract_record_client_ref(holder)
+                    if sub_ref == "__CONFLICT__" or (sub_ref and sub_ref != clean_exp_ref):
                         return ""
             raw_tx = (
                 trade_obj.get("id")
@@ -2153,20 +2337,22 @@ class ProfitSweepVault:
             return str(raw_tx).strip() if isinstance(raw_tx, str) and raw_tx.strip() else ""
         raw_st_k = response.get("status")
         if raw_st_k is not None and str(raw_st_k).strip():
-            if str(raw_st_k).strip().upper() in ambiguous_or_failed:
+            if str(raw_st_k).strip().upper() not in _KRAKEN_SUBMISSION_STATUSES:
+                return ""
+        if clean_exp_ref:
+            sub_ref_k = cls._extract_record_client_ref(response)
+            if sub_ref_k == "__CONFLICT__" or (sub_ref_k and sub_ref_k != clean_exp_ref):
                 return ""
         raw_txid = response.get("txid")
         if isinstance(raw_txid, (list, tuple)):
-            for item in raw_txid:
-                if isinstance(item, str) and item.strip():
-                    return item.strip()
-            return ""
+            tx_items = [item.strip() for item in raw_txid if isinstance(item, str) and item.strip()]
+            return tx_items[0] if len(tx_items) == 1 else ""
         raw_k = raw_txid or response.get("order_id") or response.get("id") or response.get("refid")
         return str(raw_k).strip() if isinstance(raw_k, str) and raw_k.strip() else ""
 
     @staticmethod
     def _parse_optional_decimal(val: Any) -> Decimal | None:
-        if val is None or val == "":
+        if val is None or val == "" or isinstance(val, bool):
             return None
         try:
             d = Decimal(str(val))
@@ -2177,22 +2363,56 @@ class ProfitSweepVault:
         return d
 
     @classmethod
-    def _parse_conversion_history_evidence(
+    def _extract_decimal_and_currency(cls, val: Any) -> tuple[Decimal | None, str, bool]:
+        """Parse either a scalar decimal or a Coinbase-style ``{"value": ..., "currency": ...}`` mapping."""
+        if val is None:
+            return (None, "", False)
+        if isinstance(val, Mapping):
+            raw_num = val.get("value") if "value" in val else val.get("amount")
+            cur = str(val.get("currency") or "").strip().upper()
+            dec = cls._parse_optional_decimal(raw_num)
+            return (dec, cur, dec is None)
+        dec = cls._parse_optional_decimal(val)
+        return (dec, "", dec is None)
+
+    @staticmethod
+    def _is_in_progress_conversion_detail(detail: str) -> bool:
+        if detail.startswith("unconfirmed_conversion_status="):
+            norm_st = detail.split("=", 1)[1].strip().upper()
+            return norm_st in _IN_PROGRESS_CONVERSION_STATUSES
+        return False
+
+    @classmethod
+    def _evaluate_conversion_history_evidence(
         cls,
         *,
         rail: str,
         evidence: Any,
         expected_client_ref: str,
         expected_spec: Mapping[str, Any],
-    ) -> tuple[str, str | None, str]:
-        """Fail-closed parser for exchange conversion history evidence.
+        expected_conv_tx_id: str | None = None,
+        expected_amount_usd: Decimal | None = None,
+    ) -> tuple[str, str | None, Decimal | None, str]:
+        """Strict allowlist evaluator for authoritative exchange conversion history evidence.
 
-        Returns ``(outcome, conversion_tx_id, detail)`` where outcome is one of
+        Enforces all four mandatory settlement bindings:
+        1. Rail-specific terminal status allowlist only.
+        2. Exact request binding (client_reference_id/cl_ord_id/userref OR bound conversion_tx_id).
+        3. Exact asset/pair, side (sell -> USD), and pinned accounts binding.
+        4. Exact terminal full fill (vol_exec/filled_size/source_amount >= expected_source_amount,
+           and vol_exec >= vol when vol is present) AND strictly positive realized USD proceeds
+           >= requested ACH withdrawal USD amount.
+
+        Returns ``(outcome, conversion_tx_id, realized_usd, detail)`` where outcome is one of
         ``"CONFIRMED"``, ``"NOT_EXECUTED"``, or ``"UNRESOLVED"``.
         """
         if not isinstance(evidence, Mapping):
-            return ("UNRESOLVED", None, "non-mapping conversion history payload")
+            return ("UNRESOLVED", None, None, "non-mapping conversion history payload")
+        if rail not in (RAIL_COINBASE_ACH, RAIL_KRAKEN_ACH):
+            return ("UNRESOLVED", None, None, f"unsupported conversion rail {rail!r}")
 
+        clean_exp_ref = str(expected_client_ref or "").strip()
+        clean_exp_tx = str(expected_conv_tx_id or "").strip()
         record: Mapping[str, Any] = evidence
         inferred_tx_id = ""
         history_complete = bool(
@@ -2202,156 +2422,377 @@ class ProfitSweepVault:
 
         # Unwrap Coinbase {"trade": {...}} or {"trades": [...]}
         if isinstance(evidence.get("trade"), Mapping):
+            top_ref = cls._extract_record_client_ref(evidence)
+            if top_ref == "__CONFLICT__" or (top_ref and clean_exp_ref and top_ref != clean_exp_ref):
+                return ("UNRESOLVED", None, None, "conversion history wrapper client_reference_id mismatch")
             record = evidence["trade"]
         elif isinstance(evidence.get("trades"), list):
             trades = evidence["trades"]
-            matched: Mapping[str, Any] | None = None
+            matched_cb: list[Mapping[str, Any]] = []
             for item in trades:
                 if not isinstance(item, Mapping):
                     continue
-                item_ref = str(
-                    item.get("client_reference_id")
-                    or item.get("conversion_client_ref")
-                    or ""
-                ).strip()
-                if expected_client_ref and item_ref == expected_client_ref:
-                    matched = item
-                    break
-            if matched is not None:
-                record = matched
+                item_ref = cls._extract_record_client_ref(item)
+                if item_ref == "__CONFLICT__":
+                    continue
+                item_tx = cls._extract_record_tx_id(item)
+                if item_tx == "__CONFLICT__":
+                    continue
+                if item_ref and clean_exp_ref and item_ref != clean_exp_ref:
+                    continue
+                if clean_exp_tx and item_tx and item_tx != clean_exp_tx:
+                    continue
+                if (clean_exp_ref and item_ref == clean_exp_ref) or (clean_exp_tx and item_tx == clean_exp_tx):
+                    matched_cb.append(item)
+            if len(matched_cb) == 1:
+                record = matched_cb[0]
+            elif len(matched_cb) > 1:
+                return ("UNRESOLVED", None, None, "ambiguous multiple matching Coinbase conversion trades")
             elif len(trades) == 0 and history_complete:
-                return ("NOT_EXECUTED", None, "empty complete Coinbase conversion history")
+                return ("NOT_EXECUTED", None, None, "empty complete Coinbase conversion history")
             else:
-                return ("UNRESOLVED", None, "Coinbase conversion history did not conclusively match client_reference_id")
+                return ("UNRESOLVED", None, None, "Coinbase conversion history did not conclusively match request")
 
         # Unwrap Kraken ClosedOrders {"closed": {txid: {...}}} or QueryOrders {txid: {...}}
         elif isinstance(evidence.get("closed"), Mapping):
             closed_map = evidence["closed"]
-            matched_k: tuple[str, Mapping[str, Any]] | None = None
+            matched_k: list[tuple[str, Mapping[str, Any]]] = []
             for txk, order_v in closed_map.items():
                 if not isinstance(order_v, Mapping):
                     continue
-                cl_id = str(order_v.get("cl_ord_id") or order_v.get("client_reference_id") or "").strip()
-                if expected_client_ref and cl_id:
-                    if cl_id == expected_client_ref:
-                        matched_k = (str(txk).strip(), order_v)
-                        break
-                elif len(closed_map) == 1 and not cl_id:
-                    matched_k = (str(txk).strip(), order_v)
-                    break
-            if matched_k is not None:
-                inferred_tx_id, record = matched_k
+                txk_s = str(txk).strip()
+                cl_id = cls._extract_record_client_ref(order_v)
+                if cl_id == "__CONFLICT__":
+                    continue
+                if cl_id and clean_exp_ref and cl_id != clean_exp_ref:
+                    continue
+                if clean_exp_tx and txk_s != clean_exp_tx:
+                    continue
+                if (clean_exp_ref and cl_id == clean_exp_ref) or (clean_exp_tx and txk_s == clean_exp_tx):
+                    matched_k.append((txk_s, order_v))
+            if len(matched_k) == 1:
+                inferred_tx_id, record = matched_k[0]
+            elif len(matched_k) > 1:
+                return ("UNRESOLVED", None, None, "ambiguous multiple matching Kraken ClosedOrders entries")
             elif len(closed_map) == 0 and history_complete:
-                return ("NOT_EXECUTED", None, "empty complete Kraken ClosedOrders history")
+                return ("NOT_EXECUTED", None, None, "empty complete Kraken ClosedOrders history")
             else:
-                return ("UNRESOLVED", None, "Kraken ClosedOrders history did not conclusively match cl_ord_id")
+                return ("UNRESOLVED", None, None, "Kraken ClosedOrders history did not conclusively match request")
         elif rail == RAIL_KRAKEN_ACH and "status" not in evidence:
-            matched_q: tuple[str, Mapping[str, Any]] | None = None
+            matched_q: list[tuple[str, Mapping[str, Any]]] = []
             for txk, order_v in evidence.items():
                 if not isinstance(order_v, Mapping) or "status" not in order_v:
                     continue
-                cl_id = str(order_v.get("cl_ord_id") or order_v.get("client_reference_id") or "").strip()
-                if expected_client_ref and cl_id and cl_id != expected_client_ref:
+                txk_s = str(txk).strip()
+                cl_id = cls._extract_record_client_ref(order_v)
+                if cl_id == "__CONFLICT__":
                     continue
-                matched_q = (str(txk).strip(), order_v)
-                break
-            if matched_q is not None:
-                inferred_tx_id, record = matched_q
+                if cl_id and clean_exp_ref and cl_id != clean_exp_ref:
+                    continue
+                if clean_exp_tx and txk_s != clean_exp_tx:
+                    continue
+                if (clean_exp_ref and cl_id == clean_exp_ref) or (clean_exp_tx and txk_s == clean_exp_tx):
+                    matched_q.append((txk_s, order_v))
+            if len(matched_q) == 1:
+                inferred_tx_id, record = matched_q[0]
+            elif len(matched_q) > 1:
+                return ("UNRESOLVED", None, None, "ambiguous multiple matching Kraken QueryOrders entries")
+            elif len(evidence) == 0 and history_complete:
+                return ("NOT_EXECUTED", None, None, "empty complete Kraken QueryOrders history")
+            else:
+                return ("UNRESOLVED", None, None, "Kraken QueryOrders history did not conclusively match request")
 
         raw_status = record.get("status")
         if raw_status is None or not str(raw_status).strip():
-            return ("UNRESOLVED", None, "missing conversion status in exchange history")
+            return ("UNRESOLVED", None, None, "missing conversion status in exchange history")
         norm_status = str(raw_status).strip().upper()
 
-        rec_ref = str(
-            record.get("client_reference_id")
-            or record.get("conversion_client_ref")
-            or record.get("cl_ord_id")
-            or evidence.get("client_reference_id")
-            or evidence.get("conversion_client_ref")
-            or ""
-        ).strip()
-        if rec_ref and expected_client_ref and rec_ref != expected_client_ref:
-            return ("UNRESOLVED", None, "exchange history client_reference_id mismatch")
+        rec_ref = cls._extract_record_client_ref(record)
+        if rec_ref == "__CONFLICT__":
+            return ("UNRESOLVED", None, None, "conflicting client reference fields in conversion history")
+        if rec_ref and (not clean_exp_ref or rec_ref != clean_exp_ref):
+            return ("UNRESOLVED", None, None, "exchange history client_reference_id mismatch")
 
-        confirmed_statuses = {
-            "CONFIRMED",
-            "COMPLETED",
-            "FILLED",
-            "CLOSED",
-            "SETTLED",
-            "TRADE_STATUS_COMPLETED",
-            "EXECUTED",
-        }
-        not_executed_statuses = {
-            "NOT_EXECUTED",
-            "NOT_FOUND_DEFINITIVE",
-            "CANCELLED",
-            "CANCELED",
-            "REJECTED",
-            "EXPIRED",
-            "FAILED_NOT_EXECUTED",
-            "TRADE_STATUS_CANCELED",
-            "TRADE_STATUS_FAILED",
-        }
+        rec_tx = cls._extract_record_tx_id(record, inferred_tx_id=inferred_tx_id)
+        if rec_tx == "__CONFLICT__":
+            return ("UNRESOLVED", None, None, "conflicting transaction IDs in conversion history")
+        if clean_exp_tx and rec_tx and rec_tx != clean_exp_tx:
+            return ("UNRESOLVED", None, None, "conversion history conversion_tx_id mismatch")
 
-        raw_vol_exec = record.get("vol_exec") if "vol_exec" in record else record.get("executed_volume")
-        vol_exec_dec = cls._parse_optional_decimal(raw_vol_exec)
-        if raw_vol_exec is not None and vol_exec_dec is None:
-            return ("UNRESOLVED", None, "unparseable executed volume in conversion history")
+        bound_by_ref = bool(clean_exp_ref and rec_ref == clean_exp_ref)
+        bound_by_tx = bool(clean_exp_tx and rec_tx == clean_exp_tx)
 
-        expected_amt_dec = cls._parse_optional_decimal(expected_spec.get("amount"))
+        not_executed_statuses = (
+            _COINBASE_NOT_EXECUTED_STATUSES if rail == RAIL_COINBASE_ACH else _KRAKEN_NOT_EXECUTED_STATUSES
+        )
+        if norm_status == "NOT_FOUND" and history_complete:
+            if rec_ref and (not clean_exp_ref or rec_ref != clean_exp_ref):
+                return ("UNRESOLVED", None, None, "exchange history client_reference_id mismatch")
+            return ("NOT_EXECUTED", None, None, "exchange_status=NOT_FOUND")
+        if norm_status in not_executed_statuses:
+            if not (bound_by_ref or bound_by_tx):
+                return ("UNRESOLVED", None, None, "not-executed conversion history missing request binding")
+            for exec_key in ("vol_exec", "executed_volume", "filled_size", "filled_amount", "source_amount"):
+                if exec_key in record and record.get(exec_key) is not None:
+                    exec_dec, _, exec_bad = cls._extract_decimal_and_currency(record.get(exec_key))
+                    if exec_bad or exec_dec is None or exec_dec != Decimal("0"):
+                        return (
+                            "UNRESOLVED",
+                            None,
+                            None,
+                            "partial conversion execution detected; manual reconciliation required",
+                        )
+            return ("NOT_EXECUTED", None, None, f"exchange_status={norm_status}")
 
-        if norm_status in confirmed_statuses:
-            raw_tx = (
-                record.get("conversion_tx_id")
-                or record.get("trade_id")
-                or record.get("txid")
-                or record.get("id")
-                or record.get("order_id")
-                or inferred_tx_id
-            )
-            if isinstance(raw_tx, (list, tuple)):
-                tx_id = next((str(x).strip() for x in raw_tx if isinstance(x, str) and x.strip()), "")
-            else:
-                tx_id = str(raw_tx).strip() if isinstance(raw_tx, str) and raw_tx.strip() else ""
-            if not tx_id:
-                return ("UNRESOLVED", None, "confirmed conversion missing trustworthy tx_id")
+        confirmed_statuses = (
+            _COINBASE_TERMINAL_CONFIRMED_STATUSES
+            if rail == RAIL_COINBASE_ACH
+            else _KRAKEN_TERMINAL_CONFIRMED_STATUSES
+        )
+        if norm_status not in confirmed_statuses:
+            return ("UNRESOLVED", None, None, f"unconfirmed_conversion_status={norm_status}")
 
-            raw_amt = (
-                record.get("amount")
-                if "amount" in record
-                else (record.get("volume") if "volume" in record else record.get("vol"))
-            )
-            if raw_amt is not None and expected_amt_dec is not None:
-                rec_amt_dec = cls._parse_optional_decimal(raw_amt)
-                if rec_amt_dec is None or rec_amt_dec != expected_amt_dec:
-                    return ("UNRESOLVED", None, "conversion history amount mismatch")
-            if vol_exec_dec is not None:
-                if vol_exec_dec <= Decimal("0"):
-                    return ("UNRESOLVED", None, "confirmed conversion reported non-positive executed volume")
-                if expected_amt_dec is not None and vol_exec_dec != expected_amt_dec:
-                    return ("UNRESOLVED", None, "conversion history executed volume mismatch")
+        # Mandatory Binding 2: Trustworthy conversion tx_id + exact request binding
+        if not rec_tx:
+            return ("UNRESOLVED", None, None, "confirmed conversion missing trustworthy tx_id")
+        if not (bound_by_ref or bound_by_tx):
+            return ("UNRESOLVED", None, None, "conversion history missing request reference binding")
 
-            rec_from_cur = str(record.get("from_currency") or "").strip().upper()
+        # Mandatory Binding 3: Exact asset/pair, side (sell -> USD), and pinned accounts
+        if rail == RAIL_COINBASE_ACH:
             exp_from_cur = str(expected_spec.get("from_currency") or "").strip().upper()
-            if rec_from_cur and exp_from_cur and rec_from_cur != exp_from_cur:
-                return ("UNRESOLVED", None, "conversion history from_currency mismatch")
+            exp_to_cur = str(expected_spec.get("to_currency") or "USD").strip().upper()
+            if not exp_from_cur or exp_to_cur != "USD":
+                return ("UNRESOLVED", None, None, "invalid expected Coinbase conversion currency spec")
 
-            descr = record.get("descr") if isinstance(record.get("descr"), Mapping) else {}
-            rec_pair = str(record.get("pair") or descr.get("pair") or "").strip().upper()
+            source_obj = record.get("source") if isinstance(record.get("source"), Mapping) else {}
+            source_ledger = (
+                source_obj.get("ledger_account")
+                if isinstance(source_obj.get("ledger_account"), Mapping)
+                else {}
+            )
+            target_obj = record.get("target") if isinstance(record.get("target"), Mapping) else {}
+            target_ledger = (
+                target_obj.get("ledger_account")
+                if isinstance(target_obj.get("ledger_account"), Mapping)
+                else {}
+            )
+
+            from_cur_candidates: list[str] = []
+            for cand in (
+                record.get("from_currency"),
+                record.get("source_currency"),
+                source_obj.get("currency"),
+                source_ledger.get("currency"),
+            ):
+                if cand is not None and str(cand).strip():
+                    from_cur_candidates.append(str(cand).strip().upper())
+            for cur_holder in ("user_entered_amount", "source_amount", "filled_size"):
+                if isinstance(record.get(cur_holder), Mapping):
+                    _, h_cur, _ = cls._extract_decimal_and_currency(record.get(cur_holder))
+                    if h_cur:
+                        from_cur_candidates.append(h_cur)
+            if not from_cur_candidates or len(set(from_cur_candidates)) > 1:
+                return ("UNRESOLVED", None, None, "conversion history missing or conflicting source currency")
+            if from_cur_candidates[0] != exp_from_cur:
+                return ("UNRESOLVED", None, None, "conversion history from_currency mismatch")
+
+            to_cur_candidates: list[str] = []
+            for cand in (
+                record.get("to_currency"),
+                record.get("target_currency"),
+                record.get("usd_proceeds_currency"),
+                target_obj.get("currency"),
+                target_ledger.get("currency"),
+            ):
+                if cand is not None and str(cand).strip():
+                    to_cur_candidates.append(str(cand).strip().upper())
+            for cur_holder in ("total", "target_amount", "usd_proceeds", "subtotal"):
+                if isinstance(record.get(cur_holder), Mapping):
+                    _, h_cur, _ = cls._extract_decimal_and_currency(record.get(cur_holder))
+                    if h_cur:
+                        to_cur_candidates.append(h_cur)
+            if not to_cur_candidates or len(set(to_cur_candidates)) > 1:
+                return ("UNRESOLVED", None, None, "conversion history missing or conflicting target currency")
+            if to_cur_candidates[0] != "USD":
+                return ("UNRESOLVED", None, None, "conversion history to_currency mismatch")
+
+            rec_side_cb = str(record.get("side") or record.get("type") or "").strip().upper()
+            if rec_side_cb and rec_side_cb not in ("SELL", "CONVERT"):
+                return ("UNRESOLVED", None, None, f"conversion history invalid side {rec_side_cb!r}")
+
+            raw_pair_cb = str(record.get("pair") or "").strip().upper()
+            if raw_pair_cb:
+                canon_cb = _KRAKEN_PAIR_CANON.get(raw_pair_cb, "")
+                exp_pair_cb = "XBTUSD" if exp_from_cur in ("BTC", "XBT") else f"{exp_from_cur}USD"
+                if not canon_cb or canon_cb != exp_pair_cb:
+                    return ("UNRESOLVED", None, None, "conversion history pair mismatch")
+
+            exp_src_acct = str(expected_spec.get("source_account_uuid") or "").strip()
+            for acct_cand in (
+                record.get("from_account"),
+                record.get("source_account"),
+                record.get("source_account_uuid"),
+                record.get("from_account_uuid"),
+                source_ledger.get("account_id"),
+            ):
+                if acct_cand is not None and str(acct_cand).strip():
+                    if not exp_src_acct or str(acct_cand).strip() != exp_src_acct:
+                        return ("UNRESOLVED", None, None, "conversion history source account mismatch")
+
+            exp_usd_acct = str(expected_spec.get("usd_account_uuid") or "").strip()
+            for acct_cand in (
+                record.get("to_account"),
+                record.get("target_account"),
+                record.get("usd_account_uuid"),
+                record.get("to_account_uuid"),
+                target_ledger.get("account_id"),
+            ):
+                if acct_cand is not None and str(acct_cand).strip():
+                    if not exp_usd_acct or str(acct_cand).strip() != exp_usd_acct:
+                        return ("UNRESOLVED", None, None, "conversion history destination USD account mismatch")
+        else:
             exp_pair = str(expected_spec.get("pair") or "").strip().upper()
-            if rec_pair and exp_pair and rec_pair != exp_pair:
-                return ("UNRESOLVED", None, "conversion history pair mismatch")
+            descr = record.get("descr") if isinstance(record.get("descr"), Mapping) else {}
+            raw_pair = str(record.get("pair") or descr.get("pair") or "").strip().upper()
+            canon_pair = _KRAKEN_PAIR_CANON.get(raw_pair, "")
+            if not exp_pair or not canon_pair or canon_pair != exp_pair:
+                return ("UNRESOLVED", None, None, "conversion history missing or mismatched pair")
 
-            return ("CONFIRMED", tx_id, f"exchange_status={norm_status}")
+            rec_side = str(record.get("side") or record.get("type") or descr.get("type") or "").strip().upper()
+            if rec_side != "SELL":
+                return ("UNRESOLVED", None, None, "conversion history missing or non-sell side")
 
-        if norm_status in not_executed_statuses or (norm_status == "NOT_FOUND" and history_complete):
-            if vol_exec_dec is not None and vol_exec_dec > Decimal("0"):
-                return ("UNRESOLVED", None, "partial conversion execution detected; manual reconciliation required")
-            return ("NOT_EXECUTED", None, f"exchange_status={norm_status}")
+            rec_from_cur = str(record.get("from_currency") or record.get("source_currency") or "").strip().upper()
+            allowed_bases = _KRAKEN_BASE_ASSETS_BY_PAIR.get(exp_pair, frozenset())
+            if rec_from_cur and rec_from_cur not in allowed_bases:
+                return ("UNRESOLVED", None, None, "conversion history source currency mismatch")
 
-        return ("UNRESOLVED", None, f"ambiguous_exchange_status={norm_status}")
+            rec_to_cur = str(record.get("to_currency") or record.get("target_currency") or "").strip().upper()
+            if rec_to_cur and rec_to_cur not in ("USD", "ZUSD"):
+                return ("UNRESOLVED", None, None, "conversion history target currency mismatch")
+
+        # Mandatory Binding 4: Exact terminal full fill + strictly positive bound realized USD proceeds
+        expected_amt_dec = cls._parse_optional_decimal(expected_spec.get("amount"))
+        if expected_amt_dec is None or expected_amt_dec <= Decimal("0"):
+            return ("UNRESOLVED", None, None, "invalid expected source conversion amount")
+
+        order_vol_dec: Decimal | None = None
+        for ord_key in ("vol", "volume", "amount", "order_volume"):
+            if ord_key in record and record.get(ord_key) is not None:
+                ov_dec, _, ov_bad = cls._extract_decimal_and_currency(record.get(ord_key))
+                if ov_bad or ov_dec is None or ov_dec <= Decimal("0"):
+                    return ("UNRESOLVED", None, None, f"invalid {ord_key} in conversion history")
+                if ov_dec != expected_amt_dec:
+                    return ("UNRESOLVED", None, None, "conversion history ordered volume mismatch")
+                order_vol_dec = ov_dec
+                break
+
+        exec_vols: list[Decimal] = []
+        for exec_key in ("vol_exec", "executed_volume", "filled_size", "filled_amount", "source_amount"):
+            if exec_key in record and record.get(exec_key) is not None:
+                ev_dec, ev_cur, ev_bad = cls._extract_decimal_and_currency(record.get(exec_key))
+                if ev_bad or ev_dec is None or ev_dec <= Decimal("0"):
+                    return ("UNRESOLVED", None, None, f"invalid or non-positive {exec_key} in conversion history")
+                if ev_cur:
+                    if rail == RAIL_COINBASE_ACH:
+                        if ev_cur != str(expected_spec.get("from_currency") or "").strip().upper():
+                            return ("UNRESOLVED", None, None, f"{exec_key} currency mismatch")
+                    else:
+                        allowed_bases = _KRAKEN_BASE_ASSETS_BY_PAIR.get(
+                            str(expected_spec.get("pair") or "").strip().upper(), frozenset()
+                        )
+                        if ev_cur not in allowed_bases:
+                            return ("UNRESOLVED", None, None, f"{exec_key} currency mismatch")
+                exec_vols.append(ev_dec)
+        if not exec_vols:
+            return ("UNRESOLVED", None, None, "conversion history missing filled/executed volume")
+        if len(set(exec_vols)) > 1:
+            return ("UNRESOLVED", None, None, "conflicting filled volume fields in conversion history")
+        vol_exec_dec = exec_vols[0]
+        if order_vol_dec is not None and vol_exec_dec < order_vol_dec:
+            return ("UNRESOLVED", None, None, "conversion history partial fill (vol_exec < vol)")
+        if vol_exec_dec < expected_amt_dec:
+            return ("UNRESOLVED", None, None, "conversion history filled volume shortfall")
+
+        explicit_proceeds: list[Decimal] = []
+        for net_key in (
+            "usd_proceeds",
+            "net_proceeds_usd",
+            "realized_usd_proceeds",
+            "proceeds_usd",
+            "received_usd",
+            "target_amount",
+            "to_amount",
+            "total",
+        ):
+            if net_key in record and record.get(net_key) is not None:
+                p_dec, p_cur, p_bad = cls._extract_decimal_and_currency(record.get(net_key))
+                if p_bad or p_dec is None or (p_cur and p_cur not in ("USD", "ZUSD")):
+                    return ("UNRESOLVED", None, None, f"invalid {net_key} in conversion history")
+                explicit_proceeds.append(p_dec)
+        if len(set(explicit_proceeds)) > 1:
+            return ("UNRESOLVED", None, None, "conflicting realized USD proceeds fields in conversion history")
+        realized_usd_dec: Decimal | None = explicit_proceeds[0] if explicit_proceeds else None
+
+        if realized_usd_dec is None:
+            for gross_key in ("cost", "subtotal"):
+                if gross_key in record and record.get(gross_key) is not None:
+                    gross_dec, gross_cur, gross_bad = cls._extract_decimal_and_currency(record.get(gross_key))
+                    if gross_bad or gross_dec is None or (gross_cur and gross_cur not in ("USD", "ZUSD")):
+                        return ("UNRESOLVED", None, None, f"invalid {gross_key} in conversion history")
+                    fee_dec = Decimal("0")
+                    for fee_key in ("fee", "total_fee", "fee_usd"):
+                        if fee_key in record and record.get(fee_key) is not None:
+                            f_dec, f_cur, f_bad = cls._extract_decimal_and_currency(record.get(fee_key))
+                            if f_bad or f_dec is None or f_dec < Decimal("0") or (f_cur and f_cur not in ("USD", "ZUSD")):
+                                return ("UNRESOLVED", None, None, f"invalid {fee_key} in conversion history")
+                            fee_dec = f_dec
+                            break
+                    realized_usd_dec = gross_dec - fee_dec
+                    break
+
+        if realized_usd_dec is None:
+            return ("UNRESOLVED", None, None, "conversion history missing realized USD proceeds")
+        if realized_usd_dec <= Decimal("0"):
+            return ("UNRESOLVED", None, None, "conversion history non-positive realized USD proceeds")
+        if expected_amount_usd is not None:
+            exp_wd_dec = expected_amount_usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if realized_usd_dec < exp_wd_dec:
+                return (
+                    "UNRESOLVED",
+                    None,
+                    None,
+                    f"realized USD proceeds ({decimal_text(realized_usd_dec)}) below requested ACH amount ({decimal_text(exp_wd_dec)})",
+                )
+
+        return ("CONFIRMED", rec_tx, realized_usd_dec, f"exchange_status={norm_status}")
+
+    @classmethod
+    def _parse_conversion_history_evidence(
+        cls,
+        *,
+        rail: str,
+        evidence: Any,
+        expected_client_ref: str,
+        expected_spec: Mapping[str, Any],
+        expected_conv_tx_id: str | None = None,
+        expected_amount_usd: Decimal | None = None,
+    ) -> tuple[str, str | None, str]:
+        """Fail-closed parser for exchange conversion history evidence.
+
+        Returns ``(outcome, conversion_tx_id, detail)`` where outcome is one of
+        ``"CONFIRMED"``, ``"NOT_EXECUTED"``, or ``"UNRESOLVED"``.
+        """
+        outcome, tx_id, _, detail = cls._evaluate_conversion_history_evidence(
+            rail=rail,
+            evidence=evidence,
+            expected_client_ref=expected_client_ref,
+            expected_spec=expected_spec,
+            expected_conv_tx_id=expected_conv_tx_id,
+            expected_amount_usd=expected_amount_usd,
+        )
+        return (outcome, tx_id, detail)
 
     @classmethod
     def _parse_withdrawal_history_evidence(
@@ -2524,6 +2965,7 @@ class ProfitSweepVault:
             "amount_usd": str(row["amount_usd_text"]),
             "created_at": str(row["created_at"]),
         }
+        expected_amt_usd = Decimal(str(row["amount_usd_text"])).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         ts = _iso(self._clock())
         try:
             if exchange_history_checker is not None:
@@ -2535,19 +2977,27 @@ class ProfitSweepVault:
                     raise OfframpSecurityError(
                         "EXCHANGE_HISTORY_REQUIRED: provide coinbase_client or exchange_history_checker"
                     )
-                evidence = coinbase_client.get_conversion_status(
-                    client_reference_id=conv_ref or None,
-                    conversion_tx_id=conv_tx or None,
-                )
+                cb_st_kwargs: dict[str, Any] = {}
+                if self._accepts_kwarg(coinbase_client.get_conversion_status, "client_reference_id"):
+                    cb_st_kwargs["client_reference_id"] = conv_ref or None
+                if self._accepts_kwarg(coinbase_client.get_conversion_status, "provider_tx_id"):
+                    cb_st_kwargs["provider_tx_id"] = conv_tx or None
+                elif self._accepts_kwarg(coinbase_client.get_conversion_status, "conversion_tx_id"):
+                    cb_st_kwargs["conversion_tx_id"] = conv_tx or None
+                evidence = coinbase_client.get_conversion_status(**cb_st_kwargs)
             elif rail == RAIL_KRAKEN_ACH:
                 if kraken_client is None or not callable(getattr(kraken_client, "get_conversion_status", None)):
                     raise OfframpSecurityError(
                         "EXCHANGE_HISTORY_REQUIRED: provide kraken_client or exchange_history_checker"
                     )
-                evidence = kraken_client.get_conversion_status(
-                    client_reference_id=conv_ref or None,
-                    conversion_tx_id=conv_tx or None,
-                )
+                krk_st_kwargs: dict[str, Any] = {}
+                if self._accepts_kwarg(kraken_client.get_conversion_status, "client_reference_id"):
+                    krk_st_kwargs["client_reference_id"] = conv_ref or None
+                if self._accepts_kwarg(kraken_client.get_conversion_status, "provider_tx_id"):
+                    krk_st_kwargs["provider_tx_id"] = conv_tx or None
+                elif self._accepts_kwarg(kraken_client.get_conversion_status, "conversion_tx_id"):
+                    krk_st_kwargs["conversion_tx_id"] = conv_tx or None
+                evidence = kraken_client.get_conversion_status(**krk_st_kwargs)
             else:
                 raise OfframpSecurityError(f"Unsupported rail {rail!r} for conversion reconciliation")
         except OfframpSecurityError:
@@ -2586,25 +3036,66 @@ class ProfitSweepVault:
                 f"Conversion history lookup failed ({type(exc).__name__}); transfer remains frozen in CONVERSION_OUTCOME_UNKNOWN"
             ) from None
 
-        outcome, rec_tx_id, detail = self._parse_conversion_history_evidence(
+        outcome, rec_tx_id, realized_usd, detail = self._evaluate_conversion_history_evidence(
             rail=rail,
             evidence=evidence,
             expected_client_ref=conv_ref,
             expected_spec=conv_spec,
+            expected_conv_tx_id=conv_tx or None,
+            expected_amount_usd=expected_amt_usd,
         )
 
-        if outcome == "CONFIRMED" and rec_tx_id:
+        if outcome == "CONFIRMED" and rec_tx_id and realized_usd is not None:
+            realized_usd_str = decimal_text(realized_usd)
             next_status = "OUTCOME_UNKNOWN" if wd_status == WITHDRAWAL_STATUS_OUTCOME_UNKNOWN else "RESERVED_PENDING_DISPATCH"
             with self._lock, closing(self._connect()) as conn:
                 conn.execute("BEGIN IMMEDIATE")
+                dup_tx = conn.execute(
+                    "SELECT transfer_id FROM bank_transfers WHERE conversion_tx_id = ? AND transfer_id != ?",
+                    (rec_tx_id, tid),
+                ).fetchone()
+                if dup_tx is not None:
+                    conn.execute(
+                        "UPDATE bank_transfers "
+                        "SET status = 'OUTCOME_UNKNOWN', conversion_status = ?, "
+                        "conversion_error_detail = ?, error_detail = ? "
+                        "WHERE transfer_id = ? AND scope_id = ? AND conversion_status IN (?, ?)",
+                        (
+                            CONVERSION_STATUS_OUTCOME_UNKNOWN,
+                            "REPLAYED_CONVERSION_TX_ID",
+                            "REPLAYED_CONVERSION_TX_ID",
+                            tid,
+                            self.scope_id,
+                            CONVERSION_STATUS_OUTCOME_UNKNOWN,
+                            CONVERSION_STATUS_PENDING,
+                        ),
+                    )
+                    self._append_audit(
+                        conn,
+                        "ACH_CONVERSION_RECONCILIATION_UNRESOLVED",
+                        {
+                            "transfer_id": tid,
+                            "conversion_client_ref": conv_ref,
+                            "detail": "replayed conversion_tx_id across transfers",
+                            "owner_request_id": owner_request_id,
+                        },
+                        ts,
+                    )
+                    conn.execute("COMMIT")
+                    conn.commit()
+                    raise OfframpSecurityError(
+                        f"Replayed conversion_tx_id {rec_tx_id!r} already bound to {dup_tx['transfer_id']!r}"
+                    )
                 cur = conn.execute(
                     "UPDATE bank_transfers "
-                    "SET conversion_status = ?, conversion_tx_id = ?, conversion_error_detail = NULL, "
+                    "SET conversion_status = ?, conversion_tx_id = ?, conversion_realized_usd_text = ?, "
+                    "conversion_error_detail = NULL, "
                     "status = ?, error_detail = CASE WHEN withdrawal_status = ? THEN error_detail ELSE NULL END "
                     "WHERE transfer_id = ? AND scope_id = ? AND conversion_status IN (?, ?)",
                     (
                         CONVERSION_STATUS_CONFIRMED,
                         rec_tx_id,
+                        realized_usd_str,
                         next_status,
                         WITHDRAWAL_STATUS_OUTCOME_UNKNOWN,
                         tid,
@@ -2623,6 +3114,7 @@ class ProfitSweepVault:
                         "transfer_id": tid,
                         "conversion_client_ref": conv_ref,
                         "conversion_tx_id": rec_tx_id,
+                        "realized_usd_proceeds": realized_usd_str,
                         "detail": detail,
                         "owner_request_id": owner_request_id,
                     },
@@ -2636,6 +3128,7 @@ class ProfitSweepVault:
                 "conversion_status": CONVERSION_STATUS_CONFIRMED,
                 "conversion_client_ref": conv_ref or None,
                 "conversion_tx_id": rec_tx_id,
+                "realized_usd_proceeds": realized_usd_str,
                 "status": next_status,
                 "vault": self.snapshot(),
             }
@@ -2988,6 +3481,9 @@ class ProfitSweepVault:
         intent_id: str | None = None,
         intent_sha256: str | None = None,
         epoch_guard: Callable[[], None] | None = None,
+        conversion_poll_attempts: int | None = None,
+        conversion_poll_interval_seconds: float | None = None,
+        conversion_poll_sleep: Callable[[float], None] | None = None,
     ) -> dict[str, Any]:
         """Atomically verify prepared intent, reserve funds, and run separately journaled conversion + ACH withdrawal phases (Findings [4], [9], [12], [13])."""
         amt_q = decimal_value(amount_usd, "amount_usd", positive=True).quantize(
@@ -3036,7 +3532,7 @@ class ProfitSweepVault:
 
         def _reserve_ach(
             *, consume_same_db: bool, consume_fallback: bool
-        ) -> tuple[str, str, str, str | None, str | None, bool, str]:
+        ) -> tuple[str, str, str, str | None, str | None, bool, str, Decimal | None]:
             with closing(self._connect()) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
@@ -3084,6 +3580,14 @@ class ProfitSweepVault:
                         )
                         existing_wd_status = str(
                             existing["withdrawal_status"] or WITHDRAWAL_STATUS_NOT_STARTED
+                        )
+                        existing_conv_realized: Decimal | None = (
+                            self._parse_optional_decimal(existing["conversion_realized_usd_text"])
+                            if (
+                                "conversion_realized_usd_text" in existing.keys()
+                                and existing["conversion_realized_usd_text"] not in (None, "")
+                            )
+                            else None
                         )
                         if existing_conv_status in (
                             CONVERSION_STATUS_OUTCOME_UNKNOWN,
@@ -3177,6 +3681,7 @@ class ProfitSweepVault:
                         res_conv_tx = existing_conv_tx
                         res_conv_req = conv_required_flag
                         res_prev_wd = existing_wd_status
+                        res_conv_realized = existing_conv_realized
                     else:
                         pending = self._pending_disbursement_unlocked(conn)
                         if amt_q > pending:
@@ -3274,6 +3779,7 @@ class ProfitSweepVault:
                         res_conv_tx = None
                         res_conv_req = conv_enabled
                         res_prev_wd = WITHDRAWAL_STATUS_NOT_STARTED
+                        res_conv_realized = None
                     cur_i = conn.execute(
                         "UPDATE treasury_intents SET status = 'CONSUMED', consumed_at = ? WHERE intent_id = ? AND status = 'PREPARED'",
                         (ts_reserve, stored_iid),
@@ -3300,6 +3806,7 @@ class ProfitSweepVault:
                         res_conv_tx,
                         res_conv_req,
                         res_prev_wd,
+                        res_conv_realized,
                     )
                 except Exception:
                     if conn.in_transaction:
@@ -3316,6 +3823,7 @@ class ProfitSweepVault:
                     conv_tx_id,
                     conv_required,
                     prev_wd_status,
+                    conv_realized_usd,
                 ) = _reserve_ach(consume_same_db=True, consume_fallback=False)
             elif callable(getattr(verifier, "atomic_consume", None)):
                 with closing(self._connect_ro()) as ro_conn:
@@ -3350,6 +3858,7 @@ class ProfitSweepVault:
                         conv_tx_id,
                         conv_required,
                         prev_wd_status,
+                        conv_realized_usd,
                     ) = _reserve_ach(consume_same_db=False, consume_fallback=False)
             else:
                 (
@@ -3360,6 +3869,7 @@ class ProfitSweepVault:
                     conv_tx_id,
                     conv_required,
                     prev_wd_status,
+                    conv_realized_usd,
                 ) = _reserve_ach(consume_same_db=False, consume_fallback=True)
 
         try:
@@ -3471,11 +3981,24 @@ class ProfitSweepVault:
                             krk_conv_kwargs["client_reference_id"] = conv_client_ref
                         conv_resp = kraken_client.convert_to_usd(**krk_conv_kwargs)
 
-                    conv_tx_id = self._extract_conversion_tx_id(rail=rail, response=conv_resp)
+                    conv_tx_id = self._extract_conversion_tx_id(
+                        rail=rail,
+                        response=conv_resp,
+                        expected_client_ref=conv_client_ref,
+                    )
                     if not conv_tx_id:
                         raise OfframpSecurityError(
-                            f"Provider {rail} conversion response omitted a trustworthy transaction ID; "
+                            f"Provider {rail} conversion submission response omitted a trustworthy submission ID; "
                             f"freezing as CONVERSION_OUTCOME_UNKNOWN"
+                        )
+                    with self._lock, closing(self._connect_ro()) as ro_conn:
+                        dup_tx_row = ro_conn.execute(
+                            "SELECT transfer_id FROM bank_transfers WHERE conversion_tx_id = ? AND transfer_id != ?",
+                            (conv_tx_id, transfer_id),
+                        ).fetchone()
+                    if dup_tx_row is not None:
+                        raise OfframpSecurityError(
+                            f"Replayed conversion_tx_id {conv_tx_id!r} already bound to {dup_tx_row['transfer_id']!r}"
                         )
                 except Exception as exc:
                     ts_conv_err = _iso(self._clock())
@@ -3511,14 +4034,194 @@ class ProfitSweepVault:
                         conn.commit()
                     raise
 
-                ts_conv_ok = _iso(self._clock())
+                # Submission ack ONLY yields CONVERSION_PENDING + conversion_tx_id; commit BEFORE get_conversion_status()!
+                ts_conv_ack = _iso(self._clock())
                 with self._lock, closing(self._connect()) as conn:
                     conn.execute("BEGIN IMMEDIATE")
+                    dup_tx_write = conn.execute(
+                        "SELECT transfer_id FROM bank_transfers WHERE conversion_tx_id = ? AND transfer_id != ?",
+                        (conv_tx_id, transfer_id),
+                    ).fetchone()
+                    if dup_tx_write is not None:
+                        conn.execute(
+                            "UPDATE bank_transfers "
+                            "SET status = 'OUTCOME_UNKNOWN', conversion_status = ?, "
+                            "conversion_error_detail = ?, error_detail = ? "
+                            "WHERE transfer_id = ? AND scope_id = ?",
+                            (
+                                CONVERSION_STATUS_OUTCOME_UNKNOWN,
+                                "REPLAYED_CONVERSION_TX_ID",
+                                "REPLAYED_CONVERSION_TX_ID",
+                                transfer_id,
+                                self.scope_id,
+                            ),
+                        )
+                        self._append_audit(
+                            conn,
+                            "ACH_CONVERSION_OUTCOME_UNKNOWN",
+                            {
+                                "transfer_id": transfer_id,
+                                "idempotency_key": eff_idem,
+                                "conversion_client_ref": conv_client_ref,
+                                "rail": rail,
+                                "error": "OfframpSecurityError",
+                            },
+                            ts_conv_ack,
+                        )
+                        conn.execute("COMMIT")
+                        conn.commit()
+                        raise OfframpSecurityError(
+                            f"Replayed conversion_tx_id {conv_tx_id!r} already bound to {dup_tx_write['transfer_id']!r}"
+                        )
                     conn.execute(
                         "UPDATE bank_transfers "
                         "SET conversion_status = ?, conversion_tx_id = ?, conversion_error_detail = NULL "
                         "WHERE transfer_id = ? AND scope_id = ?",
-                        (CONVERSION_STATUS_CONFIRMED, conv_tx_id, transfer_id, self.scope_id),
+                        (CONVERSION_STATUS_PENDING, conv_tx_id, transfer_id, self.scope_id),
+                    )
+                    self._append_audit(
+                        conn,
+                        "ACH_CONVERSION_SUBMITTED_PENDING",
+                        {
+                            "transfer_id": transfer_id,
+                            "idempotency_key": eff_idem,
+                            "conversion_client_ref": conv_client_ref,
+                            "conversion_tx_id": conv_tx_id,
+                            "rail": rail,
+                        },
+                        ts_conv_ack,
+                    )
+                    conn.execute("COMMIT")
+                    conn.commit()
+                conv_status = CONVERSION_STATUS_PENDING
+
+                # Bounded polling of authoritative get_conversion_status() until terminal full-fill settlement
+                poll_attempts = (
+                    conversion_poll_attempts
+                    if conversion_poll_attempts is not None
+                    else self._conversion_poll_attempts
+                )
+                if type(poll_attempts) is not int or poll_attempts < 1 or poll_attempts > 30:
+                    raise ContractError("conversion_poll_attempts must be an integer in [1, 30]")
+                if conversion_poll_interval_seconds is not None:
+                    if (
+                        isinstance(conversion_poll_interval_seconds, bool)
+                        or not isinstance(conversion_poll_interval_seconds, (int, float))
+                    ):
+                        raise ContractError("conversion_poll_interval_seconds must be in [0.0, 10.0]")
+                    poll_interval = float(conversion_poll_interval_seconds)
+                else:
+                    poll_interval = self._conversion_poll_interval_seconds
+                if not (0.0 <= poll_interval <= 10.0):
+                    raise ContractError("conversion_poll_interval_seconds must be in [0.0, 10.0]")
+                if conversion_poll_sleep is not None and not callable(conversion_poll_sleep):
+                    raise ContractError("conversion_poll_sleep must be callable")
+                poll_sleep_fn = conversion_poll_sleep or self._conversion_poll_sleep
+
+                settled_realized_usd: Decimal | None = None
+                last_poll_detail = "conversion status polling exhausted without terminal full-fill proof"
+                try:
+                    status_client = coinbase_client if rail == RAIL_COINBASE_ACH else kraken_client
+                    status_fn = getattr(status_client, "get_conversion_status", None)
+                    if status_client is None or not callable(status_fn):
+                        raise OfframpSecurityError(
+                            f"EXCHANGE_CONVERSION_STATUS_REQUIRED: {rail} client must implement get_conversion_status()"
+                        )
+                    status_kwargs: dict[str, Any] = {}
+                    if self._accepts_kwarg(status_fn, "client_reference_id"):
+                        status_kwargs["client_reference_id"] = conv_client_ref or None
+                    if self._accepts_kwarg(status_fn, "provider_tx_id"):
+                        status_kwargs["provider_tx_id"] = conv_tx_id or None
+                    elif self._accepts_kwarg(status_fn, "conversion_tx_id"):
+                        status_kwargs["conversion_tx_id"] = conv_tx_id or None
+
+                    for poll_idx in range(poll_attempts):
+                        if rail == RAIL_COINBASE_ACH:
+                            poll_evidence = coinbase_client.get_conversion_status(**status_kwargs)
+                        else:
+                            poll_evidence = kraken_client.get_conversion_status(**status_kwargs)
+                        outcome, settled_tx_id, realized_usd, detail = self._evaluate_conversion_history_evidence(
+                            rail=rail,
+                            evidence=poll_evidence,
+                            expected_client_ref=conv_client_ref,
+                            expected_spec=conv_spec,
+                            expected_conv_tx_id=conv_tx_id,
+                            expected_amount_usd=amt_q,
+                        )
+                        last_poll_detail = detail
+                        if (
+                            outcome == "CONFIRMED"
+                            and settled_tx_id
+                            and realized_usd is not None
+                            and realized_usd > Decimal("0")
+                            and realized_usd >= amt_q
+                        ):
+                            conv_tx_id = settled_tx_id
+                            settled_realized_usd = realized_usd
+                            break
+                        if outcome == "NOT_EXECUTED":
+                            raise OfframpSecurityError(
+                                f"Provider {rail} conversion {transfer_id!r} was not executed ({detail}); "
+                                f"freezing as CONVERSION_OUTCOME_UNKNOWN"
+                            )
+                        if not self._is_in_progress_conversion_detail(detail):
+                            raise OfframpSecurityError(
+                                f"Provider {rail} conversion {transfer_id!r} failed terminal full-fill proof "
+                                f"({detail}); freezing as CONVERSION_OUTCOME_UNKNOWN"
+                            )
+                        if poll_idx + 1 < poll_attempts and poll_interval > 0.0:
+                            poll_sleep_fn(poll_interval)
+
+                    if settled_realized_usd is None:
+                        raise OfframpSecurityError(
+                            f"Provider {rail} conversion {transfer_id!r} did not reach terminal full fill within "
+                            f"{poll_attempts} polls ({last_poll_detail}); freezing as CONVERSION_OUTCOME_UNKNOWN"
+                        )
+                except Exception as exc:
+                    ts_poll_err = _iso(self._clock())
+                    poll_err_txt = f"{type(exc).__name__}:{str(exc)[:180]}"
+                    with self._lock, closing(self._connect()) as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        conn.execute(
+                            "UPDATE bank_transfers "
+                            "SET status = 'OUTCOME_UNKNOWN', conversion_status = ?, "
+                            "conversion_error_detail = ?, error_detail = ? "
+                            "WHERE transfer_id = ? AND scope_id = ?",
+                            (
+                                CONVERSION_STATUS_OUTCOME_UNKNOWN,
+                                poll_err_txt,
+                                poll_err_txt,
+                                transfer_id,
+                                self.scope_id,
+                            ),
+                        )
+                        self._append_audit(
+                            conn,
+                            "ACH_CONVERSION_OUTCOME_UNKNOWN",
+                            {
+                                "transfer_id": transfer_id,
+                                "idempotency_key": eff_idem,
+                                "conversion_client_ref": conv_client_ref,
+                                "conversion_tx_id": conv_tx_id,
+                                "rail": rail,
+                                "error": type(exc).__name__,
+                            },
+                            ts_poll_err,
+                        )
+                        conn.execute("COMMIT")
+                        conn.commit()
+                    raise
+
+                ts_conv_ok = _iso(self._clock())
+                realized_usd_str = decimal_text(settled_realized_usd)
+                with self._lock, closing(self._connect()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        "UPDATE bank_transfers "
+                        "SET conversion_status = ?, conversion_tx_id = ?, conversion_realized_usd_text = ?, "
+                        "conversion_error_detail = NULL "
+                        "WHERE transfer_id = ? AND scope_id = ?",
+                        (CONVERSION_STATUS_CONFIRMED, conv_tx_id, realized_usd_str, transfer_id, self.scope_id),
                     )
                     self._append_audit(
                         conn,
@@ -3528,6 +4231,7 @@ class ProfitSweepVault:
                             "idempotency_key": eff_idem,
                             "conversion_client_ref": conv_client_ref,
                             "conversion_tx_id": conv_tx_id,
+                            "realized_usd_proceeds": realized_usd_str,
                             "rail": rail,
                         },
                         ts_conv_ok,
@@ -3535,6 +4239,19 @@ class ProfitSweepVault:
                     conn.execute("COMMIT")
                     conn.commit()
                 conv_status = CONVERSION_STATUS_CONFIRMED
+                conv_realized_usd = settled_realized_usd
+
+            if conv_required and (
+                conv_status != CONVERSION_STATUS_CONFIRMED
+                or not conv_tx_id
+                or conv_realized_usd is None
+                or conv_realized_usd <= Decimal("0")
+                or amt_q > conv_realized_usd
+            ):
+                raise OfframpSecurityError(
+                    f"CONVERSION_PROOF_REQUIRED: cannot start ACH withdrawal for {transfer_id!r} "
+                    f"without terminal full-fill conversion proof covering ${decimal_text(amt_q)}"
+                )
 
             # ------------------------------------------------------------------
             # PHASE 2: Separately journaled ACH withdrawal (direct SQLite durable commit BEFORE external call!)
@@ -3548,6 +4265,10 @@ class ProfitSweepVault:
                         "SET status = 'RESERVED_PENDING_DISPATCH', withdrawal_status = ?, withdrawal_error_detail = NULL "
                         "WHERE transfer_id = ? AND scope_id = ? "
                         "AND conversion_status IN (?, ?) "
+                        "AND (conversion_required = 0 OR ("
+                        "conversion_tx_id IS NOT NULL AND conversion_tx_id != '' "
+                        "AND conversion_realized_usd_text IS NOT NULL AND conversion_realized_usd_text != ''"
+                        ")) "
                         "AND withdrawal_status != ?",
                         (
                             WITHDRAWAL_STATUS_PENDING,
