@@ -242,7 +242,8 @@
             "DISCONNECTED",
             "FROZEN",
             "LIVE_FORBIDDEN",
-            "NOT_CONNECTED"
+            "NOT_CONNECTED",
+            "BROKER_OFFLINE"
           ]
         },
         "failure": {
@@ -392,6 +393,24 @@
         },
         "drawdown_pct": {
           "$ref": "#/$defs/decimal"
+        },
+        "offline_brokers": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "enum": [
+              "HUGOSWAY_MT5",
+              "LHFX_MT5",
+              "OANDA_PRACTICE",
+              "OANDA_LIVE"
+            ]
+          }
+        },
+        "online_equity": {
+          "$ref": "#/$defs/decimal"
+        },
+        "equity_incomplete": {
+          "type": "boolean"
         }
       }
     },

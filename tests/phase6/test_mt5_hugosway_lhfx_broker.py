@@ -1245,8 +1245,8 @@ class Mql5BridgeSourceContractTests(unittest.TestCase):
     def test_cas_forex_mt5_bridge_all_receipt_json_calls_pass_11_typed_args(self) -> None:
         mq5_path = REPO_ROOT / "mt5" / "CasForexMt5Bridge.mq5"
         src = mq5_path.read_text(encoding="utf-8")
-        _, calls = self._assert_receipt_json_contract(src, expected_min_calls=15)
-        self.assertEqual(len(calls), 15)
+        _, calls = self._assert_receipt_json_contract(src, expected_min_calls=16)
+        self.assertEqual(len(calls), 16)
 
     def test_receipt_json_contract_catches_10_arg_and_untyped_number_regressions(self) -> None:
         sig_header = (

@@ -1215,12 +1215,42 @@
           "items": {
             "$ref": "#/$defs/pnlBrokerSummary"
           }
+        },
+        "offline_brokers": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "enum": [
+              "HUGOSWAY_MT5",
+              "LHFX_MT5",
+              "OANDA_PRACTICE",
+              "OANDA_LIVE"
+            ]
+          }
+        },
+        "offline_broker_notice": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          ]
+        },
+        "online_equity_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "equity_incomplete_brokers_offline": {
+          "type": "boolean"
         }
       }
     },
     "forexSessionLabel": {
       "enum": [
-        "Asia / Tokyo\u2013Sydney",
+        "Asia / Tokyo–Sydney",
         "London",
         "New York / US"
       ]

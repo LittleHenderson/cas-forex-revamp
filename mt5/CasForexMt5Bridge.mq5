@@ -50,6 +50,11 @@ bool     g_hmac_key_loaded = false;
 uchar    g_valve_key[];
 bool     g_valve_key_loaded = false;
 string   g_global_seen_ids[];
+double   g_last_connected_balance     = 0.0;
+double   g_last_connected_equity      = 0.0;
+double   g_last_connected_margin      = 0.0;
+double   g_last_connected_margin_free = 0.0;
+bool     g_has_connected_account      = false;
 
 //+------------------------------------------------------------------+
 //| Helpers                                                          |
@@ -734,6 +739,12 @@ void ExecuteRequest(const string request_id, const string text)
    SaveReplayNonceLedger(req_nonce);
    RecordGlobalReplayId(request_id);
 
+   if(TerminalInfoInteger(TERMINAL_CONNECTED) == 0)
+     {
+      WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10031, "0", "0", "0", "0", "0", "0", "BROKER_OFFLINE"));
+      return;
+     }
+
    string action  = JsonGet(text, "action");
    string symbol  = BrokerSymbol(JsonGet(text, "symbol"));
    string side    = JsonGet(text, "side");
@@ -929,44 +940,71 @@ void PublishCandles()
 
 void PublishMarket()
   {
+   bool   connected        = (TerminalInfoInteger(TERMINAL_CONNECTED) != 0);
+   double live_balance     = AccountInfoDouble(ACCOUNT_BALANCE);
+   double live_equity      = AccountInfoDouble(ACCOUNT_EQUITY);
+   double live_margin      = AccountInfoDouble(ACCOUNT_MARGIN);
+   double live_margin_free = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   if(connected)
+     {
+      if(live_balance > 0.0 || live_equity > 0.0 || g_has_connected_account)
+        {
+         g_last_connected_balance     = live_balance;
+         g_last_connected_equity      = live_equity;
+         g_last_connected_margin      = live_margin;
+         g_last_connected_margin_free = live_margin_free;
+         if(live_balance > 0.0 || live_equity > 0.0)
+            g_has_connected_account = true;
+        }
+     }
+   double out_balance     = connected ? live_balance     : (g_has_connected_account ? g_last_connected_balance     : 0.0);
+   double out_equity      = connected ? live_equity      : (g_has_connected_account ? g_last_connected_equity      : 0.0);
+   double out_margin      = connected ? live_margin      : (g_has_connected_account ? g_last_connected_margin      : 0.0);
+   double out_margin_free = connected ? live_margin_free : (g_has_connected_account ? g_last_connected_margin_free : 0.0);
    string json = StringFormat(
-      "{\"protocol\":\"%s\",\"server\":\"%s\",\"account_trade_mode\":\"%s\",\"observed_at\":\"%s\",\"account\":{"
+      "{\"protocol\":\"%s\",\"connected\":%s,\"server\":\"%s\",\"account_trade_mode\":\"%s\",\"observed_at\":\"%s\",\"account\":{"
       "\"login\":\"%s\",\"currency\":\"%s\",\"balance\":\"%s\",\"equity\":\"%s\",\"margin\":\"%s\",\"margin_free\":\"%s\",\"leverage\":\"%s\"},\"ticks\":[",
-      SPOOL_PROTOCOL, SafeText(AccountInfoString(ACCOUNT_SERVER)), AccountTradeModeLabel(), IsoNowUtc(),
+      SPOOL_PROTOCOL, connected ? "true" : "false", SafeText(AccountInfoString(ACCOUNT_SERVER)), AccountTradeModeLabel(), IsoNowUtc(),
       IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)), AccountInfoString(ACCOUNT_CURRENCY),
-      DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2), DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2),
-      DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2), DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2),
+      DoubleToString(out_balance, 2), DoubleToString(out_equity, 2),
+      DoubleToString(out_margin, 2), DoubleToString(out_margin_free, 2),
       IntegerToString(AccountInfoInteger(ACCOUNT_LEVERAGE)));
 
    bool first = true;
-   for(int i = 0; i < ArraySize(g_symbols); i++)
+   if(connected)
      {
-      string bsym = BrokerSymbol(g_symbols[i]);
-      MqlTick tick;
-      if(!SymbolInfoTick(bsym, tick) || tick.bid <= 0.0 || tick.ask < tick.bid)
-         continue;
-      json += StringFormat("%s{\"symbol\":\"%s\",\"bid\":\"%s\",\"ask\":\"%s\",\"time_msc\":\"%s\"}",
-                           first ? "" : ",", g_symbols[i], Price(bsym, tick.bid), Price(bsym, tick.ask),
-                           IntegerToString((long)tick.time_msc));
-      first = false;
+      for(int i = 0; i < ArraySize(g_symbols); i++)
+        {
+         string bsym = BrokerSymbol(g_symbols[i]);
+         MqlTick tick;
+         if(!SymbolInfoTick(bsym, tick) || tick.bid <= 0.0 || tick.ask < tick.bid)
+            continue;
+         json += StringFormat("%s{\"symbol\":\"%s\",\"bid\":\"%s\",\"ask\":\"%s\",\"time_msc\":\"%s\"}",
+                              first ? "" : ",", g_symbols[i], Price(bsym, tick.bid), Price(bsym, tick.ask),
+                              IntegerToString((long)tick.time_msc));
+         first = false;
+        }
      }
    json += "],\"positions\":[";
 
    first = true;
-   for(int p = 0; p < PositionsTotal(); p++)
+   if(connected)
      {
-      ulong ticket = PositionGetTicket(p);
-      if(ticket == 0 || !PositionSelectByTicket(ticket))
-         continue;
-      string bsym = PositionGetString(POSITION_SYMBOL);
-      string side = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
-      double psl = PositionGetDouble(POSITION_SL);
-      double ptp = PositionGetDouble(POSITION_TP);
-      json += StringFormat("%s{\"ticket\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":\"%s\",\"price_open\":\"%s\",\"sl\":\"%s\",\"tp\":\"%s\",\"profit\":\"%s\"}",
-                           first ? "" : ",", IntegerToString((long)ticket), CasSymbol(bsym), side,
-                           DoubleToString(PositionGetDouble(POSITION_VOLUME), 2), Price(bsym, PositionGetDouble(POSITION_PRICE_OPEN)),
-                           (psl > 0.0) ? Price(bsym, psl) : "0", (ptp > 0.0) ? Price(bsym, ptp) : "0", DoubleToString(PositionGetDouble(POSITION_PROFIT), 2));
-      first = false;
+      for(int p = 0; p < PositionsTotal(); p++)
+        {
+         ulong ticket = PositionGetTicket(p);
+         if(ticket == 0 || !PositionSelectByTicket(ticket))
+            continue;
+         string bsym = PositionGetString(POSITION_SYMBOL);
+         string side = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+         double psl = PositionGetDouble(POSITION_SL);
+         double ptp = PositionGetDouble(POSITION_TP);
+         json += StringFormat("%s{\"ticket\":\"%s\",\"symbol\":\"%s\",\"side\":\"%s\",\"volume\":\"%s\",\"price_open\":\"%s\",\"sl\":\"%s\",\"tp\":\"%s\",\"profit\":\"%s\"}",
+                              first ? "" : ",", IntegerToString((long)ticket), CasSymbol(bsym), side,
+                              DoubleToString(PositionGetDouble(POSITION_VOLUME), 2), Price(bsym, PositionGetDouble(POSITION_PRICE_OPEN)),
+                              (psl > 0.0) ? Price(bsym, psl) : "0", (ptp > 0.0) ? Price(bsym, ptp) : "0", DoubleToString(PositionGetDouble(POSITION_PROFIT), 2));
+         first = false;
+        }
      }
    json += "]}";
    WriteAtomic("market_ticks.json", json);

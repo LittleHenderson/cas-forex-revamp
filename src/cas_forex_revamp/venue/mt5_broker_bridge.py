@@ -135,6 +135,8 @@ __all__ = [
     "Mt5Position",
     "Mt5SpoolBridgeTransport",
     "Mt5SpoolPaperTerminalEmulator",
+    "STATUS_BROKER_OFFLINE",
+    "SimMt5SpoolEa",
     "Mt5Tick",
     "Mt5Transport",
     "DEFAULT_OANDA_SUMMARY_MAX_AGE_SECONDS",
@@ -179,6 +181,7 @@ logger = logging.getLogger(__name__)
 MT5_PLATFORM_CODE = "MT5"
 MT5_PLATFORM_NAME = "MetaTrader 5"
 MT5_SPOOL_PROTOCOL = "cas-forex-mt5-spool/2"
+STATUS_BROKER_OFFLINE = "BROKER_OFFLINE"
 MT5_CONTRACT_SIZE = Decimal("100000")
 MT5_INDEX_CONTRACT_SIZE = Decimal("1")
 MT5_GOLD_CONTRACT_SIZE = Decimal("100")
@@ -1991,6 +1994,7 @@ class Mt5AccountSnapshot:
     margin_free: Decimal
     leverage: int
     trade_mode: str
+    connected: bool = True
 
     def to_wire_dict(self) -> dict[str, Any]:
         return {
@@ -2002,6 +2006,7 @@ class Mt5AccountSnapshot:
             "margin_free": decimal_text(self.margin_free),
             "leverage": f"1:{self.leverage}",
             "trade_mode": self.trade_mode,
+            "connected": bool(self.connected),
         }
 
 
@@ -2346,6 +2351,12 @@ class Mt5NativePythonTransport:
         leverage = int(_sdk_field(info, "leverage"))
         if leverage <= 0 or leverage > self._max_leverage:
             raise Mt5MarginRefusalError(f"MT5 account leverage 1:{leverage} exceeds the 1:{self._max_leverage} cap")
+        term_fn = getattr(sdk, "terminal_info", None)
+        term_connected = True
+        if callable(term_fn):
+            tinfo = term_fn()
+            if tinfo is not None:
+                term_connected = bool(getattr(tinfo, "connected", True))
         return Mt5AccountSnapshot(
             server=server,
             login=int(_sdk_field(info, "login")),
@@ -2356,6 +2367,7 @@ class Mt5NativePythonTransport:
             margin_free=_sdk_decimal(_sdk_field(info, "margin_free"), "margin_free"),
             leverage=leverage,
             trade_mode=trade_mode_label,
+            connected=term_connected,
         )
 
     def symbol_tick(self, symbol: str) -> Mt5Tick:
@@ -2643,6 +2655,8 @@ class Mt5SpoolBridgeTransport:
             raise Mt5TransportError("market_ticks.json not published yet; is CasForexMt5Bridge EA running?") from None
         if type(doc) is not dict or doc.get("protocol") != MT5_SPOOL_PROTOCOL:
             raise Mt5TransportError("market_ticks.json protocol mismatch")
+        if "connected" in doc and type(doc["connected"]) is not bool:
+            raise Mt5TransportError("market_ticks.json connected field must be a boolean")
         creds = self._credentials
         expected_mode = creds.execution_mode if creds else EXECUTION_MODE_DEMO
         broker_id = creds.broker_id if creds else "MT5"
@@ -2676,6 +2690,7 @@ class Mt5SpoolBridgeTransport:
         currency = acct.get("currency")
         if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
             raise Mt5TransportError("account.currency must be an ISO-4217 code")
+        connected = doc.get("connected", True)
         return Mt5AccountSnapshot(
             server=str(doc["server"]),
             login=int(login_raw),
@@ -2686,11 +2701,16 @@ class Mt5SpoolBridgeTransport:
             margin_free=_wire_decimal(acct.get("margin_free"), "margin_free"),  # type: ignore[arg-type]
             leverage=leverage,
             trade_mode=str(doc.get("account_trade_mode", "DEMO")),
+            connected=connected,
         )
 
     def symbol_tick(self, symbol: str) -> Mt5Tick:
         Mt5MarginCalculator.split_symbol(symbol)
         doc = self._market_doc()
+        if doc.get("connected", True) is False:
+            raise Mt5PreDispatchTransportError(
+                f"MT5 terminal is disconnected for {symbol}: {STATUS_BROKER_OFFLINE}"
+            )
         ticks = doc.get("ticks")
         if type(ticks) is not list:
             raise Mt5TransportError("market_ticks.json missing ticks list")
@@ -2930,7 +2950,10 @@ class Mt5SpoolPaperTerminalEmulator:
         key_dir: str | Path | None = None,
         valve_admission_key_file: str | Path | None = None,
         custody_inspector: SpoolCustodyInspector | None = None,
+        connected: bool = True,
     ) -> None:
+        if type(connected) is not bool:
+            raise ContractError("connected must be a boolean")
         self.spool_dir = Path(spool_dir)
         self.server = server
         self.login = login
@@ -2972,6 +2995,19 @@ class Mt5SpoolPaperTerminalEmulator:
             _spool_meta_root(self.spool_dir) / ".global_emu_replay.json",
             custody_inspector=custody_inspector,
         )
+        self.connected: bool = connected
+        self._simulate_raw_zero_when_offline: bool = False
+        self._has_connected_account: bool = bool(connected and balance > Decimal("0"))
+        self._last_connected_balance: Decimal = balance if self._has_connected_account else Decimal("0.00")
+        self._last_connected_equity: Decimal = balance if self._has_connected_account else Decimal("0.00")
+        self._last_connected_margin: Decimal = Decimal("0.00")
+        self._last_connected_margin_free: Decimal = balance if self._has_connected_account else Decimal("0.00")
+
+    def set_connected(self, connected: bool, *, raw_zero_account: bool = False) -> None:
+        if type(connected) is not bool:
+            raise ContractError("connected must be a boolean")
+        self.connected = connected
+        self._simulate_raw_zero_when_offline = bool(raw_zero_account) if not connected else False
 
     def set_quote(self, symbol: str, bid: Decimal, ask: Decimal) -> None:
         self.quotes[symbol] = (bid, ask)
@@ -3032,39 +3068,71 @@ class Mt5SpoolPaperTerminalEmulator:
         floating = self._floating()
         used = self._used_margin()
         equity = self.balance + floating
+        free = equity - used
+        if self.connected:
+            if self.balance > Decimal("0") or equity > Decimal("0") or self._has_connected_account:
+                self._last_connected_balance = self.balance
+                self._last_connected_equity = equity
+                self._last_connected_margin = used
+                self._last_connected_margin_free = free
+                if self.balance > Decimal("0") or equity > Decimal("0"):
+                    self._has_connected_account = True
+            out_balance = self.balance
+            out_equity = equity
+            out_margin = used
+            out_free = free
+        elif self._simulate_raw_zero_when_offline or not self._has_connected_account:
+            out_balance = Decimal("0.00")
+            out_equity = Decimal("0.00")
+            out_margin = Decimal("0.00")
+            out_free = Decimal("0.00")
+        else:
+            out_balance = self._last_connected_balance
+            out_equity = self._last_connected_equity
+            out_margin = self._last_connected_margin
+            out_free = self._last_connected_margin_free
         now = self._clock()
         time_msc = str(int(now.timestamp() * 1000))
         doc = {
             "protocol": MT5_SPOOL_PROTOCOL,
+            "connected": bool(self.connected),
             "server": self.server,
             "account_trade_mode": self.trade_mode,
             "observed_at": _iso(now),
             "account": {
                 "login": str(self.login),
                 "currency": self.currency,
-                "balance": decimal_text(self.balance),
-                "equity": decimal_text(equity),
-                "margin": decimal_text(used),
-                "margin_free": decimal_text(equity - used),
+                "balance": decimal_text(out_balance),
+                "equity": decimal_text(out_equity),
+                "margin": decimal_text(out_margin),
+                "margin_free": decimal_text(out_free),
                 "leverage": str(self.leverage),
             },
-            "ticks": [
-                {"symbol": sym, "bid": decimal_text(bid), "ask": decimal_text(ask), "time_msc": time_msc}
-                for sym, (bid, ask) in sorted(self.quotes.items())
-            ],
-            "positions": [
-                {
-                    "ticket": ticket,
-                    "symbol": pos["symbol"],
-                    "side": pos["side"].value,
-                    "volume": decimal_text(pos["volume"]),
-                    "price_open": decimal_text(pos["price_open"]),
-                    "sl": "0" if pos["sl"] is None else decimal_text(pos["sl"]),
-                    "tp": "0" if pos.get("tp") is None else decimal_text(pos["tp"]),
-                    "profit": decimal_text(self._pnl(pos, self._close_price(pos), pos["volume"])),
-                }
-                for ticket, pos in sorted(self._positions.items())
-            ],
+            "ticks": (
+                [
+                    {"symbol": sym, "bid": decimal_text(bid), "ask": decimal_text(ask), "time_msc": time_msc}
+                    for sym, (bid, ask) in sorted(self.quotes.items())
+                ]
+                if self.connected
+                else []
+            ),
+            "positions": (
+                [
+                    {
+                        "ticket": ticket,
+                        "symbol": pos["symbol"],
+                        "side": pos["side"].value,
+                        "volume": decimal_text(pos["volume"]),
+                        "price_open": decimal_text(pos["price_open"]),
+                        "sl": "0" if pos["sl"] is None else decimal_text(pos["sl"]),
+                        "tp": "0" if pos.get("tp") is None else decimal_text(pos["tp"]),
+                        "profit": decimal_text(self._pnl(pos, self._close_price(pos), pos["volume"])),
+                    }
+                    for ticket, pos in sorted(self._positions.items())
+                ]
+                if self.connected
+                else []
+            ),
         }
         _atomic_write_json(self.spool_dir / "market_ticks.json", doc, custody_inspector=self._custody_inspector)
 
@@ -3162,6 +3230,8 @@ class Mt5SpoolPaperTerminalEmulator:
             self._replay_ledger.verify_and_record(request_id=req_id, nonce=int(nonce_raw))
         except Mt5TransportError:
             return self._receipt(req, "REJECTED", 10013, message="replayed nonce or request_id")
+        if not self.connected:
+            return self._receipt(req, "REJECTED", 10031, message=STATUS_BROKER_OFFLINE)
         action = req["action"]
         symbol = req["symbol"]
         if symbol not in self.quotes:
@@ -3251,6 +3321,9 @@ class Mt5SpoolPaperTerminalEmulator:
         """Drop-in replacement for ``time.sleep`` inside :class:`Mt5SpoolBridgeTransport` tests."""
         self.process_pending()
         self.publish_market()
+
+
+SimMt5SpoolEa = Mt5SpoolPaperTerminalEmulator
 
 
 # ---------------------------------------------------------------------------
@@ -3736,6 +3809,7 @@ class Mt5PaperBrokerVenue:
         self._clock = clock or _utc_now
         self._audit = _AuditChain()
         self._account: Mt5AccountSnapshot | None = None
+        self._last_connected_account: Mt5AccountSnapshot | None = None
         self._positions: tuple[Mt5Position, ...] = ()
         self._request_counter = 0
         self._mutation_journal = mutation_journal if mutation_journal is not None else Mt5MutationJournal()
@@ -3760,6 +3834,50 @@ class Mt5PaperBrokerVenue:
 
     @property
     def account(self) -> Mt5AccountSnapshot | None:
+        return self._account
+
+    @property
+    def is_offline(self) -> bool:
+        return self._account is not None and not self._account.connected
+
+    @property
+    def last_connected_account(self) -> Mt5AccountSnapshot | None:
+        return self._last_connected_account
+
+    def _apply_account_snapshot(
+        self,
+        snap: Mt5AccountSnapshot,
+        positions: tuple[Mt5Position, ...] | None = None,
+    ) -> Mt5AccountSnapshot:
+        if snap.connected:
+            if snap.balance > Decimal("0") or snap.equity > Decimal("0") or self._last_connected_account is not None:
+                self._last_connected_account = snap
+            self._account = snap
+            if positions is not None:
+                self._positions = positions
+            return snap
+        if (
+            self._last_connected_account is not None
+            and snap.balance == Decimal("0")
+            and snap.equity == Decimal("0")
+            and (self._last_connected_account.balance > Decimal("0") or self._last_connected_account.equity > Decimal("0"))
+        ):
+            self._account = Mt5AccountSnapshot(
+                server=snap.server,
+                login=snap.login,
+                currency=snap.currency,
+                balance=self._last_connected_account.balance,
+                equity=self._last_connected_account.equity,
+                margin=self._last_connected_account.margin,
+                margin_free=self._last_connected_account.margin_free,
+                leverage=snap.leverage,
+                trade_mode=snap.trade_mode,
+                connected=False,
+            )
+        else:
+            self._account = snap
+        if positions:
+            self._positions = positions
         return self._account
 
     @property
@@ -3799,15 +3917,14 @@ class Mt5PaperBrokerVenue:
                 index_contract_size=self._calc.index_contract_size,
                 gold_contract_size=self._calc.gold_contract_size,
             )
-        self._account = snap
-        self._positions = self._transport.positions()
+        applied = self._apply_account_snapshot(snap, self._transport.positions())
         self._audit.append("MT5_CONNECTED", self._clock(), {
             "broker_id": self.broker_id,
             "transport": self.transport_name,
-            "account": snap.to_wire_dict(),
+            "account": applied.to_wire_dict(),
             "valve_weights_sha256": self._valve_sha,
         })
-        return snap
+        return applied
 
     def _next_request_id(self, order: OrderIntent) -> str:
         self._request_counter += 1
@@ -3833,9 +3950,7 @@ class Mt5PaperBrokerVenue:
             raise Mt5TransportError(f"{self.broker_id} venue is not connected")
         account = self._transport.account_info()
         positions = self._transport.positions()
-        self._account = account
-        self._positions = positions
-        return account
+        return self._apply_account_snapshot(account, positions)
 
     def execute(
         self,
@@ -3854,6 +3969,18 @@ class Mt5PaperBrokerVenue:
             raise ContractError("execute requires an OrderIntent")
         if self._account is None:
             raise Mt5PreDispatchTransportError(f"{self.broker_id} venue is not connected")
+        if self.is_offline:
+            try:
+                refreshed = self._transport.account_info()
+                self._apply_account_snapshot(refreshed)
+            except (Mt5TransportError, OSError) as exc:
+                raise Mt5PreDispatchTransportError(
+                    f"{self.broker_id} terminal is offline ({STATUS_BROKER_OFFLINE}): {type(exc).__name__}"
+                ) from None
+            if self.is_offline:
+                raise Mt5PreDispatchTransportError(
+                    f"{self.broker_id} terminal is offline and disconnected: {STATUS_BROKER_OFFLINE}"
+                )
         decision = require_valve_clearance(order, valve_decision, expected_weights_sha256=self._valve_sha)
         now = self._clock()
         if self._credentials.execution_mode == EXECUTION_MODE_LIVE:
@@ -3910,13 +4037,17 @@ class Mt5PaperBrokerVenue:
                 if side is Side.SELL and price < order.limit_price:
                     raise Mt5MarginRefusalError("current bid is below the SELL limit price; not sent")
             try:
-                account = self._transport.account_info()
+                account = self._apply_account_snapshot(self._transport.account_info())
             except Mt5PreDispatchTransportError:
                 raise
             except (Mt5TransportError, OSError) as exc:
                 raise Mt5PreDispatchTransportError(
                     f"{self.broker_id} pre-dispatch account_info read failed: {type(exc).__name__}"
                 ) from None
+            if not account.connected:
+                raise Mt5PreDispatchTransportError(
+                    f"{self.broker_id} terminal is offline and disconnected: {STATUS_BROKER_OFFLINE}"
+                )
             margin_check = self._calc.check_new_position(
                 symbol=order.symbol,
                 side=side,
@@ -4840,6 +4971,11 @@ class BrokerHierarchyRouter:
                 self._status[broker_id] = "FAILED"
                 self._failures[broker_id] = type(exc).__name__
                 logger.warning("broker %s activation failed (%s); failing over", broker_id, type(exc).__name__)
+                continue
+            if isinstance(venue, Mt5PaperBrokerVenue) and venue.is_offline:
+                self._status[broker_id] = STATUS_BROKER_OFFLINE
+                self._failures[broker_id] = STATUS_BROKER_OFFLINE
+                logger.warning("broker %s terminal disconnected (%s); failing over", broker_id, STATUS_BROKER_OFFLINE)
                 continue
             self._status[broker_id] = "ACTIVE"
             self._active = venue
