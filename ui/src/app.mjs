@@ -71,6 +71,11 @@ import {
   normalizeDecimalString,
   patchCompoundingPanelInPlace,
 } from './compounding-panel.mjs';
+import {
+  attachScrollActivityListeners,
+  captureScrollSnapshot,
+  createScrollActivityGuard,
+} from './scroll-guard.mjs';
 
 // Fixed same-origin assets. Only explicit trusted bootstrap may inject a scoped bridge.
 const schemaURL = new URL('../docs/contracts/cockpit.schema.json', document.baseURI);
@@ -99,6 +104,16 @@ let explainer = null;
 let activePointerPress = false;
 let streamRenderTimer = null;
 let deferredRenderPending = false;
+let scrollListeners = null;
+const scrollGuard = createScrollActivityGuard({
+  onQuiet: () => { flushDeferredRender(); },
+});
+
+function restoreScrollPosition(scrollSnap) {
+  scrollListeners?.syncWorkspace?.();
+  scrollGuard.restoreSnapshot(scrollSnap, document, window, { skipWindow: true });
+  if (typeof window.scrollTo === 'function') window.scrollTo(scrollSnap.windowX, scrollSnap.windowY);
+}
 let loopbackAuthToken = null;
 let pendingBootPairCode = null;
 let bootSecurityIssue = null;
@@ -212,7 +227,7 @@ function routeFromHash() {
 }
 
 function isInteractiveFormActive() {
-  if (activePointerPress) return true;
+  if (activePointerPress || scrollGuard.isScrolling()) return true;
   const active = document.activeElement;
   return Boolean(root.contains(active) && ['SELECT', 'INPUT', 'TEXTAREA'].includes(active?.tagName));
 }
@@ -248,8 +263,7 @@ function scheduleStreamRender() {
 }
 
 function rerenderMoneyFlowInPlace(focusSelector = null) {
-  const sx = window.scrollX || 0;
-  const sy = window.scrollY || 0;
+  const scrollSnap = captureScrollSnapshot(document, window);
   const currentSec = root.querySelector('#money-flow-section');
   if (!currentSec) {
     render();
@@ -263,12 +277,11 @@ function rerenderMoneyFlowInPlace(focusSelector = null) {
       nextSec.querySelector(focusSelector)?.focus({ preventScroll: true });
     }
   }
-  if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
+  restoreScrollPosition(scrollSnap);
 }
 
 function rerenderLiveFundingInPlace(focusSelector = null) {
-  const sx = window.scrollX || 0;
-  const sy = window.scrollY || 0;
+  const scrollSnap = captureScrollSnapshot(document, window);
   const currentSec = root.querySelector('#live-funding-section');
   if (!currentSec) {
     render();
@@ -281,12 +294,11 @@ function rerenderLiveFundingInPlace(focusSelector = null) {
       nextSec.querySelector(focusSelector)?.focus({ preventScroll: true });
     }
   }
-  if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
+  restoreScrollPosition(scrollSnap);
 }
 
 function rerenderAiSectionsInPlace(focusSelector = null) {
-  const sx = window.scrollX || 0;
-  const sy = window.scrollY || 0;
+  const scrollSnap = captureScrollSnapshot(document, window);
   const currentHero = root.querySelector('[data-banked-profits-hero="true"]');
   const currentOverseer = root.querySelector('.ai-overseer-panel');
   const currentAnalytics = root.querySelector('.analytics-vault-panel');
@@ -312,12 +324,11 @@ function rerenderAiSectionsInPlace(focusSelector = null) {
   if (focusSelector) {
     root.querySelector(focusSelector)?.focus({ preventScroll: true });
   }
-  if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
+  restoreScrollPosition(scrollSnap);
 }
 
 function rerenderAnalyticsInPlace(focusSelector = null) {
-  const sx = window.scrollX || 0;
-  const sy = window.scrollY || 0;
+  const scrollSnap = captureScrollSnapshot(document, window);
   const currentAnalytics = root.querySelector('.analytics-vault-panel');
   if (!currentAnalytics) {
     render();
@@ -331,12 +342,11 @@ function rerenderAnalyticsInPlace(focusSelector = null) {
       nextAnalytics.querySelector(focusSelector)?.focus({ preventScroll: true });
     }
   }
-  if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
+  restoreScrollPosition(scrollSnap);
 }
 
 function render(focusMain = false) {
-  const prevScrollX = window.scrollX || 0;
-  const prevScrollY = window.scrollY || 0;
+  const scrollSnap = captureScrollSnapshot(document, window);
   const active = document.activeElement;
   const activeUnlock = root.contains(active) && active?.tagName === 'INPUT' && active?.name === 'cockpit_access_key'
     ? {
@@ -359,7 +369,7 @@ function render(focusMain = false) {
     }
   }
   try { mountMarketCharts(root, state); mountAnalyticsCanvases(root, state); mountMoneyFlowWidget(root, state); } catch { /* Chart/SVG optional in headless environments. */ }
-  if (!focusMain && typeof window.scrollTo === 'function') window.scrollTo(prevScrollX, prevScrollY);
+  if (!focusMain) restoreScrollPosition(scrollSnap);
   try { explainer?.sync(); } catch { disableExplainer(); }
   document.title = `${state.route[0].toUpperCase() + state.route.slice(1)} / CAS Forex`;
   if (focusMain) document.querySelector('#main')?.focus({ preventScroll: true });
@@ -380,7 +390,7 @@ function render(focusMain = false) {
     const replacement = [...root.querySelectorAll('button')].find((item) => !item.disabled && JSON.stringify(item.dataset) === identity);
     (replacement ?? document.querySelector('#main'))?.focus({ preventScroll: true });
   }
-  if (!focusMain && typeof window.scrollTo === 'function') window.scrollTo(prevScrollX, prevScrollY);
+  if (!focusMain) restoreScrollPosition(scrollSnap);
 }
 
 function announce(message) { announcer.textContent = message; }
@@ -395,6 +405,7 @@ function disableExplainer() {
   document.body.classList.remove('forex-explainer-ready', 'forex-explainer-open');
   delete document.body.dataset.forexExplainerEdge;
   delete document.body.dataset.forexExplainerSide;
+  scrollListeners?.syncWorkspace?.();
   state.explainerIssue = 'The local guide is unavailable in this browser session.';
   announce(state.explainerIssue);
 }
@@ -754,8 +765,7 @@ async function readCompounding() {
 }
 
 function syncCompoundingDom(focusSelector = null) {
-  const sx = window.scrollX || 0;
-  const sy = window.scrollY || 0;
+  const scrollSnap = captureScrollSnapshot(document, window);
   const resolved = resolveCockpitCompounding(state);
   const panelEl = root.querySelector('[data-compounding-panel="true"]');
   if (panelEl) {
@@ -764,7 +774,7 @@ function syncCompoundingDom(focusSelector = null) {
       panelEl.querySelector(focusSelector)?.focus({ preventScroll: true });
     }
   }
-  if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
+  restoreScrollPosition(scrollSnap);
 }
 
 function refreshCompoundingFromTick() {
@@ -866,8 +876,7 @@ async function readAggressionDial() {
 }
 
 function syncAggressionDialDom(focusSelector = null, forceSectionReplace = false) {
-  const sx = window.scrollX || 0;
-  const sy = window.scrollY || 0;
+  const scrollSnap = captureScrollSnapshot(document, window);
   const resolved = resolveCockpitAggressionDial(state);
   const hasConfirmDom = Boolean(root.querySelector('[data-dial-confirm-banner="true"]'));
   const needsConfirmDom = Boolean(
@@ -901,7 +910,7 @@ function syncAggressionDialDom(focusSelector = null, forceSectionReplace = false
   if (focusSelector) {
     root.querySelector(focusSelector)?.focus({ preventScroll: true });
   }
-  if (typeof window.scrollTo === 'function') window.scrollTo(sx, sy);
+  restoreScrollPosition(scrollSnap);
 }
 
 function submitAggressionDialMutation(payload, { debounceMs = 0, onHighRiskConflict = null } = {}) {
@@ -1933,7 +1942,9 @@ root.addEventListener('pointerdown', () => { activePointerPress = true; });
 const releasePointer = () => { if (activePointerPress) { activePointerPress = false; flushDeferredRender(); } };
 window.addEventListener('pointerup', releasePointer);
 window.addEventListener('pointercancel', releasePointer);
+window.addEventListener('blur', releasePointer);
 root.addEventListener('focusout', () => { window.setTimeout(flushDeferredRender, 0); });
+scrollListeners = attachScrollActivityListeners({ doc: document, win: window, guard: scrollGuard });
 
 const MAX_EXPLAINER_TTS_BYTES = 4 * 1024 * 1024;
 
@@ -1994,6 +2005,7 @@ try {
       return doc;
     },
   });
+  scrollListeners?.syncWorkspace?.();
 } catch { disableExplainer(); }
 
 // This entry point runs only when the UI document is explicitly opened.
@@ -2032,5 +2044,5 @@ function updateObservationAge() {
 }
 let ageTimer = window.setInterval(updateObservationAge, 1000);
 document.addEventListener('visibilitychange', () => { if (document.hidden) controller?.invalidateReadAge(); updateObservationAge(); });
-window.addEventListener('pagehide', () => { controller?.invalidateReadAge(); stopLiveCockpitPollLoop(); window.clearInterval(ageTimer); ageTimer = null; });
+window.addEventListener('pagehide', () => { controller?.invalidateReadAge(); stopLiveCockpitPollLoop(); scrollGuard.reset(); window.clearInterval(ageTimer); ageTimer = null; });
 window.addEventListener('pageshow', () => { updateObservationAge(); if (ageTimer === null) ageTimer = window.setInterval(updateObservationAge, 1000); if (state.liveStreamConnected) startLiveCockpitPollLoop(); });

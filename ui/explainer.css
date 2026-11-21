@@ -83,7 +83,7 @@
    No transform/contain is used: fixed marks and the desktop sheet retain the
    viewport as their containing block and sit outside this scrolling content. */
 body.forex-explainer-ready { overflow: hidden; }
-.forex-explainer-workspace { position: fixed; inset: 0; overflow: auto; overscroll-behavior: contain; }
+.forex-explainer-workspace { position: fixed; inset: 0; overflow: auto; overscroll-behavior: contain; overflow-anchor: none; }
 .forex-explainer-workspace:focus-visible { outline: 2px solid var(--focus, #9c4300); outline-offset: -2px; }
 body.forex-explainer-ready[data-forex-explainer-edge="left"] .forex-explainer-workspace { left: 48px; }
 body.forex-explainer-ready[data-forex-explainer-edge="right"] .forex-explainer-workspace { right: 48px; }
