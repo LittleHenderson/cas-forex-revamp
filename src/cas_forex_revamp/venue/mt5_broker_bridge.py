@@ -50,7 +50,7 @@ Safety invariants:
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation, localcontext
@@ -523,35 +523,111 @@ class SpoolPathCustodyObservation:
 
 SpoolCustodyInspector = Callable[[Path], SpoolPathCustodyObservation]
 _CACHED_WIN_USER_SID: str | None = None
+_WIN32_API_LOCK = threading.Lock()
+_WIN32_CUSTODY_API: dict[str, Any] | None = None
+
+
+def _get_win32_custody_api() -> dict[str, Any]:
+    """Lazily initialize and cache Win32 ctypes DLL handles, signatures, and structs once per process."""
+    global _WIN32_CUSTODY_API
+    cached = _WIN32_CUSTODY_API
+    if cached is not None:
+        return cached
+    with _WIN32_API_LOCK:
+        cached = _WIN32_CUSTODY_API
+        if cached is not None:
+            return cached
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _SID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+        class _TOKEN_USER(ctypes.Structure):
+            _fields_ = [("User", _SID_AND_ATTRIBUTES)]
+
+        class _ACL_SIZE_INFO(ctypes.Structure):
+            _fields_ = [
+                ("AceCount", wintypes.DWORD),
+                ("AclBytesInUse", wintypes.DWORD),
+                ("AclBytesFree", wintypes.DWORD),
+            ]
+
+        class _ACE_HEADER(ctypes.Structure):
+            _fields_ = [("AceType", ctypes.c_ubyte), ("AceFlags", ctypes.c_ubyte), ("AceSize", wintypes.WORD)]
+
+        class _ACCESS_ALLOWED_ACE(ctypes.Structure):
+            _fields_ = [("Header", _ACE_HEADER), ("Mask", wintypes.DWORD), ("SidStart", wintypes.DWORD)]
+
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetFileAttributesW.restype = wintypes.DWORD
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+        advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+        ]
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+        advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+        advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.ULONG)
+        ]
+        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+        advapi32.GetSecurityDescriptorDacl.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)
+        ]
+        advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+        advapi32.SetNamedSecurityInfoW.argtypes = [
+            wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+        advapi32.GetNamedSecurityInfoW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+        advapi32.GetSecurityDescriptorControl.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD)
+        ]
+        advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
+        advapi32.GetAclInformation.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD]
+        advapi32.GetAclInformation.restype = wintypes.BOOL
+        advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+        advapi32.GetAce.restype = wintypes.BOOL
+
+        cached = {
+            "ctypes": ctypes,
+            "wintypes": wintypes,
+            "advapi32": advapi32,
+            "kernel32": kernel32,
+            "_TOKEN_USER": _TOKEN_USER,
+            "_ACL_SIZE_INFO": _ACL_SIZE_INFO,
+            "_ACCESS_ALLOWED_ACE": _ACCESS_ALLOWED_ACE,
+        }
+        _WIN32_CUSTODY_API = cached
+        return cached
 
 
 def _win32_current_user_sid() -> str:
     global _CACHED_WIN_USER_SID
     if _CACHED_WIN_USER_SID is not None:
         return _CACHED_WIN_USER_SID
-    import ctypes
-    from ctypes import wintypes
-
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    class _SID_AND_ATTRIBUTES(ctypes.Structure):
-        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
-
-    class _TOKEN_USER(ctypes.Structure):
-        _fields_ = [("User", _SID_AND_ATTRIBUTES)]
-
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.GetTokenInformation.argtypes = [
-        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
-    ]
-    advapi32.GetTokenInformation.restype = wintypes.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    api = _get_win32_custody_api()
+    ctypes = api["ctypes"]
+    wintypes = api["wintypes"]
+    advapi32 = api["advapi32"]
+    kernel32 = api["kernel32"]
+    _TOKEN_USER = api["_TOKEN_USER"]
 
     tok = wintypes.HANDLE()
     if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(tok)):
@@ -582,26 +658,12 @@ def _win32_current_user_sid() -> str:
 
 def _win32_apply_owner_only_dacl(path: Path) -> None:
     """Apply a protected explicit owner-only DACL (Owner + SYSTEM + Administrators, zero broad/inherited ACEs)."""
-    import ctypes
-    from ctypes import wintypes
-
     owner_sid = _win32_current_user_sid()
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.ULONG)
-    ]
-    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
-    advapi32.GetSecurityDescriptorDacl.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)
-    ]
-    advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
-    advapi32.SetNamedSecurityInfoW.argtypes = [
-        wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-    ]
-    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    api = _get_win32_custody_api()
+    ctypes = api["ctypes"]
+    wintypes = api["wintypes"]
+    advapi32 = api["advapi32"]
+    kernel32 = api["kernel32"]
 
     is_dir = path.is_dir()
     flags = "OICI" if is_dir else ""
@@ -641,45 +703,13 @@ def inspect_spool_path_custody(path: Path) -> SpoolPathCustodyObservation:
     st = os.lstat(target)
     reparse_or_link = _is_reparse_or_symlink(target, st)
     if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-
-        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-        class _ACL_SIZE_INFO(ctypes.Structure):
-            _fields_ = [
-                ("AceCount", wintypes.DWORD),
-                ("AclBytesInUse", wintypes.DWORD),
-                ("AclBytesFree", wintypes.DWORD),
-            ]
-
-        class _ACE_HEADER(ctypes.Structure):
-            _fields_ = [("AceType", ctypes.c_ubyte), ("AceFlags", ctypes.c_ubyte), ("AceSize", wintypes.WORD)]
-
-        class _ACCESS_ALLOWED_ACE(ctypes.Structure):
-            _fields_ = [("Header", _ACE_HEADER), ("Mask", wintypes.DWORD), ("SidStart", wintypes.DWORD)]
-
-        kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
-        kernel32.GetFileAttributesW.restype = wintypes.DWORD
-        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-        advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-        advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-        advapi32.GetNamedSecurityInfoW.argtypes = [
-            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(ctypes.c_void_p),
-        ]
-        advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
-        advapi32.GetSecurityDescriptorControl.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD)
-        ]
-        advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
-        advapi32.GetAclInformation.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD]
-        advapi32.GetAclInformation.restype = wintypes.BOOL
-        advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
-        advapi32.GetAce.restype = wintypes.BOOL
+        api = _get_win32_custody_api()
+        ctypes = api["ctypes"]
+        wintypes = api["wintypes"]
+        advapi32 = api["advapi32"]
+        kernel32 = api["kernel32"]
+        _ACL_SIZE_INFO = api["_ACL_SIZE_INFO"]
+        _ACCESS_ALLOWED_ACE = api["_ACCESS_ALLOWED_ACE"]
 
         attrs = kernel32.GetFileAttributesW(str(target))
         if attrs != 0xFFFFFFFF and (attrs & _WIN_FILE_ATTRIBUTE_REPARSE_POINT):
@@ -1437,7 +1467,17 @@ def _atomic_write_bytes(
             os.chmod(tmp, 0o600)  # nosec B103: owner-only 0o600 spool artifact
         elif os.name == "nt" and custody_inspector is None:
             _win32_apply_owner_only_dacl(tmp)
-        os.replace(tmp, path)
+        if os.name == "nt":
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.01)
+        else:
+            os.replace(tmp, path)
         if os.name == "posix":
             dir_fd = os.open(path.parent, os.O_RDONLY)
             try:
@@ -2970,6 +3010,11 @@ class Mt5SpoolBridgeTransport:
         self._snapshot_seq_path = (
             _spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.snapshot_seq.json"
         )
+        self._last_verified_seq: int | None = None
+        self._last_verified_mac: str | None = None
+        self._last_seq_file_sig: tuple[int, int, int, int, int] | None = None
+        self._last_seq_custody_mono: float = 0.0
+        self._seq_custody_recheck_seconds: float = 5.0
         self._prepared_nonces: dict[str, int] = {}
 
     def __repr__(self) -> str:
@@ -3070,21 +3115,36 @@ class Mt5SpoolBridgeTransport:
             reverify_ticket=True,
         )
 
+    @staticmethod
+    def _lstat_sig(st: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (int(st.st_ino), int(st.st_size), int(st.st_mtime_ns), int(st.st_ctime_ns), int(st.st_mode))
+
     def _verify_and_record_snapshot_seq(self, seq_val: int, mac_hex: str) -> None:
         with self._snapshot_seq_lock:
-            if os.path.lexists(self._snapshot_seq_path):
-                state = _read_spool_json(
-                    self._snapshot_seq_path,
-                    max_bytes=65536,
-                    custody_inspector=self._custody_inspector,
-                )
-                if type(state) is not dict:
-                    raise Mt5SnapshotIntegrityError("corrupted MT5 consumer snapshot_seq ledger")
-                last_seq_raw = state.get("last_snapshot_seq")
-                last_mac = str(state.get("last_snapshot_hmac", "")).lower()
-                if type(last_seq_raw) is not str or not last_seq_raw.isdigit() or not _HEX64_RE.fullmatch(last_mac):
-                    raise Mt5SnapshotIntegrityError("corrupted MT5 consumer snapshot_seq ledger fields")
-                last_seq = int(last_seq_raw)
+            now_mono = self._monotonic()
+            fast_verified = False
+            if (
+                self._custody_inspector is None
+                and self._last_verified_seq is not None
+                and self._last_verified_mac is not None
+                and self._last_seq_file_sig is not None
+                and (now_mono - self._last_seq_custody_mono) < self._seq_custody_recheck_seconds
+            ):
+                try:
+                    st_seq = os.lstat(self._snapshot_seq_path)
+                except OSError:
+                    st_seq = None
+                if (
+                    st_seq is not None
+                    and not _is_reparse_or_symlink(self._snapshot_seq_path, st_seq)
+                    and stat.S_ISREG(st_seq.st_mode)
+                    and self._lstat_sig(st_seq) == self._last_seq_file_sig
+                ):
+                    fast_verified = True
+
+            if fast_verified:
+                last_seq = int(self._last_verified_seq)  # type: ignore[arg-type]
+                last_mac = str(self._last_verified_mac)
                 if seq_val < last_seq:
                     raise Mt5SnapshotIntegrityError(
                         f"MT5 market snapshot_seq rollback rejected ({seq_val} < {last_seq})"
@@ -3095,22 +3155,65 @@ class Mt5SpoolBridgeTransport:
                     raise Mt5SnapshotIntegrityError(
                         f"MT5 market snapshot_seq={seq_val} equivocation rejected"
                     )
-            _atomic_write_json(
-                self._snapshot_seq_path,
-                {"last_snapshot_seq": str(seq_val), "last_snapshot_hmac": mac_hex},
-                custody_inspector=self._custody_inspector,
-            )
-            reread = _read_spool_json(
-                self._snapshot_seq_path,
-                max_bytes=65536,
-                custody_inspector=self._custody_inspector,
-            )
-            if (
-                type(reread) is not dict
-                or reread.get("last_snapshot_seq") != str(seq_val)
-                or not hmac.compare_digest(str(reread.get("last_snapshot_hmac", "")).lower(), mac_hex)
-            ):
-                raise Mt5SnapshotIntegrityError("MT5 consumer snapshot_seq persistence verification failed")
+            else:
+                if os.path.lexists(self._snapshot_seq_path):
+                    state = _read_spool_json(
+                        self._snapshot_seq_path,
+                        max_bytes=65536,
+                        custody_inspector=self._custody_inspector,
+                    )
+                    if type(state) is not dict:
+                        raise Mt5SnapshotIntegrityError("corrupted MT5 consumer snapshot_seq ledger")
+                    last_seq_raw = state.get("last_snapshot_seq")
+                    last_mac = str(state.get("last_snapshot_hmac", "")).lower()
+                    if type(last_seq_raw) is not str or not last_seq_raw.isdigit() or not _HEX64_RE.fullmatch(last_mac):
+                        raise Mt5SnapshotIntegrityError("corrupted MT5 consumer snapshot_seq ledger fields")
+                    last_seq = int(last_seq_raw)
+                    if seq_val < last_seq:
+                        raise Mt5SnapshotIntegrityError(
+                            f"MT5 market snapshot_seq rollback rejected ({seq_val} < {last_seq})"
+                        )
+                    if seq_val == last_seq:
+                        if hmac.compare_digest(mac_hex, last_mac):
+                            if self._custody_inspector is None:
+                                st_seq_disk = os.lstat(self._snapshot_seq_path)
+                                self._last_verified_seq = last_seq
+                                self._last_verified_mac = last_mac
+                                self._last_seq_file_sig = self._lstat_sig(st_seq_disk)
+                                self._last_seq_custody_mono = now_mono
+                            return
+                        raise Mt5SnapshotIntegrityError(
+                            f"MT5 market snapshot_seq={seq_val} equivocation rejected"
+                        )
+
+            try:
+                _atomic_write_json(
+                    self._snapshot_seq_path,
+                    {"last_snapshot_seq": str(seq_val), "last_snapshot_hmac": mac_hex},
+                    custody_inspector=self._custody_inspector,
+                )
+                reread = _read_spool_json(
+                    self._snapshot_seq_path,
+                    max_bytes=65536,
+                    custody_inspector=self._custody_inspector,
+                )
+                if (
+                    type(reread) is not dict
+                    or reread.get("last_snapshot_seq") != str(seq_val)
+                    or not hmac.compare_digest(str(reread.get("last_snapshot_hmac", "")).lower(), mac_hex)
+                ):
+                    raise Mt5SnapshotIntegrityError("MT5 consumer snapshot_seq persistence verification failed")
+            except Exception:
+                self._last_verified_seq = None
+                self._last_verified_mac = None
+                self._last_seq_file_sig = None
+                raise
+            if self._custody_inspector is None:
+                st_new = os.lstat(self._snapshot_seq_path)
+                self._last_verified_seq = seq_val
+                self._last_verified_mac = mac_hex
+                self._last_seq_file_sig = self._lstat_sig(st_new)
+                self._last_seq_custody_mono = self._monotonic()
 
     def _market_doc(self) -> dict[str, Any]:
         path = self.spool_dir / "market_ticks.json"
@@ -3217,12 +3320,46 @@ class Mt5SpoolBridgeTransport:
             connected=connected,
         )
 
-    def symbol_tick(self, symbol: str, *, require_fresh_tick: bool = True) -> Mt5Tick:
-        Mt5MarginCalculator.split_symbol(symbol)
+    @staticmethod
+    def _extract_verified_tick(
+        doc: Mapping[str, Any],
+        symbol: str,
+        *,
+        require_fresh_tick: bool,
+        now_ms: int,
+        max_tick_age_ms: int,
+        future_ms: int,
+        ticks_by_norm: Mapping[str, Mapping[str, Any]],
+    ) -> Mt5Tick:
+        item = ticks_by_norm.get(symbol)
+        if item is None:
+            raise Mt5TransportError(f"no published MT5 tick for {symbol}")
+        msc_raw = item.get("time_msc")
+        if type(msc_raw) is not str or not msc_raw.isdigit() or int(msc_raw) <= 0:
+            raise Mt5SnapshotIntegrityError(f"MT5 tick for {symbol} has invalid time_msc")
+        tick_ms = int(msc_raw)
+        if tick_ms > now_ms + future_ms:
+            raise Mt5SnapshotIntegrityError(f"MT5 tick time_msc for {symbol} exceeds future skew")
+        if require_fresh_tick and (now_ms - tick_ms) > max_tick_age_ms:
+            raise Mt5SnapshotIntegrityError(
+                f"MT5 tick for {symbol} is stale (age_ms={now_ms - tick_ms} > {max_tick_age_ms})"
+            )
+        return Mt5Tick(
+            symbol=symbol,
+            bid=_wire_decimal(item.get("bid"), "bid", positive=True),  # type: ignore[arg-type]
+            ask=_wire_decimal(item.get("ask"), "ask", positive=True),  # type: ignore[arg-type]
+            time_msc=msc_raw,
+        )
+
+    def _prepare_tick_snapshot(
+        self,
+        *,
+        disconnect_label: str,
+    ) -> tuple[dict[str, Any], dict[str, Mapping[str, Any]], int, int, int]:
         doc = self._market_doc()
         if doc.get("connected", True) is False:
             raise Mt5PreDispatchTransportError(
-                f"MT5 terminal is disconnected for {symbol}: {STATUS_BROKER_OFFLINE}"
+                f"MT5 terminal is disconnected for {disconnect_label}: {STATUS_BROKER_OFFLINE}"
             )
         ticks = doc.get("ticks")
         if type(ticks) is not list:
@@ -3232,25 +3369,58 @@ class Mt5SpoolBridgeTransport:
         max_tick_age_ms = self._max_tick_age_ms_live if expected_mode == EXECUTION_MODE_LIVE else self._max_tick_age_ms_demo
         now_ms = int(self._clock().timestamp() * 1000)
         future_ms = int(self._max_future_skew_seconds * 1000)
+        ticks_by_norm: dict[str, Mapping[str, Any]] = {}
         for item in ticks:
-            if type(item) is dict and isinstance(item.get("symbol"), str) and normalize_market_symbol(item["symbol"]) == symbol:
-                msc_raw = item.get("time_msc")
-                if type(msc_raw) is not str or not msc_raw.isdigit() or int(msc_raw) <= 0:
-                    raise Mt5SnapshotIntegrityError(f"MT5 tick for {symbol} has invalid time_msc")
-                tick_ms = int(msc_raw)
-                if tick_ms > now_ms + future_ms:
-                    raise Mt5SnapshotIntegrityError(f"MT5 tick time_msc for {symbol} exceeds future skew")
-                if require_fresh_tick and (now_ms - tick_ms) > max_tick_age_ms:
-                    raise Mt5SnapshotIntegrityError(
-                        f"MT5 tick for {symbol} is stale (age_ms={now_ms - tick_ms} > {max_tick_age_ms})"
-                    )
-                return Mt5Tick(
-                    symbol=symbol,
-                    bid=_wire_decimal(item.get("bid"), "bid", positive=True),  # type: ignore[arg-type]
-                    ask=_wire_decimal(item.get("ask"), "ask", positive=True),  # type: ignore[arg-type]
-                    time_msc=msc_raw,
+            if type(item) is dict and isinstance(item.get("symbol"), str):
+                norm_sym = normalize_market_symbol(item["symbol"])
+                if norm_sym not in ticks_by_norm:
+                    ticks_by_norm[norm_sym] = item
+        return doc, ticks_by_norm, now_ms, max_tick_age_ms, future_ms
+
+    def symbol_tick(self, symbol: str, *, require_fresh_tick: bool = True) -> Mt5Tick:
+        Mt5MarginCalculator.split_symbol(symbol)
+        doc, ticks_by_norm, now_ms, max_tick_age_ms, future_ms = self._prepare_tick_snapshot(disconnect_label=symbol)
+        return self._extract_verified_tick(
+            doc,
+            symbol,
+            require_fresh_tick=require_fresh_tick,
+            now_ms=now_ms,
+            max_tick_age_ms=max_tick_age_ms,
+            future_ms=future_ms,
+            ticks_by_norm=ticks_by_norm,
+        )
+
+    def symbol_ticks_batch(
+        self,
+        symbols: Sequence[str],
+        *,
+        require_fresh_tick: bool = True,
+    ) -> tuple[dict[str, Mt5Tick], dict[str, str]]:
+        """Verify market_ticks.json ONCE and extract/freshness-check all requested symbols."""
+        req_syms = list(symbols)
+        for sym in req_syms:
+            Mt5MarginCalculator.split_symbol(sym)
+        if not req_syms:
+            return {}, {}
+        doc, ticks_by_norm, now_ms, max_tick_age_ms, future_ms = self._prepare_tick_snapshot(
+            disconnect_label=",".join(req_syms)
+        )
+        found: dict[str, Mt5Tick] = {}
+        errors: dict[str, str] = {}
+        for sym in req_syms:
+            try:
+                found[sym] = self._extract_verified_tick(
+                    doc,
+                    sym,
+                    require_fresh_tick=require_fresh_tick,
+                    now_ms=now_ms,
+                    max_tick_age_ms=max_tick_age_ms,
+                    future_ms=future_ms,
+                    ticks_by_norm=ticks_by_norm,
                 )
-        raise Mt5TransportError(f"no published MT5 tick for {symbol}")
+            except (ContractError, OSError) as exc_sym:
+                errors[sym] = type(exc_sym).__name__
+        return found, errors
 
     def read_index_candles(self, symbol: str) -> dict[str, list[dict[str, Any]]] | None:
         """Read optional broker-native M1/M5/H1 candle bars from market_candles.json if present."""

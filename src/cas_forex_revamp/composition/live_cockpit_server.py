@@ -324,15 +324,13 @@ class _DeadlineRFile:
             max_more = budget + 1 if limit < 0 else min(limit - len(chunks), budget + 1)
             if max_more <= 0:
                 break
-            self._sock.settimeout(min(rem, 0.10))
+            self._sock.settimeout(max(0.001, rem))
             if has_peek:
                 try:
                     peeked = self._raw.peek(1)
                 except (TimeoutError, socket.timeout):
-                    if self._mono() >= self._deadline:
-                        self.header_deadline_exceeded = True
-                        raise TimeoutError("absolute pre-auth HTTP deadline exceeded") from None
-                    continue
+                    self.header_deadline_exceeded = True
+                    raise TimeoutError("absolute pre-auth HTTP deadline exceeded") from None
                 if not peeked:
                     break
                 nl_pos = peeked.find(b"\n")
@@ -342,10 +340,8 @@ class _DeadlineRFile:
                 try:
                     part = self._raw.readline(max_more)
                 except (TimeoutError, socket.timeout):
-                    if self._mono() >= self._deadline:
-                        self.header_deadline_exceeded = True
-                        raise TimeoutError("absolute pre-auth HTTP deadline exceeded") from None
-                    continue
+                    self.header_deadline_exceeded = True
+                    raise TimeoutError("absolute pre-auth HTTP deadline exceeded") from None
             if not part:
                 break
             chunks.extend(part)
@@ -448,6 +444,7 @@ class _ExclusiveThreadingHTTPServer(HTTPServer):
     """Bounded loopback HTTP server preventing SO_REUSEADDR hijacking and pre-auth alias/map exhaustion (Findings [8], [11], [14])."""
 
     allow_reuse_address = False
+    request_queue_size = 64
 
     def __init__(
         self,
@@ -1264,25 +1261,86 @@ def _roll_mt5_index_bars(prev_bars: Any, bucket_iso: str, mid_px: Any, _dec_txt:
 def _build_mt5_index_snapshot_from_router(
     router: Any,
     prev_stream: dict[str, Any] | None = None,
+    *,
+    poll_cache: dict[str, dict[str, Any]] | None = None,
+    log_throttle: dict[tuple[str, str, str], tuple[float, int]] | None = None,
+    mono_clock: Callable[[], float] = time.monotonic,
 ) -> tuple[dict[str, Any] | None, dict[str, tuple[Any, Any]]]:
     """Read NAS100/US30 quotes from active MT5 bridge transports and format an index stream payload."""
     from datetime import datetime, timezone
     from cas_forex_revamp.contracts import decimal_text as _dec_txt
     from cas_forex_revamp.venue.live_market_stream import INDEX_INSTRUMENTS
 
+    now_mono = mono_clock()
+
+    def _emit_tick_skip(broker_key: str, sym: str, err_name: str) -> None:
+        if log_throttle is None:
+            print(f"[ai-fast] Tick skipped for {sym}: {err_name}")
+            return
+        tkey = (broker_key, sym, err_name)
+        prev_log = log_throttle.get(tkey)
+        if prev_log is None or (now_mono - prev_log[0]) >= 60.0:
+            suppressed = 0 if prev_log is None else prev_log[1]
+            suffix = f" (suppressed {suppressed} repeats)" if suppressed > 0 else ""
+            print(f"[ai-fast] Tick skipped for {sym}: {err_name}{suffix}")
+            log_throttle[tkey] = (now_mono, 0)
+        else:
+            log_throttle[tkey] = (prev_log[0], prev_log[1] + 1)
+
     mt5_q: dict[str, tuple[Any, Any]] = {}
     mt5_src_broker: dict[str, str] = {}
     for broker_id, venue in router.venues.items():
         if hasattr(venue, "_transport") and venue.account is not None:
+            tr = venue._transport
+            broker_key = str(broker_id)
+            file_sig: tuple[int, int, int] | None = None
+            if poll_cache is not None and hasattr(tr, "spool_dir"):
+                try:
+                    st_mt = os.lstat(Path(tr.spool_dir) / "market_ticks.json")
+                    file_sig = (int(st_mt.st_ino), int(st_mt.st_size), int(st_mt.st_mtime_ns))
+                except OSError:
+                    file_sig = None
+            cached = poll_cache.get(broker_key) if poll_cache is not None else None
+            if (
+                cached is not None
+                and file_sig is not None
+                and cached.get("file_sig") == file_sig
+                and (now_mono - float(cached.get("checked_mono", 0.0))) < 1.0
+            ):
+                batch_ticks = dict(cached.get("ticks") or {})
+                err_map = dict(cached.get("errors") or {})
+            else:
+                batch_ticks = {}
+                err_map: dict[str, str] = {}
+                batch_fn = getattr(tr, "symbol_ticks_batch", None)
+                if callable(batch_fn):
+                    try:
+                        batch_ticks, err_map = batch_fn(INDEX_INSTRUMENTS)
+                    except (ContractError, OSError) as exc_batch:
+                        err_name = type(exc_batch).__name__
+                        err_map = {sym: err_name for sym in INDEX_INSTRUMENTS}
+                else:
+                    for sym in INDEX_INSTRUMENTS:
+                        try:
+                            batch_ticks[sym] = tr.symbol_tick(sym)
+                        except (ContractError, OSError) as exc_sym:
+                            err_map[sym] = type(exc_sym).__name__
+                if poll_cache is not None:
+                    poll_cache[broker_key] = {
+                        "file_sig": file_sig,
+                        "checked_mono": now_mono,
+                        "ticks": dict(batch_ticks),
+                        "errors": dict(err_map),
+                    }
             got_tick = False
             for sym in INDEX_INSTRUMENTS:
-                try:
-                    tk = venue._transport.symbol_tick(sym)
+                if sym in batch_ticks:
+                    tk = batch_ticks[sym]
                     mt5_q[sym] = (tk.bid, tk.ask)
-                    mt5_src_broker[sym] = str(broker_id)
+                    mt5_src_broker[sym] = broker_key
                     got_tick = True
-                except (ContractError, OSError) as exc_sym:
-                    print(f"[ai-fast] Tick skipped for {sym}: {type(exc_sym).__name__}")
+                elif sym in err_map:
+                    _emit_tick_skip(broker_key, sym, err_map[sym])
             if got_tick and hasattr(router, "_status") and router._status.get(broker_id) == "DISCONNECTED":
                 router._status[broker_id] = "ACTIVE"
     if not mt5_q:
@@ -1299,16 +1357,30 @@ def _build_mt5_index_snapshot_from_router(
                 prev_by_pair[row["pair"]] = row
     _DISP = {"NAS100": "NAS100 / NDX", "US30": "US30 / DJIA", "SPX500": "SPX500 / S&P 500", "XAUUSD": "XAU/USD · Gold"}
     _TICK = {"NAS100": "0.25", "US30": "0.25", "SPX500": "0.01", "XAUUSD": "0.01"}
+    needed_candle_syms = [
+        sym_idx
+        for sym_idx in INDEX_INSTRUMENTS
+        if sym_idx in mt5_q
+        and not (
+            isinstance(prev_by_pair.get(sym_idx, {}).get("candles_m1"), list)
+            and len(prev_by_pair[sym_idx]["candles_m1"]) >= 2
+            and isinstance(prev_by_pair.get(sym_idx, {}).get("candles_m5"), list)
+            and len(prev_by_pair[sym_idx]["candles_m5"]) >= 2
+            and isinstance(prev_by_pair.get(sym_idx, {}).get("candles_h1"), list)
+            and len(prev_by_pair[sym_idx]["candles_h1"]) >= 2
+        )
+    ]
     native_cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
-    for venue in router.venues.values():
-        tr = getattr(venue, "_transport", None)
-        rc_fn = getattr(tr, "read_index_candles", None)
-        if callable(rc_fn):
-            for sym_idx in INDEX_INSTRUMENTS:
-                if sym_idx not in native_cache:
-                    got_c = rc_fn(sym_idx)
-                    if isinstance(got_c, dict):
-                        native_cache[sym_idx] = got_c
+    if needed_candle_syms:
+        for venue in router.venues.values():
+            tr = getattr(venue, "_transport", None)
+            rc_fn = getattr(tr, "read_index_candles", None)
+            if callable(rc_fn):
+                for sym_idx in needed_candle_syms:
+                    if sym_idx not in native_cache:
+                        got_c = rc_fn(sym_idx)
+                        if isinstance(got_c, dict):
+                            native_cache[sym_idx] = got_c
     idx_rows = []
     for sym_idx in INDEX_INSTRUMENTS:
         if sym_idx in mt5_q:
@@ -5235,13 +5307,20 @@ def run_cockpit_cli(
 
     def _fast_tick_loop() -> None:
         interval = max(0.05, float(args.fast_tick_ms) / 1000.0)
+        fast_poll_cache: dict[str, dict[str, Any]] = {}
+        fast_log_throttle: dict[tuple[str, str, str], tuple[float, int]] = {}
         while not stop_flag.wait(interval):
             if not args.autonomous_ai:
                 continue
             try:
                 with stream_lock:
                     prev_idx = latest_mt5_index_stream[0]
-                mt5_idx_snap, mt5_q = _build_mt5_index_snapshot_from_router(router, prev_stream=prev_idx)
+                mt5_idx_snap, mt5_q = _build_mt5_index_snapshot_from_router(
+                    router,
+                    prev_stream=prev_idx,
+                    poll_cache=fast_poll_cache,
+                    log_throttle=fast_log_throttle,
+                )
                 if mt5_q:
                     if mt5_idx_snap is not None:
                         with stream_lock:
