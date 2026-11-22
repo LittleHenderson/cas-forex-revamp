@@ -5271,7 +5271,10 @@ def run_cockpit_cli(
     def _poll_loop() -> None:
         poll_mt5_cache: dict[str, dict[str, Any]] = {}
         poll_log_throttle: dict[tuple[str, str, str], tuple[float, int]] = {}
-        while not stop_flag.wait(float(args.poll_seconds)):
+        base_wait = float(args.poll_seconds)
+        next_wait = base_wait
+        consecutive_feed_errors = 0
+        while not stop_flag.wait(next_wait):
             if callable(getattr(router, "try_reconnect_oanda", None)):
                 try:
                     if router.try_reconnect_oanda():
@@ -5312,7 +5315,11 @@ def run_cockpit_cli(
                         msg_ai = " ".join(str(exc_ai).split())[:140]
                         print(f"[ai] Standard cycle skipped ({type(exc_ai).__name__}: {msg_ai}).")
                 srv.notify_stream_updated()
+                consecutive_feed_errors = 0
+                next_wait = base_wait
             except Exception as exc:
+                consecutive_feed_errors += 1
+                next_wait = max(base_wait, min(60.0, base_wait * (2 ** min(consecutive_feed_errors - 1, 2))))
                 print(f"[feed] Poll skipped ({type(exc).__name__}); keeping last verified snapshot.")
 
     def _fast_tick_loop() -> None:

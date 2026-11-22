@@ -24,7 +24,7 @@ thread, or subprocess side effects). An order whose outcome is unknown is never 
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
@@ -1803,6 +1803,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         self,
         *,
         equities: Mapping[str, Decimal] | None = None,
+        offline_brokers: Sequence[str] | None = None,
         peak_equity: Decimal | None = None,
         require_fresh_oanda: bool = False,
     ) -> tuple[Decimal, Decimal | None, Decimal]:
@@ -1815,7 +1816,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 else Decimal("0")
             )
             return total_eq, peak_equity, dd_exp
-        offline_ids = self.offline_brokers()
+        offline_ids = list(offline_brokers) if offline_brokers is not None else self.offline_brokers()
         online_eq_map = {
             b: v
             for b, v in eq_map.items()
@@ -2235,7 +2236,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             return compact in _LIVE_LHFX_SERVERS
         return False
 
-    def live_funding_readiness(self) -> dict[str, Any]:
+    def live_funding_readiness(self, *, equities: Mapping[str, Decimal] | None = None) -> dict[str, Any]:
         """Return secret-free 5-gate readiness status for Real-Money LIVE funding & arming."""
         oanda_acct_ok = _has_staged_env_value(self._env, ENV_OANDA_LIVE_ACCOUNT_ID)
         oanda_tok_ok = (
@@ -2281,7 +2282,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             else f"Pending owner Ed25519 live tickets: {', '.join(missing_g2)}."
         )
 
-        eq_map = self.equities()
+        eq_map = dict(equities) if equities is not None else self.equities()
         total_eq = self.barbell.total_equity(eq_map)
         tol = self.barbell.allocation_tolerance_share
         if self.barbell.demo_virtual_sleeve:
@@ -2379,10 +2380,14 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
 
     def routing_snapshot(self) -> dict[str, Any]:
         eq_map = self.equities()
-        offline_list = self.offline_brokers()
-        online_eq_map = self.online_equities()
+        offline_list = [broker_id for broker_id in self.priority_order if self.is_broker_offline(broker_id)]
+        online_eq_map = {
+            broker_id: val
+            for broker_id, val in eq_map.items()
+            if not self.is_broker_offline(broker_id) and (broker_id in self._venues or val > Decimal("0"))
+        }
         online_total = self.barbell.total_equity(online_eq_map)
-        _, eff_pk, eff_dd = self.effective_drawdown_state(equities=eq_map)
+        _, eff_pk, eff_dd = self.effective_drawdown_state(equities=eq_map, offline_brokers=offline_list)
         snap = super().routing_snapshot()
         try:
             oracle_cfg = self.oracle().config_dict()
@@ -2414,6 +2419,6 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             },
             "offset_planner": self.offset_planner.config_dict(),
         }
-        snap["live_readiness"] = self.live_funding_readiness()
+        snap["live_readiness"] = self.live_funding_readiness(equities=eq_map)
         assert_safe_json_numbers(snap)
         return snap

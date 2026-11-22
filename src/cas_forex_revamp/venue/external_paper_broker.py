@@ -107,6 +107,7 @@ from .live_market_stream import (
     build_digest_market_stream_envelope,
     build_market_stream_envelope,
     build_pinned_public_opener,
+    get_cached_tls12_ssl_context,
     parse_ecb_g10_reference,
     validate_market_stream_for_venue,
     validate_pinned_public_feed_url as _validate_stream_public_feed_url,
@@ -2183,8 +2184,7 @@ class OandaPracticePaperClient:
             finally:
                 headers.clear()
         else:
-            ctx = ssl.create_default_context()
-            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx = get_cached_tls12_ssl_context()
             opener = urllib.request.build_opener(
                 urllib.request.HTTPSHandler(context=ctx),
                 NoRedirectHandler(error_cls=PaperBrokerTransportError),

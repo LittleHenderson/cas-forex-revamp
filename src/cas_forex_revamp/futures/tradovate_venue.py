@@ -120,7 +120,7 @@ from cas_forex_revamp.venue.live_auth_ticket import (
     verify_live_authorization_context,
     verify_live_environ_authorization_context,
 )
-from cas_forex_revamp.venue.live_market_stream import verify_public_ip_address
+from cas_forex_revamp.venue.live_market_stream import get_cached_tls12_ssl_context, verify_public_ip_address
 
 __all__ = [
     "BROKER_TRADOVATE_FUTURES",
@@ -1836,8 +1836,7 @@ class TradovateHttpsTransport:
         if body_bytes is not None:
             headers["Content-Length"] = str(len(body_bytes))
 
-        ctx = ssl.create_default_context()
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx = get_cached_tls12_ssl_context()
         conn = _PinnedPublicIPHTTPSConnection(
             host,
             port=443,

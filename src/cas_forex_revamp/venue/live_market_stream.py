@@ -29,9 +29,11 @@ from hashlib import sha256
 import http.client
 import ipaddress
 import json
+import os
 import re
 import socket
 import ssl
+import threading
 import time
 from typing import Any
 import urllib.error
@@ -468,6 +470,28 @@ class _PinnedPublicHTTPSConnection(http.client.HTTPSConnection):
             raise
 
 
+_TLS_CONTEXT_CACHE_LOCK = threading.Lock()
+_TLS_CONTEXT_CACHE: dict[tuple[str, str, str, str], ssl.SSLContext] = {}
+
+
+def get_cached_tls12_ssl_context() -> ssl.SSLContext:
+    """Return a cached TLS 1.2+ default SSLContext keyed by runtime OpenSSL CA env overrides."""
+    verify_paths = ssl.get_default_verify_paths()
+    cache_key = (
+        verify_paths.cafile or "",
+        verify_paths.capath or "",
+        os.environ.get(verify_paths.openssl_cafile_env, ""),
+        os.environ.get(verify_paths.openssl_capath_env, ""),
+    )
+    with _TLS_CONTEXT_CACHE_LOCK:
+        ctx = _TLS_CONTEXT_CACHE.get(cache_key)
+        if ctx is None:
+            ctx = ssl.create_default_context()
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            _TLS_CONTEXT_CACHE[cache_key] = ctx
+        return ctx
+
+
 class PinnedPublicHTTPSHandler(urllib.request.HTTPSHandler):
     """HTTPSHandler binding TLS 1.2+, verified global-unicast DNS resolution, and SNI."""
 
@@ -478,8 +502,7 @@ class PinnedPublicHTTPSHandler(urllib.request.HTTPSHandler):
         ip_error_cls: type[ContractError] = ContractError,
     ) -> None:
         if context is None:
-            context = ssl.create_default_context()
-            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            context = get_cached_tls12_ssl_context()
         super().__init__(context=context)
         self._pinned_context = context
         self._ip_error_cls = ip_error_cls
@@ -502,8 +525,7 @@ def build_pinned_public_opener(
     error_cls: type[ContractError] = ContractError,
 ) -> urllib.request.OpenerDirector:
     """Build a redirect-refusing, TLS 1.2+, public-IP-verified opener with no default redirect handler."""
-    ctx = ssl.create_default_context()
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx = get_cached_tls12_ssl_context()
     opener = urllib.request.OpenerDirector()
     opener.add_handler(urllib.request.UnknownHandler())
     opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
@@ -1619,6 +1641,57 @@ class ExpandedPublicLiveFxFeedClient:
                 raise ContractError(f"Kraken Ticker {dpair} quantized spread collapsed ({bid}/{ask})")
             direct_quotes[dpair] = (bid, ask)
 
+        def _validate_quote_spread_and_ecb(
+            pair_name: str,
+            q_bid: Decimal,
+            q_ask: Decimal,
+            tick_step: Decimal,
+        ) -> tuple[Decimal, Decimal]:
+            q_mid = _quantize_price((q_bid + q_ask) / Decimal("2"), tick_step)
+            q_calc_mid = (q_bid + q_ask) / Decimal("2")
+            actual_spread_bps = ((q_ask - q_bid) / q_calc_mid) * Decimal("10000")
+            if actual_spread_bps <= Decimal("0") or actual_spread_bps > spread_limits[pair_name]:
+                raise ContractError(
+                    f"{pair_name}: spread {actual_spread_bps:.4f} bps exceeds pair max_spread_bps={spread_limits[pair_name]}"
+                )
+            ref_mid = ecb_refs.get(pair_name)
+            if ref_mid is None or ref_mid <= Decimal("0"):
+                raise ContractError(f"{pair_name}: missing independent ECB reference rate; failing closed")
+            exact_dev_bps = (abs(q_mid - ref_mid) / ref_mid) * Decimal("10000")
+            calc_mid_dev_bps = (abs(q_calc_mid - ref_mid) / ref_mid) * Decimal("10000")
+            if exact_dev_bps > dev_limits[pair_name] or calc_mid_dev_bps > dev_limits[pair_name]:
+                raise ContractError(
+                    f"{pair_name}: mid {q_mid} deviates {exact_dev_bps:.4f} bps from ECB reference {ref_mid} "
+                    f"(pair max_reference_deviation_bps={dev_limits[pair_name]})"
+                )
+            return q_mid, exact_dev_bps.quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
+
+        # Fail fast on wide weekend Kraken spreads / reference deviations before issuing 36 OHLC & Yahoo GETs.
+        prevalidated_quotes: dict[str, tuple[Decimal, Decimal, Decimal, Decimal]] = {}
+        with localcontext(Context(prec=50)):
+            for pair in pairs:
+                spec = EXPANDED_PAIR_SPECS[pair]
+                tick = spec["tick"]
+                mode = spec["mode"]
+                if mode == "DIRECT_KRAKEN_ORDERBOOK":
+                    bid, ask = direct_quotes[pair]
+                elif mode == "SYNTHETIC_KRAKEN_CROSS_BOOK":
+                    op, leg_a, leg_b = spec["legs"]
+                    bid_a, ask_a = direct_quotes[leg_a]
+                    bid_b, ask_b = direct_quotes[leg_b]
+                    if op == "MUL":
+                        bid = _quantize_price(bid_a * bid_b, tick, rounding=ROUND_FLOOR)
+                        ask = _quantize_price(ask_a * ask_b, tick, rounding=ROUND_CEILING)
+                    else:
+                        bid = _quantize_price(bid_a / ask_b, tick, rounding=ROUND_FLOOR)
+                        ask = _quantize_price(ask_a / bid_b, tick, rounding=ROUND_CEILING)
+                    if ask <= bid:
+                        raise ContractError(f"{pair}: synthetic cross book spread collapsed ({bid}/{ask})")
+                else:
+                    continue
+                mid, dev_bps = _validate_quote_spread_and_ecb(pair, bid, ask, tick)
+                prevalidated_quotes[pair] = (bid, ask, mid, dev_bps)
+
         direct_candles: dict[str, dict[str, list[OhlcCandleBar]]] = {}
         for dpair in sorted(needed_direct):
             tick = EXPANDED_PAIR_SPECS[dpair]["tick"]
@@ -1641,22 +1714,13 @@ class ExpandedPublicLiveFxFeedClient:
                 mode = spec["mode"]
 
                 if mode == "DIRECT_KRAKEN_ORDERBOOK":
-                    bid, ask = direct_quotes[pair]
+                    bid, ask, mid, dev_bps = prevalidated_quotes[pair]
                     c_m1 = direct_candles[pair]["m1"]
                     c_m5 = direct_candles[pair]["m5"]
                     c_h1 = direct_candles[pair]["h1"]
                 elif mode == "SYNTHETIC_KRAKEN_CROSS_BOOK":
                     op, leg_a, leg_b = spec["legs"]
-                    bid_a, ask_a = direct_quotes[leg_a]
-                    bid_b, ask_b = direct_quotes[leg_b]
-                    if op == "MUL":
-                        bid = _quantize_price(bid_a * bid_b, tick, rounding=ROUND_FLOOR)
-                        ask = _quantize_price(ask_a * ask_b, tick, rounding=ROUND_CEILING)
-                    else:
-                        bid = _quantize_price(bid_a / ask_b, tick, rounding=ROUND_FLOOR)
-                        ask = _quantize_price(ask_a / bid_b, tick, rounding=ROUND_CEILING)
-                    if ask <= bid:
-                        raise ContractError(f"{pair}: synthetic cross book spread collapsed ({bid}/{ask})")
+                    bid, ask, mid, dev_bps = prevalidated_quotes[pair]
                     c_m1 = _synthesize_cross_candles(direct_candles[leg_a]["m1"], direct_candles[leg_b]["m1"], op=op, tick=tick, max_bars=m1_bars)
                     c_m5 = _synthesize_cross_candles(direct_candles[leg_a]["m5"], direct_candles[leg_b]["m5"], op=op, tick=tick, max_bars=m5_bars)
                     c_h1 = _synthesize_cross_candles(direct_candles[leg_a]["h1"], direct_candles[leg_b]["h1"], op=op, tick=tick, max_bars=h1_bars)
@@ -1675,26 +1739,9 @@ class ExpandedPublicLiveFxFeedClient:
                     ask = _quantize_price(spot + half_spread, tick, rounding=ROUND_CEILING)
                     if ask <= bid:
                         raise ContractError(f"{pair}: interbank spread collapsed ({bid}/{ask})")
+                    mid, dev_bps = _validate_quote_spread_and_ecb(pair, bid, ask, tick)
 
-                mid = _quantize_price((bid + ask) / Decimal("2"), tick)
-                calc_mid = (bid + ask) / Decimal("2")
-                actual_spread_bps = ((ask - bid) / calc_mid) * Decimal("10000")
-                if actual_spread_bps <= Decimal("0") or actual_spread_bps > spread_limits[pair]:
-                    raise ContractError(
-                        f"{pair}: spread {actual_spread_bps:.4f} bps exceeds pair max_spread_bps={spread_limits[pair]}"
-                    )
-
-                ref_mid = ecb_refs.get(pair)
-                if ref_mid is None or ref_mid <= Decimal("0"):
-                    raise ContractError(f"{pair}: missing independent ECB reference rate; failing closed")
-                exact_dev_bps = (abs(mid - ref_mid) / ref_mid) * Decimal("10000")
-                calc_mid_dev_bps = (abs(calc_mid - ref_mid) / ref_mid) * Decimal("10000")
-                if exact_dev_bps > dev_limits[pair] or calc_mid_dev_bps > dev_limits[pair]:
-                    raise ContractError(
-                        f"{pair}: mid {mid} deviates {exact_dev_bps:.4f} bps from ECB reference {ref_mid} "
-                        f"(pair max_reference_deviation_bps={dev_limits[pair]})"
-                    )
-                dev_bps = exact_dev_bps.quantize(Decimal("0.1"), rounding=ROUND_FLOOR)
+                ref_mid = ecb_refs[pair]
 
                 c_m1 = _anchor_last_bar_to_mid(c_m1, mid, tick)
                 c_m5 = _anchor_last_bar_to_mid(c_m5, mid, tick)
@@ -1832,7 +1879,7 @@ class PublicUsIndexFeedClient:
             if not isinstance(raw, bytes) or len(raw) == 0 or len(raw) > self._max_wire_bytes:
                 raise ContractError("index transport returned invalid payload size")
             return raw
-        return _open_pinned_public_url(safe_url, timeout_seconds=self._timeout, max_wire_bytes=self._max_wire_bytes)
+        return _https_get_pinned_host(safe_url, timeout_seconds=self._timeout, max_bytes=self._max_wire_bytes)
 
     def fetch_index_stream(self, *, sequence: int = 1) -> dict[str, Any]:
         now_dt = utc_time(self._clock(), "index observed_at")
