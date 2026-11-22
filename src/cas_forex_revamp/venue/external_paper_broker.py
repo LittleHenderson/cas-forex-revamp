@@ -44,6 +44,7 @@ import urllib.request
 from cas_forex_revamp.composition.application import RuntimeConfig
 from cas_forex_revamp.composition.assembly import InertSimulation
 from cas_forex_revamp.composition.rehearsal import RehearsalWiring
+from cas_forex_revamp.contracts.tls_context import get_cached_tls12_ssl_context
 from cas_forex_revamp.contracts import (
     AccountRunKey,
     AuthorizedCommand,
@@ -2183,8 +2184,7 @@ class OandaPracticePaperClient:
             finally:
                 headers.clear()
         else:
-            ctx = ssl.create_default_context()
-            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx = get_cached_tls12_ssl_context()
             opener = urllib.request.build_opener(
                 urllib.request.HTTPSHandler(context=ctx),
                 NoRedirectHandler(error_cls=PaperBrokerTransportError),
