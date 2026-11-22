@@ -93,43 +93,140 @@ _WIN_INHERIT_PROPAGATION_FLAGS = _WIN_OBJECT_INHERIT_ACE | _WIN_CONTAINER_INHERI
 _WIN_OWNER_RIGHTS_SID = "S-1-3-4"
 
 
+_WIN32_STATE_API_LOCK = RLock()
+_WIN32_STATE_API: dict[str, Any] | None = None
+_CACHED_WIN_CURRENT_USER_SID: str | None = None
+
+
+def _get_win32_state_api() -> dict[str, Any]:
+    """Lazily initialize and cache Win32 ctypes DLL handles, signatures, and structs once per process."""
+    global _WIN32_STATE_API
+    cached = _WIN32_STATE_API
+    if cached is not None:
+        return cached
+    with _WIN32_STATE_API_LOCK:
+        cached = _WIN32_STATE_API
+        if cached is not None:
+            return cached
+        import ctypes.wintypes as wt
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _ByHandleFileInformation(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wt.DWORD),
+                ("ftCreationTime", wt.FILETIME),
+                ("ftLastAccessTime", wt.FILETIME),
+                ("ftLastWriteTime", wt.FILETIME),
+                ("dwVolumeSerialNumber", wt.DWORD),
+                ("nFileSizeHigh", wt.DWORD),
+                ("nFileSizeLow", wt.DWORD),
+                ("nNumberOfLinks", wt.DWORD),
+                ("nFileIndexHigh", wt.DWORD),
+                ("nFileIndexLow", wt.DWORD),
+            ]
+
+        class _AclSizeInfo(ctypes.Structure):
+            _fields_ = [("AceCount", wt.DWORD), ("AclBytesInUse", wt.DWORD), ("AclBytesFree", wt.DWORD)]
+
+        class _AceHeader(ctypes.Structure):
+            _fields_ = [("AceType", wt.BYTE), ("AceFlags", wt.BYTE), ("AceSize", wt.WORD)]
+
+        class _StandardAce(ctypes.Structure):
+            _fields_ = [("Header", _AceHeader), ("Mask", wt.DWORD), ("SidStart", wt.DWORD)]
+
+        kernel32.GetCurrentProcess.restype = wt.HANDLE
+        kernel32.CreateFileW.argtypes = [
+            wt.LPCWSTR,
+            wt.DWORD,
+            wt.DWORD,
+            ctypes.c_void_p,
+            wt.DWORD,
+            wt.DWORD,
+            wt.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = wt.BOOL
+        kernel32.GetFileInformationByHandle.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_ByHandleFileInformation),
+        ]
+        kernel32.GetFileInformationByHandle.restype = wt.BOOL
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+
+        advapi32.GetSecurityInfo.argtypes = [
+            ctypes.c_void_p,
+            wt.DWORD,
+            wt.DWORD,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        advapi32.GetSecurityInfo.restype = wt.DWORD
+        advapi32.GetSecurityDescriptorControl.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(wt.WORD),
+            ctypes.POINTER(wt.DWORD),
+        ]
+        advapi32.GetSecurityDescriptorControl.restype = wt.BOOL
+        advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.LPWSTR)]
+        advapi32.ConvertSidToStringSidW.restype = wt.BOOL
+        advapi32.GetAclInformation.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, wt.DWORD]
+        advapi32.GetAclInformation.restype = wt.BOOL
+        advapi32.GetAce.argtypes = [ctypes.c_void_p, wt.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+        advapi32.GetAce.restype = wt.BOOL
+        advapi32.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.HANDLE)]
+        advapi32.OpenProcessToken.restype = wt.BOOL
+        advapi32.GetTokenInformation.argtypes = [wt.HANDLE, wt.DWORD, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+        advapi32.GetTokenInformation.restype = wt.BOOL
+        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+            wt.LPCWSTR,
+            wt.DWORD,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wt.ULONG),
+        ]
+        advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wt.BOOL
+        advapi32.GetSecurityDescriptorDacl.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(wt.BOOL),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wt.BOOL),
+        ]
+        advapi32.GetSecurityDescriptorDacl.restype = wt.BOOL
+        advapi32.SetSecurityInfo.argtypes = [
+            ctypes.c_void_p,
+            wt.DWORD,
+            wt.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        advapi32.SetSecurityInfo.restype = wt.DWORD
+
+        cached = {
+            "wt": wt,
+            "advapi32": advapi32,
+            "kernel32": kernel32,
+            "_ByHandleFileInformation": _ByHandleFileInformation,
+            "_AclSizeInfo": _AclSizeInfo,
+            "_AceHeader": _AceHeader,
+            "_StandardAce": _StandardAce,
+        }
+        _WIN32_STATE_API = cached
+        return cached
+
+
 def _open_windows_no_reparse_handle(path: Path, desired_access: int) -> int:
     """Open a Win32 handle with FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS and reject reparse points."""
-    import ctypes.wintypes as wt
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.argtypes = [
-        wt.LPCWSTR,
-        wt.DWORD,
-        wt.DWORD,
-        ctypes.c_void_p,
-        wt.DWORD,
-        wt.DWORD,
-        wt.HANDLE,
-    ]
-    kernel32.CreateFileW.restype = ctypes.c_void_p
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = wt.BOOL
-
-    class _ByHandleFileInformation(ctypes.Structure):
-        _fields_ = [
-            ("dwFileAttributes", wt.DWORD),
-            ("ftCreationTime", wt.FILETIME),
-            ("ftLastAccessTime", wt.FILETIME),
-            ("ftLastWriteTime", wt.FILETIME),
-            ("dwVolumeSerialNumber", wt.DWORD),
-            ("nFileSizeHigh", wt.DWORD),
-            ("nFileSizeLow", wt.DWORD),
-            ("nNumberOfLinks", wt.DWORD),
-            ("nFileIndexHigh", wt.DWORD),
-            ("nFileIndexLow", wt.DWORD),
-        ]
-
-    kernel32.GetFileInformationByHandle.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(_ByHandleFileInformation),
-    ]
-    kernel32.GetFileInformationByHandle.restype = wt.BOOL
+    api = _get_win32_state_api()
+    kernel32 = api["kernel32"]
+    _ByHandleFileInformation = api["_ByHandleFileInformation"]
 
     invalid_ptr = ctypes.c_void_p(-1).value
     flags = _WIN_FILE_FLAG_OPEN_REPARSE_POINT | _WIN_FILE_FLAG_BACKUP_SEMANTICS
@@ -163,47 +260,13 @@ def _windows_sid_and_dacl_info(
     path_or_handle: Path | int,
 ) -> tuple[str, bool, bool, list[tuple[int, int, int, str]]]:
     """Query Windows owner SID, DACL presence/NULL flags, and full ACE list via handle-based GetSecurityInfo."""
-    import ctypes.wintypes as wt
-
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    advapi32.GetSecurityInfo.argtypes = [
-        ctypes.c_void_p,
-        wt.DWORD,
-        wt.DWORD,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    advapi32.GetSecurityInfo.restype = wt.DWORD
-    advapi32.GetSecurityDescriptorControl.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(wt.WORD),
-        ctypes.POINTER(wt.DWORD),
-    ]
-    advapi32.GetSecurityDescriptorControl.restype = wt.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.LPWSTR)]
-    advapi32.ConvertSidToStringSidW.restype = wt.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = wt.BOOL
-    advapi32.GetAclInformation.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, wt.DWORD]
-    advapi32.GetAclInformation.restype = wt.BOOL
-    advapi32.GetAce.argtypes = [ctypes.c_void_p, wt.DWORD, ctypes.POINTER(ctypes.c_void_p)]
-    advapi32.GetAce.restype = wt.BOOL
-
-    class _AclSizeInfo(ctypes.Structure):
-        _fields_ = [("AceCount", wt.DWORD), ("AclBytesInUse", wt.DWORD), ("AclBytesFree", wt.DWORD)]
-
-    class _AceHeader(ctypes.Structure):
-        _fields_ = [("AceType", wt.BYTE), ("AceFlags", wt.BYTE), ("AceSize", wt.WORD)]
-
-    class _StandardAce(ctypes.Structure):
-        _fields_ = [("Header", _AceHeader), ("Mask", wt.DWORD), ("SidStart", wt.DWORD)]
+    api = _get_win32_state_api()
+    wt = api["wt"]
+    advapi32 = api["advapi32"]
+    kernel32 = api["kernel32"]
+    _AclSizeInfo = api["_AclSizeInfo"]
+    _AceHeader = api["_AceHeader"]
+    _StandardAce = api["_StandardAce"]
 
     def _sid_str(psid: ctypes.c_void_p) -> str:
         if not psid.value:
@@ -277,19 +340,14 @@ def _windows_sid_and_dacl_info(
 
 
 def _windows_current_user_sid() -> str:
-    import ctypes.wintypes as wt
-
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetCurrentProcess.restype = wt.HANDLE
-    advapi32.OpenProcessToken.argtypes = [wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.HANDLE)]
-    advapi32.OpenProcessToken.restype = wt.BOOL
-    advapi32.GetTokenInformation.argtypes = [wt.HANDLE, wt.DWORD, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD)]
-    advapi32.GetTokenInformation.restype = wt.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.LPWSTR)]
-    advapi32.ConvertSidToStringSidW.restype = wt.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.argtypes = [wt.HANDLE]
+    global _CACHED_WIN_CURRENT_USER_SID
+    cached_sid = _CACHED_WIN_CURRENT_USER_SID
+    if cached_sid is not None:
+        return cached_sid
+    api = _get_win32_state_api()
+    wt = api["wt"]
+    advapi32 = api["advapi32"]
+    kernel32 = api["kernel32"]
 
     tok = wt.HANDLE()
     if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(tok)):
@@ -305,9 +363,12 @@ def _windows_current_user_sid() -> str:
         if not advapi32.ConvertSidToStringSidW(psid, ctypes.byref(pstr)):
             raise ContractError("Windows ConvertSidToStringSidW failed")
         try:
-            return str(pstr.value or "")
+            sid_str = str(pstr.value or "")
         finally:
             kernel32.LocalFree(pstr)
+        if sid_str:
+            _CACHED_WIN_CURRENT_USER_SID = sid_str
+        return sid_str
     finally:
         kernel32.CloseHandle(tok)
 
@@ -381,7 +442,6 @@ def _apply_windows_protected_owner_dacl(path_or_handle: Path | int, *, is_dir: b
     """Apply an explicit protected owner-only DACL (D:P + SYSTEM + Administrators + current user) on Windows."""
     if os.name != "nt":
         return
-    import ctypes.wintypes as wt
 
     cur_sid = _windows_current_user_sid()
     if not cur_sid.startswith("S-1-"):
@@ -391,37 +451,10 @@ def _apply_windows_protected_owner_dacl(path_or_handle: Path | int, *, is_dir: b
     else:
         sddl = f"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{cur_sid})"
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
-        wt.LPCWSTR,
-        wt.DWORD,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(wt.ULONG),
-    ]
-    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wt.BOOL
-    advapi32.GetSecurityDescriptorDacl.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(wt.BOOL),
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(wt.BOOL),
-    ]
-    advapi32.GetSecurityDescriptorDacl.restype = wt.BOOL
-    advapi32.SetSecurityInfo.argtypes = [
-        ctypes.c_void_p,
-        wt.DWORD,
-        wt.DWORD,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-    ]
-    advapi32.SetSecurityInfo.restype = wt.DWORD
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = wt.BOOL
+    api = _get_win32_state_api()
+    wt = api["wt"]
+    advapi32 = api["advapi32"]
+    kernel32 = api["kernel32"]
 
     p_sd = ctypes.c_void_p()
     if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(p_sd), None):
@@ -574,13 +607,13 @@ def _audit_directory_children_custody(
             )
 
 
-def verify_non_symlink_sqlite_target(
+def _verify_non_symlink_sqlite_target_and_hold_dir(
     db_path: str | Path,
     *,
     create_parent: bool = True,
     label: str = "safety SQLite DB",
-) -> Path:
-    """Validate parent & leaf SQLite target without Path.resolve() symlink dereferencing (Finding [13])."""
+) -> tuple[Path, int | None]:
+    """Validate parent & leaf SQLite target once and return (target, held_dir_fd)."""
     if not isinstance(db_path, (str, Path)):
         raise ContractError(f"{label} path must be a filesystem path")
     raw_str = str(db_path).strip()
@@ -636,10 +669,26 @@ def verify_non_symlink_sqlite_target(
                         label=f"{label} ({cname})",
                         ignore_missing=is_sidecar,
                     )
-    finally:
+        return parent_dir / db_name, dir_fd
+    except Exception:
         if dir_fd is not None:
             os.close(dir_fd)
-    return parent_dir / db_name
+        raise
+
+
+def verify_non_symlink_sqlite_target(
+    db_path: str | Path,
+    *,
+    create_parent: bool = True,
+    label: str = "safety SQLite DB",
+) -> Path:
+    """Validate parent & leaf SQLite target without Path.resolve() symlink dereferencing (Finding [13])."""
+    target, dir_fd = _verify_non_symlink_sqlite_target_and_hold_dir(
+        db_path, create_parent=create_parent, label=label
+    )
+    if dir_fd is not None:
+        os.close(dir_fd)
+    return target
 
 
 def open_verified_sqlite_connection(
@@ -651,14 +700,11 @@ def open_verified_sqlite_connection(
     label: str = "safety SQLite DB",
 ) -> sqlite3.Connection:
     """Open SQLite DB relative to verified parent dir_fd with O_NOFOLLOW and post-open inode verification (Finding [13])."""
-    target = verify_non_symlink_sqlite_target(
+    target, held_dir_fd = _verify_non_symlink_sqlite_target_and_hold_dir(
         db_path, create_parent=(create_parent and not read_only), label=label
     )
     parent_dir = target.parent
     db_name = target.name
-    _, held_dir_fd = open_verified_directory_fd(
-        parent_dir, create=(create_parent and not read_only), label=f"parent of {label}"
-    )
     try:
         expected_id: tuple[int, int] | None = None
         if os.name == "posix" and held_dir_fd is not None:

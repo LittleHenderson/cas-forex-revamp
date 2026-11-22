@@ -21,10 +21,14 @@ from cas_forex_revamp.composition.live_cockpit_server import (
     _ExclusiveThreadingHTTPServer,
     _build_mt5_index_snapshot_from_router,
 )
+from cas_forex_revamp.composition import state_store as state_store_mod
+from cas_forex_revamp.valve.tks_meta_valve_controller import load_default_forex_valve_gate
+from cas_forex_revamp.composition.state_store import open_verified_sqlite_connection
 from cas_forex_revamp.venue import mt5_broker_bridge as bridge_mod
 from cas_forex_revamp.venue.mt5_broker_bridge import (
     BROKER_HUGOSWAY_MT5,
     Mt5Credentials,
+    Mt5PaperBrokerVenue,
     Mt5PreDispatchTransportError,
     Mt5SnapshotIntegrityError,
     Mt5SpoolBridgeTransport,
@@ -391,3 +395,129 @@ class Pr33Mt5FastTickPerfTests(unittest.TestCase):
             self.assertEqual(data, b"")
         time.sleep(0.05)
         self.assertGreaterEqual(int(srv_slow.pre_auth_timeouts_total), 1)
+
+    def test_account_and_positions_single_read_and_probe_uses_it(self) -> None:
+        clock = _MutableClock(T0)
+        with tempfile.TemporaryDirectory() as td:
+            spool = Path(td) / "hugosway_mt5"
+            emu = Mt5SpoolPaperTerminalEmulator(
+                spool,
+                server="Hugo demo PRO5",
+                login=7001234,
+                quotes={"EURUSD": (D("1.10000"), D("1.10010"))},
+                balance=D("12000"),
+                clock=clock,
+            )
+            emu.publish_market()
+            tr = Mt5SpoolBridgeTransport(spool, sleep=emu.sleep_hook, poll_interval_seconds=0.01, clock=clock)
+            creds = Mt5Credentials(BROKER_HUGOSWAY_MT5, 7001234, "Hugo demo PRO5")
+            venue = Mt5PaperBrokerVenue(broker_id=BROKER_HUGOSWAY_MT5, credentials=creds, transport=tr, valve_gate=load_default_forex_valve_gate(), clock=clock)
+            venue.connect()
+
+            with mock.patch.object(tr, "_market_doc", wraps=tr._market_doc) as wrapped_doc:
+                acct, pos = tr.account_and_positions()
+                self.assertEqual(wrapped_doc.call_count, 1)
+                self.assertEqual(acct, tr.account_info())
+                self.assertEqual(pos, tr.positions())
+                self.assertEqual(wrapped_doc.call_count, 3)
+
+                wrapped_doc.reset_mock()
+                probed = venue.probe()
+                self.assertEqual(wrapped_doc.call_count, 1)
+                self.assertEqual(probed.equity, acct.equity)
+
+    def test_build_mt5_index_snapshot_backs_off_2s_when_zero_fresh_ticks_and_wakes_immediately_when_fresh(self) -> None:
+        mono = _MutableMono(200.0)
+        with tempfile.TemporaryDirectory() as td:
+            spool = Path(td) / "hugosway_mt5"
+            spool.mkdir()
+            ticks_path = spool / "market_ticks.json"
+            ticks_path.write_text('{"seq":1}\n', encoding="utf-8")
+
+            stale_errors = {
+                "NAS100": "Mt5SnapshotIntegrityError",
+                "US30": "Mt5SnapshotIntegrityError",
+                "SPX500": "Mt5SnapshotIntegrityError",
+                "XAUUSD": "Mt5SnapshotIntegrityError",
+            }
+            tr = mock.MagicMock()
+            tr.spool_dir = spool
+            tr.symbol_ticks_batch.return_value = ({}, stale_errors)
+
+            venue = SimpleNamespace(_transport=tr, account=object())
+            router = SimpleNamespace(venues={BROKER_HUGOSWAY_MT5: venue}, _status={BROKER_HUGOSWAY_MT5: "ACTIVE"})
+            poll_cache: dict[str, dict[str, object]] = {}
+            log_throttle: dict[tuple[str, str, str], tuple[float, int]] = {}
+
+            with redirect_stdout(io.StringIO()):
+                snap0, q0 = _build_mt5_index_snapshot_from_router(
+                    router,
+                    prev_stream=None,
+                    poll_cache=poll_cache,
+                    log_throttle=log_throttle,
+                    mono_clock=mono,
+                )
+                self.assertIsNone(snap0)
+                self.assertEqual(q0, {})
+                self.assertEqual(tr.symbol_ticks_batch.call_count, 1)
+
+                # Closed market: even when file_sig changes every 200ms, hold 2.0s backoff
+                for seq_i in range(2, 6):
+                    mono.advance(0.25)
+                    ticks_path.write_text(f'{{"seq":{seq_i}}}\n', encoding="utf-8")
+                    snap_idle, _ = _build_mt5_index_snapshot_from_router(
+                        router,
+                        prev_stream=None,
+                        poll_cache=poll_cache,
+                        log_throttle=log_throttle,
+                        mono_clock=mono,
+                    )
+                    self.assertIsNone(snap_idle)
+                self.assertEqual(tr.symbol_ticks_batch.call_count, 1)
+
+                # At >= 2.0s elapsed, market opens with fresh tick -> transitions immediately to 50ms wakes on file_sig change
+                fresh_ticks = {"NAS100": Mt5Tick("NAS100", D("21000.25"), D("21001.50"), "1700000000000")}
+                tr.symbol_ticks_batch.return_value = (fresh_ticks, {})
+                tr.read_index_candles.return_value = None
+                mono.advance(1.1)
+                snap_open, q_open = _build_mt5_index_snapshot_from_router(
+                    router,
+                    prev_stream=None,
+                    poll_cache=poll_cache,
+                    log_throttle=log_throttle,
+                    mono_clock=mono,
+                )
+                self.assertIsNotNone(snap_open)
+                self.assertEqual(set(q_open.keys()), {"NAS100"})
+                self.assertEqual(tr.symbol_ticks_batch.call_count, 2)
+
+                # Once fresh, next file_sig change 50ms later wakes immediately without waiting 2.0s
+                mono.advance(0.05)
+                ticks_path.write_text('{"seq":99,"live":true}\n', encoding="utf-8")
+                snap_fast, _ = _build_mt5_index_snapshot_from_router(
+                    router,
+                    prev_stream=snap_open,
+                    poll_cache=poll_cache,
+                    log_throttle=log_throttle,
+                    mono_clock=mono,
+                )
+                self.assertIsNotNone(snap_fast)
+                self.assertEqual(tr.symbol_ticks_batch.call_count, 3)
+
+    def test_open_verified_sqlite_connection_calls_open_verified_directory_fd_once(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "custody_check.sqlite3"
+            with mock.patch.object(
+                state_store_mod,
+                "open_verified_directory_fd",
+                wraps=state_store_mod.open_verified_directory_fd,
+            ) as wrapped_open_dir:
+                conn = open_verified_sqlite_connection(db_path, label="pr34-test-db")
+                try:
+                    conn.execute("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)")
+                    conn.execute("INSERT INTO t (id) VALUES (1)")
+                    row = conn.execute("SELECT id FROM t WHERE id = 1").fetchone()
+                    self.assertEqual(row, (1,))
+                finally:
+                    conn.close()
+                self.assertEqual(wrapped_open_dir.call_count, 1)

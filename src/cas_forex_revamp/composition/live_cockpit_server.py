@@ -1301,12 +1301,15 @@ def _build_mt5_index_snapshot_from_router(
                 except OSError:
                     file_sig = None
             cached = poll_cache.get(broker_key) if poll_cache is not None else None
-            if (
-                cached is not None
-                and file_sig is not None
-                and cached.get("file_sig") == file_sig
-                and (now_mono - float(cached.get("checked_mono", 0.0))) < 1.0
-            ):
+            cache_hit = False
+            if cached is not None:
+                age_s = now_mono - float(cached.get("checked_mono", 0.0))
+                has_fresh_ticks = bool(cached.get("ticks"))
+                if not has_fresh_ticks:
+                    cache_hit = 0.0 <= age_s < 2.0
+                elif file_sig is not None and cached.get("file_sig") == file_sig:
+                    cache_hit = 0.0 <= age_s < 1.0
+            if cache_hit and cached is not None:
                 batch_ticks = dict(cached.get("ticks") or {})
                 err_map = dict(cached.get("errors") or {})
             else:
@@ -5266,6 +5269,8 @@ def run_cockpit_cli(
     stop_flag = threading.Event()
 
     def _poll_loop() -> None:
+        poll_mt5_cache: dict[str, dict[str, Any]] = {}
+        poll_log_throttle: dict[tuple[str, str, str], tuple[float, int]] = {}
         while not stop_flag.wait(float(args.poll_seconds)):
             if callable(getattr(router, "try_reconnect_oanda", None)):
                 try:
@@ -5282,7 +5287,12 @@ def run_cockpit_cli(
                 with stream_lock:
                     prev_mt5_idx = latest_mt5_index_stream[0]
                     prev_pub_idx = latest_public_index_stream[0]
-                mt5_idx_snap, _ = _build_mt5_index_snapshot_from_router(router, prev_stream=prev_mt5_idx)
+                mt5_idx_snap, _ = _build_mt5_index_snapshot_from_router(
+                    router,
+                    prev_stream=prev_mt5_idx,
+                    poll_cache=poll_mt5_cache,
+                    log_throttle=poll_log_throttle,
+                )
                 pub_idx_snap = prev_pub_idx
                 if index_client is not None:
                     try:
