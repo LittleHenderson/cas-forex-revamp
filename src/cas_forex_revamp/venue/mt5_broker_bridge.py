@@ -3289,8 +3289,7 @@ class Mt5SpoolBridgeTransport:
         self._verify_and_record_snapshot_seq(int(seq_raw), actual_mac)
         return doc
 
-    def account_info(self) -> Mt5AccountSnapshot:
-        doc = self._market_doc()
+    def _parse_account_from_doc(self, doc: Mapping[str, Any]) -> Mt5AccountSnapshot:
         acct = doc.get("account")
         if type(acct) is not dict:
             raise Mt5TransportError("market_ticks.json missing account object")
@@ -3319,6 +3318,9 @@ class Mt5SpoolBridgeTransport:
             trade_mode=str(doc.get("account_trade_mode", "DEMO")),
             connected=connected,
         )
+
+    def account_info(self) -> Mt5AccountSnapshot:
+        return self._parse_account_from_doc(self._market_doc())
 
     @staticmethod
     def _extract_verified_tick(
@@ -3457,8 +3459,8 @@ class Mt5SpoolBridgeTransport:
                     out[tf_key] = clean_rows
         return out or None
 
-    def positions(self) -> tuple[Mt5Position, ...]:
-        doc = self._market_doc()
+    @staticmethod
+    def _parse_positions_from_doc(doc: Mapping[str, Any]) -> tuple[Mt5Position, ...]:
         rows = doc.get("positions", [])
         if type(rows) is not list:
             raise Mt5TransportError("market_ticks.json positions must be a list")
@@ -3480,6 +3482,14 @@ class Mt5SpoolBridgeTransport:
                 take_profit=_wire_decimal(item.get("tp", "0"), "tp", allow_zero_as_none=True),
             ))
         return tuple(out)
+
+    def positions(self) -> tuple[Mt5Position, ...]:
+        return self._parse_positions_from_doc(self._market_doc())
+
+    def account_and_positions(self) -> tuple[Mt5AccountSnapshot, tuple[Mt5Position, ...]]:
+        """Read and verify market_ticks.json ONCE and return both account snapshot and open positions."""
+        doc = self._market_doc()
+        return self._parse_account_from_doc(doc), self._parse_positions_from_doc(doc)
 
     def prepare_request(self, request: Mt5OrderRequest) -> Mt5OrderRequest:
         creds = self._require_connected()
@@ -4759,8 +4769,12 @@ class Mt5PaperBrokerVenue:
         """Health probe: refresh account + positions; raises Mt5TransportError if the terminal is unreachable."""
         if self._account is None:
             raise Mt5TransportError(f"{self.broker_id} venue is not connected")
-        account = self._transport.account_info()
-        positions = self._transport.positions()
+        ap_fn = getattr(self._transport, "account_and_positions", None)
+        if callable(ap_fn):
+            account, positions = ap_fn()
+        else:
+            account = self._transport.account_info()
+            positions = self._transport.positions()
         return self._apply_account_snapshot(account, positions)
 
     def execute(
