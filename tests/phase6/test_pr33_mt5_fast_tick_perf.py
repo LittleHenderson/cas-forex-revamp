@@ -224,9 +224,12 @@ class Pr33Mt5FastTickPerfTests(unittest.TestCase):
                     raise PermissionError("simulated transient AV/indexer lock")
                 real_replace(src, dst)
 
+            def locked_replace(_src: Path, _dst: Path) -> None:
+                raise PermissionError("locked")
+
+            nt_os_flaky = SimpleNamespace(**{**os.__dict__, "name": "nt", "replace": flaky_replace})
             with (
-                mock.patch("cas_forex_revamp.venue.mt5_broker_bridge.os.name", "nt"),
-                mock.patch("cas_forex_revamp.venue.mt5_broker_bridge.os.replace", side_effect=flaky_replace),
+                mock.patch("cas_forex_revamp.venue.mt5_broker_bridge.os", nt_os_flaky),
                 mock.patch("cas_forex_revamp.venue.mt5_broker_bridge.time.sleep"),
             ):
                 _atomic_write_bytes(target, b'{"ok":true}\n', custody_inspector=no_op_inspector)
@@ -234,9 +237,9 @@ class Pr33Mt5FastTickPerfTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b'{"ok":true}\n')
 
             # Persistent PermissionError fails closed after 5 retries and removes .tmp files
+            nt_os_locked = SimpleNamespace(**{**os.__dict__, "name": "nt", "replace": locked_replace})
             with (
-                mock.patch("cas_forex_revamp.venue.mt5_broker_bridge.os.name", "nt"),
-                mock.patch("cas_forex_revamp.venue.mt5_broker_bridge.os.replace", side_effect=PermissionError("locked")),
+                mock.patch("cas_forex_revamp.venue.mt5_broker_bridge.os", nt_os_locked),
                 mock.patch("cas_forex_revamp.venue.mt5_broker_bridge.time.sleep"),
             ):
                 with self.assertRaises(Mt5TransportError):
