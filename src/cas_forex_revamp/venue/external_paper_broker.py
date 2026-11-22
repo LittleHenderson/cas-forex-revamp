@@ -44,6 +44,7 @@ import urllib.request
 from cas_forex_revamp.composition.application import RuntimeConfig
 from cas_forex_revamp.composition.assembly import InertSimulation
 from cas_forex_revamp.composition.rehearsal import RehearsalWiring
+from cas_forex_revamp.contracts.tls_context import get_cached_tls12_ssl_context
 from cas_forex_revamp.contracts import (
     AccountRunKey,
     AuthorizedCommand,
@@ -107,7 +108,6 @@ from .live_market_stream import (
     build_digest_market_stream_envelope,
     build_market_stream_envelope,
     build_pinned_public_opener,
-    get_cached_tls12_ssl_context,
     parse_ecb_g10_reference,
     validate_market_stream_for_venue,
     validate_pinned_public_feed_url as _validate_stream_public_feed_url,

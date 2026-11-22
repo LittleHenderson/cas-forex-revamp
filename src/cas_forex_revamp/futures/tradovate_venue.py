@@ -120,7 +120,8 @@ from cas_forex_revamp.venue.live_auth_ticket import (
     verify_live_authorization_context,
     verify_live_environ_authorization_context,
 )
-from cas_forex_revamp.venue.live_market_stream import get_cached_tls12_ssl_context, verify_public_ip_address
+from cas_forex_revamp.contracts.tls_context import get_cached_tls12_ssl_context
+from cas_forex_revamp.venue.live_market_stream import verify_public_ip_address
 
 __all__ = [
     "BROKER_TRADOVATE_FUTURES",

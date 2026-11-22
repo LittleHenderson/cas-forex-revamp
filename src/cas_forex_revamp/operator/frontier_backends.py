@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 
 from cas_forex_revamp.contracts import ContractError, canonical_bytes, content_digest, decimal_text
-from cas_forex_revamp.venue.live_market_stream import get_cached_tls12_ssl_context
+from cas_forex_revamp.contracts.tls_context import get_cached_tls12_ssl_context
 from cas_forex_revamp.contracts.primitives import decimal_value, digest, integer, utc_time
 
 from .decisions import OperatorUnavailable

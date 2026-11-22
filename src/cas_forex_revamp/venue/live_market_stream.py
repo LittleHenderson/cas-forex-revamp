@@ -29,11 +29,9 @@ from hashlib import sha256
 import http.client
 import ipaddress
 import json
-import os
 import re
 import socket
 import ssl
-import threading
 import time
 from typing import Any
 import urllib.error
@@ -42,6 +40,11 @@ import urllib.request
 
 from cas_forex_revamp.contracts import ContractError, canonical_bytes, decimal_text, parse_decimal
 from cas_forex_revamp.contracts.primitives import decimal_value, digest, identifier, integer, utc_time
+from cas_forex_revamp.contracts.tls_context import (
+    _TLS_CONTEXT_CACHE,
+    _TLS_CONTEXT_CACHE_LOCK,
+    get_cached_tls12_ssl_context,
+)
 
 MAX_SAFE_JS_INTEGER = (1 << 53) - 1
 MAX_STREAM_WIRE_BYTES = 1_048_576
@@ -468,28 +471,6 @@ class _PinnedPublicHTTPSConnection(http.client.HTTPSConnection):
         except Exception:
             raw_sock.close()
             raise
-
-
-_TLS_CONTEXT_CACHE_LOCK = threading.Lock()
-_TLS_CONTEXT_CACHE: dict[tuple[str, str, str, str], ssl.SSLContext] = {}
-
-
-def get_cached_tls12_ssl_context() -> ssl.SSLContext:
-    """Return a cached TLS 1.2+ default SSLContext keyed by runtime OpenSSL CA env overrides."""
-    verify_paths = ssl.get_default_verify_paths()
-    cache_key = (
-        verify_paths.cafile or "",
-        verify_paths.capath or "",
-        os.environ.get(verify_paths.openssl_cafile_env, ""),
-        os.environ.get(verify_paths.openssl_capath_env, ""),
-    )
-    with _TLS_CONTEXT_CACHE_LOCK:
-        ctx = _TLS_CONTEXT_CACHE.get(cache_key)
-        if ctx is None:
-            ctx = ssl.create_default_context()
-            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            _TLS_CONTEXT_CACHE[cache_key] = ctx
-        return ctx
 
 
 class PinnedPublicHTTPSHandler(urllib.request.HTTPSHandler):

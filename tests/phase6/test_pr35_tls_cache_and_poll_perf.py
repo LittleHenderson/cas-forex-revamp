@@ -15,6 +15,7 @@ from cas_forex_revamp.composition import live_cockpit_server as cockpit_mod
 from cas_forex_revamp.futures import tradovate_venue as tradovate_mod
 from cas_forex_revamp.operator import frontier_backends as frontier_mod
 from cas_forex_revamp.valve.tks_meta_valve_controller import PeakEquityStore, load_default_forex_valve_gate
+from cas_forex_revamp.contracts import tls_context as tls_mod
 from cas_forex_revamp.venue import dual_shield_router as router_mod
 from cas_forex_revamp.venue import external_paper_broker as paper_mod
 from cas_forex_revamp.venue import live_market_stream as stream_mod
@@ -60,7 +61,8 @@ class Pr35TlsCacheAndFeedPerfTests(unittest.TestCase):
         self.assertTrue(hasattr(tradovate_mod, "TradovateMicroFuturesVenue"))
 
         saved_env = {k: os.environ.get(k) for k in ("SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE")}
-        saved_cache = dict(stream_mod._TLS_CONTEXT_CACHE)
+        self.assertIs(stream_mod.get_cached_tls12_ssl_context, tls_mod.get_cached_tls12_ssl_context)
+        saved_cache = dict(tls_mod._TLS_CONTEXT_CACHE)
         created_contexts: list[mock.MagicMock] = []
 
         def _fake_create_default_context() -> mock.MagicMock:
@@ -72,13 +74,13 @@ class Pr35TlsCacheAndFeedPerfTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as ca_tmp:
                 ca_one = str(Path(ca_tmp) / "ca-one.pem")
                 ca_two = str(Path(ca_tmp) / "ca-two.pem")
-                with stream_mod._TLS_CONTEXT_CACHE_LOCK:
-                    stream_mod._TLS_CONTEXT_CACHE.clear()
+                with tls_mod._TLS_CONTEXT_CACHE_LOCK:
+                    tls_mod._TLS_CONTEXT_CACHE.clear()
                 os.environ["SSL_CERT_FILE"] = ca_one
                 os.environ.pop("SSL_CERT_DIR", None)
                 os.environ.pop("REQUESTS_CA_BUNDLE", None)
 
-                with mock.patch.object(stream_mod.ssl, "create_default_context", side_effect=_fake_create_default_context) as mk_ctx:
+                with mock.patch.object(tls_mod.ssl, "create_default_context", side_effect=_fake_create_default_context) as mk_ctx:
                     ctx1 = get_cached_tls12_ssl_context()
                     ctx2 = get_cached_tls12_ssl_context()
                     opener = build_pinned_public_opener()
@@ -100,9 +102,9 @@ class Pr35TlsCacheAndFeedPerfTests(unittest.TestCase):
                     self.assertIs(get_cached_tls12_ssl_context(), ctx1)
                     self.assertEqual(mk_ctx.call_count, 2)
         finally:
-            with stream_mod._TLS_CONTEXT_CACHE_LOCK:
-                stream_mod._TLS_CONTEXT_CACHE.clear()
-                stream_mod._TLS_CONTEXT_CACHE.update(saved_cache)
+            with tls_mod._TLS_CONTEXT_CACHE_LOCK:
+                tls_mod._TLS_CONTEXT_CACHE.clear()
+                tls_mod._TLS_CONTEXT_CACHE.update(saved_cache)
             for k, prev in saved_env.items():
                 if prev is None:
                     os.environ.pop(k, None)
