@@ -2,7 +2,7 @@ import { createExplainer } from './explainer.mjs';
 import { decodeCockpit, parseUniqueJSON, MAX_SNAPSHOT_BYTES } from './wire.mjs';
 import { resetInspection, reviewRecords, inspectRecord } from './model.mjs';
 import { displayFreshness } from './freshness.mjs';
-import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose, replaceSafeHTML, resolveCockpitCompounding } from './render.mjs';
+import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose, replaceSafeHTML, resolveCockpitCompounding, resolveCockpitOptionBDemo } from './render.mjs';
 import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decision-read.mjs';
 import { ScopedBridge, createAuthenticatedLoopbackBridge } from './bridge.mjs';
 import { ALL_WATCHLIST_MARKETS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts, releaseDetachedCanvases } from './chart.mjs';
@@ -71,6 +71,11 @@ import {
   normalizeDecimalString,
   patchCompoundingPanelInPlace,
 } from './compounding-panel.mjs';
+import {
+  STATIC_OPTION_B_DEMO,
+  normalizeOptionBDemo,
+  patchOptionBDemoPanelInPlace,
+} from './option-b-demo-panel.mjs';
 import {
   attachScrollActivityListeners,
   captureScrollSnapshot,
@@ -208,6 +213,7 @@ let state = {
   liveFunding: createDefaultLiveFundingState(),
   aggressionDial: STATIC_AGGRESSION_DIAL,
   compounding: STATIC_COMPOUNDING_PANEL,
+  optionBDemo: STATIC_OPTION_B_DEMO,
   unlockDraft: '',
   unlockKeyVisible: false,
   sessionScope: initialSessionScope,
@@ -571,6 +577,11 @@ function handleSseEvent(eventName, dataText) {
       state.compounding = normalizeCompoundingPanel(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
       syncCompoundingDom();
     } catch { /* Ignore malformed compounding frame. */ }
+  } else if (eventName === 'option_b_demo') {
+    try {
+      state.optionBDemo = normalizeOptionBDemo(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
+      syncOptionBDemoDom();
+    } catch { /* Ignore malformed Option B demo frame. */ }
   }
 }
 
@@ -738,6 +749,7 @@ async function readAiCockpitFeeds() {
   } catch { state.parallelTiers = null; }
   await readAggressionDial();
   await readCompounding();
+  await readOptionBDemo();
 }
 
 const LIVE_COCKPIT_POLL_MS = 4000;
@@ -777,6 +789,22 @@ function syncCompoundingDom(focusSelector = null) {
   restoreScrollPosition(scrollSnap);
 }
 
+async function readOptionBDemo() {
+  try {
+    const rawOb = await readStatic(new URL('/api/option-b-demo', window.location.origin), MAX_AI_PAYLOAD_BYTES);
+    state.optionBDemo = normalizeOptionBDemo(parseUniqueJSON(rawOb, MAX_AI_PAYLOAD_BYTES));
+  } catch { /* Keep prior verified Option B paper demo snapshot. */ }
+}
+
+function syncOptionBDemoDom() {
+  const scrollSnap = captureScrollSnapshot(document, window);
+  const panelEl = root.querySelector('[data-option-b-demo="true"]');
+  if (panelEl) {
+    patchOptionBDemoPanelInPlace(panelEl, resolveCockpitOptionBDemo(state));
+  }
+  restoreScrollPosition(scrollSnap);
+}
+
 function refreshCompoundingFromTick() {
   if (!state.liveStreamConnected || compoundingTickRefreshInFlight) return;
   compoundingTickRefreshInFlight = true;
@@ -795,10 +823,12 @@ async function pollLiveCockpitState() {
     } catch { /* Keep prior verified trader snapshot. */ }
     await readAggressionDial();
     await readCompounding();
+    await readOptionBDemo();
     if (!isDialSliderDragging()) {
       syncAggressionDialDom();
     }
     syncCompoundingDom();
+    syncOptionBDemoDom();
   } finally {
     liveCockpitPollInFlight = false;
   }

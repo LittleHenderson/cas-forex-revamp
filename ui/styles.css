@@ -2627,3 +2627,36 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
     border-color: #2FB377;
   }
 }
+/* PR #42: Option B $5,000.00 US-Regulated CME Micro Futures Paper Demo Card */
+.ob-demo-panel { background: #0d1117; border: 1px solid #1e293b; border-top: 3px solid #38bdf8; color: #e2e8f0; padding: 18px 20px; overflow-anchor: none; }
+.ob-header-row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
+.ob-badge-strip { display: flex; flex-wrap: wrap; gap: 8px; }
+.ob-badge { display: inline-flex; align-items: center; padding: 4px 10px; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; border-radius: 4px; border: 1px solid #334155; }
+.ob-badge-safe { background: #0c2638; color: #7dd3fc; border-color: #0284c7; }
+.ob-badge-active { background: #07291e; color: #6ee7b7; border-color: #10b981; }
+.ob-badge-danger { background: #3b0d14; color: #fda4af; border-color: #f43f5e; }
+.ob-kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.ob-kpi-card { background: #111827; border: 1px solid #1f2937; border-radius: 6px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+.ob-kpi-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; }
+.ob-kpi-value { font-size: 18px; font-weight: 800; color: #f8fafc; }
+.ob-kpi-value.is-positive { color: #34d399; }
+.ob-kpi-value.is-negative { color: #fb7185; }
+.ob-kpi-value.is-flat { color: #e2e8f0; }
+.ob-kpi-sub { font-size: 11px; color: #94a3b8; }
+.ob-progress-track { height: 8px; background: #1e293b; border-radius: 999px; overflow: hidden; margin-bottom: 12px; }
+.ob-progress-fill { height: 100%; background: linear-gradient(90deg, #38bdf8, #34d399); transition: width 0.25s ease; }
+.ob-pct-0 { width: 0%; } .ob-pct-5 { width: 5%; } .ob-pct-10 { width: 10%; } .ob-pct-15 { width: 15%; }
+.ob-pct-20 { width: 20%; } .ob-pct-25 { width: 25%; } .ob-pct-30 { width: 30%; } .ob-pct-35 { width: 35%; }
+.ob-pct-40 { width: 40%; } .ob-pct-45 { width: 45%; } .ob-pct-50 { width: 50%; } .ob-pct-55 { width: 55%; }
+.ob-pct-60 { width: 60%; } .ob-pct-65 { width: 65%; } .ob-pct-70 { width: 70%; } .ob-pct-75 { width: 75%; }
+.ob-pct-80 { width: 80%; } .ob-pct-85 { width: 85%; } .ob-pct-90 { width: 90%; } .ob-pct-95 { width: 95%; }
+.ob-pct-100 { width: 100%; }
+.ob-contract-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-bottom: 12px; }
+.ob-contract-pill { background: #0f172a; border: 1px solid #1e293b; border-radius: 6px; padding: 10px 12px; }
+.ob-contract-head, .ob-contract-meta { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.ob-contract-map, .ob-contract-sub { font-size: 11px; color: #94a3b8; }
+.ob-open-count { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 3px; background: #1e293b; color: #cbd5e1; }
+.ob-open-count.has-open { background: #064e3b; color: #6ee7b7; }
+.ob-footer-strip { border-top: 1px solid #1e293b; padding-top: 10px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.ob-footer-line { margin: 0; color: #e2e8f0; }
+.ob-footer-note { margin: 4px 0 0; font-size: 11px; color: #94a3b8; }
