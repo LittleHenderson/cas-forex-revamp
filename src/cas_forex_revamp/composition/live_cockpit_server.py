@@ -57,6 +57,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from cas_forex_revamp.operator.decisions import OperatorUnavailable
 from cas_forex_revamp.operator.frontier_backends import assert_safe_ai_catalog_payload
 from cas_forex_revamp.composition.autonomous_trader import build_enriched_compounding_payload
+from cas_forex_revamp.composition.option_b_paper_runner import OptionBPaperDemoRunner
 from cas_forex_revamp.treasury.compounding_controller import (
     CompoundingControllerError,
     OwnerKeyRequiredError as CompoundingOwnerKeyRequiredError,
@@ -1587,6 +1588,7 @@ _KNOWN_METRICS_ROUTES: frozenset[str] = frozenset({
     "/api/ai-model-select",
     "/api/aggression-dial",
     "/api/compounding",
+    "/api/option-b-demo",
 })
 
 _CONTENT_TYPES: dict[str, str] = {
@@ -1689,6 +1691,7 @@ class LoopbackCockpitServer:
         parallel_tiers: Any | None = None,
         aggression_dial: Any | None = None,
         compounding_controller: Any | None = None,
+        option_b_demo: Any | None = None,
         phase8_bridge: Any | None = None,
         owner_recovery: Any | None = None,
         model_execution_gate: Any | None = None,
@@ -1747,6 +1750,7 @@ class LoopbackCockpitServer:
                 autonomous_trader, "_compounding_controller", None
             )
         self._compounding_controller = inferred_comp
+        self._option_b_demo = option_b_demo
         inferred_p8 = phase8_bridge
         if inferred_p8 is None and autonomous_trader is not None:
             inferred_p8 = getattr(autonomous_trader, "phase8_bridge", None) or getattr(
@@ -2662,6 +2666,22 @@ class LoopbackCockpitServer:
             execution_mode=execution_mode,
         )
 
+    def _read_option_b_demo_snapshot(
+        self,
+        *,
+        owner_controls_allowed: bool,
+        session_scope: str,
+    ) -> dict[str, Any] | None:
+        if self._option_b_demo is None:
+            return None
+        raw = self._option_b_demo.snapshot()
+        if not isinstance(raw, Mapping):
+            return None
+        snap = dict(raw)
+        snap["owner_controls_allowed"] = bool(owner_controls_allowed)
+        snap["session_scope"] = str(session_scope)
+        return assert_safe_ai_catalog_payload(snap)
+
     def _resolve_static_path(self, raw_path: str) -> Path | None:
         clean = urllib.parse.unquote(raw_path.split("?", 1)[0].split("#", 1)[0])
         if clean in ("/", "/ui", "/ui/"):
@@ -3288,6 +3308,26 @@ class LoopbackCockpitServer:
                                 {"error": "Compounding snapshot unavailable"},
                             )
                         return
+                    if route == "/api/option-b-demo":
+                        try:
+                            ob_snap = outer._read_option_b_demo_snapshot(
+                                owner_controls_allowed=(auth_scope == SESSION_SCOPE_OWNER_FULL),
+                                session_scope=auth_scope,
+                            )
+                            if ob_snap is None:
+                                self._write_json(
+                                    HTTPStatus.NOT_FOUND,
+                                    {"error": "Option B paper demo runner not configured"},
+                                )
+                            else:
+                                self._write_json(HTTPStatus.OK, ob_snap)
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(
+                                HTTPStatus.INTERNAL_SERVER_ERROR,
+                                {"error": "Option B paper demo snapshot unavailable"},
+                            )
+                        return
                     if route == "/api/index-stream":
                         try:
                             idx_snap = outer._index_stream_reader() if outer._index_stream_reader is not None else None
@@ -3339,6 +3379,8 @@ class LoopbackCockpitServer:
                             last_aggression_dial_mono = 0.0
                             last_compounding_json = ""
                             last_compounding_mono = 0.0
+                            last_option_b_json = ""
+                            last_option_b_mono = 0.0
                             outer._record_sse_client(1)
                             sse_client_recorded = True
                             try:
@@ -3492,6 +3534,29 @@ class LoopbackCockpitServer:
                                             except Exception as exc:
                                                 outer._last_routing_error = type(exc).__name__
                                                 eframe = f"event: error\ndata: {json.dumps({'source': 'compounding', 'error': 'Compounding snapshot unavailable'})}\n\n".encode("utf-8")
+                                                self.wfile.write(eframe)
+                                                emitted_events += 1
+                                        if outer._option_b_demo is not None:
+                                            try:
+                                                obsnap = outer._read_option_b_demo_snapshot(
+                                                    owner_controls_allowed=(auth_scope == SESSION_SCOPE_OWNER_FULL),
+                                                    session_scope=auth_scope,
+                                                )
+                                                if obsnap is not None:
+                                                    objson = json.dumps(obsnap, sort_keys=False)
+                                                    if (
+                                                        not last_option_b_json
+                                                        or objson != last_option_b_json
+                                                        or (now_mono - last_option_b_mono) >= 1.0
+                                                    ):
+                                                        last_option_b_json = objson
+                                                        last_option_b_mono = now_mono
+                                                        obframe = f"event: option_b_demo\ndata: {objson}\n\n".encode("utf-8")
+                                                        self.wfile.write(obframe)
+                                                        emitted_events += 1
+                                            except Exception as exc:
+                                                outer._last_routing_error = type(exc).__name__
+                                                eframe = f"event: error\ndata: {json.dumps({'source': 'option_b_demo', 'error': 'Option B paper demo snapshot unavailable'})}\n\n".encode("utf-8")
                                                 self.wfile.write(eframe)
                                                 emitted_events += 1
                                         if emitted_events > 0:
@@ -4239,6 +4304,137 @@ class LoopbackCockpitServer:
                     except _SessionRevokedError:
                         self._reject_unauthorized()
                     except (OwnerKeyRequiredError, CompoundingOwnerKeyRequiredError):
+                        self._reject_insufficient_scope()
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+
+                if route == "/api/option-b-demo":
+                    if outer._option_b_demo is None:
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "Option B paper demo runner not configured"})
+                        return
+                    try:
+                        body = self._read_json_body(max_bytes=16384)
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        if auth_scope != SESSION_SCOPE_OWNER_FULL:
+                            self._reject_insufficient_scope()
+                            return
+                        if type(body) is not dict:
+                            raise ContractError("JSON object required")
+                        raw_act = body.get("action")
+                        if not isinstance(raw_act, str) or not raw_act.strip():
+                            raise ContractError("action field required")
+                        act_norm = raw_act.strip().upper()
+                        raw_reason = body.get("reason")
+                        clean_reason: str | None = None
+                        if raw_reason is not None:
+                            if (
+                                not isinstance(raw_reason, str)
+                                or not raw_reason.strip()
+                                or len(raw_reason.strip()) > 160
+                                or any(ch in raw_reason for ch in ("\x00", "\r", "\n"))
+                            ):
+                                raise ContractError("reason must be a clean string of at most 160 characters")
+                            clean_reason = raw_reason.strip()
+                        action_result: dict[str, Any]
+                        if act_norm == "CLOSE_POSITION":
+                            extra_keys = sorted(set(body.keys()) - {"action", "position_id", "reason"})
+                            if extra_keys:
+                                raise ContractError(f"Unexpected additional properties in POST /api/option-b-demo: {extra_keys}")
+                            raw_pid = body.get("position_id")
+                            if not isinstance(raw_pid, str) or not raw_pid.strip() or len(raw_pid.strip()) > 120:
+                                raise ContractError("position_id must be a non-empty string")
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                receipt = outer._option_b_demo.close_position(
+                                    raw_pid.strip(),
+                                    reason=clean_reason or "OPTION_B_OWNER_CLOSE",
+                                )
+                                snap = outer._read_option_b_demo_snapshot(
+                                    owner_controls_allowed=True,
+                                    session_scope=SESSION_SCOPE_OWNER_FULL,
+                                )
+                            action_result = {
+                                "ok": True,
+                                "action": "CLOSE_POSITION",
+                                "receipt": receipt.to_dict() if hasattr(receipt, "to_dict") else {"order_id": getattr(receipt, "order_id", "")},
+                                "snapshot": snap,
+                            }
+                        elif act_norm == "EMERGENCY_CLOSE_ALL":
+                            extra_keys = sorted(set(body.keys()) - {"action", "reason"})
+                            if extra_keys:
+                                raise ContractError(f"Unexpected additional properties in POST /api/option-b-demo: {extra_keys}")
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                receipts = outer._option_b_demo.emergency_close_all(
+                                    reason=clean_reason or "OPTION_B_OWNER_EMERGENCY_FLATTEN",
+                                )
+                                snap = outer._read_option_b_demo_snapshot(
+                                    owner_controls_allowed=True,
+                                    session_scope=SESSION_SCOPE_OWNER_FULL,
+                                )
+                            action_result = {
+                                "ok": True,
+                                "action": "EMERGENCY_CLOSE_ALL",
+                                "closed_count": len(receipts),
+                                "snapshot": snap,
+                            }
+                        elif act_norm == "MIRROR_SIGNAL":
+                            allowed_mirror = {
+                                "action",
+                                "symbol",
+                                "side",
+                                "stop_distance_points",
+                                "take_profit_points",
+                                "risk_pct",
+                                "reason",
+                            }
+                            extra_keys = sorted(set(body.keys()) - allowed_mirror)
+                            if extra_keys:
+                                raise ContractError(f"Unexpected additional properties in POST /api/option-b-demo: {extra_keys}")
+                            raw_sym = body.get("symbol")
+                            raw_side = body.get("side")
+                            if not isinstance(raw_sym, str) or not raw_sym.strip():
+                                raise ContractError("symbol must be a non-empty string")
+                            if not isinstance(raw_side, str) or raw_side.strip().upper() not in ("BUY", "SELL"):
+                                raise ContractError("side must be BUY or SELL")
+                            stop_pts = outer._parse_strict_decimal_field(
+                                body.get("stop_distance_points"), "stop_distance_points"
+                            )
+                            tp_pts = outer._parse_strict_decimal_field(
+                                body.get("take_profit_points"), "take_profit_points"
+                            )
+                            risk_pct = (
+                                outer._parse_strict_decimal_field(body.get("risk_pct"), "risk_pct")
+                                if body.get("risk_pct") is not None
+                                else Decimal("1.00")
+                            )
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                mirror_res = outer._option_b_demo.mirror_entry_signal(
+                                    symbol=raw_sym.strip().upper(),
+                                    side=raw_side.strip().upper(),
+                                    stop_distance_points=stop_pts,
+                                    take_profit_points=tp_pts,
+                                    risk_pct=risk_pct,
+                                    reason=clean_reason or "OPTION_B_OWNER_MIRROR_SIGNAL",
+                                )
+                                snap = outer._read_option_b_demo_snapshot(
+                                    owner_controls_allowed=True,
+                                    session_scope=SESSION_SCOPE_OWNER_FULL,
+                                )
+                            action_result = {
+                                "ok": True,
+                                "action": "MIRROR_SIGNAL",
+                                "result": mirror_res,
+                                "snapshot": snap,
+                            }
+                        else:
+                            raise ContractError(f"Unsupported Option B demo action {raw_act!r}")
+                        outer.notify_stream_updated()
+                        self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(action_result))
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
+                    except OwnerKeyRequiredError:
                         self._reject_insufficient_scope()
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -5094,6 +5290,39 @@ def load_dotenv_file(path: str | Path) -> dict[str, str]:
     return loaded
 
 
+def _feed_option_b_demo_from_index_stream(
+    option_b_demo: Any | None,
+    idx_stream: Mapping[str, Any] | None,
+) -> int:
+    """Feed verified NAS100/US30/SPX500/XAUUSD quotes into Option B Paper Demo without calling AI inference."""
+    if option_b_demo is None or not isinstance(idx_stream, Mapping):
+        return 0
+    markets = idx_stream.get("markets")
+    if not isinstance(markets, list):
+        return 0
+    fed = 0
+    for row in markets:
+        if not isinstance(row, Mapping):
+            continue
+        pair = str(row.get("pair") or "").strip().upper()
+        if pair not in ("NAS100", "US30", "SPX500", "XAUUSD"):
+            continue
+        raw_bid = row.get("bid")
+        raw_ask = row.get("ask")
+        if raw_bid is None or raw_ask is None:
+            continue
+        try:
+            bid_d = Decimal(str(raw_bid))
+            ask_d = Decimal(str(raw_ask))
+            if bid_d <= Decimal("0") or ask_d < bid_d:
+                continue
+            option_b_demo.ingest_spot_quote(pair, bid_d, ask_d)
+            fed += 1
+        except Exception as exc_ob:
+            print(f"[option-b] Quote feed skipped for {pair} ({type(exc_ob).__name__}).")
+    return fed
+
+
 def _poll_index_and_fx_once(
     *,
     router: Any,
@@ -5111,6 +5340,7 @@ def _poll_index_and_fx_once(
     base_wait: float,
     now_mono: float,
     notify_updated: Callable[[], Any] | None = None,
+    option_b_demo: Any | None = None,
 ) -> None:
     """Run one background poll tick keeping index reference refresh independent of FX errors.
 
@@ -5149,6 +5379,11 @@ def _poll_index_and_fx_once(
                 latest_public_index_stream[0] = pub_idx_snap
             if mt5_idx_snap is not None:
                 latest_mt5_index_stream[0] = mt5_idx_snap
+        if option_b_demo is not None:
+            _feed_option_b_demo_from_index_stream(
+                option_b_demo,
+                mt5_idx_snap if mt5_idx_snap is not None else pub_idx_snap,
+            )
         if notify_updated is not None:
             notify_updated()
 
@@ -5510,6 +5745,11 @@ def run_cockpit_cli(
 
     if callable(getattr(registry, "bind_execution_gate", None)):
         registry.bind_execution_gate(runtime_state.model_gate)
+    option_b_demo = OptionBPaperDemoRunner(
+        db_path=runtime_state.state_dir / "option_b_paper_demo.sqlite3",
+        valve_gate=gate,
+    )
+    _feed_option_b_demo_from_index_stream(option_b_demo, _read_index_stream())
     srv = LoopbackCockpitServer(
         repo_root=root,
         host=args.host,
@@ -5523,6 +5763,7 @@ def run_cockpit_cli(
         profit_vault=runtime_state.profit_vault,
         parallel_tiers=runtime_state.parallel_tiers,
         aggression_dial=aggression_dial,
+        option_b_demo=option_b_demo,
         owner_recovery=runtime_state.owner_recovery,
         model_execution_gate=runtime_state.model_gate,
         token_file=str(merged.get("CAS_FOREX_COCKPIT_TOKEN_FILE", "")).strip() or None,
@@ -5580,6 +5821,7 @@ def run_cockpit_cli(
                 base_wait=base_wait,
                 now_mono=time.monotonic(),
                 notify_updated=srv.notify_stream_updated,
+                option_b_demo=option_b_demo,
             )
 
     def _fast_tick_loop() -> None:

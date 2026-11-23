@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from contextlib import closing
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
 from pathlib import Path
 import sqlite3
 from threading import RLock
@@ -60,6 +60,7 @@ OPTION_B_RECENT_EVENTS_LIMIT = 25
 _CAS_TO_MICRO_SUPPORTED: frozenset[str] = frozenset({"NAS100", "US30", "SPX500", "XAUUSD"})
 _PENNY = Decimal("0.01")
 _PCT4 = Decimal("0.0001")
+_DD_10DP = Decimal("0.0000000001")
 
 
 def _utc_now() -> datetime:
@@ -72,6 +73,10 @@ def _q2(value: Decimal) -> Decimal:
 
 def _q4(value: Decimal) -> Decimal:
     return value.quantize(_PCT4, rounding=ROUND_HALF_UP)
+
+
+def _q10_ceil(value: Decimal) -> Decimal:
+    return value.quantize(_DD_10DP, rounding=ROUND_CEILING) if value > Decimal("0") else Decimal("0")
 
 
 def _usd_text(value: Decimal) -> str:
@@ -610,7 +615,7 @@ class OptionBPaperDemoRunner:
             snap_acct = self._emulator.account_snapshot(now_utc=now)
             durable_peak = self._read_durable_peak_unlocked()
             eff_peak = max(durable_peak, snap_acct.peak_equity_usd, snap_acct.equity_usd)
-            dd = compute_drawdown_pct(snap_acct.equity_usd, eff_peak)
+            dd = _q10_ceil(compute_drawdown_pct(snap_acct.equity_usd, eff_peak))
             if dd >= self._max_drawdown_pct:
                 detail = f"Hard drawdown brake active ({decimal_text(_q4(dd * Decimal('100')))}% >= 10.00%)"
                 self._log_event("ENTRY_BLOCKED_DRAWDOWN", cas_sym, root, detail, now)
@@ -717,7 +722,13 @@ class OptionBPaperDemoRunner:
                 return self._initial_starting_equity_usd
             return _q2(_exact_decimal(row["peak_equity_usd"], "peak_equity_usd", positive=True))
 
-    def snapshot(self, *, now_utc: datetime | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        *,
+        now_utc: datetime | None = None,
+        owner_controls_allowed: bool = False,
+        session_scope: str = "UNBOUND",
+    ) -> dict[str, Any]:
         """Strictly 0-write (?mode=ro + PRAGMA query_only=ON) Option B Paper Demo snapshot."""
         now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
         with self._lock:
@@ -765,7 +776,7 @@ class OptionBPaperDemoRunner:
             peak_eq = _q2(max(durable_peak, acct.peak_equity_usd, balance, equity))
             net_pnl = _q2(equity - starting)
             net_pnl_pct = _q2((net_pnl / starting) * Decimal("100"))
-            dd_ratio = compute_drawdown_pct(equity, peak_eq)
+            dd_ratio = _q10_ceil(compute_drawdown_pct(equity, peak_eq))
             dd_pct = _q2(dd_ratio * Decimal("100"))
             dd_locked = dd_ratio >= self._max_drawdown_pct
 
@@ -903,6 +914,8 @@ class OptionBPaperDemoRunner:
                 "recent_events": recent_events_out,
                 "supported_contracts": contracts_list,
                 "audit_chain_valid": bool(venue_snap.get("audit_chain_valid", False)),
+                "owner_controls_allowed": bool(owner_controls_allowed),
+                "session_scope": str(session_scope),
                 "observed_at": _iso_utc(now),
             }
 

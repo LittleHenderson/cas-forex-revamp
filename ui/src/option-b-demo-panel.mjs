@@ -101,6 +101,9 @@ export function normalizeOptionBDemo(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return STATIC_OPTION_B_DEMO;
   }
+  if (typeof raw.equityUsd === 'string' && raw.equity_usd === undefined && Array.isArray(raw.supportedContracts)) {
+    return raw;
+  }
   const contractsRaw = Array.isArray(raw.supported_contracts) ? raw.supported_contracts : [];
   const contracts = contractsRaw.length > 0
     ? contractsRaw.map((c) => Object.freeze({
