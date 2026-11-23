@@ -8,8 +8,8 @@ import json
 from pathlib import Path
 import sqlite3
 import threading
-import urllib.error
-import urllib.request
+import http.client
+import urllib.parse
 
 import jsonschema
 import pytest
@@ -60,26 +60,35 @@ def _http_json(
     body: dict | None = None,
     extra_headers: dict[str, str] | None = None,
 ) -> tuple[int, dict]:
-    headers = {"Accept": "application/json"}
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = int(parsed.port or (443 if parsed.scheme == "https" else 80))
+    path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+    headers = {
+        "Host": parsed.netloc,
+        "Accept": "application/json",
+    }
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = str(len(data))
     if extra_headers:
         headers.update(extra_headers)
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    conn = http.client.HTTPConnection(host, port, timeout=5)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as err:
-        raw = err.read().decode("utf-8", errors="replace")
+        conn.request(method, path, body=data, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", errors="replace")
         try:
             payload = json.loads(raw)
         except Exception:
             payload = {"raw": raw}
-        return err.code, payload
+        return resp.status, payload
+    finally:
+        conn.close()
 
 
 def test_pr42_get_option_b_demo_auth_schema_and_zero_write(tmp_path: Path) -> None:
