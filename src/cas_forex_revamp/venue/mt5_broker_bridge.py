@@ -1513,7 +1513,7 @@ def _read_spool_json(
     custody_inspector: SpoolCustodyInspector | None = None,
 ) -> Any:
     last_err: Exception | None = None
-    for attempt in range(5):
+    for attempt in range(8):
         try:
             st = os.lstat(path)
         except FileNotFoundError:
@@ -1543,7 +1543,7 @@ def _read_spool_json(
             return strict_safe_json_loads(raw, max_bytes=max_bytes)
         except ContractError as exc:
             last_err = exc
-            if attempt < 4:
+            if attempt < 7:
                 time.sleep(0.015)
                 continue
             raise Mt5TransportError(f"spool file {path.name} is not strict safe JSON: {exc}") from None
