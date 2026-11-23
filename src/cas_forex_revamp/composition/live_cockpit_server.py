@@ -239,6 +239,9 @@ MAX_ACTIVE_PAIRING_CODES = 8
 MAX_ACTIVE_DEVICE_SESSIONS = 16
 PAIR_EXCHANGE_WINDOW_SECONDS = 60.0
 MAX_PAIR_EXCHANGE_ATTEMPTS_PER_WINDOW = 10
+DEFAULT_FAST_ENTRY_SCAN_INTERVAL_SECONDS = 5.0
+DEFAULT_FAST_ENTRY_SCAN_OPEN_INTERVAL_SECONDS = 15.0
+DEFAULT_FAST_ERROR_LOG_COOLDOWN_SECONDS = 60.0
 
 _DEVICE_ALLOWED_POST_ROUTES: frozenset[str] = frozenset({
     "/api/explainer-ask",
@@ -2960,6 +2963,44 @@ class LoopbackCockpitServer:
                     extra_headers=[("WWW-Authenticate", 'Bearer realm="cas-forex-cockpit"')],
                 )
 
+            def _drain_small_request_body(self, *, max_bytes: int = MAX_PRE_AUTH_BODY_BYTES) -> None:
+                """Drain small bounded request bodies before early 403/4xx writes so HTTP/1.1 proxies avoid TCP RST."""
+                if self.headers.get("Transfer-Encoding") is not None:
+                    return
+                raw_len = self.headers.get("Content-Length")
+                if raw_len is None:
+                    return
+                raw_s = str(raw_len).strip()
+                if not raw_s.isascii() or not raw_s.isdigit():
+                    return
+                length = int(raw_s)
+                if length <= 0 or length > max_bytes:
+                    return
+                raw_sock = _unwrap_socket(self.connection)
+                prev_to: float | None = None
+                if raw_sock is not None:
+                    try:
+                        prev_to = raw_sock.gettimeout()
+                        raw_sock.settimeout(0.25)
+                    except OSError as exc_to:
+                        _drain_to_err = type(exc_to).__name__
+                        prev_to = None
+                try:
+                    remaining = length
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(remaining, 4096))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                except OSError as exc_drain:
+                    _drain_err = type(exc_drain).__name__
+                finally:
+                    if raw_sock is not None and prev_to is not None:
+                        try:
+                            raw_sock.settimeout(prev_to)
+                        except OSError as exc_rst:
+                            _drain_rst_err = type(exc_rst).__name__
+
             def _reject_insufficient_scope(self) -> None:
                 outer._record_auth_failure()
                 self._write_json(
@@ -3587,6 +3628,7 @@ class LoopbackCockpitServer:
 
                 # Enforce strict least-privilege separation: paired devices CANNOT invoke owner controls (Finding [2])
                 if auth_scope != SESSION_SCOPE_OWNER_FULL and route not in _DEVICE_ALLOWED_POST_ROUTES:
+                    self._drain_small_request_body(max_bytes=MAX_PRE_AUTH_BODY_BYTES)
                     self._reject_insufficient_scope()
                     return
 
@@ -5110,6 +5152,7 @@ def _poll_index_and_fx_once(
         if notify_updated is not None:
             notify_updated()
 
+    # End of Phase A index refresh; Phase B polls 16-pair FX stream below
     if feed_client is not None and now_mono >= float(poll_state.get("next_fx_poll_mono", 0.0)):
         try:
             env_stream = feed_client.fetch_market_stream().to_wire_dict()
@@ -5134,6 +5177,79 @@ def _poll_index_and_fx_once(
             fx_backoff = max(base_wait, min(60.0, base_wait * (2 ** min(errs - 1, 2))))
             poll_state["next_fx_poll_mono"] = now_mono + fx_backoff
             print(f"[feed] Poll skipped ({type(exc).__name__}); keeping last verified snapshot.")
+
+
+def _run_fast_tick_iteration(
+    *,
+    router: Any,
+    trader: Any,
+    parallel_tiers: Any | None = None,
+    stream_lock: threading.Lock,
+    latest_mt5_index_stream: list[dict[str, Any] | None],
+    fast_poll_cache: dict[str, dict[str, Any]],
+    fast_log_throttle: dict[tuple[str, str, str], tuple[float, int]],
+    fast_state: dict[str, Any],
+    idle_scan_interval_s: float = DEFAULT_FAST_ENTRY_SCAN_INTERVAL_SECONDS,
+    open_scan_interval_s: float = DEFAULT_FAST_ENTRY_SCAN_OPEN_INTERVAL_SECONDS,
+    error_log_cooldown_s: float = DEFAULT_FAST_ERROR_LOG_COOLDOWN_SECONDS,
+    now_mono: float | None = None,
+    mono_clock: Callable[[], float] = time.monotonic,
+    notify_updated: Callable[[], Any] | None = None,
+    log_fn: Callable[[str], None] = print,
+) -> None:
+    """Run one 50ms stop-protection iteration while throttling entry-scan AI inference calls."""
+    try:
+        with stream_lock:
+            prev_idx = latest_mt5_index_stream[0]
+        mt5_idx_snap, mt5_q = _build_mt5_index_snapshot_from_router(
+            router,
+            prev_stream=prev_idx,
+            poll_cache=fast_poll_cache,
+            log_throttle=fast_log_throttle,
+            mono_clock=mono_clock,
+        )
+        if mt5_q:
+            if mt5_idx_snap is not None:
+                with stream_lock:
+                    latest_mt5_index_stream[0] = mt5_idx_snap
+            has_open = (
+                trader.has_open_positions_fast()
+                if callable(getattr(trader, "has_open_positions_fast", None))
+                else True
+            )
+            cur_m = float(now_mono) if now_mono is not None else mono_clock()
+            last_cycle_m = fast_state.get("last_fast_cycle_mono")
+            scan_interval = open_scan_interval_s if has_open else idle_scan_interval_s
+            due = last_cycle_m is None or (cur_m - float(last_cycle_m)) >= scan_interval
+            if due and trader._inference_lock.acquire(blocking=False):
+                try:
+                    trader.run_fast_tick_cycle(mt5_quotes=mt5_q)
+                finally:
+                    fast_state["last_fast_cycle_mono"] = mono_clock()
+                    trader._inference_lock.release()
+            elif has_open:
+                # Non-blocking 50ms stop protection even between entry scans or during HTTP inference
+                trader.evaluate_fast_protection(quotes=mt5_q)
+                if parallel_tiers is not None:
+                    parallel_tiers.process_tick(quotes=mt5_q, signal=None)
+            if notify_updated is not None:
+                notify_updated()
+    except Exception as exc_ft:
+        cur_err_m = float(now_mono) if now_mono is not None else mono_clock()
+        fast_state["last_fast_cycle_mono"] = cur_err_m
+        msg_ft = " ".join(str(exc_ft).split())[:140]
+        err_key = (type(exc_ft).__name__, msg_ft)
+        err_map: dict[tuple[str, str], tuple[float, int]] = fast_state.setdefault("err_throttle", {})
+        prev_emit, suppressed = err_map.get(err_key, (None, 0))
+        if prev_emit is None or (cur_err_m - prev_emit) >= error_log_cooldown_s:
+            sup_note = f" (suppressed {suppressed} repeated)" if suppressed > 0 else ""
+            err_map[err_key] = (cur_err_m, 0)
+            if len(err_map) > 128:
+                oldest_ek = next(iter(err_map))
+                err_map.pop(oldest_ek, None)
+            log_fn(f"[ai-fast] Fast tick skipped ({type(exc_ft).__name__}: {msg_ft}){sup_note}.")
+        else:
+            err_map[err_key] = (prev_emit, suppressed + 1)
 
 
 def run_cockpit_cli(
@@ -5171,7 +5287,13 @@ def run_cockpit_cli(
     if args.env_file is not None:
         merged.update(load_dotenv_file(args.env_file))
 
-    from cas_forex_revamp.composition.autonomous_trader import AutonomousAiTrader, ENV_RISK_GEAR_MODE
+    from cas_forex_revamp.composition.autonomous_trader import (
+        AutonomousAiTrader,
+        DEFAULT_LIVE_AI_INFERENCE_COOLDOWN_SECONDS,
+        ENV_AI_INFERENCE_COOLDOWN_SECONDS,
+        ENV_RISK_GEAR_MODE,
+        MAX_AI_INFERENCE_COOLDOWN_SECONDS,
+    )
     from cas_forex_revamp.composition.state_store import initialize_shared_runtime_state
     from cas_forex_revamp.operator.frontier_backends import FrontierModelRegistry
     from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
@@ -5283,6 +5405,23 @@ def run_cockpit_cli(
         getattr(runtime_state.parallel_tiers, "bind_aggression_dial", None)
     ):
         runtime_state.parallel_tiers.bind_aggression_dial(aggression_dial)
+    ai_cooldown_s = DEFAULT_LIVE_AI_INFERENCE_COOLDOWN_SECONDS
+    if ENV_AI_INFERENCE_COOLDOWN_SECONDS in merged:
+        raw_cd = str(merged[ENV_AI_INFERENCE_COOLDOWN_SECONDS]).strip()
+        if not raw_cd:
+            raise ContractError(f"Invalid empty {ENV_AI_INFERENCE_COOLDOWN_SECONDS}")
+        try:
+            ai_cooldown_s = float(raw_cd)
+        except ValueError as exc_cd:
+            raise ContractError(f"Invalid {ENV_AI_INFERENCE_COOLDOWN_SECONDS}={raw_cd!r}") from exc_cd
+        if (
+            not math.isfinite(ai_cooldown_s)
+            or ai_cooldown_s < 0.0
+            or ai_cooldown_s > MAX_AI_INFERENCE_COOLDOWN_SECONDS
+        ):
+            raise ContractError(
+                f"Invalid {ENV_AI_INFERENCE_COOLDOWN_SECONDS}={raw_cd!r}: must be in 0..{int(MAX_AI_INFERENCE_COOLDOWN_SECONDS)}"
+            )
     trader = AutonomousAiTrader(
         router=router,
         model_registry=registry,
@@ -5297,6 +5436,7 @@ def run_cockpit_cli(
         aggression_dial=aggression_dial,
         risk_gear_mode=merged.get(ENV_RISK_GEAR_MODE),
         risk_gear_path=runtime_state.state_dir / "risk_gear.json",
+        ai_inference_cooldown_seconds=ai_cooldown_s,
         initial_capital_usd=cli_init_cap,
         state_dir=runtime_state.state_dir,
     )
@@ -5446,44 +5586,21 @@ def run_cockpit_cli(
         interval = max(0.05, float(args.fast_tick_ms) / 1000.0)
         fast_poll_cache: dict[str, dict[str, Any]] = {}
         fast_log_throttle: dict[tuple[str, str, str], tuple[float, int]] = {}
-        last_idle_fast_cycle_mono = 0.0
+        fast_state: dict[str, Any] = {}
         while not stop_flag.wait(interval):
             if not args.autonomous_ai:
                 continue
-            try:
-                with stream_lock:
-                    prev_idx = latest_mt5_index_stream[0]
-                mt5_idx_snap, mt5_q = _build_mt5_index_snapshot_from_router(
-                    router,
-                    prev_stream=prev_idx,
-                    poll_cache=fast_poll_cache,
-                    log_throttle=fast_log_throttle,
-                )
-                if mt5_q:
-                    if mt5_idx_snap is not None:
-                        with stream_lock:
-                            latest_mt5_index_stream[0] = mt5_idx_snap
-                    has_open = trader.has_open_positions_fast() if callable(getattr(trader, "has_open_positions_fast", None)) else True
-                    now_ft_mono = time.monotonic()
-                    if has_open or (now_ft_mono - last_idle_fast_cycle_mono) >= 1.0:
-                        if trader._inference_lock.acquire(blocking=False):
-                            try:
-                                cyc_res = trader.run_fast_tick_cycle(mt5_quotes=mt5_q)
-                                if not has_open and isinstance(cyc_res, Mapping) and cyc_res.get("action") == "WAIT":
-                                    last_idle_fast_cycle_mono = time.monotonic()
-                            finally:
-                                trader._inference_lock.release()
-                        elif has_open:
-                            # Non-blocking 50ms stop protection even during 3-8s deep-thinking HTTP inference
-                            trader.evaluate_fast_protection(quotes=mt5_q)
-                            runtime_state.parallel_tiers.process_tick(quotes=mt5_q, signal=None)
-                    srv.notify_stream_updated()
-            except Exception as exc_ft:
-                has_open_err = trader.has_open_positions_fast() if callable(getattr(trader, "has_open_positions_fast", None)) else False
-                if not has_open_err:
-                    last_idle_fast_cycle_mono = time.monotonic()
-                msg_ft = " ".join(str(exc_ft).split())[:140]
-                print(f"[ai-fast] Fast tick skipped ({type(exc_ft).__name__}: {msg_ft}).")
+            _run_fast_tick_iteration(
+                router=router,
+                trader=trader,
+                parallel_tiers=runtime_state.parallel_tiers,
+                stream_lock=stream_lock,
+                latest_mt5_index_stream=latest_mt5_index_stream,
+                fast_poll_cache=fast_poll_cache,
+                fast_log_throttle=fast_log_throttle,
+                fast_state=fast_state,
+                notify_updated=srv.notify_stream_updated,
+            )
 
     poller = threading.Thread(target=_poll_loop, name="cas-forex-feed-poll", daemon=True)
     fast_poller = threading.Thread(target=_fast_tick_loop, name="cas-forex-mt5-50ms", daemon=True)

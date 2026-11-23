@@ -19,6 +19,7 @@ from decimal import InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP,
 from hashlib import sha256
 import json
 import logging
+import math
 from pathlib import Path
 import re
 import sqlite3
@@ -51,6 +52,7 @@ from cas_forex_revamp.operator.frontier_backends import (
     FrontierTransportError,
     assert_safe_ai_catalog_payload,
 )
+from cas_forex_revamp.operator.decisions import OperatorUnavailable
 from cas_forex_revamp.operator.model import ActualModelDecisionAdapter, DurableModelExecutionGate, ModelInvocation
 from cas_forex_revamp.composition.phase8_live_bridge import Phase8LiveTradingBridge
 from cas_forex_revamp.execution.smart_execution import (
@@ -145,6 +147,11 @@ CAPITAL_STATUS_AT_PRINCIPAL = "AT_PRINCIPAL"
 CAPITAL_STATUS_IN_SURPLUS = "IN_SURPLUS"
 DEFAULT_DEMO_3BROKER_CAPITAL_USD = Decimal("300000.00")
 DEFAULT_STARTUP_VAULT_RETRY_COOLDOWN_SECONDS = 5.0
+DEFAULT_AI_INFERENCE_COOLDOWN_SECONDS = 0.0
+DEFAULT_LIVE_AI_INFERENCE_COOLDOWN_SECONDS = 60.0
+MAX_AI_INFERENCE_COOLDOWN_SECONDS = 3600.0
+ENV_AI_INFERENCE_COOLDOWN_SECONDS = "CAS_FOREX_AI_INFERENCE_COOLDOWN_SECONDS"
+MAX_AI_COOLDOWN_ENTRIES = 256
 
 FEED_MT5_FAST_SPOOL = "MT5_DIRECT_SPOOL_50MS"
 FEED_PUBLIC_FALLBACK = "PUBLIC_15S_FALLBACK"
@@ -555,6 +562,7 @@ class AutonomousAiTrader:
         risk_gear_path: str | Path | None = None,
         initial_capital_usd: Decimal | None = None,
         startup_vault_retry_cooldown_seconds: float = DEFAULT_STARTUP_VAULT_RETRY_COOLDOWN_SECONDS,
+        ai_inference_cooldown_seconds: float = DEFAULT_AI_INFERENCE_COOLDOWN_SECONDS,
         compounding_controller: CompoundingAndMilestoneController | None = None,
         phase8_bridge: Phase8LiveTradingBridge | None = None,
         state_dir: str | Path | None = None,
@@ -575,6 +583,16 @@ class AutonomousAiTrader:
             raise ContractError("compounding_controller must be a CompoundingAndMilestoneController or None")
         if phase8_bridge is not None and not isinstance(phase8_bridge, Phase8LiveTradingBridge):
             raise ContractError("phase8_bridge must be a Phase8LiveTradingBridge or None")
+        if (
+            isinstance(ai_inference_cooldown_seconds, bool)
+            or not isinstance(ai_inference_cooldown_seconds, (int, float))
+            or not math.isfinite(float(ai_inference_cooldown_seconds))
+            or float(ai_inference_cooldown_seconds) < 0.0
+            or float(ai_inference_cooldown_seconds) > MAX_AI_INFERENCE_COOLDOWN_SECONDS
+        ):
+            raise ContractError(
+                f"ai_inference_cooldown_seconds must be a finite number in 0..{int(MAX_AI_INFERENCE_COOLDOWN_SECONDS)}"
+            )
 
         self._router = router
         self._registry = model_registry
@@ -658,6 +676,10 @@ class AutonomousAiTrader:
         self._last_quota_status: str = ""
         self._last_consec_losses: int = 0
         self._last_drawdown_pct: Decimal = Decimal("0")
+        self._ai_inference_cooldown_seconds: float = float(ai_inference_cooldown_seconds)
+        self._ai_cooldown_until: dict[tuple[str, str, bool], datetime] = {}
+        self._ai_cooldown_reason: dict[tuple[str, str, bool], str] = {}
+        self._ai_daily_cap_blocked_day: str | None = None
         self._tick_history: dict[str, deque[tuple[Decimal, Decimal]]] = {
             sym: deque(maxlen=64) for sym in EXPANDED_MARKETS
         }
@@ -2696,6 +2718,96 @@ class AutonomousAiTrader:
                 logger.warning("record_closed_pnl vault sync deferred for %s: %s", ticket, type(exc_vsync).__name__)
         return snap
 
+    def _record_ai_cooldown_unlocked(self, key: tuple[str, str, bool], ts: datetime, reason: str) -> None:
+        """Record a bounded per-(symbol, side, pyramid) AI inference cooldown."""
+        if self._ai_inference_cooldown_seconds <= 0.0:
+            return
+        expired = [k for k, exp in self._ai_cooldown_until.items() if exp <= ts]
+        for k in expired:
+            self._ai_cooldown_until.pop(k, None)
+            self._ai_cooldown_reason.pop(k, None)
+        while len(self._ai_cooldown_until) >= MAX_AI_COOLDOWN_ENTRIES:
+            oldest_k = next(iter(self._ai_cooldown_until))
+            self._ai_cooldown_until.pop(oldest_k, None)
+            self._ai_cooldown_reason.pop(oldest_k, None)
+        self._ai_cooldown_until[key] = ts + timedelta(seconds=self._ai_inference_cooldown_seconds)
+        self._ai_cooldown_reason[key] = str(reason)[:80]
+
+    def _build_wait_cycle_unlocked(
+        self,
+        *,
+        cycle_id: str,
+        ts: datetime,
+        t0_ns: int,
+        active_id: str,
+        sym: str | None,
+        reason: str,
+        prot_updates: list[dict[str, Any]],
+        quotes_map: Mapping[str, tuple[Decimal, Decimal]] | None = None,
+        eff_depth: str | None = None,
+        regime_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Record and return a clean non-inference WAIT cycle report under ``self._lock``."""
+        self._last_action = "WAIT"
+        self._last_symbol = sym
+        self._last_reason = reason
+        self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+        if self._parallel_tiers is not None and quotes_map:
+            self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
+        report: dict[str, Any] = {
+            "schema": "cas-forex.ai-cycle/1",
+            "cycle_id": cycle_id,
+            "observed_at": _iso(ts),
+            "model_id": active_id,
+            "cadence": self._last_cadence,
+        }
+        if eff_depth is not None:
+            report["thinking_depth"] = eff_depth
+        if regime_name is not None:
+            report["regime"] = regime_name
+        report.update({
+            "action": "WAIT",
+            "symbol": sym,
+            "reason": reason,
+            "valve_score": self._last_valve_score,
+            "protection_updates": prot_updates,
+        })
+        self._append_journal_cycle(report)
+        return report
+
+    def _handle_daily_call_cap_paused(
+        self,
+        op_exc: OperatorUnavailable,
+        *,
+        utc_day: str,
+        cycle_id: str,
+        ts: datetime,
+        t0_ns: int,
+        active_id: str,
+        sym: str,
+        eff_depth: str,
+        regime_name: str,
+        prot_updates: list[dict[str, Any]],
+        quotes_map: Mapping[str, tuple[Decimal, Decimal]],
+    ) -> dict[str, Any] | None:
+        """Pause AI inference cleanly for the current UTC day when daily call budget is exhausted."""
+        if self._ai_inference_cooldown_seconds <= 0.0 or "MODEL_DAILY_CALL_CAP_EXCEEDED" not in str(op_exc):
+            return None
+        with self._lock:
+            self._ai_daily_cap_blocked_day = utc_day
+            return self._build_wait_cycle_unlocked(
+                cycle_id=cycle_id,
+                ts=ts,
+                t0_ns=t0_ns,
+                active_id=active_id,
+                sym=sym,
+                reason=f"AI_DAILY_CALL_CAP_PAUSED ({utc_day}): 50ms stop-loss protection active; resets 00:00 UTC",
+                prot_updates=prot_updates,
+                quotes_map=quotes_map,
+                eff_depth=eff_depth,
+                regime_name=regime_name,
+            )
+
     def _observe_markets_readonly(
         self,
         markets: Mapping[str, Mapping[str, Any]],
@@ -3235,6 +3347,39 @@ class AutonomousAiTrader:
                     self._append_journal_cycle(report)
                     return report
 
+            cd_key = (sym, side.value, bool(is_pyramid_add))
+            utc_day = ts.strftime("%Y-%m-%d")
+            if self._ai_inference_cooldown_seconds > 0.0:
+                if self._ai_daily_cap_blocked_day == utc_day:
+                    return self._build_wait_cycle_unlocked(
+                        cycle_id=cycle_id,
+                        ts=ts,
+                        t0_ns=t0_ns,
+                        active_id=active_id,
+                        sym=sym,
+                        reason=f"AI_DAILY_CALL_CAP_PAUSED ({utc_day}): 50ms stop-loss protection active; resets 00:00 UTC",
+                        prot_updates=prot_updates,
+                        quotes_map=quotes_map,
+                        eff_depth=eff_depth,
+                        regime_name=regime_name,
+                    )
+                until_ts = self._ai_cooldown_until.get(cd_key)
+                if until_ts is not None and ts < until_ts:
+                    rem_s = max(1, int((until_ts - ts).total_seconds()))
+                    cd_why = self._ai_cooldown_reason.get(cd_key, "recent AI evaluation")
+                    return self._build_wait_cycle_unlocked(
+                        cycle_id=cycle_id,
+                        ts=ts,
+                        t0_ns=t0_ns,
+                        active_id=active_id,
+                        sym=sym,
+                        reason=f"AI_INFERENCE_COOLDOWN ({sym} {side.value}: {rem_s}s remaining; {cd_why})",
+                        prot_updates=prot_updates,
+                        quotes_map=quotes_map,
+                        eff_depth=eff_depth,
+                        regime_name=regime_name,
+                    )
+
             run_scout = bool(
                 self._registry.fast_scout_enabled
                 and active_id != "gemini-decision-1"
@@ -3297,6 +3442,23 @@ class AutonomousAiTrader:
                         "best_probability": None,
                         "decisions": [],
                     }
+                except OperatorUnavailable as op_exc:
+                    paused = self._handle_daily_call_cap_paused(
+                        op_exc,
+                        utc_day=utc_day,
+                        cycle_id=cycle_id,
+                        ts=ts,
+                        t0_ns=t0_ns,
+                        active_id=active_id,
+                        sym=sym,
+                        eff_depth=eff_depth,
+                        regime_name=regime_name,
+                        prot_updates=prot_updates,
+                        quotes_map=quotes_map,
+                    )
+                    if paused is not None:
+                        return paused
+                    raise
 
         with self._lock:
             if scout is not None:
@@ -3323,6 +3485,7 @@ class AutonomousAiTrader:
                 self._append_journal_cycle(report)
                 return report
             if scout is not None and scout.get("executed") and not scout.get("wake_heavy_model"):
+                self._record_ai_cooldown_unlocked(cd_key, ts, "scout WAIT")
                 self._last_action = "WAIT"
                 self._last_symbol = sym
                 self._last_reason = f"Gemini Decision 1 Fast Scout held WAIT on {sym}"
@@ -3415,6 +3578,23 @@ class AutonomousAiTrader:
                         reasoning_effort=eff_depth,
                     )
                 raise
+            except OperatorUnavailable as op_exc:
+                paused = self._handle_daily_call_cap_paused(
+                    op_exc,
+                    utc_day=utc_day,
+                    cycle_id=cycle_id,
+                    ts=ts,
+                    t0_ns=t0_ns,
+                    active_id=active_id,
+                    sym=sym,
+                    eff_depth=eff_depth,
+                    regime_name=regime_name,
+                    prot_updates=prot_updates,
+                    quotes_map=quotes_map,
+                )
+                if paused is not None:
+                    return paused
+                raise
 
         # Phase 3 (re-acquire self._lock): verify governance still active -> Valve -> dual-shield execution
         call_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
@@ -3442,6 +3622,7 @@ class AutonomousAiTrader:
 
             chosen_ref = dec_result.selection.selected_action_ref
             if chosen_ref is None:
+                self._record_ai_cooldown_unlocked(cd_key, ts, "model WAIT")
                 self._last_action = "WAIT"
                 self._last_symbol = sym
                 self._last_reason = dec_result.selection.reason
@@ -3553,6 +3734,7 @@ class AutonomousAiTrader:
                     now_utc=ts,
                 )
                 if not p8_dec.allowed and p8_dec.reason_code != SmartRefusalReason.VALVE_REFUSAL.value:
+                    self._record_ai_cooldown_unlocked(cd_key, ts, f"phase8:{p8_dec.reason_code}")
                     self._veto_count += 1
                     self._last_action = "WAIT"
                     self._last_symbol = sym
@@ -3581,6 +3763,7 @@ class AutonomousAiTrader:
                     proposal_box, current_view=current_view, now=ts
                 )
             except ValveRefusalError:
+                self._record_ai_cooldown_unlocked(cd_key, ts, "valve veto")
                 self._veto_count += 1
                 self._last_action = "VALVE_VETOED"
                 self._last_symbol = sym
@@ -3594,6 +3777,7 @@ class AutonomousAiTrader:
                 )
                 obs_prob = Decimal(f"{valve_dec.mlp_score:.8f}")
                 if obs_prob < min_prob_req:
+                    self._record_ai_cooldown_unlocked(cd_key, ts, "dial min_signal_prob")
                     self._veto_count += 1
                     self._last_valve_score = decimal_text(obs_prob)
                     self._last_action = "WAIT"
@@ -3644,12 +3828,15 @@ class AutonomousAiTrader:
                 limit_price=limit_ref,
                 take_profit_price=tp_price,
             )
-            exec_res = self._router.execute_open(broker_order, valve_decision=valve_dec)
-            if exec_res.result.receipt is not None and not exec_res.result.receipt.accepted:
-                raise Mt5BridgeError(
-                    f"{exec_res.executed_on} rejected OPEN {sym} "
-                    f"(retcode={exec_res.result.receipt.retcode}: {exec_res.result.receipt.message})"
-                )
+            try:
+                exec_res = self._router.execute_open(broker_order, valve_decision=valve_dec)
+                if exec_res.result.receipt is not None and not exec_res.result.receipt.accepted:
+                    raise Mt5BridgeError(
+                        f"{exec_res.executed_on} rejected OPEN {sym} "
+                        f"(retcode={exec_res.result.receipt.retcode}: {exec_res.result.receipt.message})"
+                    )
+            finally:
+                self._record_ai_cooldown_unlocked(cd_key, ts, "post-execution")
             ticket = (
                 exec_res.result.receipt.position_ticket
                 if exec_res.result.receipt is not None and exec_res.result.receipt.position_ticket
