@@ -22,6 +22,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cas_forex_revamp.contracts import ActionKind, ContractError, canonical_bytes, decimal_text
 from cas_forex_revamp.contracts.primitives import decimal_value, identifier, integer, utc_time
+from cas_forex_revamp.risk.demo_high_growth_profile import (
+    DEMO_HIGH_GROWTH_DAILY_GOAL_PCT,
+    DEMO_HIGH_GROWTH_DAILY_LOSS_BRAKE_PCT,
+    DemoHighGrowthProfile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +262,7 @@ class DailyQuotaGovernanceStore:
         ratchet_floor_ratio: Decimal = DEFAULT_PROFIT_RATCHET_FLOOR_RATIO,
         session_cadence: str = SESSION_CADENCE_AUTO,
         owner_verifier: Any | None = None,
+        demo_high_growth: DemoHighGrowthProfile | None = None,
     ) -> None:
         self._path = Path(path) if path is not None else None
         self._scope_id = identifier(scope_id, "scope_id")
@@ -306,8 +312,32 @@ class DailyQuotaGovernanceStore:
         self._active_period_base: str | None = None
         self._active_leg: int = 1
         self._leg_max_loss_cap_usd: Decimal | None = None
+        if demo_high_growth is not None and not isinstance(demo_high_growth, DemoHighGrowthProfile):
+            raise ContractError("demo_high_growth must be a DemoHighGrowthProfile or None")
+        self._demo_high_growth: DemoHighGrowthProfile = (
+            demo_high_growth if demo_high_growth is not None else DemoHighGrowthProfile(enabled=False)
+        )
+        self._demo_high_growth.assert_demo_mode("DEMO", live_trading_armed=False, live_trading_locked=True)
         self._unlocked_day_key: str | None = None
         self._unlocked_day_pnl_usd: Decimal = Decimal("0.00")
+
+    def set_demo_high_growth_profile(
+        self,
+        profile: DemoHighGrowthProfile,
+        *,
+        execution_mode: Any = "DEMO",
+        live_trading_armed: bool = False,
+        live_trading_locked: bool = True,
+    ) -> None:
+        if not isinstance(profile, DemoHighGrowthProfile):
+            raise ContractError("profile must be a DemoHighGrowthProfile")
+        profile.assert_demo_mode(
+            execution_mode,
+            live_trading_armed=live_trading_armed,
+            live_trading_locked=live_trading_locked,
+        )
+        with self._lock:
+            self._demo_high_growth = profile
 
     @classmethod
     def from_environ(
@@ -697,6 +727,20 @@ class DailyQuotaGovernanceStore:
             mode = self._quota_mode
             max_loss = self._max_loss_usd
             max_loss_pct = self._max_loss_pct
+            dhg = self._demo_high_growth
+
+        if dhg.enabled:
+            eq_base = (
+                starting_equity
+                if (starting_equity is not None and starting_equity > Decimal("0"))
+                else hard
+            )
+            hard = max(Decimal("1.00"), _q2(eq_base * DEMO_HIGH_GROWTH_DAILY_GOAL_PCT))
+            soft = max(Decimal("0.50"), _q2(hard * Decimal("0.70")))
+            max_loss = max(Decimal("1.00"), _q2(eq_base * DEMO_HIGH_GROWTH_DAILY_LOSS_BRAKE_PCT))
+            if max_loss_override is not None and max_loss_override > Decimal("0"):
+                max_loss = min(max_loss, _q2(max_loss_override))
+            return soft, hard, max_loss
 
         if starting_equity is not None and starting_equity > Decimal("0"):
             if mode in ("PCT", "COMPOUND_CAPPED") and qpct is not None:

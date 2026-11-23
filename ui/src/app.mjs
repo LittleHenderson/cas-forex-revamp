@@ -2,7 +2,7 @@ import { createExplainer } from './explainer.mjs';
 import { decodeCockpit, parseUniqueJSON, MAX_SNAPSHOT_BYTES } from './wire.mjs';
 import { resetInspection, reviewRecords, inspectRecord } from './model.mjs';
 import { displayFreshness } from './freshness.mjs';
-import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose, replaceSafeHTML, resolveCockpitCompounding, resolveCockpitOptionBDemo } from './render.mjs';
+import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose, replaceSafeHTML, resolveCockpitCompounding, resolveCockpitDemoHighGrowth, resolveCockpitOptionBDemo } from './render.mjs';
 import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decision-read.mjs';
 import { ScopedBridge, createAuthenticatedLoopbackBridge } from './bridge.mjs';
 import { ALL_WATCHLIST_MARKETS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts, releaseDetachedCanvases } from './chart.mjs';
@@ -76,6 +76,11 @@ import {
   normalizeOptionBDemo,
   patchOptionBDemoPanelInPlace,
 } from './option-b-demo-panel.mjs';
+import {
+  STATIC_DEMO_HIGH_GROWTH,
+  normalizeDemoHighGrowth,
+  patchDemoHighGrowthPanelInPlace,
+} from './demo-high-growth-panel.mjs';
 import {
   attachScrollActivityListeners,
   captureScrollSnapshot,
@@ -214,6 +219,7 @@ let state = {
   aggressionDial: STATIC_AGGRESSION_DIAL,
   compounding: STATIC_COMPOUNDING_PANEL,
   optionBDemo: STATIC_OPTION_B_DEMO,
+  demoHighGrowth: STATIC_DEMO_HIGH_GROWTH,
   unlockDraft: '',
   unlockKeyVisible: false,
   sessionScope: initialSessionScope,
@@ -582,6 +588,11 @@ function handleSseEvent(eventName, dataText) {
       state.optionBDemo = normalizeOptionBDemo(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
       syncOptionBDemoDom();
     } catch { /* Ignore malformed Option B demo frame. */ }
+  } else if (eventName === 'demo_high_growth_profile') {
+    try {
+      state.demoHighGrowth = normalizeDemoHighGrowth(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
+      syncDemoHighGrowthDom();
+    } catch { /* Ignore malformed DEMO high-growth profile frame. */ }
   }
 }
 
@@ -750,6 +761,7 @@ async function readAiCockpitFeeds() {
   await readAggressionDial();
   await readCompounding();
   await readOptionBDemo();
+  await readDemoHighGrowth();
 }
 
 const LIVE_COCKPIT_POLL_MS = 4000;
@@ -805,6 +817,57 @@ function syncOptionBDemoDom() {
   restoreScrollPosition(scrollSnap);
 }
 
+async function readDemoHighGrowth() {
+  try {
+    const rawDhg = await readStatic(new URL('/api/demo-high-growth-profile', window.location.origin), MAX_AI_PAYLOAD_BYTES);
+    state.demoHighGrowth = normalizeDemoHighGrowth(parseUniqueJSON(rawDhg, MAX_AI_PAYLOAD_BYTES));
+  } catch { /* Keep prior verified DEMO high-growth profile snapshot. */ }
+}
+
+function syncDemoHighGrowthDom(focusSelector = null) {
+  const scrollSnap = captureScrollSnapshot(document, window);
+  const panelEl = root.querySelector('[data-demo-high-growth="true"]');
+  if (panelEl) {
+    patchDemoHighGrowthPanelInPlace(panelEl, resolveCockpitDemoHighGrowth(state));
+    if (focusSelector) {
+      panelEl.querySelector(focusSelector)?.focus({ preventScroll: true });
+    }
+  }
+  restoreScrollPosition(scrollSnap);
+}
+
+async function submitDemoHighGrowthMutation(payload, focusSelector = null) {
+  if (!state.liveStreamConnected) return;
+  if (!isStrictOwnerCompoundingSession()) {
+    requireOwnerControlOrWarn('DEMO High-Growth Practice Profile toggle');
+    syncDemoHighGrowthDom();
+    return;
+  }
+  try {
+    const res = await postLoopbackJson('/api/demo-high-growth-profile', payload);
+    state.demoHighGrowth = normalizeDemoHighGrowth(res);
+    state.aiIssue = null;
+    await Promise.all([readAggressionDial(), readCompounding(), readOptionBDemo()]);
+    syncDemoHighGrowthDom(focusSelector);
+    if (!isDialSliderDragging()) syncAggressionDialDom();
+    syncCompoundingDom();
+    syncOptionBDemoDom();
+    announce(state.demoHighGrowth.enabled
+      ? 'DEMO High-Growth Practice Mode enabled (10% risk, 30% DD freeze, 100% compounding).'
+      : 'DEMO High-Growth Practice Mode disabled (restored 1.00% / 10.00% standard caps).');
+  } catch (error) {
+    if (error?.status === 403) {
+      state.ownerControlsAllowed = false;
+      state.canPairDevice = false;
+    }
+    state.aiIssue = error instanceof Error ? error.message : 'DEMO high-growth profile update failed.';
+    announce(state.aiIssue);
+    await readDemoHighGrowth();
+    if (error?.status === 403) render();
+    else syncDemoHighGrowthDom(focusSelector);
+  }
+}
+
 function refreshCompoundingFromTick() {
   if (!state.liveStreamConnected || compoundingTickRefreshInFlight) return;
   compoundingTickRefreshInFlight = true;
@@ -824,11 +887,13 @@ async function pollLiveCockpitState() {
     await readAggressionDial();
     await readCompounding();
     await readOptionBDemo();
+    await readDemoHighGrowth();
     if (!isDialSliderDragging()) {
       syncAggressionDialDom();
     }
     syncCompoundingDom();
     syncOptionBDemoDom();
+    syncDemoHighGrowthDom();
   } finally {
     liveCockpitPollInFlight = false;
   }
@@ -1536,6 +1601,20 @@ root.addEventListener('click', (event) => {
         announce(notice);
       }
     })();
+    return;
+  }
+  if (target.dataset.dhgAction === 'TOGGLE_ENABLED') {
+    if (state.liveStreamConnected && !isStrictOwnerCompoundingSession()) {
+      requireOwnerControlOrWarn('DEMO High-Growth Practice Profile toggle');
+      syncDemoHighGrowthDom();
+      return;
+    }
+    const cur = resolveCockpitDemoHighGrowth(state);
+    if (cur.liveModeBlocked || !cur.ownerControlsAllowed) return;
+    const nextEnabled = !cur.enabled;
+    state.demoHighGrowth = normalizeDemoHighGrowth({ ...cur, enabled: nextEnabled });
+    syncDemoHighGrowthDom('[data-dhg-action="TOGGLE_ENABLED"]');
+    void submitDemoHighGrowthMutation({ enabled: nextEnabled }, '[data-dhg-action="TOGGLE_ENABLED"]');
     return;
   }
   if (target.dataset.compoundingAction === 'TOGGLE_FULL_100') {

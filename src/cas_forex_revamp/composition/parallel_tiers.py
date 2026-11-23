@@ -51,6 +51,13 @@ from cas_forex_revamp.contracts import (
 from cas_forex_revamp.contracts.commands import ActionIntent
 from cas_forex_revamp.contracts.primitives import decimal_value, parse_decimal, utc_time
 from cas_forex_revamp.operator.decisions import DecisionProposal
+from cas_forex_revamp.risk.demo_high_growth_profile import (
+    DEMO_HIGH_GROWTH_BE_SCALE,
+    DEMO_HIGH_GROWTH_DAILY_GOAL_PCT,
+    DEMO_HIGH_GROWTH_DAILY_LOSS_BRAKE_PCT,
+    DEMO_HIGH_GROWTH_TRAIL_SCALE,
+    DemoHighGrowthProfile,
+)
 from cas_forex_revamp.treasury.profit_sweep import ProfitSweepVault
 from cas_forex_revamp.valve.aggression_dial import (
     AggressionDialStore,
@@ -233,6 +240,7 @@ class ParallelTierEngine:
         fx_min_lot: Decimal = MT5_MIN_VOLUME,
         index_min_lot: Decimal = MT5_MIN_VOLUME,
         aggression_dial: AggressionDialStore | None = None,
+        demo_high_growth: DemoHighGrowthProfile | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not isinstance(db_path, Path):
@@ -241,6 +249,8 @@ class ParallelTierEngine:
             raise ContractError("valve_gate must be a ForexMetaValveGate")
         if aggression_dial is not None and not isinstance(aggression_dial, AggressionDialStore):
             raise ContractError("aggression_dial must be an AggressionDialStore or None")
+        if demo_high_growth is not None and not isinstance(demo_high_growth, DemoHighGrowthProfile):
+            raise ContractError("demo_high_growth must be a DemoHighGrowthProfile or None")
         db_path.parent.mkdir(parents=True, exist_ok=True)
         apply_verified_directory_mode(db_path.parent, dir_mode=0o700)
         self.db_path = db_path
@@ -255,9 +265,25 @@ class ParallelTierEngine:
         self._regime = TrendRegimeDetector()
         self._peak_store = PeakEquityStore(db_path)
         self._aggression_dial: AggressionDialStore | None = aggression_dial
+        self._default_sweep_ratio = decimal_value(sweep_ratio, "sweep_ratio")
+        self._demo_high_growth: DemoHighGrowthProfile = (
+            demo_high_growth if demo_high_growth is not None else DemoHighGrowthProfile(enabled=False)
+        )
+        self._demo_high_growth.assert_demo_mode("DEMO", live_trading_armed=False, live_trading_locked=True)
+        eff_sweep = self._demo_high_growth.effective_sweep_ratio(self._default_sweep_ratio)
         self._quotas: dict[str, DailyQuotaGovernanceStore] = {}
         self._vaults: dict[str, ProfitSweepVault] = {}
-        self._init_db(sweep_ratio=sweep_ratio)
+        self._tier_symbol_loss_cooldown_until: dict[tuple[str, str], datetime] = {}
+        self._init_db(sweep_ratio=eff_sweep)
+        if self._demo_high_growth.enabled:
+            for q_store in self._quotas.values():
+                if callable(getattr(q_store, "set_demo_high_growth_profile", None)):
+                    q_store.set_demo_high_growth_profile(
+                        self._demo_high_growth,
+                        execution_mode="DEMO",
+                        live_trading_armed=False,
+                        live_trading_locked=True,
+                    )
 
     @property
     def aggression_dial(self) -> AggressionDialStore | None:
@@ -269,6 +295,35 @@ class ParallelTierEngine:
             raise ContractError("aggression_dial must be an AggressionDialStore or None")
         with self._lock:
             self._aggression_dial = store
+
+    def set_demo_high_growth_profile(
+        self,
+        profile: DemoHighGrowthProfile,
+        *,
+        execution_mode: Any = "DEMO",
+        live_trading_armed: bool = False,
+        live_trading_locked: bool = True,
+    ) -> None:
+        if not isinstance(profile, DemoHighGrowthProfile):
+            raise ContractError("profile must be a DemoHighGrowthProfile")
+        profile.assert_demo_mode(
+            execution_mode,
+            live_trading_armed=live_trading_armed,
+            live_trading_locked=live_trading_locked,
+        )
+        with self._lock:
+            self._demo_high_growth = profile
+            eff_ratio = profile.effective_sweep_ratio(self._default_sweep_ratio)
+            for vault in self._vaults.values():
+                vault.set_config(sweep_ratio=eff_ratio)
+            for q_store in self._quotas.values():
+                if callable(getattr(q_store, "set_demo_high_growth_profile", None)):
+                    q_store.set_demo_high_growth_profile(
+                        profile,
+                        execution_mode=execution_mode,
+                        live_trading_armed=live_trading_armed,
+                        live_trading_locked=live_trading_locked,
+                    )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=5.0, isolation_level=None)
@@ -446,16 +501,26 @@ class ParallelTierEngine:
         min_lot = self._index_min_lot if symbol in INDEX_INSTRUMENTS else self._fx_min_lot
         min_units = csize * min_lot
         step_units = csize * MT5_VOLUME_STEP
-        policy_cap = self._policy.max_stop_risk_amount(deployable_equity)
-        if tier_risk_pct is not None:
-            clamped_pct = min(
-                tier_risk_pct,
-                MAX_CONSTITUTIONAL_STOP_RISK_PCT,
-                self._policy.max_stop_loss_equity_risk_pct,
+        with self._lock:
+            dhg = self._demo_high_growth
+        if dhg.enabled:
+            dhg_ceil = dhg.effective_stop_risk_ceiling_pct()
+            policy_cap = ((deployable_equity * dhg_ceil) / Decimal("100")).quantize(
+                Decimal("0.01"), rounding=ROUND_FLOOR
             )
-            base_budget = min((deployable_equity * clamped_pct) / Decimal("100"), policy_cap)
+            eff_pct = dhg.target_risk_pct if tier_risk_pct is None else min(tier_risk_pct, dhg_ceil)
+            base_budget = min((deployable_equity * eff_pct) / Decimal("100"), policy_cap)
         else:
-            base_budget = policy_cap
+            policy_cap = self._policy.max_stop_risk_amount(deployable_equity)
+            if tier_risk_pct is not None:
+                clamped_pct = min(
+                    tier_risk_pct,
+                    MAX_CONSTITUTIONAL_STOP_RISK_PCT,
+                    self._policy.max_stop_loss_equity_risk_pct,
+                )
+                base_budget = min((deployable_equity * clamped_pct) / Decimal("100"), policy_cap)
+            else:
+                base_budget = policy_cap
         budget = base_budget * risk_multiplier
 
         _, quote_ccy = Mt5MarginCalculator.split_symbol(symbol)
@@ -651,6 +716,14 @@ class ParallelTierEngine:
                                     tid,
                                 ),
                             )
+                            if (
+                                net_pnl < Decimal("0")
+                                and self._demo_high_growth.enabled
+                                and self._demo_high_growth.post_loss_cooldown_seconds > 0
+                            ):
+                                self._tier_symbol_loss_cooldown_until[(tid, sym)] = ts_dt + timedelta(
+                                    seconds=self._demo_high_growth.post_loss_cooldown_seconds
+                                )
                             pending_closes.append((f"{tid}:{pos['ticket']}", sym, str(pos["ticket"]), net_pnl, balance))
                             acct = conn.execute("SELECT * FROM tier_accounts WHERE tier_id = ?", (tid,)).fetchone()
                             continue
@@ -665,6 +738,10 @@ class ParallelTierEngine:
                         be_off = Decimal("1.50") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("10")
                         trail_act = Decimal("22.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("220")
                         trail_dist = Decimal("14.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("140")
+                        if self._demo_high_growth.enabled and self._demo_high_growth.let_winners_run:
+                            be_trig = (be_trig * DEMO_HIGH_GROWTH_BE_SCALE).quantize(t_sz, rounding=ROUND_HALF_UP)
+                            trail_act = (trail_act * DEMO_HIGH_GROWTH_TRAIL_SCALE).quantize(t_sz, rounding=ROUND_HALF_UP)
+                            trail_dist = (trail_dist * DEMO_HIGH_GROWTH_TRAIL_SCALE).quantize(t_sz, rounding=ROUND_HALF_UP)
 
                         new_sl = sl_p
                         new_stage = str(pos["protection_stage"])
@@ -756,7 +833,75 @@ class ParallelTierEngine:
 
                         tier_risk_pct_val: Decimal | None = None
                         tier_min_prob_val: Decimal | None = None
-                        if tier_eff is not None:
+                        dhg_active = self._demo_high_growth
+                        if dhg_active.enabled:
+                            tier_risk_pct_val = (
+                                dhg_active.max_risk_pct
+                                if regime == "STRONG_TREND"
+                                else dhg_active.target_risk_pct
+                            )
+                            tier_min_prob_val = (
+                                max(MIN_CONSTITUTIONAL_VALVE_PROB, Decimal(str(tier_eff["min_signal_prob"])))
+                                if tier_eff is not None
+                                else MIN_CONSTITUTIONAL_VALVE_PROB
+                            )
+                            tier_max_trades = (
+                                max(3, int(tier_eff["max_open_trades"]) if tier_eff is not None else 5)
+                                if dhg_active.pyramiding_enabled
+                                else 1
+                            )
+                            tier_goal_usd = (equity * DEMO_HIGH_GROWTH_DAILY_GOAL_PCT).quantize(
+                                Decimal("0.01"), rounding=ROUND_HALF_UP
+                            )
+                            tier_soft_usd = (tier_goal_usd * Decimal("0.70")).quantize(
+                                Decimal("0.01"), rounding=ROUND_HALF_UP
+                            )
+                            tier_loss_brake_usd = (equity * DEMO_HIGH_GROWTH_DAILY_LOSS_BRAKE_PCT).quantize(
+                                Decimal("0.01"), rounding=ROUND_HALF_UP
+                            )
+                            q_snap = self._quotas[tid].snapshot(now=ts_dt, starting_equity=equity)
+                            q_pnl = Decimal(str(q_snap["realized_net_pnl_usd"]))
+                            q_consec = int(q_snap["consecutive_losses"])
+                            q_max_consec = int(q_snap["max_consecutive_losses"])
+                            dhg_cd_until = (
+                                self._tier_symbol_loss_cooldown_until.get((tid, sym))
+                                if (not is_add and dhg_active.post_loss_cooldown_seconds > 0)
+                                else None
+                            )
+                            if dhg_cd_until is not None and ts_dt < dhg_cd_until:
+                                rem_s = max(1, int((dhg_cd_until - ts_dt).total_seconds()))
+                                allowed_q = False
+                                q_reason = f"DEMO_POST_LOSS_COOLDOWN ({sym}: {rem_s}s remaining)"
+                                q_mult = Decimal("0")
+                            elif q_pnl <= -tier_loss_brake_usd:
+                                allowed_q = False
+                                q_reason = f"DAILY_LOSS_BRAKE ({decimal_text(q_pnl)}<=-{decimal_text(tier_loss_brake_usd)})"
+                                q_mult = Decimal("0")
+                            elif q_consec >= q_max_consec:
+                                allowed_q = False
+                                q_reason = QUOTA_STATUS_LOSS_TRIPPED
+                                q_mult = Decimal("0")
+                            elif q_pnl >= tier_goal_usd and not (is_add and regime == "STRONG_TREND"):
+                                allowed_q = False
+                                q_reason = f"SESSION_GOAL_REACHED ({decimal_text(q_pnl)}>={decimal_text(tier_goal_usd)})"
+                                q_mult = Decimal("0")
+                            elif total_open_cnt >= tier_max_trades:
+                                allowed_q = False
+                                q_reason = f"MAX_OPEN_TRADES_REACHED ({total_open_cnt}>={tier_max_trades})"
+                                q_mult = Decimal("0")
+                            elif q_pnl >= tier_goal_usd and is_add and regime == "STRONG_TREND":
+                                allowed_q = True
+                                q_reason = None
+                                q_mult = Decimal("0.50")
+                            elif q_pnl >= tier_soft_usd:
+                                allowed_q = True
+                                q_reason = None
+                                q_mult = Decimal("0.75")
+                            else:
+                                allowed_q = True
+                                q_reason = None
+                                q_mult = Decimal("1.00")
+                        elif tier_eff is not None:
                             tier_risk_pct_val = Decimal(str(tier_eff["risk_pct"]))
                             tier_min_prob_val = max(
                                 MIN_CONSTITUTIONAL_VALVE_PROB,
@@ -881,7 +1026,9 @@ class ParallelTierEngine:
                                         "available_margin": decimal_text(free_margin),
                                         "position_inventory": inv_json,
                                         "peak_equity": decimal_text(pk_val),
-                                        "max_drawdown_pct": decimal_text(DEFAULT_MAX_DRAWDOWN_PCT),
+                                        "max_drawdown_pct": decimal_text(
+                                            self._demo_high_growth.effective_drawdown_ceiling_pct()
+                                        ),
                                         "current_market": [
                                             {
                                                 "instrument_id": sym,

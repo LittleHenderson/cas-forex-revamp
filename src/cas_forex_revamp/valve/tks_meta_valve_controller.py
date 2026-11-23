@@ -38,6 +38,10 @@ from typing import Any
 
 from cas_forex_revamp.contracts import ActionKind, ContractError, ControlKind, canonical_bytes, decimal_text
 from cas_forex_revamp.contracts.primitives import utc_time
+from cas_forex_revamp.risk.demo_high_growth_profile import (
+    DEMO_HIGH_GROWTH_MAX_DRAWDOWN_PCT,
+    DemoHighGrowthProfile,
+)
 
 
 MAX_CONSTITUTIONAL_DRAWDOWN_PCT = Decimal("0.10")
@@ -1379,6 +1383,7 @@ def extract_forex_valve_features(
     now: datetime | None = None,
     max_drawdown_pct: Decimal | str | None = DEFAULT_MAX_DRAWDOWN_PCT,
     peak_equity_store: PeakEquityStore | None = None,
+    demo_max_drawdown_ceiling: Decimal = MAX_CONSTITUTIONAL_DRAWDOWN_PCT,
 ) -> tuple[list[float], list[str]]:
     """Extract 8-D safety feature vector and deterministic hard-veto reasons."""
     if policy is None and isinstance(current_view, Mapping) and "policy" in current_view and current_view["policy"] is not None:
@@ -1473,8 +1478,18 @@ def extract_forex_valve_features(
     # remain available during drawdown.
     # Constitutional invariant (Finding [5]): max_drawdown_pct can NEVER exceed 0.10 (10.00%);
     # policy overrides may ONLY tighten below the immutable 10.00% ceiling.
+    if (
+        not isinstance(demo_max_drawdown_ceiling, Decimal)
+        or not demo_max_drawdown_ceiling.is_finite()
+        or demo_max_drawdown_ceiling <= Decimal("0")
+        or demo_max_drawdown_ceiling > DEMO_HIGH_GROWTH_MAX_DRAWDOWN_PCT
+    ):
+        raise ContractError(
+            f"demo_max_drawdown_ceiling must be Decimal in (0, {DEMO_HIGH_GROWTH_MAX_DRAWDOWN_PCT}]"
+        )
     if intent is not None and intent.kind in (ActionKind.OPEN, ActionKind.ADD):
         pol_dict = policy if isinstance(policy, Mapping) else {}
+        eff_dd_ceiling = demo_max_drawdown_ceiling
         dd_threshold: Decimal | None = None
         dd_invalid = False
         dd_ceiling_exceeded = False
@@ -1483,24 +1498,24 @@ def extract_forex_valve_features(
             gate_dd = _safe_decimal(max_drawdown_pct)
             if gate_dd is None or gate_dd <= Decimal("0") or gate_dd >= Decimal("1"):
                 dd_invalid = True
-            elif gate_dd > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+            elif gate_dd > eff_dd_ceiling:
                 dd_ceiling_exceeded = True
-                gate_dd = MAX_CONSTITUTIONAL_DRAWDOWN_PCT
+                gate_dd = eff_dd_ceiling
         if "max_drawdown_pct" in pol_dict:
             pol_dd = _safe_decimal(pol_dict.get("max_drawdown_pct"))
             if pol_dd is None or pol_dd <= Decimal("0") or pol_dd >= Decimal("1"):
                 dd_invalid = True
-            elif pol_dd > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+            elif pol_dd > eff_dd_ceiling:
                 dd_ceiling_exceeded = True
                 dd_threshold = (
-                    min(gate_dd, MAX_CONSTITUTIONAL_DRAWDOWN_PCT)
+                    min(gate_dd, eff_dd_ceiling)
                     if gate_dd is not None
-                    else MAX_CONSTITUTIONAL_DRAWDOWN_PCT
+                    else eff_dd_ceiling
                 )
             else:
                 dd_threshold = min(pol_dd, gate_dd) if gate_dd is not None else pol_dd
         elif gate_dd is not None:
-            dd_threshold = min(gate_dd, MAX_CONSTITUTIONAL_DRAWDOWN_PCT)
+            dd_threshold = min(gate_dd, eff_dd_ceiling)
 
         if dd_ceiling_exceeded:
             vetoes.append("CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED")
@@ -2037,9 +2052,12 @@ class ForexMetaValveGate:
         default_policy: dict[str, Any] | None = None,
         max_drawdown_pct: Decimal | str | None = DEFAULT_MAX_DRAWDOWN_PCT,
         peak_equity_store: PeakEquityStore | None = None,
+        demo_high_growth: DemoHighGrowthProfile | None = None,
     ) -> None:
         if not isinstance(controller, TKSMetaValveController):
             raise ContractError("ForexMetaValveGate requires a typed TKSMetaValveController")
+        if demo_high_growth is not None and not isinstance(demo_high_growth, DemoHighGrowthProfile):
+            raise ContractError("demo_high_growth must be a DemoHighGrowthProfile or None")
         self.controller = controller
         if default_policy is not None:
             if not isinstance(default_policy, Mapping):
@@ -2051,14 +2069,45 @@ class ForexMetaValveGate:
                     allow_none=False,
                 )
         self.default_policy = deepcopy(default_policy) if default_policy is not None else None
-        self.max_drawdown_pct: Decimal | None = validate_constitutional_drawdown_pct(
+        self._base_max_drawdown_pct: Decimal | None = validate_constitutional_drawdown_pct(
             max_drawdown_pct,
             field="max_drawdown_pct",
             allow_none=True,
         )
+        self._demo_high_growth: DemoHighGrowthProfile = (
+            demo_high_growth if demo_high_growth is not None else DemoHighGrowthProfile(enabled=False)
+        )
+        self.max_drawdown_pct: Decimal | None = (
+            self._demo_high_growth.max_drawdown_pct
+            if self._demo_high_growth.enabled
+            else self._base_max_drawdown_pct
+        )
         self.peak_equity_store = peak_equity_store if peak_equity_store is not None else PeakEquityStore()
         self._weights_sha256 = controller.weights_sha256()
         self._gate_id = secrets.token_hex(16)
+
+    def effective_drawdown_ceiling_pct(self) -> Decimal:
+        return self._demo_high_growth.effective_drawdown_ceiling_pct()
+
+    def set_demo_high_growth_profile(
+        self,
+        profile: DemoHighGrowthProfile,
+        *,
+        execution_mode: Any = "DEMO",
+        live_trading_armed: bool = False,
+        live_trading_locked: bool = True,
+    ) -> None:
+        if not isinstance(profile, DemoHighGrowthProfile):
+            raise ContractError("profile must be a DemoHighGrowthProfile")
+        profile.assert_demo_mode(
+            execution_mode,
+            live_trading_armed=live_trading_armed,
+            live_trading_locked=live_trading_locked,
+        )
+        self._demo_high_growth = profile
+        self.max_drawdown_pct = (
+            profile.max_drawdown_pct if profile.enabled else self._base_max_drawdown_pct
+        )
 
     @property
     def weights_sha256(self) -> str:
@@ -2184,6 +2233,7 @@ class ForexMetaValveGate:
             now=now,
             max_drawdown_pct=self.max_drawdown_pct,
             peak_equity_store=self.peak_equity_store,
+            demo_max_drawdown_ceiling=self.effective_drawdown_ceiling_pct(),
         )
         feature_map = {name: val for name, val in zip(FOREX_FEATURE_NAMES, vec)}
         score = self.controller.forward(vec)

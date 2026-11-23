@@ -58,6 +58,12 @@ from cas_forex_revamp.operator.decisions import OperatorUnavailable
 from cas_forex_revamp.operator.frontier_backends import assert_safe_ai_catalog_payload
 from cas_forex_revamp.composition.autonomous_trader import build_enriched_compounding_payload
 from cas_forex_revamp.composition.option_b_paper_runner import OptionBPaperDemoRunner
+from cas_forex_revamp.risk.demo_high_growth_profile import (
+    DEMO_HIGH_GROWTH_FORBIDDEN_LIVE_CODE,
+    DemoHighGrowthProfile,
+    DemoHighGrowthProfileStore,
+    resolve_demo_high_growth_profile_from_environ,
+)
 from cas_forex_revamp.treasury.compounding_controller import (
     CompoundingControllerError,
     OwnerKeyRequiredError as CompoundingOwnerKeyRequiredError,
@@ -1222,8 +1228,16 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
         finally:
             super().server_close()
 
-def _roll_mt5_index_bars(prev_bars: Any, bucket_iso: str, mid_px: Any, _dec_txt: Any, limit: int = 48) -> list[dict[str, Any]]:
-    """Append or update the latest OHLC candle bucket for MT5-driven index streams."""
+def _roll_mt5_index_bars(
+    prev_bars: Any,
+    bucket_iso: str,
+    mid_px: Any,
+    _dec_txt: Any,
+    limit: int = 48,
+    *,
+    max_stitch_gap_seconds: int = 120,
+) -> list[dict[str, Any]]:
+    """Append or update the latest OHLC candle bucket without stitching across stale gaps/jumps."""
     from decimal import Decimal
 
     bars: list[dict[str, Any]] = []
@@ -1249,7 +1263,19 @@ def _roll_mt5_index_bars(prev_bars: Any, bucket_iso: str, mid_px: Any, _dec_txt:
         last["v"] = _dec_txt(Decimal(str(last.get("v", "1"))) + Decimal("1"))
         last["n"] = int(last.get("n", 1)) + 1
     else:
-        o_dec = Decimal(str(bars[-1]["c"])) if bars else mid_px
+        o_dec = mid_px
+        if bars:
+            prev_bar = bars[-1]
+            try:
+                prev_dt = datetime.fromisoformat(str(prev_bar["t"]).replace("Z", "+00:00"))
+                new_dt = datetime.fromisoformat(str(bucket_iso).replace("Z", "+00:00"))
+                prev_c = Decimal(str(prev_bar["c"]))
+                gap_s = (new_dt - prev_dt).total_seconds()
+                price_jump_ratio = abs(mid_px - prev_c) / max(abs(prev_c), Decimal("1"))
+                if 0.0 < gap_s <= float(max_stitch_gap_seconds) and price_jump_ratio <= Decimal("0.015"):
+                    o_dec = prev_c
+            except (ValueError, TypeError, InvalidOperation):
+                o_dec = mid_px
         bars.append({
             "t": bucket_iso,
             "o": _dec_txt(o_dec),
@@ -1417,9 +1443,9 @@ def _build_mt5_index_snapshot_from_router(
                 "source_provider": f"MT5_BROKER:{mt5_src_broker.get(sym_idx, 'MT5')}",
                 "source_broker_id": mt5_src_broker.get(sym_idx, "MT5"),
                 "is_independent_public": False,
-                "candles_m1": _roll_mt5_index_bars(p_m1, b_m1, mid_px, _dec_txt),
-                "candles_m5": _roll_mt5_index_bars(p_m5, b_m5, mid_px, _dec_txt),
-                "candles_h1": _roll_mt5_index_bars(p_h1, b_h1, mid_px, _dec_txt),
+                "candles_m1": _roll_mt5_index_bars(p_m1, b_m1, mid_px, _dec_txt, max_stitch_gap_seconds=120),
+                "candles_m5": _roll_mt5_index_bars(p_m5, b_m5, mid_px, _dec_txt, max_stitch_gap_seconds=600),
+                "candles_h1": _roll_mt5_index_bars(p_h1, b_h1, mid_px, _dec_txt, max_stitch_gap_seconds=7200),
             })
     if not idx_rows:
         return None, mt5_q
@@ -1589,6 +1615,7 @@ _KNOWN_METRICS_ROUTES: frozenset[str] = frozenset({
     "/api/aggression-dial",
     "/api/compounding",
     "/api/option-b-demo",
+    "/api/demo-high-growth-profile",
 })
 
 _CONTENT_TYPES: dict[str, str] = {
@@ -1692,6 +1719,7 @@ class LoopbackCockpitServer:
         aggression_dial: Any | None = None,
         compounding_controller: Any | None = None,
         option_b_demo: Any | None = None,
+        demo_high_growth_store: DemoHighGrowthProfileStore | None = None,
         phase8_bridge: Any | None = None,
         owner_recovery: Any | None = None,
         model_execution_gate: Any | None = None,
@@ -1751,6 +1779,7 @@ class LoopbackCockpitServer:
             )
         self._compounding_controller = inferred_comp
         self._option_b_demo = option_b_demo
+        self._demo_high_growth_store: DemoHighGrowthProfileStore | None = demo_high_growth_store
         inferred_p8 = phase8_bridge
         if inferred_p8 is None and autonomous_trader is not None:
             inferred_p8 = getattr(autonomous_trader, "phase8_bridge", None) or getattr(
@@ -2682,6 +2711,83 @@ class LoopbackCockpitServer:
         snap["session_scope"] = str(session_scope)
         return assert_safe_ai_catalog_payload(snap)
 
+    def _read_demo_high_growth_snapshot(
+        self,
+        *,
+        owner_controls_allowed: bool,
+        session_scope: str,
+    ) -> dict[str, Any] | None:
+        if self._demo_high_growth_store is None:
+            return None
+        is_live_or_unk, mode_lbl = self._resolve_aggression_live_mode_fail_closed()
+        exec_mode = "DEMO" if (not is_live_or_unk and mode_lbl == "DEMO") else mode_lbl
+        snap = self._demo_high_growth_store.snapshot(
+            execution_mode=exec_mode,
+            owner_controls_allowed=bool(owner_controls_allowed) and (exec_mode == "DEMO"),
+            session_scope=session_scope,
+        )
+        return assert_safe_ai_catalog_payload(snap)
+
+    def _apply_demo_high_growth_profile_to_components(self, profile: DemoHighGrowthProfile) -> None:
+        is_live_or_unk, _ = self._resolve_aggression_live_mode_fail_closed()
+        exec_mode = "LIVE" if is_live_or_unk else "DEMO"
+        profile.assert_demo_mode(
+            exec_mode,
+            live_trading_armed=is_live_or_unk,
+            live_trading_locked=not is_live_or_unk,
+        )
+        if self._autonomous_trader is not None and callable(
+            getattr(self._autonomous_trader, "set_demo_high_growth_profile", None)
+        ):
+            self._autonomous_trader.set_demo_high_growth_profile(profile)
+        if self._option_b_demo is not None and callable(
+            getattr(self._option_b_demo, "set_demo_high_growth_profile", None)
+        ):
+            self._option_b_demo.set_demo_high_growth_profile(
+                profile,
+                execution_mode=exec_mode,
+                live_trading_armed=is_live_or_unk,
+                live_trading_locked=not is_live_or_unk,
+            )
+        if self._parallel_tiers is not None and callable(
+            getattr(self._parallel_tiers, "set_demo_high_growth_profile", None)
+        ):
+            self._parallel_tiers.set_demo_high_growth_profile(
+                profile,
+                execution_mode=exec_mode,
+                live_trading_armed=is_live_or_unk,
+                live_trading_locked=not is_live_or_unk,
+            )
+        if self._compounding_controller is not None and callable(
+            getattr(self._compounding_controller, "set_demo_high_growth_profile", None)
+        ):
+            self._compounding_controller.set_demo_high_growth_profile(
+                profile,
+                execution_mode=exec_mode,
+                live_trading_armed=is_live_or_unk,
+                live_trading_locked=not is_live_or_unk,
+            )
+            if profile.enabled and profile.compounding_100pct and self._autonomous_trader is None:
+                self._compounding_controller.set_compounding_mode(
+                    "FULL_COMPOUND_100",
+                    owner_controls_allowed=True,
+                    actor="demo-high-growth-profile",
+                )
+        if self._phase8_bridge is not None and callable(
+            getattr(self._phase8_bridge, "set_demo_high_growth_profile", None)
+        ):
+            self._phase8_bridge.set_demo_high_growth_profile(
+                profile,
+                execution_mode=exec_mode,
+                live_trading_armed=is_live_or_unk,
+                live_trading_locked=not is_live_or_unk,
+            )
+        if self._profit_vault is not None and self._autonomous_trader is None:
+            if profile.enabled and profile.compounding_100pct:
+                self._profit_vault.set_config(sweep_ratio=Decimal("0.00"), auto_sweep_enabled=True)
+            elif not profile.enabled:
+                self._profit_vault.set_config(sweep_ratio=Decimal("0.50"), auto_sweep_enabled=True)
+
     def _resolve_static_path(self, raw_path: str) -> Path | None:
         clean = urllib.parse.unquote(raw_path.split("?", 1)[0].split("#", 1)[0])
         if clean in ("/", "/ui", "/ui/"):
@@ -3328,6 +3434,26 @@ class LoopbackCockpitServer:
                                 {"error": "Option B paper demo snapshot unavailable"},
                             )
                         return
+                    if route == "/api/demo-high-growth-profile":
+                        try:
+                            dhg_snap = outer._read_demo_high_growth_snapshot(
+                                owner_controls_allowed=(auth_scope == SESSION_SCOPE_OWNER_FULL),
+                                session_scope=auth_scope,
+                            )
+                            if dhg_snap is None:
+                                self._write_json(
+                                    HTTPStatus.NOT_FOUND,
+                                    {"error": "DEMO high-growth profile store not configured"},
+                                )
+                            else:
+                                self._write_json(HTTPStatus.OK, dhg_snap)
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(
+                                HTTPStatus.INTERNAL_SERVER_ERROR,
+                                {"error": "DEMO high-growth profile snapshot unavailable"},
+                            )
+                        return
                     if route == "/api/index-stream":
                         try:
                             idx_snap = outer._index_stream_reader() if outer._index_stream_reader is not None else None
@@ -3381,6 +3507,8 @@ class LoopbackCockpitServer:
                             last_compounding_mono = 0.0
                             last_option_b_json = ""
                             last_option_b_mono = 0.0
+                            last_dhg_json = ""
+                            last_dhg_mono = 0.0
                             outer._record_sse_client(1)
                             sse_client_recorded = True
                             try:
@@ -3557,6 +3685,29 @@ class LoopbackCockpitServer:
                                             except Exception as exc:
                                                 outer._last_routing_error = type(exc).__name__
                                                 eframe = f"event: error\ndata: {json.dumps({'source': 'option_b_demo', 'error': 'Option B paper demo snapshot unavailable'})}\n\n".encode("utf-8")
+                                                self.wfile.write(eframe)
+                                                emitted_events += 1
+                                        if outer._demo_high_growth_store is not None:
+                                            try:
+                                                dhgsnap = outer._read_demo_high_growth_snapshot(
+                                                    owner_controls_allowed=(auth_scope == SESSION_SCOPE_OWNER_FULL),
+                                                    session_scope=auth_scope,
+                                                )
+                                                if dhgsnap is not None:
+                                                    dhgjson = json.dumps(dhgsnap, sort_keys=False)
+                                                    if (
+                                                        not last_dhg_json
+                                                        or dhgjson != last_dhg_json
+                                                        or (now_mono - last_dhg_mono) >= 1.0
+                                                    ):
+                                                        last_dhg_json = dhgjson
+                                                        last_dhg_mono = now_mono
+                                                        dhgframe = f"event: demo_high_growth_profile\ndata: {dhgjson}\n\n".encode("utf-8")
+                                                        self.wfile.write(dhgframe)
+                                                        emitted_events += 1
+                                            except Exception as exc:
+                                                outer._last_routing_error = type(exc).__name__
+                                                eframe = f"event: error\ndata: {json.dumps({'source': 'demo_high_growth_profile', 'error': 'DEMO high-growth profile snapshot unavailable'})}\n\n".encode("utf-8")
                                                 self.wfile.write(eframe)
                                                 emitted_events += 1
                                         if emitted_events > 0:
@@ -4407,7 +4558,7 @@ class LoopbackCockpitServer:
                             risk_pct = (
                                 outer._parse_strict_decimal_field(body.get("risk_pct"), "risk_pct")
                                 if body.get("risk_pct") is not None
-                                else Decimal("1.00")
+                                else outer._option_b_demo.default_risk_pct
                             )
                             with outer._commit_lease(supplied_tok, auth_epoch):
                                 mirror_res = outer._option_b_demo.mirror_entry_signal(
@@ -4436,6 +4587,65 @@ class LoopbackCockpitServer:
                         self._reject_unauthorized()
                     except OwnerKeyRequiredError:
                         self._reject_insufficient_scope()
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+
+                if route == "/api/demo-high-growth-profile":
+                    if outer._demo_high_growth_store is None:
+                        self._drain_small_request_body(max_bytes=16384)
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "DEMO high-growth profile store not configured"})
+                        return
+                    try:
+                        body = self._read_json_body(max_bytes=16384)
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        if auth_scope != SESSION_SCOPE_OWNER_FULL:
+                            self._reject_insufficient_scope()
+                            return
+                        if type(body) is not dict:
+                            raise ContractError("JSON object required")
+                        is_live_or_unk, _ = outer._resolve_aggression_live_mode_fail_closed()
+                        cur_prof = outer._demo_high_growth_store.profile()
+                        candidate = DemoHighGrowthProfile.from_wire_dict(body, base=cur_prof)
+                        if is_live_or_unk and candidate.enabled:
+                            self._write_json(
+                                HTTPStatus.FORBIDDEN,
+                                {
+                                    "error": DEMO_HIGH_GROWTH_FORBIDDEN_LIVE_CODE,
+                                    "code": DEMO_HIGH_GROWTH_FORBIDDEN_LIVE_CODE,
+                                },
+                            )
+                            return
+                        exec_mode = "LIVE" if is_live_or_unk else "DEMO"
+                        with outer._commit_lease(supplied_tok, auth_epoch):
+                            outer._demo_high_growth_store.update(
+                                candidate,
+                                execution_mode=exec_mode,
+                                live_trading_armed=is_live_or_unk,
+                                live_trading_locked=not is_live_or_unk,
+                            )
+                            outer._apply_demo_high_growth_profile_to_components(candidate)
+                            snap = outer._read_demo_high_growth_snapshot(
+                                owner_controls_allowed=True,
+                                session_scope=SESSION_SCOPE_OWNER_FULL,
+                            )
+                        outer.notify_stream_updated()
+                        self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(snap))
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
+                    except OwnerKeyRequiredError:
+                        self._reject_insufficient_scope()
+                    except ContractError as exc:
+                        err_s = str(exc)
+                        if DEMO_HIGH_GROWTH_FORBIDDEN_LIVE_CODE in err_s:
+                            self._write_json(
+                                HTTPStatus.FORBIDDEN,
+                                {"error": err_s, "code": DEMO_HIGH_GROWTH_FORBIDDEN_LIVE_CODE},
+                            )
+                        else:
+                            self._write_json(HTTPStatus.BAD_REQUEST, {"error": err_s})
                     except Exception as exc:
                         self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
@@ -5657,6 +5867,41 @@ def run_cockpit_cli(
             raise ContractError(
                 f"Invalid {ENV_AI_INFERENCE_COOLDOWN_SECONDS}={raw_cd!r}: must be in 0..{int(MAX_AI_INFERENCE_COOLDOWN_SECONDS)}"
             )
+    is_live_boot = (
+        str(getattr(router, "execution_mode", "DEMO")).strip().upper() != "DEMO"
+    ) or bool(getattr(router, "_live_armed", False))
+    init_dhg_env = resolve_demo_high_growth_profile_from_environ(
+        merged,
+        execution_mode=router.execution_mode,
+        live_trading_armed=is_live_boot,
+        live_trading_locked=not is_live_boot,
+    )
+    demo_high_growth_store = DemoHighGrowthProfileStore(
+        runtime_state.state_dir / "demo_high_growth_profile.json",
+        initial_profile=init_dhg_env,
+        execution_mode=router.execution_mode,
+        live_trading_armed=is_live_boot,
+        live_trading_locked=not is_live_boot,
+    )
+    active_dhg = demo_high_growth_store.profile()
+    if active_dhg.enabled:
+        router.set_demo_high_growth_profile(active_dhg)
+        if callable(getattr(gate, "set_demo_high_growth_profile", None)):
+            gate.set_demo_high_growth_profile(
+                active_dhg,
+                execution_mode=router.execution_mode,
+                live_trading_armed=is_live_boot,
+                live_trading_locked=not is_live_boot,
+            )
+        if runtime_state.parallel_tiers is not None and callable(
+            getattr(runtime_state.parallel_tiers, "set_demo_high_growth_profile", None)
+        ):
+            runtime_state.parallel_tiers.set_demo_high_growth_profile(
+                active_dhg,
+                execution_mode=router.execution_mode,
+                live_trading_armed=is_live_boot,
+                live_trading_locked=not is_live_boot,
+            )
     trader = AutonomousAiTrader(
         router=router,
         model_registry=registry,
@@ -5673,6 +5918,7 @@ def run_cockpit_cli(
         risk_gear_path=runtime_state.state_dir / "risk_gear.json",
         ai_inference_cooldown_seconds=ai_cooldown_s,
         initial_capital_usd=cli_init_cap,
+        demo_high_growth=active_dhg,
         state_dir=runtime_state.state_dir,
     )
     if not args.autonomous_ai:
@@ -5748,7 +5994,11 @@ def run_cockpit_cli(
     option_b_demo = OptionBPaperDemoRunner(
         db_path=runtime_state.state_dir / "option_b_paper_demo.sqlite3",
         valve_gate=gate,
+        demo_high_growth=active_dhg,
     )
+    trader.bind_option_b_demo(option_b_demo)
+    if active_dhg.enabled:
+        trader.set_demo_high_growth_profile(active_dhg)
     _feed_option_b_demo_from_index_stream(option_b_demo, _read_index_stream())
     srv = LoopbackCockpitServer(
         repo_root=root,
@@ -5764,6 +6014,7 @@ def run_cockpit_cli(
         parallel_tiers=runtime_state.parallel_tiers,
         aggression_dial=aggression_dial,
         option_b_demo=option_b_demo,
+        demo_high_growth_store=demo_high_growth_store,
         owner_recovery=runtime_state.owner_recovery,
         model_execution_gate=runtime_state.model_gate,
         token_file=str(merged.get("CAS_FOREX_COCKPIT_TOKEN_FILE", "")).strip() or None,

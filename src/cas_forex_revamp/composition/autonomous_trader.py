@@ -62,6 +62,14 @@ from cas_forex_revamp.execution.smart_execution import (
     SmartSliceExecutor,
 )
 from cas_forex_revamp.ledger.unified_ledger import UnifiedRealTimeLedger
+from cas_forex_revamp.risk.demo_high_growth_profile import (
+    DEMO_HIGH_GROWTH_BE_SCALE,
+    DEMO_HIGH_GROWTH_DAILY_GOAL_PCT,
+    DEMO_HIGH_GROWTH_DAILY_LOSS_BRAKE_PCT,
+    DEMO_HIGH_GROWTH_TP_SCALE,
+    DEMO_HIGH_GROWTH_TRAIL_SCALE,
+    DemoHighGrowthProfile,
+)
 from cas_forex_revamp.risk.news_shock_shield import (
     NewsShockShield,
     TradeActionType,
@@ -461,7 +469,44 @@ def _point_unit(symbol: str) -> Decimal:
     return Decimal("0.0001")
 
 
-def _default_protection_params(symbol: str, risk_multiplier: Decimal) -> dict[str, Decimal]:
+def _is_us_equity_pre_close_chop(ts: datetime) -> bool:
+    """Return True during the 20:30-20:59 UTC weekday Wall Street pre-close chop window."""
+    utc_ts = utc_time(ts, "ts")
+    return utc_ts.weekday() < 5 and utc_ts.hour == 20 and utc_ts.minute >= 30
+
+
+def _compute_live_candle_atr(candles: Any, *, max_bars: int = 10) -> Decimal | None:
+    """Compute mean high-low range over recent normal M1 bars, ignoring >1.5% spike/cold-start anomalies."""
+    if not isinstance(candles, list) or len(candles) < 3:
+        return None
+    ranges: list[Decimal] = []
+    for bar in candles[-max_bars:]:
+        if not isinstance(bar, Mapping):
+            continue
+        try:
+            hi = Decimal(str(bar.get("h")))
+            lo = Decimal(str(bar.get("l")))
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+        if not (hi.is_finite() and lo.is_finite()) or lo <= Decimal("0") or hi < lo:
+            continue
+        span = hi - lo
+        mid = (hi + lo) / Decimal("2")
+        if mid <= Decimal("0") or span > (mid * Decimal("0.015")):
+            continue
+        ranges.append(span)
+    if len(ranges) < 3:
+        return None
+    return sum(ranges, Decimal("0")) / Decimal(len(ranges))
+
+
+def _default_protection_params(
+    symbol: str,
+    risk_multiplier: Decimal,
+    *,
+    let_winners_run: bool = False,
+) -> dict[str, Decimal]:
+    t_sz = _tick_size(symbol)
     if symbol == "NAS100":
         be_trig, be_off = Decimal("10.00"), Decimal("1.50")
         trail_act, trail_dist = Decimal("20.00"), Decimal("12.00")
@@ -475,8 +520,18 @@ def _default_protection_params(symbol: str, risk_multiplier: Decimal) -> dict[st
         be_trig, be_off = pt * Decimal("8"), pt * Decimal("1")
         trail_act, trail_dist = pt * Decimal("15"), pt * Decimal("10")
         sl_dist, tp_dist = pt * Decimal("25"), pt * Decimal("55")
-    if risk_multiplier < Decimal("1") and risk_multiplier > Decimal("0"):
-        trail_dist = max(_tick_size(symbol), (trail_dist * Decimal("0.60")).quantize(_tick_size(symbol), rounding=ROUND_HALF_UP))
+    if let_winners_run:
+        be_trig = max(t_sz, (be_trig * DEMO_HIGH_GROWTH_BE_SCALE).quantize(t_sz, rounding=ROUND_HALF_UP))
+        trail_act = max(t_sz, (trail_act * DEMO_HIGH_GROWTH_TRAIL_SCALE).quantize(t_sz, rounding=ROUND_HALF_UP))
+        trail_dist = max(t_sz, (trail_dist * DEMO_HIGH_GROWTH_TRAIL_SCALE).quantize(t_sz, rounding=ROUND_HALF_UP))
+        sl_mult = Decimal("2.40") if symbol in INDEX_INSTRUMENTS else Decimal("1.50")
+        sl_dist = max(t_sz, (sl_dist * sl_mult).quantize(t_sz, rounding=ROUND_HALF_UP))
+        tp_dist = max(
+            (tp_dist * DEMO_HIGH_GROWTH_TP_SCALE).quantize(t_sz, rounding=ROUND_HALF_UP),
+            (sl_dist * Decimal("2.20")).quantize(t_sz, rounding=ROUND_HALF_UP),
+        )
+    elif risk_multiplier < Decimal("1") and risk_multiplier > Decimal("0"):
+        trail_dist = max(t_sz, (trail_dist * Decimal("0.60")).quantize(t_sz, rounding=ROUND_HALF_UP))
     return {
         "be_trigger": be_trig,
         "be_offset": be_off,
@@ -565,6 +620,8 @@ class AutonomousAiTrader:
         ai_inference_cooldown_seconds: float = DEFAULT_AI_INFERENCE_COOLDOWN_SECONDS,
         compounding_controller: CompoundingAndMilestoneController | None = None,
         phase8_bridge: Phase8LiveTradingBridge | None = None,
+        demo_high_growth: DemoHighGrowthProfile | None = None,
+        option_b_demo: Any | None = None,
         state_dir: str | Path | None = None,
     ) -> None:
         if not isinstance(router, DualShieldBrokerRouter):
@@ -600,17 +657,45 @@ class AutonomousAiTrader:
         self._quota = quota_store or DailyQuotaGovernanceStore()
         self._peak_store = peak_equity_store or valve_gate.peak_equity_store
         self._owner_verifier = owner_verifier
+        if demo_high_growth is not None and not isinstance(demo_high_growth, DemoHighGrowthProfile):
+            raise ContractError("demo_high_growth must be a DemoHighGrowthProfile or None")
+        router_dhg = getattr(router.barbell, "demo_high_growth", None)
+        init_dhg = (
+            demo_high_growth
+            if demo_high_growth is not None
+            else (router_dhg if isinstance(router_dhg, DemoHighGrowthProfile) else DemoHighGrowthProfile(enabled=False))
+        )
+        is_live_armed = bool(getattr(router, "_live_armed", False))
+        init_dhg.assert_demo_mode(
+            router.execution_mode,
+            live_trading_armed=is_live_armed,
+            live_trading_locked=not is_live_armed,
+        )
+        if init_dhg.enabled and demo_high_growth is not None:
+            router.set_demo_high_growth_profile(init_dhg)
+            if callable(getattr(valve_gate, "set_demo_high_growth_profile", None)):
+                valve_gate.set_demo_high_growth_profile(
+                    init_dhg,
+                    execution_mode=router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
+        self._demo_high_growth: DemoHighGrowthProfile = init_dhg
+        self._option_b_demo: Any | None = option_b_demo
+        self._symbol_loss_cooldown_until: dict[str, datetime] = {}
         self._fast_tick_ms = fast_tick_ms
         self._clock = clock or _utc_now
-        if router.barbell.max_stop_loss_equity_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
+        eff_stop_ceil = router.barbell.effective_stop_risk_ceiling_pct
+        eff_dd_ceil = router.barbell.effective_drawdown_ceiling_pct
+        if router.barbell.max_stop_loss_equity_risk_pct > eff_stop_ceil:
             raise ContractError(
                 f"router max_stop_loss_equity_risk_pct {decimal_text(router.barbell.max_stop_loss_equity_risk_pct)}% "
-                "exceeds immutable constitutional 1.00% ceiling"
+                f"exceeds effective ceiling {decimal_text(eff_stop_ceil)}%"
             )
-        if router.barbell.max_drawdown_pct > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+        if router.barbell.max_drawdown_pct > eff_dd_ceil:
             raise ContractError(
                 f"router max_drawdown_pct {decimal_text(router.barbell.max_drawdown_pct)} "
-                "exceeds immutable constitutional 0.10 (10.00%) ceiling"
+                f"exceeds effective ceiling {decimal_text(eff_dd_ceil)}"
             )
         if execution_gate is None or not callable(execution_gate):
             raise ContractError(
@@ -764,6 +849,42 @@ class AutonomousAiTrader:
         self._compounding_controller: CompoundingAndMilestoneController | None = resolved_comp
         self._phase8_bridge: Phase8LiveTradingBridge | None = resolved_bridge
         self._fallback_news_shield = NewsShockShield()
+        if self._demo_high_growth.enabled:
+            if callable(getattr(self._quota, "set_demo_high_growth_profile", None)):
+                self._quota.set_demo_high_growth_profile(
+                    self._demo_high_growth,
+                    execution_mode=router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
+            if resolved_comp is not None and callable(getattr(resolved_comp, "set_demo_high_growth_profile", None)):
+                resolved_comp.set_demo_high_growth_profile(
+                    self._demo_high_growth,
+                    execution_mode=router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
+            if resolved_bridge is not None and callable(getattr(resolved_bridge, "set_demo_high_growth_profile", None)):
+                resolved_bridge.set_demo_high_growth_profile(
+                    self._demo_high_growth,
+                    execution_mode=router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
+            if self._parallel_tiers is not None and callable(getattr(self._parallel_tiers, "set_demo_high_growth_profile", None)):
+                self._parallel_tiers.set_demo_high_growth_profile(
+                    self._demo_high_growth,
+                    execution_mode=router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
+            if self._option_b_demo is not None and callable(getattr(self._option_b_demo, "set_demo_high_growth_profile", None)):
+                self._option_b_demo.set_demo_high_growth_profile(
+                    self._demo_high_growth,
+                    execution_mode=router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
 
     @property
     def compounding_controller(self) -> CompoundingAndMilestoneController | None:
@@ -776,6 +897,131 @@ class AutonomousAiTrader:
     @property
     def aggression_dial(self) -> AggressionDialStore | None:
         return self._aggression_dial
+
+    @property
+    def demo_high_growth(self) -> DemoHighGrowthProfile:
+        with self._lock:
+            return self._demo_high_growth
+
+    def demo_high_growth_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return self._demo_high_growth.to_wire_dict()
+
+    def _effective_stop_risk_ceiling_pct(self) -> Decimal:
+        with self._lock:
+            return self._demo_high_growth.effective_stop_risk_ceiling_pct()
+
+    def _effective_drawdown_ceiling_pct(self) -> Decimal:
+        with self._lock:
+            return self._demo_high_growth.effective_drawdown_ceiling_pct()
+
+    def bind_option_b_demo(self, option_b_demo: Any | None) -> None:
+        with self._lock:
+            self._option_b_demo = option_b_demo
+            if (
+                option_b_demo is not None
+                and self._demo_high_growth.enabled
+                and callable(getattr(option_b_demo, "set_demo_high_growth_profile", None))
+            ):
+                is_live_armed = bool(getattr(self._router, "_live_armed", False))
+                option_b_demo.set_demo_high_growth_profile(
+                    self._demo_high_growth,
+                    execution_mode=self._router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
+
+    def set_demo_high_growth_profile(self, profile: DemoHighGrowthProfile) -> dict[str, Any]:
+        if not isinstance(profile, DemoHighGrowthProfile):
+            raise ContractError("profile must be a DemoHighGrowthProfile")
+        is_live_armed = bool(getattr(self._router, "_live_armed", False))
+        profile.assert_demo_mode(
+            self._router.execution_mode,
+            live_trading_armed=is_live_armed,
+            live_trading_locked=not is_live_armed,
+        )
+        ts = self._now()
+        with self._lock:
+            self._router.set_demo_high_growth_profile(profile)
+            if callable(getattr(self._quota, "set_demo_high_growth_profile", None)):
+                self._quota.set_demo_high_growth_profile(
+                    profile,
+                    execution_mode=self._router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
+            if callable(getattr(self._valve_gate, "set_demo_high_growth_profile", None)):
+                self._valve_gate.set_demo_high_growth_profile(
+                    profile,
+                    execution_mode=self._router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
+            if self._compounding_controller is not None and callable(
+                getattr(self._compounding_controller, "set_demo_high_growth_profile", None)
+            ):
+                self._compounding_controller.set_demo_high_growth_profile(
+                    profile,
+                    execution_mode=self._router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
+            if self._phase8_bridge is not None and callable(
+                getattr(self._phase8_bridge, "set_demo_high_growth_profile", None)
+            ):
+                self._phase8_bridge.set_demo_high_growth_profile(
+                    profile,
+                    execution_mode=self._router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
+            if self._parallel_tiers is not None and callable(
+                getattr(self._parallel_tiers, "set_demo_high_growth_profile", None)
+            ):
+                self._parallel_tiers.set_demo_high_growth_profile(
+                    profile,
+                    execution_mode=self._router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
+            if self._option_b_demo is not None and callable(
+                getattr(self._option_b_demo, "set_demo_high_growth_profile", None)
+            ):
+                self._option_b_demo.set_demo_high_growth_profile(
+                    profile,
+                    execution_mode=self._router.execution_mode,
+                    live_trading_armed=is_live_armed,
+                    live_trading_locked=not is_live_armed,
+                )
+            self._demo_high_growth = profile
+            eff_sweep = profile.effective_sweep_ratio(Decimal("0.50"))
+            if profile.enabled and profile.compounding_100pct:
+                if self._compounding_controller is not None:
+                    self._compounding_controller.set_compounding_mode(
+                        CompoundingMode.FULL_COMPOUND_100,
+                        owner_controls_allowed=True,
+                        actor="demo-high-growth-profile",
+                        now_utc=ts,
+                    )
+                if self._profit_vault is not None:
+                    self._profit_vault.set_config(sweep_ratio=Decimal("0.00"), auto_sweep_enabled=True)
+            elif not profile.enabled:
+                if self._profit_vault is not None:
+                    self._profit_vault.set_config(sweep_ratio=eff_sweep, auto_sweep_enabled=True)
+            self._recent_actions.appendleft({
+                "observed_at": _iso(ts),
+                "kind": "DEMO_HIGH_GROWTH_PROFILE",
+                "symbol": None,
+                "detail": (
+                    f"DEMO High-Growth Practice Profile ENABLED ({decimal_text(profile.target_risk_pct)}%/"
+                    f"{decimal_text(profile.max_risk_pct)}% risk · "
+                    f"{decimal_text((profile.max_drawdown_pct * Decimal('100')).quantize(Decimal('0.01')))}% DD · "
+                    f"{profile.post_loss_cooldown_seconds}s cooldown)"
+                    if profile.enabled
+                    else "DEMO High-Growth Practice Profile DISABLED (restored 1.00% / 10.00% defaults)"
+                ),
+            })
+            return profile.to_wire_dict()
 
     def bind_compounding_controller(self, controller: CompoundingAndMilestoneController | None) -> None:
         if controller is not None and not isinstance(controller, CompoundingAndMilestoneController):
@@ -1270,7 +1516,7 @@ class AutonomousAiTrader:
             drawdown_pct=dd_q,
             valve_score=v_score_dec,
         )
-        return {
+        out = {
             "schema": "cas-forex.aggression-dial-summary/1",
             "scope_id": str(raw_dial["scope_id"]),
             "master_risk_bps": int(eff["requested_risk_bps"]),
@@ -1299,6 +1545,7 @@ class AutonomousAiTrader:
             "audit_count": int(raw_dial["audit_count"]),
             "audit_head_sha256": str(raw_dial["audit_head_sha256"]),
         }
+        return out
 
     @property
     def risk_gear_mode(self) -> str:
@@ -1322,8 +1569,8 @@ class AutonomousAiTrader:
             regime=regime,
             drawdown_pct=dd_pct,
             consecutive_losses=consec,
-            owner_max_risk_pct=self._router.barbell.max_stop_loss_equity_risk_pct,
-            owner_max_drawdown_pct=self._router.barbell.max_drawdown_pct,
+            owner_max_risk_pct=min(self._router.barbell.max_stop_loss_equity_risk_pct, MAX_CONSTITUTIONAL_STOP_RISK_PCT),
+            owner_max_drawdown_pct=min(self._router.barbell.max_drawdown_pct, MAX_CONSTITUTIONAL_DRAWDOWN_PCT),
             owner_soft_quota_usd=owner_soft,
             owner_hard_quota_usd=owner_hard,
         )
@@ -1361,7 +1608,9 @@ class AutonomousAiTrader:
         return self.status_snapshot(now=ts)
 
     def _protection_cfg(self, symbol: str, risk_multiplier: Decimal) -> dict[str, Decimal]:
-        cfg = _default_protection_params(symbol, risk_multiplier)
+        with self._lock:
+            lwr = bool(self._demo_high_growth.enabled and self._demo_high_growth.let_winners_run)
+        cfg = _default_protection_params(symbol, risk_multiplier, let_winners_run=lwr)
         if symbol in self._protection_overrides:
             for k, v in self._protection_overrides[symbol].items():
                 if k in cfg:
@@ -1510,11 +1759,12 @@ class AutonomousAiTrader:
         balance_val = bal_sum if has_venue_acct and bal_sum > Decimal("0") else total_eq
         margin_val = free_sum if has_venue_acct else total_eq
         router_dd = self._router.barbell.max_drawdown_pct
-        if router_dd > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+        eff_dd_lim = self._effective_drawdown_ceiling_pct()
+        if router_dd > eff_dd_lim:
             raise ContractError(
-                f"router max_drawdown_pct {decimal_text(router_dd)} exceeds immutable constitutional 0.10 ceiling"
+                f"router max_drawdown_pct {decimal_text(router_dd)} exceeds effective {decimal_text(eff_dd_lim)} ceiling"
             )
-        eff_dd_cap = min(router_dd, MAX_CONSTITUTIONAL_DRAWDOWN_PCT)
+        eff_dd_cap = min(router_dd, eff_dd_lim)
         return {
             "balance": decimal_text(balance_val),
             "equity": decimal_text(total_eq),
@@ -1882,6 +2132,14 @@ class AutonomousAiTrader:
                                     in_recovery_mode=in_rec_post,
                                 )
                                 had_stale_close = True
+                                if (
+                                    pnl_dec < Decimal("0")
+                                    and self._demo_high_growth.enabled
+                                    and self._demo_high_growth.post_loss_cooldown_seconds > 0
+                                ):
+                                    self._symbol_loss_cooldown_until[sym_closed] = ts + timedelta(
+                                        seconds=self._demo_high_growth.post_loss_cooldown_seconds
+                                    )
                                 if self._phase8_bridge is not None:
                                     raw_side_c = str(meta.get("side") or "BUY").strip().upper()
                                     side_c = Side.SELL if raw_side_c == Side.SELL.value else Side.BUY
@@ -2119,7 +2377,7 @@ class AutonomousAiTrader:
         ):
             raise ContractError("no online verified broker equity available for sizing")
         sizing_equity = min(total_equity, eff_eq) if eff_eq > Decimal("0") else total_equity
-        constitutional_max_budget = (sizing_equity * MAX_CONSTITUTIONAL_STOP_RISK_PCT) / Decimal("100")
+        constitutional_max_budget = (sizing_equity * self._effective_stop_risk_ceiling_pct()) / Decimal("100")
         budget = min(
             self._router.barbell.max_stop_risk_amount(sizing_equity) * risk_multiplier,
             constitutional_max_budget,
@@ -2191,6 +2449,7 @@ class AutonomousAiTrader:
         peak_eq: Decimal | None = None,
         quota_snap: Mapping[str, Any] | None = None,
         raw_dial: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
     ) -> tuple[str, Side, Decimal, Decimal, str, str, bool, str | None, int] | None:
         """Scan watchlist with TrendRegimeDetector, House-Money ADD pyramiding, and correlation cap."""
         self._last_dial_skip_reason = None
@@ -2261,6 +2520,8 @@ class AutonomousAiTrader:
             )
             if cand_dial is not None:
                 max_open_cap = int(cand_dial["max_open_trades"])
+                if self._demo_high_growth.enabled:
+                    max_open_cap = max(max_open_cap, 3) if self._demo_high_growth.pyramiding_enabled else 1
                 if len(open_meta_list) >= max_open_cap:
                     dial_cap_block = (
                         f"DIAL_MAX_OPEN_TRADES_REACHED ({len(open_meta_list)}>={max_open_cap} "
@@ -2273,6 +2534,8 @@ class AutonomousAiTrader:
                 if m.get("symbol") == sym and m.get("side") == side.value
             ]
             if matching:
+                if self._demo_high_growth.enabled and not self._demo_high_growth.pyramiding_enabled:
+                    continue
                 if len(matching) >= MAX_PYRAMID_LEGS:
                     continue
                 if regime_name not in (REGIME_STRONG_TREND, REGIME_TREND_IGNITION):
@@ -2339,6 +2602,24 @@ class AutonomousAiTrader:
 
             if not allow_cold_open:
                 continue
+            if self._demo_high_growth.enabled and now is not None:
+                if self._demo_high_growth.post_loss_cooldown_seconds > 0:
+                    cd_until = self._symbol_loss_cooldown_until.get(sym)
+                    if cd_until is not None and now < cd_until:
+                        rem_s = max(1, int((cd_until - now).total_seconds()))
+                        dial_cap_block = (
+                            f"DEMO_POST_LOSS_COOLDOWN ({sym}: {rem_s}s remaining after closed loss)"
+                        )
+                        continue
+                if (
+                    self._demo_high_growth.block_us_close_chop
+                    and sym in ("NAS100", "US30", "SPX500")
+                    and _is_us_equity_pre_close_chop(now)
+                ):
+                    dial_cap_block = (
+                        f"DEMO_US_CLOSE_CHOP_GUARD ({sym}: 20:30-21:00 UTC pre-close chop filter)"
+                    )
+                    continue
             corr_ok, _ = evaluate_correlation_cap(
                 candidate_symbol=sym,
                 candidate_side=side,
@@ -2972,7 +3253,27 @@ class AutonomousAiTrader:
             quota_status = q_snap["status"]
             self._last_quota_status = str(quota_status)
             self._last_consec_losses = max(0, int(q_snap.get("consecutive_losses", 0) or 0))
-            if quota_status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
+            dhg_eq_base_cyc = total_eq if total_eq > Decimal("0") else (self._explicit_initial_capital_usd or REFERENCE_CAPITAL_USD)
+            dhg_goal_usd_cyc = (dhg_eq_base_cyc * DEMO_HIGH_GROWTH_DAILY_GOAL_PCT).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            dhg_brake_usd_cyc = (dhg_eq_base_cyc * DEMO_HIGH_GROWTH_DAILY_LOSS_BRAKE_PCT).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            dhg_skip_respite = False
+            if self._demo_high_growth.enabled:
+                realized_pre_q = Decimal(str(q_snap.get("realized_net_pnl_usd", "0")))
+                consec_pre_q = int(q_snap.get("consecutive_losses", 0) or 0)
+                max_consec_pre_q = int(q_snap.get("max_consecutive_losses", 3) or 3)
+                if consec_pre_q >= max_consec_pre_q or quota_status == QUOTA_STATUS_LOSS_TRIPPED:
+                    allowed = False
+                    if not quota_veto:
+                        quota_veto = QUOTA_STATUS_LOSS_TRIPPED
+                elif realized_pre_q <= -dhg_brake_usd_cyc:
+                    allowed = False
+                    quota_veto = f"DEMO_DAILY_LOSS_BRAKE (${decimal_text(realized_pre_q)} <= -${decimal_text(dhg_brake_usd_cyc)})"
+                elif quota_status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED) and realized_pre_q < dhg_goal_usd_cyc:
+                    allowed = True
+                    quota_veto = None
+                    risk_mult = Decimal("1")
+                    dhg_skip_respite = True
+            if not dhg_skip_respite and quota_status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
                 obs_sym, obs_reg = self._observe_markets_readonly(markets)
                 top_sym = obs_sym or self._top_watch_symbol
                 respite_status = (
@@ -3026,7 +3327,7 @@ class AutonomousAiTrader:
             )
             realized_today_pre = Decimal(str(q_snap.get("realized_net_pnl_usd", "0")))
             dial_pre_veto: str | None = None
-            if pre_dial is not None:
+            if pre_dial is not None and not self._demo_high_growth.enabled:
                 pre_loss_brake = Decimal(str(pre_dial["daily_loss_brake_usd"]))
                 pre_goal_usd = Decimal(str(pre_dial["session_goal_usd"]))
                 if realized_today_pre <= -pre_loss_brake:
@@ -3080,6 +3381,7 @@ class AutonomousAiTrader:
                 peak_eq=peak_eq,
                 quota_snap=q_snap,
                 raw_dial=raw_dial_cyc,
+                now=ts,
             )
             if setup is None:
                 if self._last_dial_skip_reason is not None:
@@ -3131,7 +3433,46 @@ class AutonomousAiTrader:
                 dd_curr_eq=eff_dd_eq_cyc,
             )
             realized_today = Decimal(str(quota_full.get("realized_net_pnl_usd", "0")))
-            if dial_eff is not None:
+            if self._demo_high_growth.enabled:
+                dhg_soft_q = (dhg_goal_usd_cyc * Decimal("0.70")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                if realized_today <= -dhg_brake_usd_cyc or (realized_today >= dhg_goal_usd_cyc and not strong_runner_eligible):
+                    self._veto_count += 1
+                    self._last_action = "WAIT"
+                    self._last_symbol = sym
+                    self._last_reason = (
+                        f"DEMO_DAILY_LOSS_BRAKE (${decimal_text(realized_today)} <= -${decimal_text(dhg_brake_usd_cyc)})"
+                        if realized_today <= -dhg_brake_usd_cyc
+                        else f"DEMO_SESSION_GOAL_REACHED (${decimal_text(realized_today)} >= ${decimal_text(dhg_goal_usd_cyc)})"
+                    )
+                    self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                    if self._parallel_tiers is not None and quotes_map:
+                        self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
+                    report = {
+                        "schema": "cas-forex.ai-cycle/1",
+                        "cycle_id": cycle_id,
+                        "observed_at": _iso(ts),
+                        "model_id": self._registry.active_model_id,
+                        "cadence": self._last_cadence,
+                        "action": "WAIT",
+                        "symbol": sym,
+                        "reason": self._last_reason,
+                        "valve_score": self._last_valve_score,
+                        "protection_updates": prot_updates,
+                    }
+                    self._append_journal_cycle(report)
+                    return report
+                base_mult = Decimal("0.50") if (strong_runner_eligible or realized_today >= dhg_soft_q) else Decimal("1.00")
+                dhg_target = (
+                    self._demo_high_growth.max_risk_pct
+                    if regime_name == REGIME_STRONG_TREND
+                    else self._demo_high_growth.target_risk_pct
+                )
+                dhg_ceil = max(Decimal("0.01"), self._router.barbell.max_stop_loss_equity_risk_pct)
+                with localcontext() as ctx:
+                    ctx.prec = 40
+                    dhg_scale = min(Decimal("1.0000"), (dhg_target / dhg_ceil).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR))
+                eff_mult = max(Decimal("0.05"), (base_mult * dhg_scale).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR))
+            elif dial_eff is not None:
                 dial_soft_q = Decimal(str(dial_eff["soft_goal_usd"]))
                 dial_hard_q = Decimal(str(dial_eff["session_goal_usd"]))
                 dial_loss_b = Decimal(str(dial_eff["daily_loss_brake_usd"]))
@@ -3169,7 +3510,7 @@ class AutonomousAiTrader:
                 dial_risk_pct = min(
                     Decimal(str(dial_eff["effective_risk_pct"])),
                     self._router.barbell.max_stop_loss_equity_risk_pct,
-                    MAX_CONSTITUTIONAL_STOP_RISK_PCT,
+                    self._effective_stop_risk_ceiling_pct(),
                 )
                 with localcontext() as ctx:
                     ctx.prec = 40
@@ -3214,6 +3555,18 @@ class AutonomousAiTrader:
             t_sz = _tick_size(sym)
             spread = max(t_sz, ask - bid)
             entry_ref = ask if side is Side.BUY else bid
+            if self._demo_high_growth.enabled and self._demo_high_growth.let_winners_run:
+                live_atr = _compute_live_candle_atr((markets.get(sym) or {}).get("candles_m1"))
+                if live_atr is not None and live_atr > Decimal("0"):
+                    atr_sl = min(live_atr * Decimal("2.50"), entry_ref * Decimal("0.0100")).quantize(
+                        t_sz, rounding=ROUND_HALF_UP
+                    )
+                    if atr_sl > params["sl_distance"]:
+                        params["sl_distance"] = atr_sl
+                        params["tp_distance"] = max(
+                            params["tp_distance"],
+                            (atr_sl * Decimal("2.20")).quantize(t_sz, rounding=ROUND_HALF_UP),
+                        )
             if side is Side.BUY:
                 sl_price = (bid - params["sl_distance"]).quantize(t_sz, rounding=ROUND_HALF_UP)
                 tp_price = (ask + params["tp_distance"]).quantize(t_sz, rounding=ROUND_HALF_UP)
@@ -3673,7 +4026,7 @@ class AutonomousAiTrader:
                     abs(limit_ref - sl_price) / p8_prof_post.point_size,
                 )
                 eff_risk_pct_post = min(
-                    MAX_CONSTITUTIONAL_STOP_RISK_PCT,
+                    self._effective_stop_risk_ceiling_pct(),
                     max(
                         Decimal("0.01"),
                         (self._router.barbell.max_stop_loss_equity_risk_pct * eff_mult).quantize(
@@ -3686,19 +4039,22 @@ class AutonomousAiTrader:
                     for m in self._open_position_meta.values()
                     if m.get("symbol") == sym and m.get("side") == side.value
                 )
-                max_open_post = min(
-                    8,
-                    max(
-                        1,
-                        int(dial_eff["max_open_trades"])
-                        if (dial_eff is not None and "max_open_trades" in dial_eff)
-                        else MAX_PYRAMID_LEGS,
-                    ),
+                raw_max_open_p8 = (
+                    int(dial_eff["max_open_trades"])
+                    if (dial_eff is not None and "max_open_trades" in dial_eff)
+                    else MAX_PYRAMID_LEGS
                 )
+                if self._demo_high_growth.enabled:
+                    raw_max_open_p8 = max(raw_max_open_p8, 3) if self._demo_high_growth.pyramiding_enabled else 1
+                max_open_post = min(8, max(1, raw_max_open_p8))
                 max_loss_cap_post = (
-                    Decimal(str(dial_eff["daily_loss_brake_usd"]))
-                    if dial_eff is not None
-                    else Decimal(str(quota_full.get("max_daily_loss_usd", "1000.00") or "1000.00"))
+                    dhg_brake_usd_cyc
+                    if self._demo_high_growth.enabled
+                    else (
+                        Decimal(str(dial_eff["daily_loss_brake_usd"]))
+                        if dial_eff is not None
+                        else Decimal(str(quota_full.get("max_daily_loss_usd", "1000.00") or "1000.00"))
+                    )
                 )
                 daily_rem_post = max_loss_cap_post + realized_today
                 raw_dd_post = (
@@ -3911,6 +4267,41 @@ class AutonomousAiTrader:
                     },
                     now=ts,
                 )
+
+            if (
+                self._option_b_demo is not None
+                and sym in ("NAS100", "US30", "SPX500", "XAUUSD")
+                and callable(getattr(self._option_b_demo, "mirror_entry_signal", None))
+            ):
+                try:
+                    ob_stop_pts = max(
+                        Decimal("1.00"),
+                        abs(entry_ref - sl_price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                    )
+                    ob_tp_pts = max(
+                        Decimal("1.00"),
+                        abs(tp_price - entry_ref).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                    )
+                    ob_risk = (
+                        (
+                            self._demo_high_growth.max_risk_pct
+                            if regime_name == REGIME_STRONG_TREND
+                            else self._demo_high_growth.target_risk_pct
+                        )
+                        if self._demo_high_growth.enabled
+                        else None
+                    )
+                    self._option_b_demo.mirror_entry_signal(
+                        symbol=sym,
+                        side=side.value,
+                        stop_distance_points=ob_stop_pts,
+                        take_profit_points=ob_tp_pts,
+                        risk_pct=ob_risk,
+                        reason=f"AUTONOMOUS_AI_{regime_name}",
+                        now_utc=ts,
+                    )
+                except Exception as exc_ob:
+                    logger.debug("option_b_demo mirror skipped for %s: %s", sym, type(exc_ob).__name__)
 
             entry_log = {
                 "cycle_id": cycle_id,
