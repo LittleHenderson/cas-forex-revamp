@@ -99,6 +99,7 @@ __all__ = [
     "BarbellCapitalPolicy",
     "BarbellPolicyRefusalError",
     "DEFAULT_OANDA_RECONNECT_INTERVAL_SECONDS",
+    "DEFAULT_PUBLIC_INDEX_MAX_DIVERGENCE_BPS",
     "DualShieldBrokerRouter",
     "ENV_BARBELL_MAX_DRAWDOWN_PCT",
     "DualShieldExecution",
@@ -134,6 +135,8 @@ ENV_LHFX_MT5_LIVE_TICKET = "CAS_FOREX_LHFX_MT5_LIVE_TICKET"
 ENV_OANDA_LIVE_TICKET = "CAS_FOREX_OANDA_LIVE_TICKET"
 LIVE_FUNDING_ARM_PHRASE = "ARM_LIVE_REAL_MONEY_TRADING"
 DEFAULT_OANDA_RECONNECT_INTERVAL_SECONDS = 60.0
+DEFAULT_PUBLIC_INDEX_MAX_DIVERGENCE_BPS = Decimal("150")
+MAX_PUBLIC_INDEX_DIVERGENCE_BPS = Decimal("150")
 
 _LIVE_HUGOSWAY_SERVERS: frozenset[str] = frozenset({
     "hugosway-real3",
@@ -1172,6 +1175,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         drawdown_scope_id: str = "dual-shield-barbell",
         index_reference_source: Callable[[Iterable[str]], Mapping[str, Any]] | None = None,
         index_reference_max_age_seconds: float = DEFAULT_INDEX_REFERENCE_MAX_AGE_SECONDS,
+        public_index_max_divergence_bps: Decimal = DEFAULT_PUBLIC_INDEX_MAX_DIVERGENCE_BPS,
         oanda_reconnect_interval_seconds: float = DEFAULT_OANDA_RECONNECT_INTERVAL_SECONDS,
         monotonic: Callable[[], float] | None = None,
         **kwargs: Any,
@@ -1195,6 +1199,13 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         ):
             raise ContractError("index_reference_max_age_seconds must be a positive finite number")
         self._index_reference_max_age_seconds = float(index_reference_max_age_seconds)
+        pub_idx_div = decimal_value(public_index_max_divergence_bps, "public_index_max_divergence_bps", positive=True)
+        if pub_idx_div > MAX_PUBLIC_INDEX_DIVERGENCE_BPS:
+            raise ContractError(
+                f"public_index_max_divergence_bps ({decimal_text(pub_idx_div)}) exceeds "
+                f"ceiling ({decimal_text(MAX_PUBLIC_INDEX_DIVERGENCE_BPS)})"
+            )
+        self._public_index_max_divergence_bps = pub_idx_div
         self.barbell = barbell or BarbellCapitalPolicy.from_environ(self._env)
         if self.barbell.max_stop_loss_equity_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
             raise ContractError("CONSTITUTIONAL_STOP_RISK_CEILING_EXCEEDED: router refuses stop-risk above 1.00%")
@@ -1520,6 +1531,11 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 oracle = OandaQuoteTruthOracle.from_reference_quotes(
                     {symbol: ref_quote},
                     reference_name=ref_quote.source_provider,
+                    max_divergence_bps_index=(
+                        self._public_index_max_divergence_bps
+                        if ref_quote.is_independent_public
+                        else Decimal("25")
+                    ),
                     clock=self._clock,
                     max_reference_age_seconds=self._index_reference_max_age_seconds,
                 )
@@ -1599,6 +1615,30 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             )
             return peer_oracle, {symbol: (peer_rq.bid, peer_rq.ask)}
         return check_oracle, {symbol: cons_q}
+
+    def _index_venue_worst_entry(self, order: OrderIntent, venue: Mt5PaperBrokerVenue) -> Decimal | None:
+        """Compute conservative worst-case MT5 fill price for index stop-risk checks.
+
+        Avoids adding CME/CBOT futures vs cash CFD basis from PUBLIC_US_INDEX_FEED to the
+        stop distance while preventing a below-ask BUY limit or above-bid SELL limit from
+        understating actual worst-case stop-loss risk.
+        """
+        if order.symbol not in INDEX_INSTRUMENTS or order.kind is not ActionKind.OPEN:
+            return None
+        try:
+            tick = venue._transport.symbol_tick(order.symbol)
+        except (Mt5TransportError, ContractError, OSError) as exc:
+            logger.debug("index venue tick lookup skipped for %s/%s: %s", venue.broker_id, order.symbol, type(exc).__name__)
+            return None
+        if order.side is Side.BUY:
+            v_entry = tick.ask
+            if order.limit_price is not None:
+                v_entry = max(v_entry, order.limit_price)
+        else:
+            v_entry = tick.bid
+            if order.limit_price is not None:
+                v_entry = min(v_entry, order.limit_price)
+        return v_entry if v_entry > Decimal("0") else None
 
     def oracle(self) -> OandaQuoteTruthOracle:
         if self._oracle_override is not None:
@@ -2017,6 +2057,16 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             )
         rbid, rask = reference[order.symbol]
         entry = rask if order.side is Side.BUY else rbid
+        if order.symbol in INDEX_INSTRUMENTS:
+            cand_entries: list[Decimal] = []
+            for cand_bid in self._offshore_route():
+                cand_venue = self._venues.get(cand_bid)
+                if isinstance(cand_venue, Mt5PaperBrokerVenue) and not cand_venue.is_offline:
+                    v_entry = self._index_venue_worst_entry(order, cand_venue)
+                    if v_entry is not None:
+                        cand_entries.append(v_entry)
+            if cand_entries:
+                entry = min(cand_entries) if order.side is Side.BUY else max(cand_entries)
         equities = self.equities(require_fresh_oanda=True, require_fresh_mt5=True)
         eff_curr, eff_pk, _ = self.effective_drawdown_state(equities=equities)
         self.barbell.require_drawdown(current_equity=eff_curr, peak_equity=eff_pk)
@@ -2062,12 +2112,30 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             def margin_guard(check: Mt5MarginCheck, _account: Mt5AccountSnapshot, _b: str = broker_id) -> None:
                 self.barbell.require_sleeve(_b, equities=equities, used_margin_after=check.used_margin_after)
 
+            venue_risk = risk
+            venue_cap = cap
             if order.symbol in INDEX_INSTRUMENTS:
                 broker_oracle, broker_ref = self._index_reference_quotes(order.symbol, target_broker_id=broker_id)
                 eff_quote_guard = broker_oracle.guard(broker_ref, verdicts)
+                venue_entry = self._index_venue_worst_entry(order, venue) or entry
+                venue_online_eq = {
+                    b: v
+                    for b, v in equities.items()
+                    if not self.is_broker_offline(b) and (b in self._venues or v > Decimal("0"))
+                }
+                venue_risk = self.barbell.stop_loss_risk(
+                    symbol=order.symbol,
+                    units=order.quantity_units,  # type: ignore[arg-type]
+                    entry_price=venue_entry,
+                    stop_price=order.stop_price,  # type: ignore[arg-type]
+                    quotes=broker_ref,
+                )
             else:
                 eff_quote_guard = oracle.guard(reference, verdicts)
+                venue_online_eq = online_eq
             try:
+                if order.symbol in INDEX_INSTRUMENTS:
+                    venue_cap = self.barbell.require_stop_risk(venue_risk, venue_online_eq)
                 result = venue.execute(
                     order,
                     valve_decision=valve_decision,
@@ -2115,7 +2183,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             self._record(trail, broker_id, "EXECUTED", "RECONCILIATION_REQUIRED" if result.reconciliation_required else None)
             return DualShieldExecution(
                 result=result, executed_on=broker_id, safe_harbor=False, trail=tuple(trail),
-                quote_verdicts=tuple(verdicts), stop_loss_risk=risk, stop_loss_risk_cap=cap,
+                quote_verdicts=tuple(verdicts), stop_loss_risk=venue_risk, stop_loss_risk_cap=venue_cap,
             )
 
         if order.symbol in INDEX_INSTRUMENTS and str(self._env.get("CAS_FOREX_OANDA_ALLOW_INDEX_CFD", "")).strip().lower() not in ("1", "true", "yes"):
