@@ -9,9 +9,8 @@ import socket
 import tempfile
 import threading
 import unittest
-import urllib.error
+import http.client
 import urllib.parse
-import urllib.request
 
 from cas_forex_revamp.composition.autonomous_trader import (
     AutonomousAiTrader,
@@ -561,33 +560,34 @@ class Pr41AiCallPacingAnd403DrainTests(unittest.TestCase):
             self.addCleanup(srv.stop)
             owner_tok = srv.auth_headers()["Authorization"].split(" ", 1)[1]
 
-            def _http_post(path: str, token: str, payload: dict[str, object]) -> tuple[int, dict[str, object]]:
-                req = urllib.request.Request(
-                    f"{srv.base_url}{path}",
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                    },
-                    method="POST",
-                )
+            srv_port = int(urllib.parse.urlsplit(srv.base_url).port or 0)
+
+            def _http_post(path: str, token: str | None, payload: dict[str, object]) -> tuple[int, dict[str, object]]:
+                body = json.dumps(payload).encode("utf-8")
+                hdrs: dict[str, str] = {
+                    "Host": f"127.0.0.1:{srv_port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                }
+                if token is not None:
+                    hdrs["Authorization"] = f"Bearer {token}"
+                conn = http.client.HTTPConnection("127.0.0.1", srv_port, timeout=5)
                 try:
-                    with urllib.request.urlopen(req, timeout=5) as resp:
-                        return resp.status, json.loads(resp.read().decode("utf-8"))
-                except urllib.error.HTTPError as err:
-                    return err.code, json.loads(err.read().decode("utf-8"))
+                    conn.request("POST", path, body=body, headers=hdrs)
+                    resp = conn.getresponse()
+                    raw_b = resp.read().decode("utf-8")
+                    return resp.status, json.loads(raw_b)
+                finally:
+                    conn.close()
 
             st_pc, pc = _http_post("/api/pair-code", owner_tok, {})
             self.assertEqual(st_pc, 200)
-            req_ex = urllib.request.Request(
-                f"{srv.base_url}/api/pair-exchange",
-                data=json.dumps({"pair_code": pc["pair_code"], "device_label": "pr41-drain-test"}).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
+            st_ex, ex_doc = _http_post(
+                "/api/pair-exchange",
+                None,
+                {"pair_code": pc["pair_code"], "device_label": "pr41-drain-test"},
             )
-            with urllib.request.urlopen(req_ex, timeout=5) as ex_resp:
-                self.assertEqual(ex_resp.status, 200)
-                ex_doc = json.loads(ex_resp.read().decode("utf-8"))
+            self.assertEqual(st_ex, 200)
             dev_tok = str(ex_doc["session_token"])
 
             # 20 consecutive paired POSTs with JSON body must all cleanly return 403 (0 RemoteDisconnected / TCP RST)
@@ -597,7 +597,6 @@ class Pr41AiCallPacingAnd403DrainTests(unittest.TestCase):
                 self.assertEqual(doc_403.get("required_scope"), "OWNER_FULL_CONTROL")
 
             # Transfer-Encoding / oversized Content-Length still fail closed with 403 without reading unbounded body
-            srv_port = int(urllib.parse.urlsplit(srv.base_url).port or 0)
             with socket.create_connection(("127.0.0.1", srv_port), timeout=5) as sock:
                 raw_req = (
                     f"POST /api/compounding HTTP/1.1\r\n"
