@@ -1806,14 +1806,14 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
     def online_total_equity(self, *, require_fresh_oanda: bool = False) -> Decimal:
         return self.barbell.total_equity(self.online_equities(require_fresh_oanda=require_fresh_oanda))
 
-    def effective_drawdown_state(
+    def _resolve_effective_drawdown(
         self,
         *,
         equities: Mapping[str, Decimal] | None = None,
         offline_brokers: Sequence[str] | None = None,
         peak_equity: Decimal | None = None,
         require_fresh_oanda: bool = False,
-    ) -> tuple[Decimal, Decimal | None, Decimal]:
+    ) -> tuple[Decimal, Decimal | None, Decimal, str]:
         eq_map = dict(equities) if equities is not None else self.equities(require_fresh_oanda=require_fresh_oanda)
         total_eq = self.barbell.total_equity(eq_map)
         if peak_equity is not None:
@@ -1822,7 +1822,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 if (peak_equity > Decimal("0") and total_eq >= Decimal("0"))
                 else Decimal("0")
             )
-            return total_eq, peak_equity, dd_exp
+            return total_eq, peak_equity, dd_exp, self._drawdown_scope_id
         offline_ids = list(offline_brokers) if offline_brokers is not None else self.offline_brokers()
         online_eq_map = {
             b: v
@@ -1830,11 +1830,12 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             if not self.is_broker_offline(b) and (b in self._venues or v > Decimal("0"))
         }
         online_total = self.barbell.total_equity(online_eq_map)
-        online_pk = (
-            self._peak_store.read_peak(self._online_drawdown_scope_id(online_eq_map.keys()))
+        online_scope = (
+            self._online_drawdown_scope_id(online_eq_map.keys())
             if online_eq_map
-            else None
+            else self._drawdown_scope_id
         )
+        online_pk = self._peak_store.read_peak(online_scope) if online_eq_map else None
         main_pk = self.peak_equity()
         if self._has_cold_offline_zero(eq_map):
             eff_pk = online_pk if online_pk is not None else (online_total if online_total > Decimal("0") else main_pk)
@@ -1843,7 +1844,12 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 if (eff_pk is not None and eff_pk > Decimal("0"))
                 else Decimal("0")
             )
-            return online_total, eff_pk, dd_cold
+            eff_scope = (
+                online_scope
+                if (online_eq_map and (online_pk is not None or online_total > Decimal("0")))
+                else self._drawdown_scope_id
+            )
+            return online_total, eff_pk, dd_cold, eff_scope
         full_dd = (
             compute_drawdown_pct(total_eq, main_pk)
             if (main_pk is not None and main_pk > Decimal("0"))
@@ -1852,8 +1858,36 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         if offline_ids and online_pk is not None and online_pk > Decimal("0"):
             online_dd = compute_drawdown_pct(online_total, online_pk)
             if online_dd > full_dd:
-                return online_total, online_pk, online_dd
-        return total_eq, main_pk, full_dd
+                return online_total, online_pk, online_dd, online_scope
+        return total_eq, main_pk, full_dd, self._drawdown_scope_id
+
+    def effective_drawdown_state(
+        self,
+        *,
+        equities: Mapping[str, Decimal] | None = None,
+        offline_brokers: Sequence[str] | None = None,
+        peak_equity: Decimal | None = None,
+        require_fresh_oanda: bool = False,
+    ) -> tuple[Decimal, Decimal | None, Decimal]:
+        eff_curr, eff_pk, eff_dd, _ = self._resolve_effective_drawdown(
+            equities=equities,
+            offline_brokers=offline_brokers,
+            peak_equity=peak_equity,
+            require_fresh_oanda=require_fresh_oanda,
+        )
+        return eff_curr, eff_pk, eff_dd
+
+    def effective_drawdown_scope_id(
+        self,
+        *,
+        equities: Mapping[str, Decimal] | None = None,
+        offline_brokers: Sequence[str] | None = None,
+    ) -> str:
+        _, _, _, eff_scope = self._resolve_effective_drawdown(
+            equities=equities,
+            offline_brokers=offline_brokers,
+        )
+        return eff_scope
 
     def peak_equity(self) -> Decimal | None:
         return self._peak_store.read_peak(self._drawdown_scope_id)

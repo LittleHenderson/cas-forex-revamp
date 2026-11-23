@@ -5415,6 +5415,9 @@ def run_cockpit_cli(
                             runtime_state.parallel_tiers.process_tick(quotes=mt5_q, signal=None)
                     srv.notify_stream_updated()
             except Exception as exc_ft:
+                has_open_err = trader.has_open_positions_fast() if callable(getattr(trader, "has_open_positions_fast", None)) else False
+                if not has_open_err:
+                    last_idle_fast_cycle_mono = time.monotonic()
                 msg_ft = " ".join(str(exc_ft).split())[:140]
                 print(f"[ai-fast] Fast tick skipped ({type(exc_ft).__name__}: {msg_ft}).")
 
