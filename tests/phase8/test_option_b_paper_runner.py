@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from pathlib import Path
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -19,6 +20,78 @@ from cas_forex_revamp.contracts import ContractError
 from cas_forex_revamp.futures.tradovate_venue import TradovateLiveLockError
 from cas_forex_revamp.valve import ForexMetaValveGate
 from cas_forex_revamp.valve.tks_meta_valve_controller import ValveDecision
+
+
+_SCHEMA_TYPE_CHECKS = {
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+    "string": lambda v: isinstance(v, str),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+    "null": lambda v: v is None,
+}
+
+
+def _validate_node(value: object, subschema: dict, path: str) -> list[str]:
+    errors: list[str] = []
+    if "const" in subschema:
+        expected = subschema["const"]
+        if value != expected or type(value) is not type(expected):
+            errors.append(f"{path}: expected const {expected!r}, got {value!r}")
+    if "enum" in subschema:
+        allowed = subschema["enum"]
+        if not any(value == opt and type(value) is type(opt) for opt in allowed):
+            errors.append(f"{path}: value {value!r} not in enum {allowed!r}")
+    if "type" in subschema:
+        raw_types = subschema["type"]
+        expected_types = [raw_types] if isinstance(raw_types, str) else list(raw_types)
+        if not any(_SCHEMA_TYPE_CHECKS[t](value) for t in expected_types):
+            errors.append(f"{path}: expected type {expected_types!r}, got {type(value).__name__}")
+            return errors
+    if isinstance(value, str):
+        if "minLength" in subschema and len(value) < int(subschema["minLength"]):
+            errors.append(f"{path}: length {len(value)} < minLength {subschema['minLength']}")
+        if "maxLength" in subschema and len(value) > int(subschema["maxLength"]):
+            errors.append(f"{path}: length {len(value)} > maxLength {subschema['maxLength']}")
+        if "pattern" in subschema and re.search(str(subschema["pattern"]), value) is None:
+            errors.append(f"{path}: {value!r} does not match pattern {subschema['pattern']!r}")
+    if isinstance(value, int) and not isinstance(value, bool):
+        if "minimum" in subschema and value < subschema["minimum"]:
+            errors.append(f"{path}: {value} < minimum {subschema['minimum']}")
+    if isinstance(value, list):
+        if "minItems" in subschema and len(value) < int(subschema["minItems"]):
+            errors.append(f"{path}: len {len(value)} < minItems {subschema['minItems']}")
+        if "maxItems" in subschema and len(value) > int(subschema["maxItems"]):
+            errors.append(f"{path}: len {len(value)} > maxItems {subschema['maxItems']}")
+        item_schema = subschema.get("items")
+        if isinstance(item_schema, dict):
+            for idx, item in enumerate(value):
+                errors.extend(_validate_node(item, item_schema, f"{path}[{idx}]"))
+    if isinstance(value, dict):
+        props = subschema.get("properties", {})
+        for req_key in subschema.get("required", ()):
+            if req_key not in value:
+                errors.append(f"{path}: missing required key {req_key!r}")
+        if subschema.get("additionalProperties") is False:
+            extra_keys = sorted(set(value.keys()) - set(props.keys()))
+            if extra_keys:
+                errors.append(f"{path}: unexpected additional properties {extra_keys!r}")
+        for key, prop_schema in props.items():
+            if key in value and isinstance(prop_schema, dict):
+                errors.extend(_validate_node(value[key], prop_schema, f"{path}.{key}"))
+    return errors
+
+
+def _validate_option_b_schema(payload: dict, schema: dict) -> list[str]:
+    errors = _validate_node(payload, schema, "$")
+    try:
+        import jsonschema  # type: ignore
+    except ImportError:
+        jsonschema = None
+    if jsonschema is not None:
+        validator = jsonschema.Draft202012Validator(schema)
+        errors.extend(f"jsonschema: {err.message}" for err in validator.iter_errors(payload))
+    return errors
 
 
 class _StubValveGate:
@@ -264,16 +337,11 @@ class OptionBPaperDemoRunnerTests(unittest.TestCase):
         self.assertEqual(snap["vault_50pct_reserved_usd"], "0.00")
 
     def test_08_full_jsonschema_validation_across_initial_open_and_closed_states(self) -> None:
-        try:
-            import jsonschema
-        except ImportError:
-            self.skipTest("jsonschema not installed locally")
         schema_path = Path(__file__).resolve().parents[2] / "docs/contracts/option-b-demo.schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        validator = jsonschema.Draft202012Validator(schema)
 
         runner = self._make_runner(valve=_StubValveGate(allowed=True), db_name="schema_full.sqlite3")
-        self.assertEqual(list(validator.iter_errors(runner.snapshot())), [])
+        self.assertEqual(_validate_option_b_schema(runner.snapshot(), schema), [])
 
         runner.ingest_spot_quote("SPX500", Decimal("6900.00"), Decimal("6900.50"))
         self._advance(1)
@@ -285,11 +353,11 @@ class OptionBPaperDemoRunnerTests(unittest.TestCase):
             risk_pct=Decimal("0.85"),
         )
         self.assertTrue(res["executed"], res)
-        self.assertEqual(list(validator.iter_errors(runner.snapshot())), [])
+        self.assertEqual(_validate_option_b_schema(runner.snapshot(), schema), [])
 
         self._advance(5)
         runner.ingest_spot_quote("SPX500", Decimal("6925.00"), Decimal("6925.50"))
-        self.assertEqual(list(validator.iter_errors(runner.snapshot())), [])
+        self.assertEqual(_validate_option_b_schema(runner.snapshot(), schema), [])
 
 
 if __name__ == "__main__":
