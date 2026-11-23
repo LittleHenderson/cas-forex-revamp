@@ -90,6 +90,20 @@ string IsoNowUtc()
    return(t + "Z");
   }
 
+long ServerUtcOffsetSeconds()
+  {
+   long srv_now = (long)TimeTradeServer();
+   long gmt_now = (long)TimeGMT();
+   if(srv_now <= 0 || gmt_now <= 0)
+      return(0);
+   long raw_off = srv_now - gmt_now;
+   if(raw_off < -43200 || raw_off > 50400)
+      return(0);
+   if(raw_off >= 0)
+      return(((raw_off + 450) / 900) * 900);
+   return(-((((-raw_off) + 450) / 900) * 900));
+  }
+
 datetime ParseIsoUtc(const string iso)
   {
    if(StringLen(iso) < 19)
@@ -1161,6 +1175,7 @@ string CandleSeriesJson(const string bsym, const ENUM_TIMEFRAMES tf, const int c
    MqlRates rates[];
    ArraySetAsSeries(rates, false);
    int got = CopyRates(bsym, tf, 0, count, rates);
+   long srv_offset_s = ServerUtcOffsetSeconds();
    string out = "[";
    bool first = true;
    for(int i = 0; i < got; i++)
@@ -1169,8 +1184,11 @@ string CandleSeriesJson(const string bsym, const ENUM_TIMEFRAMES tf, const int c
       double lo = MathMin(rates[i].low, MathMin(rates[i].open, rates[i].close));
       if(lo <= 0.0)
          continue;
+      long bar_utc_s = (long)rates[i].time - srv_offset_s;
+      if(bar_utc_s <= 0)
+         continue;
       MqlDateTime dt;
-      TimeToStruct(rates[i].time, dt);
+      TimeToStruct((datetime)bar_utc_s, dt);
       string t_iso = StringFormat("%04d-%02d-%02dT%02d:%02d:00Z", dt.year, dt.mon, dt.day, dt.hour, dt.min);
       out += StringFormat("%s{\"t\":\"%s\",\"o\":\"%s\",\"h\":\"%s\",\"l\":\"%s\",\"c\":\"%s\",\"v\":\"%s\",\"n\":1}",
                           first ? "" : ",", t_iso, Price(bsym, rates[i].open), Price(bsym, hi),
@@ -1239,15 +1257,19 @@ void PublishMarket()
    bool first = true;
    if(connected)
      {
+      long srv_offset_ms = ServerUtcOffsetSeconds() * 1000;
       for(int i = 0; i < ArraySize(g_symbols); i++)
         {
          string bsym = BrokerSymbol(g_symbols[i]);
          MqlTick tick;
          if(!SymbolInfoTick(bsym, tick) || tick.bid <= 0.0 || tick.ask < tick.bid)
             continue;
+         long tick_utc_msc = (long)tick.time_msc - srv_offset_ms;
+         if(tick_utc_msc <= 0)
+            continue;
          string bid_s = Price(bsym, tick.bid);
          string ask_s = Price(bsym, tick.ask);
-         string msc_s = IntegerToString((long)tick.time_msc);
+         string msc_s = IntegerToString(tick_utc_msc);
          ticks_json += StringFormat("%s{\"symbol\":\"%s\",\"bid\":\"%s\",\"ask\":\"%s\",\"time_msc\":\"%s\"}",
                                     first ? "" : ",", g_symbols[i], bid_s, ask_s, msc_s);
          ticks_canon += (first ? "" : ";") + g_symbols[i] + ":" + bid_s + ":" + ask_s + ":" + msc_s;

@@ -1237,9 +1237,12 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         unverified_mt5: set[str] = set()
         for broker_id, venue in self._venues.items():
             if isinstance(venue, Mt5PaperBrokerVenue):
+                probe_verified = True
                 if isinstance(venue._transport, Mt5SpoolBridgeTransport):
+                    probe_verified = False
                     try:
                         venue.probe()
+                        probe_verified = True
                     except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
                         raise
                     except Mt5SnapshotIntegrityError:
@@ -1257,6 +1260,10 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 elif self._status.get(broker_id) == STATUS_BROKER_OFFLINE:
                     self._status[broker_id] = "ACTIVE"
                     if self._failures.get(broker_id) == STATUS_BROKER_OFFLINE:
+                        self._failures.pop(broker_id, None)
+                elif probe_verified and self._status.get(broker_id) == "SNAPSHOT_UNVERIFIED":
+                    self._status[broker_id] = "ACTIVE"
+                    if self._failures.get(broker_id) == "SNAPSHOT_INTEGRITY_FAILED":
                         self._failures.pop(broker_id, None)
             elif isinstance(venue, OandaPracticeFallbackVenue):
                 if venue.summary is not None and venue.summary_observed_at is None:
