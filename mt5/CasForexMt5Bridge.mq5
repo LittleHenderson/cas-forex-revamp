@@ -41,6 +41,8 @@ string   g_symbols[];
 bool     g_mode_ok = false;
 datetime g_last_publish = 0;
 datetime g_last_candles = 0;
+datetime g_last_history = 0;
+bool     g_history_dirty = false;
 string   g_active_nonce = "0";
 ulong    g_last_monotonic_nonce = 0;
 uchar    g_master_hmac_key[];
@@ -123,6 +125,24 @@ string SafeText(string text)
    if(StringLen(text) > 60)
       text = StringSubstr(text, 0, 60);
    return(text);
+  }
+
+string SafeHistText(string text)
+  {
+   text = SafeText(text);
+   StringReplace(text, "|", "_");
+   StringReplace(text, ";", "_");
+   StringReplace(text, ":", "_");
+   return(text);
+  }
+
+string IsoFromUtcSeconds(const long utc_s)
+  {
+   if(utc_s <= 0)
+      return("");
+   MqlDateTime dt;
+   TimeToStruct((datetime)utc_s, dt);
+   return(StringFormat("%04d-%02d-%02dT%02d:%02d:%02dZ", dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec));
   }
 
 string AccountTradeModeLabel()
@@ -1145,6 +1165,7 @@ void ProcessRequests()
       string text = ReadText(SpoolPath(claimed));
       ExecuteRequest(request_id, text);
       FileDelete(SpoolPath(claimed), CommonFlag());
+      g_history_dirty = true;
      }
   }
 
@@ -1352,6 +1373,129 @@ void PublishMarket()
    g_last_publish = TimeCurrent();
   }
 
+void PublishOrderHistory()
+  {
+   if(!g_hmac_key_loaded)
+      g_hmac_key_loaded = LoadSpoolHmacKey();
+   if(!g_hmac_key_loaded || StringLen(g_channel_key_id) != 16)
+     {
+      Print("CasForexMt5Bridge: refusing unsigned PublishOrderHistory (spool HMAC key unavailable).");
+      return;
+     }
+   bool   connected     = (TerminalInfoInteger(TERMINAL_CONNECTED) != 0);
+   string connected_str = connected ? "true" : "false";
+   string execution_mode = InpLiveExecutionMode ? "LIVE" : "DEMO";
+   string server        = SafeHistText(AccountInfoString(ACCOUNT_SERVER));
+   string trade_mode    = AccountTradeModeLabel();
+   string login         = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+   string observed_at   = IsoNowUtc();
+   long   srv_offset_s  = ServerUtcOffsetSeconds();
+
+   string open_json  = "";
+   string open_canon = "";
+   bool first = true;
+   if(connected)
+     {
+      for(int p = 0; p < PositionsTotal(); p++)
+        {
+         ulong ticket = PositionGetTicket(p);
+         if(ticket == 0)
+            continue;
+         string tkt_s = IntegerToString((long)ticket);
+         open_json  += StringFormat("%s\"%s\"", first ? "" : ",", tkt_s);
+         open_canon += (first ? "" : ";") + tkt_s;
+         first = false;
+        }
+     }
+
+   const int MAX_HIST_ROWS = 600;
+   string orders_json  = "";
+   string orders_canon = "";
+   string deals_json   = "";
+   string deals_canon  = "";
+   bool complete = false;
+   if(connected)
+     {
+      long end_srv_s = MathMax((long)TimeCurrent(), (long)TimeTradeServer()) + 86400;
+      bool hist_ok = HistorySelect(0, (datetime)end_srv_s);
+      int o_total = hist_ok ? HistoryOrdersTotal() : 0;
+      int d_total = hist_ok ? HistoryDealsTotal() : 0;
+      bool truncated = (o_total > MAX_HIST_ROWS || d_total > MAX_HIST_ROWS);
+      complete = (hist_ok && !truncated);
+
+      int o_start = MathMax(0, o_total - MAX_HIST_ROWS);
+      first = true;
+      for(int i = o_start; i < o_total; i++)
+        {
+         ulong ot = HistoryOrderGetTicket(i);
+         if(ot == 0)
+            continue;
+         string ot_s  = IntegerToString((long)ot);
+         string req_s = SafeHistText(HistoryOrderGetString(ot, ORDER_COMMENT));
+         string raw_sym = HistoryOrderGetString(ot, ORDER_SYMBOL);
+         string sym_s = SafeHistText(StringLen(raw_sym) > 0 ? CasSymbol(raw_sym) : "");
+         long ot_utc  = HistoryOrderGetInteger(ot, ORDER_TIME_SETUP) - srv_offset_s;
+         string t_iso = IsoFromUtcSeconds(ot_utc);
+         orders_json += StringFormat(
+            "%s{\"order_ticket\":\"%s\",\"request_id\":\"%s\",\"symbol\":\"%s\",\"time_utc\":\"%s\"}",
+            first ? "" : ",", ot_s, req_s, sym_s, t_iso);
+         orders_canon += (first ? "" : ";") + ot_s + ":" + req_s + ":" + sym_s + ":" + t_iso;
+         first = false;
+        }
+
+      int d_start = MathMax(0, d_total - MAX_HIST_ROWS);
+      first = true;
+      for(int i = d_start; i < d_total; i++)
+        {
+         ulong dtkt = HistoryDealGetTicket(i);
+         if(dtkt == 0)
+            continue;
+         string dt_s  = IntegerToString((long)dtkt);
+         string do_s  = IntegerToString(HistoryDealGetInteger(dtkt, DEAL_ORDER));
+         string req_s = SafeHistText(HistoryDealGetString(dtkt, DEAL_COMMENT));
+         string raw_sym = HistoryDealGetString(dtkt, DEAL_SYMBOL);
+         string sym_s = SafeHistText(StringLen(raw_sym) > 0 ? CasSymbol(raw_sym) : "");
+         long dt_utc  = HistoryDealGetInteger(dtkt, DEAL_TIME) - srv_offset_s;
+         string t_iso = IsoFromUtcSeconds(dt_utc);
+         deals_json += StringFormat(
+            "%s{\"deal_ticket\":\"%s\",\"order_ticket\":\"%s\",\"request_id\":\"%s\",\"symbol\":\"%s\",\"time_utc\":\"%s\"}",
+            first ? "" : ",", dt_s, do_s, req_s, sym_s, t_iso);
+         deals_canon += (first ? "" : ";") + dt_s + ":" + do_s + ":" + req_s + ":" + sym_s + ":" + t_iso;
+         first = false;
+        }
+     }
+
+   string complete_str = complete ? "true" : "false";
+   string open_sha   = Sha256Hex(open_canon);
+   string orders_sha = Sha256Hex(orders_canon);
+   string deals_sha  = Sha256Hex(deals_canon);
+   if(StringLen(open_sha) != 64 || StringLen(orders_sha) != 64 || StringLen(deals_sha) != 64)
+      return;
+
+   string hist_msg = SPOOL_PROTOCOL + "|" + InpBrokerChannel + "|" + g_channel_key_id + "|" + execution_mode + "|" +
+                     login + "|" + server + "|" + trade_mode + "|" + connected_str + "|" + complete_str + "|" +
+                     observed_at + "|" + open_sha + "|" + orders_sha + "|" + deals_sha;
+   string hist_mac = HmacSha256Hex(g_hmac_key, hist_msg);
+   if(StringLen(hist_mac) != 64)
+      return;
+
+   string json = StringFormat(
+      "{\"protocol\":\"%s\",\"broker_channel\":\"%s\",\"channel_key_id\":\"%s\",\"execution_mode\":\"%s\","
+      "\"account_login\":\"%s\",\"server\":\"%s\",\"account_trade_mode\":\"%s\","
+      "\"connected\":%s,\"complete\":%s,\"observed_at\":\"%s\",\"open_position_tickets\":[",
+      SPOOL_PROTOCOL, InpBrokerChannel, g_channel_key_id, execution_mode,
+      login, server, trade_mode, connected_str, complete_str, observed_at);
+   json += open_json;
+   json += "],\"orders\":[";
+   json += orders_json;
+   json += "],\"deals\":[";
+   json += deals_json;
+   json += StringFormat("],\"history_hmac_sha256\":\"%s\"}", hist_mac);
+   WriteAtomic("order_history.json", json);
+   g_last_history = TimeGMT();
+   g_history_dirty = false;
+  }
+
 int OnInit()
   {
    if(!ModeGuard())
@@ -1387,6 +1531,7 @@ int OnInit()
    ReportInterruptedRequests();
    PublishMarket();
    PublishCandles();
+   PublishOrderHistory();
    EventSetMillisecondTimer(MathMax(50, InpTimerMs));
    PrintFormat("CasForexMt5Bridge v2: running [%s] on server %s, spool %s (hmac_loaded=%s)",
                AccountTradeModeLabel(), AccountInfoString(ACCOUNT_SERVER), SpoolDir(), g_hmac_key_loaded ? "true" : "false");
@@ -1411,6 +1556,8 @@ void OnTimer()
    PublishMarket();
    if(TimeCurrent() - g_last_candles >= 5)
       PublishCandles();
+   if(g_history_dirty || (TimeGMT() - g_last_history >= 15))
+      PublishOrderHistory();
   }
 
 void OnTick()

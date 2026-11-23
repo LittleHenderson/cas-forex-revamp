@@ -1289,6 +1289,7 @@ def _build_mt5_index_snapshot_from_router(
 
     mt5_q: dict[str, tuple[Any, Any]] = {}
     mt5_src_broker: dict[str, str] = {}
+    pending_skips: list[tuple[str, str, str]] = []
     for broker_id, venue in router.venues.items():
         if hasattr(venue, "_transport") and venue.account is not None:
             tr = venue._transport
@@ -1306,7 +1307,8 @@ def _build_mt5_index_snapshot_from_router(
                 age_s = now_mono - float(cached.get("checked_mono", 0.0))
                 has_fresh_ticks = bool(cached.get("ticks"))
                 if not has_fresh_ticks:
-                    cache_hit = 0.0 <= age_s < 2.0
+                    err_ttl = 5.0 if bool(getattr(venue, "is_offline", False)) else 2.0
+                    cache_hit = 0.0 <= age_s < err_ttl
                 elif file_sig is not None and cached.get("file_sig") == file_sig:
                     cache_hit = 0.0 <= age_s < 1.0
             if cache_hit and cached is not None:
@@ -1343,9 +1345,12 @@ def _build_mt5_index_snapshot_from_router(
                     mt5_src_broker[sym] = broker_key
                     got_tick = True
                 elif sym in err_map:
-                    _emit_tick_skip(broker_key, sym, err_map[sym])
+                    pending_skips.append((broker_key, sym, err_map[sym]))
             if got_tick and hasattr(router, "_status") and router._status.get(broker_id) == "DISCONNECTED":
                 router._status[broker_id] = "ACTIVE"
+    for broker_key, sym, err_name in pending_skips:
+        if sym not in mt5_q:
+            _emit_tick_skip(broker_key, sym, err_name)
     if not mt5_q:
         return None, {}
     now_dt = datetime.now(timezone.utc)
@@ -2449,12 +2454,15 @@ class LoopbackCockpitServer:
         }
         if self._autonomous_trader is not None:
             try:
-                tsnap = self._autonomous_trader.status_snapshot()
+                if callable(getattr(self._autonomous_trader, "metrics_summary", None)):
+                    msum = self._autonomous_trader.metrics_summary()
+                else:
+                    msum = self._autonomous_trader.status_snapshot()
                 payload["trader_summary"] = {
-                    "governance_mode": str(tsnap.get("governance_mode", "")),
-                    "effective_status": str(tsnap.get("effective_status", "")),
-                    "cycle_count": int(tsnap.get("cycle_count", 0)),
-                    "veto_count": int(tsnap.get("veto_count", 0)),
+                    "governance_mode": str(msum.get("governance_mode", "")),
+                    "effective_status": str(msum.get("effective_status", "")),
+                    "cycle_count": int(msum.get("cycle_count", 0)),
+                    "veto_count": int(msum.get("veto_count", 0)),
                 }
             except Exception as exc:
                 self._last_routing_error = type(exc).__name__
@@ -2544,20 +2552,18 @@ class LoopbackCockpitServer:
         vs_dec = Decimal("0.60")
         if self._autonomous_trader is not None:
             try:
-                tsnap = self._autonomous_trader.status_snapshot()
-                if isinstance(tsnap, Mapping):
-                    raw_reg = str(tsnap.get("last_regime") or "").strip().upper()
+                if callable(getattr(self._autonomous_trader, "dial_context_summary", None)):
+                    dctx = self._autonomous_trader.dial_context_summary()
+                    raw_reg = str(dctx.get("last_regime") or "").strip().upper()
                     if raw_reg:
                         regime = raw_reg
-                    dq = tsnap.get("daily_quota")
-                    if isinstance(dq, Mapping):
-                        consec = max(0, int(dq.get("consecutive_losses", 0) or 0))
-                    ad_sub = tsnap.get("aggression_dial")
-                    if isinstance(ad_sub, Mapping) and ad_sub.get("drawdown_pct") not in (None, ""):
-                        parsed_dd = Decimal(str(ad_sub["drawdown_pct"]))
+                    consec = max(0, int(dctx.get("consecutive_losses", 0) or 0))
+                    raw_dd = dctx.get("drawdown_pct")
+                    if raw_dd not in (None, ""):
+                        parsed_dd = Decimal(str(raw_dd))
                         if parsed_dd.is_finite() and parsed_dd >= Decimal("0"):
                             dd_dec = parsed_dd.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-                    raw_vs = tsnap.get("last_valve_score")
+                    raw_vs = dctx.get("last_valve_score")
                     if raw_vs not in (None, ""):
                         parsed_vs = Decimal(str(raw_vs))
                         if parsed_vs.is_finite():
@@ -2565,6 +2571,28 @@ class LoopbackCockpitServer:
                                 Decimal("1.00"),
                                 max(Decimal("0.00"), parsed_vs.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)),
                             )
+                else:
+                    tsnap = self._autonomous_trader.status_snapshot()
+                    if isinstance(tsnap, Mapping):
+                        raw_reg = str(tsnap.get("last_regime") or "").strip().upper()
+                        if raw_reg:
+                            regime = raw_reg
+                        dq = tsnap.get("daily_quota")
+                        if isinstance(dq, Mapping):
+                            consec = max(0, int(dq.get("consecutive_losses", 0) or 0))
+                        ad_sub = tsnap.get("aggression_dial")
+                        if isinstance(ad_sub, Mapping) and ad_sub.get("drawdown_pct") not in (None, ""):
+                            parsed_dd = Decimal(str(ad_sub["drawdown_pct"]))
+                            if parsed_dd.is_finite() and parsed_dd >= Decimal("0"):
+                                dd_dec = parsed_dd.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+                        raw_vs = tsnap.get("last_valve_score")
+                        if raw_vs not in (None, ""):
+                            parsed_vs = Decimal(str(raw_vs))
+                            if parsed_vs.is_finite():
+                                vs_dec = min(
+                                    Decimal("1.00"),
+                                    max(Decimal("0.00"), parsed_vs.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)),
+                                )
             except (InvalidOperation, ValueError, TypeError, Exception) as exc_tr:
                 self._last_routing_error = type(exc_tr).__name__
 
@@ -5192,6 +5220,17 @@ def run_cockpit_cli(
         trader.stop_automation(reason="CLI launched with --no-autonomous-ai")
     if args.activate_brokers:
         router.activate_all()
+        if callable(getattr(router, "reconcile_unknown_mutations", None)) and router.has_any_unresolved_mutation():
+            try:
+                rec_startup = router.reconcile_unknown_mutations()
+                print(
+                    f"[reconcile] Startup reconciliation: checked={rec_startup.get('checked', 0)} "
+                    f"resolved={rec_startup.get('resolved', 0)} remaining={rec_startup.get('remaining_unknown', 0)}"
+                )
+            except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
+                raise
+            except Exception as exc_rec:
+                print(f"[reconcile] Startup reconciliation skipped ({type(exc_rec).__name__}).")
 
     routing_summary = safe_broker_routing_payload(router.routing_snapshot())
     cat_snap = assert_safe_ai_catalog_payload(registry.catalog_snapshot())
@@ -5274,7 +5313,24 @@ def run_cockpit_cli(
         base_wait = float(args.poll_seconds)
         next_wait = base_wait
         consecutive_feed_errors = 0
+        last_reconcile_mono = 0.0
         while not stop_flag.wait(next_wait):
+            if callable(getattr(router, "reconcile_unknown_mutations", None)) and router.has_any_unresolved_mutation():
+                now_rec_mono = time.monotonic()
+                if (now_rec_mono - last_reconcile_mono) >= 30.0:
+                    last_reconcile_mono = now_rec_mono
+                    try:
+                        rec_bg = router.reconcile_unknown_mutations()
+                        if int(rec_bg.get("resolved", 0)) > 0:
+                            print(
+                                f"[reconcile] Periodic reconciliation: resolved={rec_bg.get('resolved', 0)} "
+                                f"remaining={rec_bg.get('remaining_unknown', 0)}"
+                            )
+                            srv.notify_stream_updated()
+                    except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
+                        raise
+                    except Exception as exc_rec_bg:
+                        print(f"[reconcile] Periodic reconciliation skipped ({type(exc_rec_bg).__name__}).")
             if callable(getattr(router, "try_reconnect_oanda", None)):
                 try:
                     if router.try_reconnect_oanda():
@@ -5326,6 +5382,7 @@ def run_cockpit_cli(
         interval = max(0.05, float(args.fast_tick_ms) / 1000.0)
         fast_poll_cache: dict[str, dict[str, Any]] = {}
         fast_log_throttle: dict[tuple[str, str, str], tuple[float, int]] = {}
+        last_idle_fast_cycle_mono = 0.0
         while not stop_flag.wait(interval):
             if not args.autonomous_ai:
                 continue
@@ -5342,15 +5399,20 @@ def run_cockpit_cli(
                     if mt5_idx_snap is not None:
                         with stream_lock:
                             latest_mt5_index_stream[0] = mt5_idx_snap
-                    if trader._inference_lock.acquire(blocking=False):
-                        try:
-                            trader.run_fast_tick_cycle(mt5_quotes=mt5_q)
-                        finally:
-                            trader._inference_lock.release()
-                    else:
-                        # Non-blocking 50ms stop protection even during 3-8s deep-thinking HTTP inference
-                        trader.evaluate_fast_protection(quotes=mt5_q)
-                        runtime_state.parallel_tiers.process_tick(quotes=mt5_q, signal=None)
+                    has_open = trader.has_open_positions_fast() if callable(getattr(trader, "has_open_positions_fast", None)) else True
+                    now_ft_mono = time.monotonic()
+                    if has_open or (now_ft_mono - last_idle_fast_cycle_mono) >= 1.0:
+                        if trader._inference_lock.acquire(blocking=False):
+                            try:
+                                cyc_res = trader.run_fast_tick_cycle(mt5_quotes=mt5_q)
+                                if not has_open and isinstance(cyc_res, Mapping) and cyc_res.get("action") == "WAIT":
+                                    last_idle_fast_cycle_mono = time.monotonic()
+                            finally:
+                                trader._inference_lock.release()
+                        elif has_open:
+                            # Non-blocking 50ms stop protection even during 3-8s deep-thinking HTTP inference
+                            trader.evaluate_fast_protection(quotes=mt5_q)
+                            runtime_state.parallel_tiers.process_tick(quotes=mt5_q, signal=None)
                     srv.notify_stream_updated()
             except Exception as exc_ft:
                 msg_ft = " ".join(str(exc_ft).split())[:140]
