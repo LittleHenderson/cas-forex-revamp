@@ -1106,6 +1106,15 @@ class AutonomousAiTrader:
                 if (eff_dd_peak is not None and eff_dd_peak > Decimal("0"))
                 else Decimal("0")
             )
+        if callable(getattr(self._router, "effective_drawdown_scope_id", None)):
+            eff_dd_scope = str(
+                self._router.effective_drawdown_scope_id(
+                    equities=equities, offline_brokers=offline_ids
+                )
+                or "dual-shield-barbell"
+            )
+        else:
+            eff_dd_scope = "dual-shield-barbell"
         self._last_drawdown_pct = eff_dd_pct
         return {
             "equities": equities,
@@ -1115,6 +1124,7 @@ class AutonomousAiTrader:
             "offline_brokers": offline_ids,
             "eff_dd_eq": eff_dd_eq,
             "eff_dd_peak": eff_dd_peak if eff_dd_peak is not None else eff_dd_eq,
+            "eff_dd_scope": eff_dd_scope,
         }
 
     def has_open_positions_fast(self) -> bool:
@@ -1345,6 +1355,7 @@ class AutonomousAiTrader:
         total_eq: Decimal,
         peak_eq: Decimal,
         position_side: Side | None = None,
+        scope_id: str | None = None,
         now: datetime,
     ) -> ValveDecision:
         ev_id = f"ev-{self._cycle_seq}-{intent.instrument_id.lower()}"
@@ -1421,6 +1432,7 @@ class AutonomousAiTrader:
             peak_eq=peak_eq,
             new_risk_permission="ALLOWED" if self._governance_mode == GOVERNANCE_ACTIVE else "PAUSED",
             management_permission="STOPPED" if self._governance_mode == GOVERNANCE_STOPPED else "ALLOWED",
+            scope_id=scope_id,
         )
         return self._valve_gate.require_admissible(
             _ProposalBox(req, res, intent), current_view=current_view, now=now
@@ -1433,6 +1445,7 @@ class AutonomousAiTrader:
         peak_eq: Decimal,
         new_risk_permission: str,
         management_permission: str,
+        scope_id: str | None = None,
     ) -> dict[str, Any]:
         bal_sum = Decimal("0")
         free_sum = Decimal("0")
@@ -1482,7 +1495,7 @@ class AutonomousAiTrader:
             "peak_equity": decimal_text(peak_eq),
             "available_margin": decimal_text(margin_val),
             "position_inventory": json.dumps(inventory, sort_keys=True),
-            "scope_id": "dual-shield-barbell",
+            "scope_id": str(scope_id).strip() if (isinstance(scope_id, str) and scope_id.strip()) else "dual-shield-barbell",
             "policy": {
                 "new_risk_permission": new_risk_permission,
                 "management_permission": management_permission,
@@ -1770,6 +1783,7 @@ class AutonomousAiTrader:
                             total_eq=eff_dd_eq_fast,
                             peak_eq=peak_eq,
                             position_side=pos.side,
+                            scope_id=eq_bundle_fast.get("eff_dd_scope"),
                             now=ts,
                         )
                         order = OrderIntent.from_action_intent(intent, symbol=sym, position_ticket=pos.ticket)
@@ -3217,12 +3231,14 @@ class AutonomousAiTrader:
                     self._append_journal_cycle(report)
                     return report
 
-            if (
+            run_scout = bool(
                 self._registry.fast_scout_enabled
                 and active_id != "gemini-decision-1"
                 and self._registry.is_model_ready("gemini-decision-1")
                 and not is_pyramid_add
-            ):
+            )
+            scout_q: list[dict[str, Any]] | None = None
+            if run_scout:
                 scout_q = [{
                     "market": sym,
                     "side": side.value,
@@ -3230,18 +3246,25 @@ class AutonomousAiTrader:
                     "setup": setup_note,
                     "choices": ["WAIT", action_ref],
                 }]
+            exec_gate_ref = self._execution_gate
+            registry_ref = self._registry
+
+        # Phase 1.5 (OUTSIDE self._lock!): Gemini Decision 1 Fast Scout HTTP check never blocks UI reads or 50ms stops
+        scout: dict[str, Any] | None = None
+        if run_scout and scout_q is not None:
+            with self._inference_lock:
                 try:
-                    if isinstance(self._execution_gate, DurableModelExecutionGate):
-                        scout = self._registry.scout_opportunities(
+                    if isinstance(exec_gate_ref, DurableModelExecutionGate):
+                        scout = registry_ref.scout_opportunities(
                             scout_q,
-                            execution_gate=self._execution_gate,
+                            execution_gate=exec_gate_ref,
                             request_id=cycle_id,
                         )
                     else:
-                        if hasattr(self._execution_gate, "admit_scout_call"):
-                            self._execution_gate.admit_scout_call(model_id="gemini-decision-1", request_id=cycle_id, now=ts)
+                        if hasattr(exec_gate_ref, "admit_scout_call"):
+                            exec_gate_ref.admit_scout_call(model_id="gemini-decision-1", request_id=cycle_id, now=ts)
                         else:
-                            scout_spec, _, _ = self._registry.build_backend("gemini-decision-1")
+                            scout_spec, _, _ = registry_ref.build_backend("gemini-decision-1")
                             scout_inv = ModelInvocation(
                                 request_sha256=content_digest(scout_q),
                                 model=scout_spec,
@@ -3253,14 +3276,15 @@ class AutonomousAiTrader:
                                     max_seconds_per_call=10, max_total_seconds=10,
                                 ),
                             )
-                            self._execution_gate(scout_inv)
-                        scout = self._registry.scout_opportunities(scout_q)
+                            exec_gate_ref(scout_inv)
+                        scout = registry_ref.scout_opportunities(scout_q)
                 except FrontierTransportError as scout_exc:
-                    self._registry.record_call(
-                        "gemini-decision-1",
-                        latency_ms=max(1, (time.monotonic_ns() - t0_ns) // 1_000_000),
-                        status="SCOUT_DEGRADED",
-                    )
+                    with self._lock:
+                        registry_ref.record_call(
+                            "gemini-decision-1",
+                            latency_ms=max(1, (time.monotonic_ns() - t0_ns) // 1_000_000),
+                            status="SCOUT_DEGRADED",
+                        )
                     scout = {
                         "executed": False,
                         "reason": f"SCOUT_DEGRADED:{type(scout_exc).__name__}",
@@ -3269,30 +3293,54 @@ class AutonomousAiTrader:
                         "best_probability": None,
                         "decisions": [],
                     }
+
+        with self._lock:
+            if scout is not None:
                 self._last_scout = scout
-                if scout.get("executed") and not scout.get("wake_heavy_model"):
-                    self._last_action = "WAIT"
-                    self._last_symbol = sym
-                    self._last_reason = f"Gemini Decision 1 Fast Scout held WAIT on {sym}"
-                    self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
-                    if self._parallel_tiers is not None and quotes_map:
-                        self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
-                    report = {
-                        "schema": "cas-forex.ai-cycle/1",
-                        "cycle_id": cycle_id,
-                        "observed_at": _iso(ts),
-                        "model_id": active_id,
-                        "cadence": self._last_cadence,
-                        "thinking_depth": eff_depth,
-                        "regime": regime_name,
-                        "action": "WAIT",
-                        "symbol": sym,
-                        "reason": self._last_reason,
-                        "valve_score": self._last_valve_score,
-                        "protection_updates": prot_updates,
-                    }
-                    self._append_journal_cycle(report)
-                    return report
+            if self._governance_mode != GOVERNANCE_ACTIVE:
+                self._last_action = "WAIT"
+                self._last_symbol = sym
+                self._last_reason = f"Aborted post-scout: governance shifted to {self._governance_mode}"
+                self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                report = {
+                    "schema": "cas-forex.ai-cycle/1",
+                    "cycle_id": cycle_id,
+                    "observed_at": _iso(ts),
+                    "model_id": active_id,
+                    "cadence": self._last_cadence,
+                    "thinking_depth": eff_depth,
+                    "regime": regime_name,
+                    "action": "WAIT",
+                    "symbol": sym,
+                    "reason": self._last_reason,
+                    "valve_score": self._last_valve_score,
+                    "protection_updates": prot_updates,
+                }
+                self._append_journal_cycle(report)
+                return report
+            if scout is not None and scout.get("executed") and not scout.get("wake_heavy_model"):
+                self._last_action = "WAIT"
+                self._last_symbol = sym
+                self._last_reason = f"Gemini Decision 1 Fast Scout held WAIT on {sym}"
+                self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
+                if self._parallel_tiers is not None and quotes_map:
+                    self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
+                report = {
+                    "schema": "cas-forex.ai-cycle/1",
+                    "cycle_id": cycle_id,
+                    "observed_at": _iso(ts),
+                    "model_id": active_id,
+                    "cadence": self._last_cadence,
+                    "thinking_depth": eff_depth,
+                    "regime": regime_name,
+                    "action": "WAIT",
+                    "symbol": sym,
+                    "reason": self._last_reason,
+                    "valve_score": self._last_valve_score,
+                    "protection_updates": prot_updates,
+                }
+                self._append_journal_cycle(report)
+                return report
 
             ev_id = f"ev-{cycle_id}-{sym.lower()}"
             fact_obj = {
@@ -3429,6 +3477,7 @@ class AutonomousAiTrader:
                 peak_eq=eq_bundle_post["eff_dd_peak"],
                 new_risk_permission="ALLOWED",
                 management_permission="ALLOWED",
+                scope_id=eq_bundle_post.get("eff_dd_scope"),
             )
             proposal_box = _ModelProposal(req, dec_result, intent)
             if self._phase8_bridge is not None:

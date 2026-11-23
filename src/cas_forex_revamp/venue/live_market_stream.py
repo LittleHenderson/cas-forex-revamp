@@ -157,7 +157,7 @@ INDEX_MARKET_SPECS: dict[str, dict[str, Any]] = {
         "max": Decimal("60000.00"),
         "max_ref_dev_bps": Decimal("150"),
         "max_spread_bps": Decimal("35"),
-        "yahoo_paths": ("/v8/finance/chart/%5ENDX", "/v8/finance/chart/NQ=F"),
+        "yahoo_paths": ("/v8/finance/chart/NQ=F", "/v8/finance/chart/%5ENDX"),
         "oanda": "NAS100_USD",
     },
     "US30": {
@@ -171,7 +171,7 @@ INDEX_MARKET_SPECS: dict[str, dict[str, Any]] = {
         "max": Decimal("100000.00"),
         "max_ref_dev_bps": Decimal("150"),
         "max_spread_bps": Decimal("35"),
-        "yahoo_paths": ("/v8/finance/chart/%5EDJI", "/v8/finance/chart/YM=F"),
+        "yahoo_paths": ("/v8/finance/chart/YM=F", "/v8/finance/chart/%5EDJI"),
         "oanda": "US30_USD",
     },
     "SPX500": {
@@ -185,7 +185,7 @@ INDEX_MARKET_SPECS: dict[str, dict[str, Any]] = {
         "max": Decimal("20000.00"),
         "max_ref_dev_bps": Decimal("150"),
         "max_spread_bps": Decimal("35"),
-        "yahoo_paths": ("/v8/finance/chart/%5EGSPC", "/v8/finance/chart/ES=F"),
+        "yahoo_paths": ("/v8/finance/chart/ES=F", "/v8/finance/chart/%5EGSPC"),
         "oanda": "SPX500_USD",
     },
     "XAUUSD": {
