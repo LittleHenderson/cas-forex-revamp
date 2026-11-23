@@ -2660,3 +2660,17 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
 .ob-footer-strip { border-top: 1px solid #1e293b; padding-top: 10px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
 .ob-footer-line { margin: 0; color: #e2e8f0; }
 .ob-footer-note { margin: 4px 0 0; font-size: 11px; color: #94a3b8; }
+/* PR #43: DEMO-Only High-Growth Practice Profile Bar (Strict CSP, Dark Obsidian) */
+.dhg-panel { background: #0d1117; border: 1px solid #1e293b; border-top: 3px solid #f59e0b; color: #e2e8f0; padding: 16px 20px; margin-bottom: 16px; overflow-anchor: none; }
+.dhg-header-row { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
+.dhg-badge-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.dhg-badge { display: inline-flex; align-items: center; padding: 4px 10px; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; border-radius: 4px; border: 1px solid #334155; }
+.dhg-badge-safe { background: #271a06; color: #fcd34d; border-color: #d97706; }
+.dhg-badge-active { background: #07291e; color: #6ee7b7; border-color: #10b981; }
+.dhg-badge-muted { background: #111827; color: #cbd5e1; border-color: #334155; }
+.dhg-badge-danger { background: #3b0d14; color: #fda4af; border-color: #f43f5e; }
+.dhg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 10px; }
+.dhg-chip { background: #111827; border: 1px solid #1f2937; border-radius: 6px; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; }
+.dhg-label { font-size: 10px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; }
+.dhg-val { font-size: 14px; font-weight: 800; color: #f8fafc; }
+.dhg-sub { font-size: 11px; color: #94a3b8; }

@@ -23,6 +23,7 @@ from typing import Any
 
 from cas_forex_revamp.composition.state_store import open_verified_sqlite_connection
 from cas_forex_revamp.contracts import ContractError, decimal_text
+from cas_forex_revamp.risk.demo_high_growth_profile import DemoHighGrowthProfile
 from cas_forex_revamp.venue.dual_shield_router import (
     MAX_CONSTITUTIONAL_DRAWDOWN_PCT,
     MAX_CONSTITUTIONAL_STOP_RISK_PCT,
@@ -148,6 +149,7 @@ class OptionBPaperDemoRunner:
         mode: str = TRADOVATE_MODE_DEMO,
         max_drawdown_pct: Decimal = MAX_CONSTITUTIONAL_DRAWDOWN_PCT,
         max_stop_loss_risk_pct: Decimal = MAX_CONSTITUTIONAL_STOP_RISK_PCT,
+        demo_high_growth: DemoHighGrowthProfile | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         norm_mode = str(mode or "").strip().upper()
@@ -157,6 +159,8 @@ class OptionBPaperDemoRunner:
             )
         if valve_gate is None:
             raise ContractError("OptionBPaperDemoRunner requires an active ForexMetaValveGate")
+        if demo_high_growth is not None and not isinstance(demo_high_growth, DemoHighGrowthProfile):
+            raise ContractError("demo_high_growth must be a DemoHighGrowthProfile or None")
         if not isinstance(account_id, str) or not account_id.strip():
             raise ContractError("account_id must be a non-empty string")
 
@@ -172,20 +176,42 @@ class OptionBPaperDemoRunner:
         self._initial_starting_equity_usd = _q2(
             _exact_decimal(starting_equity_usd, "starting_equity_usd", positive=True)
         )
-        self._max_drawdown_pct = _exact_decimal(
+        base_dd = _exact_decimal(
             max_drawdown_pct, "max_drawdown_pct", positive=True
         )
-        if self._max_drawdown_pct > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+        if base_dd > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
             raise ContractError(
                 "CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: max_drawdown_pct cannot exceed 0.10 (10.00%)"
             )
-        self._max_stop_loss_risk_pct = _exact_decimal(
+        base_risk = _exact_decimal(
             max_stop_loss_risk_pct, "max_stop_loss_risk_pct", positive=True
         )
-        if self._max_stop_loss_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
+        if base_risk > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
             raise ContractError(
                 "CONSTITUTIONAL_STOP_RISK_CEILING_EXCEEDED: max_stop_loss_risk_pct cannot exceed 1.00%"
             )
+        self._base_max_drawdown_pct = base_dd
+        self._base_max_stop_loss_risk_pct = base_risk
+        self._demo_high_growth: DemoHighGrowthProfile = (
+            demo_high_growth if demo_high_growth is not None else DemoHighGrowthProfile(enabled=False)
+        )
+        self._demo_high_growth.assert_demo_mode(norm_mode, live_trading_armed=False, live_trading_locked=True)
+        self._max_drawdown_pct = (
+            self._demo_high_growth.max_drawdown_pct
+            if self._demo_high_growth.enabled
+            else self._base_max_drawdown_pct
+        )
+        self._max_stop_loss_risk_pct = (
+            self._demo_high_growth.max_risk_pct
+            if self._demo_high_growth.enabled
+            else self._base_max_stop_loss_risk_pct
+        )
+        self._default_risk_pct = (
+            self._demo_high_growth.target_risk_pct
+            if self._demo_high_growth.enabled
+            else MAX_CONSTITUTIONAL_STOP_RISK_PCT
+        )
+        self._vault_sweep_ratio = self._demo_high_growth.effective_sweep_ratio(OPTION_B_VAULT_SWEEP_RATIO)
 
         self._house_money_target_usd = _q2(
             self._initial_starting_equity_usd * OPTION_B_HOUSE_MONEY_MULTIPLIER
@@ -217,7 +243,8 @@ class OptionBPaperDemoRunner:
             account_id=self._account_id,
             mode=TRADOVATE_MODE_DEMO,
             enabled=False,
-            max_drawdown_pct=self._max_drawdown_pct,
+            max_drawdown_pct=self._base_max_drawdown_pct,
+            demo_high_growth=self._demo_high_growth,
             clock=self._clock,
         )
         self._venue.activate(mode=TRADOVATE_MODE_DEMO, now_utc=now)
@@ -231,6 +258,58 @@ class OptionBPaperDemoRunner:
     @property
     def venue_db_path(self) -> Path:
         return self._venue_db_path
+
+    @property
+    def default_risk_pct(self) -> Decimal:
+        with self._lock:
+            return self._default_risk_pct
+
+    @property
+    def max_stop_loss_risk_pct(self) -> Decimal:
+        with self._lock:
+            return self._max_stop_loss_risk_pct
+
+    @property
+    def max_drawdown_pct(self) -> Decimal:
+        with self._lock:
+            return self._max_drawdown_pct
+
+    def set_demo_high_growth_profile(
+        self,
+        profile: DemoHighGrowthProfile,
+        *,
+        execution_mode: Any = TRADOVATE_MODE_DEMO,
+        live_trading_armed: bool = False,
+        live_trading_locked: bool = True,
+    ) -> None:
+        if not isinstance(profile, DemoHighGrowthProfile):
+            raise ContractError("profile must be a DemoHighGrowthProfile")
+        profile.assert_demo_mode(
+            execution_mode,
+            live_trading_armed=live_trading_armed,
+            live_trading_locked=live_trading_locked,
+        )
+        with self._lock:
+            v_gate = self._venue.valve_gate
+            if v_gate is not None and callable(getattr(v_gate, "set_demo_high_growth_profile", None)):
+                v_gate.set_demo_high_growth_profile(
+                    profile,
+                    execution_mode=execution_mode,
+                    live_trading_armed=live_trading_armed,
+                    live_trading_locked=live_trading_locked,
+                )
+            self._venue.set_demo_high_growth_profile(profile)
+            self._demo_high_growth = profile
+            self._max_drawdown_pct = (
+                profile.max_drawdown_pct if profile.enabled else self._base_max_drawdown_pct
+            )
+            self._max_stop_loss_risk_pct = (
+                profile.max_risk_pct if profile.enabled else self._base_max_stop_loss_risk_pct
+            )
+            self._default_risk_pct = (
+                profile.target_risk_pct if profile.enabled else MAX_CONSTITUTIONAL_STOP_RISK_PCT
+            )
+            self._vault_sweep_ratio = profile.effective_sweep_ratio(OPTION_B_VAULT_SWEEP_RATIO)
 
     @property
     def venue(self) -> TradovateMicroFuturesVenue:
@@ -580,7 +659,7 @@ class OptionBPaperDemoRunner:
         side: str,
         stop_distance_points: Decimal | str | int,
         take_profit_points: Decimal | str | int,
-        risk_pct: Decimal | str | int = MAX_CONSTITUTIONAL_STOP_RISK_PCT,
+        risk_pct: Decimal | str | int | None = None,
         max_open_positions: int = 4,
         reason: str = "CAS_OPTION_B_PAPER_MIRROR",
         policy_overrides: Mapping[str, Any] | None = None,
@@ -593,7 +672,8 @@ class OptionBPaperDemoRunner:
             return {"executed": False, "status": "UNSUPPORTED_SYMBOL", "symbol": str(symbol)}
         root = translate_cas_symbol_to_micro_root(cas_sym)
 
-        risk_d = _exact_decimal(risk_pct, "risk_pct", positive=True)
+        raw_risk = self._default_risk_pct if risk_pct is None else risk_pct
+        risk_d = _exact_decimal(raw_risk, "risk_pct", positive=True)
         if risk_d > self._max_stop_loss_risk_pct:
             raise ContractError(
                 f"Option B stop-loss risk_pct {risk_d}% exceeds constitutional ceiling {self._max_stop_loss_risk_pct}%"
@@ -617,7 +697,7 @@ class OptionBPaperDemoRunner:
             eff_peak = max(durable_peak, snap_acct.peak_equity_usd, snap_acct.equity_usd)
             dd = _q10_ceil(compute_drawdown_pct(snap_acct.equity_usd, eff_peak))
             if dd >= self._max_drawdown_pct:
-                detail = f"Hard drawdown brake active ({decimal_text(_q4(dd * Decimal('100')))}% >= 10.00%)"
+                detail = f"Hard drawdown brake active ({decimal_text(_q4(dd * Decimal('100')))}% >= {decimal_text(_q2(self._max_drawdown_pct * Decimal('100')))}%)"
                 self._log_event("ENTRY_BLOCKED_DRAWDOWN", cas_sym, root, detail, now)
                 return {"executed": False, "status": "DRAWDOWN_LOCKED", "detail": detail}
 
@@ -781,7 +861,7 @@ class OptionBPaperDemoRunner:
             dd_locked = dd_ratio >= self._max_drawdown_pct
 
             surplus = max(Decimal("0.00"), _q2(balance - starting))
-            vault_reserved = _q2(surplus * OPTION_B_VAULT_SWEEP_RATIO)
+            vault_reserved = _q2(surplus * self._vault_sweep_ratio)
             retained = _q2(surplus - vault_reserved)
 
             hm_span = hm_target - starting

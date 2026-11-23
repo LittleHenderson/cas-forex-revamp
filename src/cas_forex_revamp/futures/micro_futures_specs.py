@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import Final, Mapping
 
 from cas_forex_revamp.contracts import ContractError
+from cas_forex_revamp.risk.demo_high_growth_profile import DEMO_HIGH_GROWTH_MAX_RISK_PCT
 
 # Constitutional risk & margin ceilings (PR #25 Finding [5])
 MAX_CONSTITUTIONAL_STOP_RISK_PCT: Final[Decimal] = Decimal("1.00")
@@ -617,6 +618,7 @@ def size_micro_futures_order(
     min_margin_level_pct: Decimal = DEFAULT_MIN_MARGIN_LEVEL_PCT,
     use_exchange_margin: bool = False,
     max_contracts: int = 20,
+    demo_max_stop_risk_pct: Decimal | None = None,
 ) -> MicroFuturesSizingResult:
     """Size an exact whole-contract micro futures position under constitutional risk & margin ceilings."""
     spec = get_contract_spec(symbol_or_root)
@@ -641,10 +643,25 @@ def size_micro_futures_order(
         allow_negative=False,
         error_cls=MicroFuturesSizingRefusalError,
     )
-    if exact_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
+    if demo_max_stop_risk_pct is not None:
+        eff_stop_ceiling = _require_decimal(
+            demo_max_stop_risk_pct,
+            "demo_max_stop_risk_pct",
+            allow_zero=False,
+            allow_negative=False,
+            error_cls=MicroFuturesSizingRefusalError,
+        )
+        if eff_stop_ceiling > DEMO_HIGH_GROWTH_MAX_RISK_PCT:
+            raise MicroFuturesSizingRefusalError(
+                f"demo_max_stop_risk_pct {eff_stop_ceiling}% exceeds DEMO high-growth ceiling "
+                f"{DEMO_HIGH_GROWTH_MAX_RISK_PCT}%"
+            )
+    else:
+        eff_stop_ceiling = MAX_CONSTITUTIONAL_STOP_RISK_PCT
+    if exact_risk_pct > eff_stop_ceiling:
         raise MicroFuturesSizingRefusalError(
             f"Requested risk_pct {exact_risk_pct}% exceeds constitutional stop-risk ceiling "
-            f"of {MAX_CONSTITUTIONAL_STOP_RISK_PCT}%"
+            f"of {eff_stop_ceiling}%"
         )
     exact_used_margin = _require_decimal(
         existing_used_margin_usd,

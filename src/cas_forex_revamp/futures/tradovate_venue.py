@@ -104,6 +104,7 @@ from cas_forex_revamp.futures.micro_futures_specs import (
     validate_contract_not_expired,
 )
 from cas_forex_revamp.operator.decisions import DecisionProposal
+from cas_forex_revamp.risk.demo_high_growth_profile import DemoHighGrowthProfile
 from cas_forex_revamp.valve.tks_meta_valve_controller import (
     ForexMetaValveGate,
     ValveDecision,
@@ -4415,6 +4416,7 @@ class TradovateMicroFuturesVenue:
         max_quote_future_skew_seconds: Decimal | int | float | str = DEFAULT_MAX_QUOTE_FUTURE_SKEW_SECONDS,
         roll_buffer_days: int = 7,
         use_exchange_margin: bool = False,
+        demo_high_growth: DemoHighGrowthProfile | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if type(roll_buffer_days) is not int or roll_buffer_days < 0:
@@ -4423,6 +4425,8 @@ class TradovateMicroFuturesVenue:
             raise ContractError("enabled must be a strict bool or None")
         if type(live_arming_verified) is not bool:
             raise TradovateLiveLockError("live_arming_verified must be a strict bool")
+        if demo_high_growth is not None and not isinstance(demo_high_growth, DemoHighGrowthProfile):
+            raise ContractError("demo_high_growth must be a DemoHighGrowthProfile or None")
         dd_cap = validate_constitutional_drawdown_pct(
             max_drawdown_pct,
             field="max_drawdown_pct",
@@ -4515,7 +4519,20 @@ class TradovateMicroFuturesVenue:
         self._live_auth_context: LiveAuthorizationContext | None = eff_creds.live_auth_context
         self._live_arm_phrase: str | None = eff_creds.live_arm_phrase
         self._valve_gate = valve_gate
-        self._max_drawdown_pct = dd_cap
+        self._base_max_drawdown_pct = dd_cap
+        self._demo_high_growth: DemoHighGrowthProfile = (
+            demo_high_growth if demo_high_growth is not None else DemoHighGrowthProfile(enabled=False)
+        )
+        self._demo_high_growth.assert_demo_mode(
+            eff_creds.mode,
+            live_trading_armed=(eff_creds.mode == TRADOVATE_MODE_LIVE or eff_creds.live_arming_verified),
+            live_trading_locked=(eff_creds.mode == TRADOVATE_MODE_DEMO),
+        )
+        self._max_drawdown_pct = (
+            self._demo_high_growth.max_drawdown_pct
+            if self._demo_high_growth.enabled
+            else self._base_max_drawdown_pct
+        )
         self._min_margin_level_pct = margin_floor
         self._max_quote_age_seconds = max_q_age
         self._max_quote_future_skew_seconds = max_q_skew
@@ -4590,6 +4607,20 @@ class TradovateMicroFuturesVenue:
     @property
     def valve_gate(self) -> ForexMetaValveGate | Any | None:
         return self._valve_gate
+
+    def set_demo_high_growth_profile(self, profile: DemoHighGrowthProfile) -> None:
+        if not isinstance(profile, DemoHighGrowthProfile):
+            raise ContractError("profile must be a DemoHighGrowthProfile")
+        profile.assert_demo_mode(
+            self._mode,
+            live_trading_armed=(self._mode == TRADOVATE_MODE_LIVE or self._credentials.live_arming_verified),
+            live_trading_locked=(self._mode == TRADOVATE_MODE_DEMO),
+        )
+        with self._lock:
+            self._demo_high_growth = profile
+            self._max_drawdown_pct = (
+                profile.max_drawdown_pct if profile.enabled else self._base_max_drawdown_pct
+            )
 
     @property
     def venue_status(self) -> str:
@@ -5459,6 +5490,11 @@ class TradovateMicroFuturesVenue:
             _check_no_control_chars(idempotency_key, "idempotency_key")
 
         with self._lock:
+            self._demo_high_growth.assert_demo_mode(
+                self._mode,
+                live_trading_armed=(self._mode == TRADOVATE_MODE_LIVE or self._credentials.live_arming_verified),
+                live_trading_locked=(self._mode == TRADOVATE_MODE_DEMO),
+            )
             request_id = self._next_request_id("open")
 
             # 1. Standby fail-closed gate
@@ -5639,6 +5675,9 @@ class TradovateMicroFuturesVenue:
             eff_stop_distance = abs(ref_entry - aligned_sl)
 
             # 6. Constitutional <= 1.00% risk & >= 1,000% margin whole-contract sizing wall
+            demo_max_risk = (
+                self._demo_high_growth.max_risk_pct if self._demo_high_growth.enabled else None
+            )
             sizing: MicroFuturesSizingResult = size_micro_futures_order(
                 symbol_or_root=root,
                 equity_usd=acct.equity_usd,
@@ -5647,6 +5686,7 @@ class TradovateMicroFuturesVenue:
                 existing_used_margin_usd=acct.used_margin_usd,
                 min_margin_level_pct=self._min_margin_level_pct,
                 use_exchange_margin=self._use_exchange_margin,
+                demo_max_stop_risk_pct=demo_max_risk,
             )
             if contracts is not None:
                 if type(contracts) is not int or contracts < 1:

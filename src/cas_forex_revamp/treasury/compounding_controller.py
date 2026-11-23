@@ -38,6 +38,7 @@ from typing import Any
 
 from cas_forex_revamp.contracts import ContractError, canonical_bytes
 from cas_forex_revamp.contracts.primitives import decimal_value, identifier, utc_time
+from cas_forex_revamp.risk.demo_high_growth_profile import DemoHighGrowthProfile
 
 COMPOUNDING_CONTROLLER_SCHEMA = "cas-forex.compounding-controller/1"
 DEFAULT_SCOPE_ID = "default"
@@ -400,6 +401,7 @@ class CompoundingAndMilestoneController:
         auto_enable_vault_at_target: bool = True,
         scope_id: str = DEFAULT_SCOPE_ID,
         now_utc: datetime | None = None,
+        demo_high_growth: DemoHighGrowthProfile | None = None,
     ) -> None:
         if not isinstance(db_path, (str, Path)):
             raise CompoundingControllerError("db_path must be a filesystem path")
@@ -449,6 +451,11 @@ class CompoundingAndMilestoneController:
         auto_enable = _require_bool(auto_enable_vault_at_target, "auto_enable_vault_at_target")
         init_ts = _iso_utc(_utc_now(now_utc))
 
+        if demo_high_growth is not None and not isinstance(demo_high_growth, DemoHighGrowthProfile):
+            raise CompoundingControllerError("demo_high_growth must be a DemoHighGrowthProfile or None")
+        self._demo_high_growth: DemoHighGrowthProfile = (
+            demo_high_growth if demo_high_growth is not None else DemoHighGrowthProfile(enabled=False)
+        )
         self._lock = RLock()
         self._init_db(
             principal=principal,
@@ -460,6 +467,32 @@ class CompoundingAndMilestoneController:
             auto_enable_vault_at_target=auto_enable,
             created_at=init_ts,
         )
+
+    def set_demo_high_growth_profile(
+        self,
+        profile: DemoHighGrowthProfile,
+        *,
+        execution_mode: Any = "DEMO",
+        live_trading_armed: bool = False,
+        live_trading_locked: bool = True,
+    ) -> None:
+        if not isinstance(profile, DemoHighGrowthProfile):
+            raise CompoundingControllerError("profile must be a DemoHighGrowthProfile")
+        profile.assert_demo_mode(
+            execution_mode,
+            live_trading_armed=live_trading_armed,
+            live_trading_locked=live_trading_locked,
+        )
+        with self._lock:
+            self._demo_high_growth = profile
+
+    def _effective_max_stop_risk_pct(self) -> Decimal:
+        with self._lock:
+            return self._demo_high_growth.effective_stop_risk_ceiling_pct()
+
+    def _effective_max_drawdown_pct(self) -> Decimal:
+        with self._lock:
+            return self._demo_high_growth.effective_drawdown_ceiling_pct()
 
     def _connect_rw(self) -> sqlite3.Connection:
         from cas_forex_revamp.composition.state_store import open_verified_sqlite_connection
@@ -1239,13 +1272,13 @@ class CompoundingAndMilestoneController:
         if req_risk_pct <= Decimal("0"):
             return _deny("NON_POSITIVE_RISK_PCT")
 
-        if req_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
+        if req_risk_pct > self._effective_max_stop_risk_pct():
             return _deny("CONSTITUTIONAL_STOP_RISK_EXCEEDED")
 
         if equity <= _ZERO_2DP:
             return _deny("NON_POSITIVE_EQUITY")
 
-        if dd_pct >= MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+        if dd_pct >= self._effective_max_drawdown_pct():
             return _deny("CONSTITUTIONAL_DRAWDOWN_LIMIT_REACHED")
 
         if margin_pct is not None and margin_pct < MIN_MARGIN_LEVEL_PCT:

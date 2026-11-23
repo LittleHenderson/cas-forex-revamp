@@ -48,6 +48,7 @@ from cas_forex_revamp.execution.smart_execution import (
     SmartSliceExecutor,
 )
 from cas_forex_revamp.ledger.unified_ledger import UnifiedRealTimeLedger
+from cas_forex_revamp.risk.demo_high_growth_profile import DemoHighGrowthProfile
 from cas_forex_revamp.risk.news_shock_shield import (
     NewsShockShield,
     TradeActionType,
@@ -367,6 +368,7 @@ class Phase8LiveTradingBridge:
         smart_planner: SmartExecutionPlanner,
         smart_executor: SmartSliceExecutor,
         compounding_controller: Any | None = None,
+        demo_high_growth: DemoHighGrowthProfile | None = None,
     ) -> None:
         if valve_gate is None or not callable(getattr(valve_gate, "evaluate", None)):
             raise Phase8BridgeValveError(
@@ -388,8 +390,13 @@ class Phase8LiveTradingBridge:
         self._event_bus = event_bus
         self._news_shield = news_shield
         self._smart_planner = smart_planner
+        if demo_high_growth is not None and not isinstance(demo_high_growth, DemoHighGrowthProfile):
+            raise Phase8BridgeError("demo_high_growth must be a DemoHighGrowthProfile or None")
         self._smart_executor = smart_executor
         self._compounding_controller = compounding_controller
+        self._demo_high_growth: DemoHighGrowthProfile = (
+            demo_high_growth if demo_high_growth is not None else DemoHighGrowthProfile(enabled=False)
+        )
 
         self._lock = threading.RLock()
         self._closed = False
@@ -432,6 +439,32 @@ class Phase8LiveTradingBridge:
     @property
     def compounding_controller(self) -> Any | None:
         return self._compounding_controller
+
+    def set_demo_high_growth_profile(
+        self,
+        profile: DemoHighGrowthProfile,
+        *,
+        execution_mode: Any = "DEMO",
+        live_trading_armed: bool = False,
+        live_trading_locked: bool = True,
+    ) -> None:
+        if not isinstance(profile, DemoHighGrowthProfile):
+            raise Phase8BridgeError("profile must be a DemoHighGrowthProfile")
+        profile.assert_demo_mode(
+            execution_mode,
+            live_trading_armed=live_trading_armed,
+            live_trading_locked=live_trading_locked,
+        )
+        with self._lock:
+            self._demo_high_growth = profile
+
+    def _effective_max_stop_risk_pct(self) -> Decimal:
+        with self._lock:
+            return self._demo_high_growth.effective_stop_risk_ceiling_pct()
+
+    def _effective_max_drawdown_pct(self) -> Decimal:
+        with self._lock:
+            return self._demo_high_growth.effective_drawdown_ceiling_pct()
 
     def __enter__(self) -> Phase8LiveTradingBridge:
         return self
@@ -610,7 +643,7 @@ class Phase8LiveTradingBridge:
                 execution_plan=None,
                 house_money_status=house_money_status,
             )
-        if risk_pct_dec > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
+        if risk_pct_dec > self._effective_max_stop_risk_pct():
             return PreEntryBridgeDecision(
                 allowed=False,
                 reason_code="CONSTITUTIONAL_STOP_RISK_EXCEEDED",
@@ -622,7 +655,7 @@ class Phase8LiveTradingBridge:
                 execution_plan=None,
                 house_money_status=house_money_status,
             )
-        if dd_pct_dec >= MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+        if dd_pct_dec >= self._effective_max_drawdown_pct():
             return PreEntryBridgeDecision(
                 allowed=False,
                 reason_code="CONSTITUTIONAL_DRAWDOWN_LIMIT_REACHED",

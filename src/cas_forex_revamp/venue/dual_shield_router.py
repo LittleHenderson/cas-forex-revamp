@@ -36,6 +36,10 @@ from typing import Any
 
 from cas_forex_revamp.contracts import ActionKind, ContractError, Side, decimal_text, parse_decimal
 from cas_forex_revamp.contracts.primitives import decimal_value, utc_time
+from cas_forex_revamp.risk.demo_high_growth_profile import (
+    DemoHighGrowthProfile,
+    resolve_demo_high_growth_profile_from_environ,
+)
 from cas_forex_revamp.valve.tks_meta_valve_controller import (
     DEFAULT_MAX_DRAWDOWN_PCT,
     MAX_CONSTITUTIONAL_DRAWDOWN_PCT,
@@ -717,7 +721,10 @@ class BarbellCapitalPolicy:
         allocation_tolerance_share: Decimal = Decimal("0.02"),
         account_currency: str = "USD",
         demo_virtual_sleeve: bool = False,
+        demo_high_growth: DemoHighGrowthProfile | None = None,
     ) -> None:
+        if demo_high_growth is not None and not isinstance(demo_high_growth, DemoHighGrowthProfile):
+            raise ContractError("demo_high_growth must be a DemoHighGrowthProfile or None")
         self.shares: dict[str, Decimal] = {
             BROKER_OANDA_PRACTICE: _share(oanda_reserve_share, "oanda_reserve_share"),
             BROKER_HUGOSWAY_MT5: _share(hugosway_share, "hugosway_share"),
@@ -727,21 +734,71 @@ class BarbellCapitalPolicy:
             raise ContractError("barbell shares (OANDA reserve + Hugo's Way + LHFX) must sum to exactly 1")
         if self.shares[BROKER_OANDA_PRACTICE] < Decimal("0.5"):
             raise ContractError("the regulated OANDA reserve must hold at least 50% of barbell equity")
-        self.max_stop_loss_equity_risk_pct = decimal_value(
+        self._demo_high_growth: DemoHighGrowthProfile = (
+            demo_high_growth if demo_high_growth is not None else DemoHighGrowthProfile(enabled=False)
+        )
+        base_risk = decimal_value(
             max_stop_loss_equity_risk_pct, "max_stop_loss_equity_risk_pct", positive=True
         )
-        if self.max_stop_loss_equity_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
+        if base_risk > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
             raise ContractError(
                 "CONSTITUTIONAL_STOP_RISK_CEILING_EXCEEDED: max_stop_loss_equity_risk_pct must not exceed 1.00%"
             )
-        self.max_drawdown_pct = decimal_value(max_drawdown_pct, "max_drawdown_pct", positive=True)
-        if self.max_drawdown_pct > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+        base_dd = decimal_value(max_drawdown_pct, "max_drawdown_pct", positive=True)
+        if base_dd > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
             raise ContractError(
                 "CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: max_drawdown_pct must not exceed 0.10 (10.00%)"
             )
+        self._base_stop_risk_pct: Decimal = base_risk
+        self._base_drawdown_pct: Decimal = base_dd
+        self.max_stop_loss_equity_risk_pct = (
+            self._demo_high_growth.max_risk_pct if self._demo_high_growth.enabled else self._base_stop_risk_pct
+        )
+        self.max_drawdown_pct = (
+            self._demo_high_growth.max_drawdown_pct if self._demo_high_growth.enabled else self._base_drawdown_pct
+        )
         self.tolerance = _share(allocation_tolerance_share, "allocation_tolerance_share")
         self.demo_virtual_sleeve = bool(demo_virtual_sleeve)
         self._calc = Mt5MarginCalculator(account_currency=account_currency)
+
+    @property
+    def demo_high_growth(self) -> DemoHighGrowthProfile:
+        return self._demo_high_growth
+
+    @property
+    def is_demo_high_growth_enabled(self) -> bool:
+        return self._demo_high_growth.enabled
+
+    @property
+    def effective_stop_risk_ceiling_pct(self) -> Decimal:
+        return self._demo_high_growth.effective_stop_risk_ceiling_pct()
+
+    @property
+    def effective_drawdown_ceiling_pct(self) -> Decimal:
+        return self._demo_high_growth.effective_drawdown_ceiling_pct()
+
+    def apply_demo_high_growth_profile(
+        self,
+        profile: DemoHighGrowthProfile,
+        *,
+        execution_mode: Any = "DEMO",
+        live_trading_armed: bool = False,
+        live_trading_locked: bool = True,
+    ) -> None:
+        if not isinstance(profile, DemoHighGrowthProfile):
+            raise ContractError("profile must be a DemoHighGrowthProfile")
+        profile.assert_demo_mode(
+            execution_mode,
+            live_trading_armed=live_trading_armed,
+            live_trading_locked=live_trading_locked,
+        )
+        self._demo_high_growth = profile
+        if profile.enabled:
+            self.max_stop_loss_equity_risk_pct = profile.max_risk_pct
+            self.max_drawdown_pct = profile.max_drawdown_pct
+        else:
+            self.max_stop_loss_equity_risk_pct = self._base_stop_risk_pct
+            self.max_drawdown_pct = self._base_drawdown_pct
 
     @property
     def allocation_tolerance_share(self) -> Decimal:
@@ -823,9 +880,10 @@ class BarbellCapitalPolicy:
             )
 
     def require_drawdown(self, *, current_equity: Decimal | None, peak_equity: Decimal | None) -> Decimal:
-        if self.max_drawdown_pct > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
+        dd_ceiling = self.effective_drawdown_ceiling_pct
+        if self.max_drawdown_pct > dd_ceiling:
             raise ContractError(
-                "CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: max_drawdown_pct must not exceed 0.10 (10.00%)"
+                f"CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: max_drawdown_pct must not exceed {decimal_text(dd_ceiling)}"
             )
         if current_equity is None or peak_equity is None or peak_equity <= Decimal("0"):
             raise BarbellPolicyRefusalError(
@@ -833,7 +891,7 @@ class BarbellCapitalPolicy:
                 "MISSING_DRAWDOWN_ACCOUNTING",
             )
         dd_pct = compute_drawdown_pct(current_equity, peak_equity)
-        eff_limit = min(self.max_drawdown_pct, MAX_CONSTITUTIONAL_DRAWDOWN_PCT)
+        eff_limit = min(self.max_drawdown_pct, dd_ceiling)
         if dd_pct >= eff_limit:
             dd_disp = dd_pct.quantize(Decimal("0.00000001"), rounding=ROUND_CEILING)
             raise BarbellPolicyRefusalError(
@@ -857,9 +915,10 @@ class BarbellCapitalPolicy:
         return min(actual, virtual_total)
 
     def require_stop_risk(self, risk: Decimal, equities: Mapping[str, Decimal]) -> Decimal:
-        if self.max_stop_loss_equity_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
+        risk_ceiling = self.effective_stop_risk_ceiling_pct
+        if self.max_stop_loss_equity_risk_pct > risk_ceiling:
             raise ContractError(
-                "CONSTITUTIONAL_STOP_RISK_CEILING_EXCEEDED: max_stop_loss_equity_risk_pct must not exceed 1.00%"
+                f"CONSTITUTIONAL_STOP_RISK_CEILING_EXCEEDED: max_stop_loss_equity_risk_pct must not exceed {decimal_text(risk_ceiling)}%"
             )
         total = self.effective_total_equity(equities)
         if total <= 0:
@@ -1178,6 +1237,7 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         public_index_max_divergence_bps: Decimal = DEFAULT_PUBLIC_INDEX_MAX_DIVERGENCE_BPS,
         oanda_reconnect_interval_seconds: float = DEFAULT_OANDA_RECONNECT_INTERVAL_SECONDS,
         monotonic: Callable[[], float] | None = None,
+        demo_high_growth: DemoHighGrowthProfile | None = None,
         **kwargs: Any,
     ) -> None:
         if (
@@ -1206,13 +1266,64 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
                 f"ceiling ({decimal_text(MAX_PUBLIC_INDEX_DIVERGENCE_BPS)})"
             )
         self._public_index_max_divergence_bps = pub_idx_div
-        self.barbell = barbell or BarbellCapitalPolicy.from_environ(self._env)
-        if self.barbell.max_stop_loss_equity_risk_pct > MAX_CONSTITUTIONAL_STOP_RISK_PCT:
-            raise ContractError("CONSTITUTIONAL_STOP_RISK_CEILING_EXCEEDED: router refuses stop-risk above 1.00%")
-        if self.barbell.max_drawdown_pct > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
-            raise ContractError("CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: router refuses drawdown above 10.00%")
-        if self._valve_gate.max_drawdown_pct is not None and self._valve_gate.max_drawdown_pct > MAX_CONSTITUTIONAL_DRAWDOWN_PCT:
-            raise ContractError("CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: valve gate drawdown exceeds 10.00%")
+        resolved_dhg = (
+            demo_high_growth
+            if demo_high_growth is not None
+            else resolve_demo_high_growth_profile_from_environ(
+                self._env,
+                execution_mode=self.execution_mode,
+                live_trading_armed=self._live_armed,
+                live_trading_locked=not bool(self._live_armed),
+            )
+        )
+        if not isinstance(resolved_dhg, DemoHighGrowthProfile):
+            raise ContractError("demo_high_growth must be a DemoHighGrowthProfile or None")
+        resolved_dhg.assert_demo_mode(
+            self.execution_mode,
+            live_trading_armed=self._live_armed,
+            live_trading_locked=not bool(self._live_armed),
+        )
+        self.barbell = barbell or BarbellCapitalPolicy.from_environ(
+            self._env,
+            demo_high_growth=resolved_dhg if resolved_dhg.enabled else None,
+        )
+        if resolved_dhg.enabled:
+            self.barbell.apply_demo_high_growth_profile(
+                resolved_dhg,
+                execution_mode=self.execution_mode,
+                live_trading_armed=self._live_armed,
+                live_trading_locked=not bool(self._live_armed),
+            )
+            self._valve_gate.set_demo_high_growth_profile(
+                resolved_dhg,
+                execution_mode=self.execution_mode,
+                live_trading_armed=self._live_armed,
+                live_trading_locked=not bool(self._live_armed),
+            )
+        self.barbell.demo_high_growth.assert_demo_mode(
+            self.execution_mode,
+            live_trading_armed=self._live_armed,
+            live_trading_locked=not bool(self._live_armed),
+        )
+        self._valve_gate._demo_high_growth.assert_demo_mode(
+            self.execution_mode,
+            live_trading_armed=self._live_armed,
+            live_trading_locked=not bool(self._live_armed),
+        )
+        eff_stop_ceil = self.barbell.effective_stop_risk_ceiling_pct
+        eff_dd_ceil = self.barbell.effective_drawdown_ceiling_pct
+        if self.barbell.max_stop_loss_equity_risk_pct > eff_stop_ceil:
+            raise ContractError(
+                f"CONSTITUTIONAL_STOP_RISK_CEILING_EXCEEDED: router refuses stop-risk above {decimal_text(eff_stop_ceil)}%"
+            )
+        if self.barbell.max_drawdown_pct > eff_dd_ceil:
+            raise ContractError(
+                f"CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: router refuses drawdown above {decimal_text(eff_dd_ceil)}"
+            )
+        if self._valve_gate.max_drawdown_pct is not None and self._valve_gate.max_drawdown_pct > eff_dd_ceil:
+            raise ContractError(
+                f"CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED: valve gate drawdown exceeds {decimal_text(eff_dd_ceil)}"
+            )
         if self.barbell.demo_virtual_sleeve and self.execution_mode != EXECUTION_MODE_DEMO:
             raise ContractError("CAS_FOREX_DEMO_BARBELL_VIRTUAL_SLEEVE is strictly forbidden in LIVE execution mode")
         self.offset_planner = offset_planner or OandaProtectiveOffsetPlanner(venue_id=self._oanda_broker_id)
@@ -2023,12 +2134,38 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
             reasons.append(f"{self._oanda_broker_id}={exc.reason}")
             return False, "; ".join(reasons)
 
+    def set_demo_high_growth_profile(self, profile: DemoHighGrowthProfile) -> None:
+        if not isinstance(profile, DemoHighGrowthProfile):
+            raise ContractError("profile must be a DemoHighGrowthProfile")
+        profile.assert_demo_mode(
+            self.execution_mode,
+            live_trading_armed=self._live_armed,
+            live_trading_locked=not bool(self._live_armed),
+        )
+        self.barbell.apply_demo_high_growth_profile(
+            profile,
+            execution_mode=self.execution_mode,
+            live_trading_armed=self._live_armed,
+            live_trading_locked=not bool(self._live_armed),
+        )
+        self._valve_gate.set_demo_high_growth_profile(
+            profile,
+            execution_mode=self.execution_mode,
+            live_trading_armed=self._live_armed,
+            live_trading_locked=not bool(self._live_armed),
+        )
+
     def execute_open(
         self,
         order: OrderIntent | RiskIncreasingOrderIntent,
         *,
         valve_decision: ValveDecision,
     ) -> DualShieldExecution:
+        self.barbell.demo_high_growth.assert_demo_mode(
+            self.execution_mode,
+            live_trading_armed=self._live_armed,
+            live_trading_locked=not bool(self._live_armed),
+        )
         if isinstance(order, RiskIncreasingOrderIntent):
             order = order.order
         if not isinstance(order, OrderIntent) or order.kind is not ActionKind.OPEN:
