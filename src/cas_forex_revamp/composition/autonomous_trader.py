@@ -1115,7 +1115,11 @@ class AutonomousAiTrader:
             )
         else:
             eff_dd_scope = "dual-shield-barbell"
-        self._last_drawdown_pct = eff_dd_pct
+        self._last_drawdown_pct = (
+            eff_dd_pct.quantize(Decimal("0.0000000001"), rounding=ROUND_CEILING)
+            if eff_dd_pct > Decimal("0")
+            else Decimal("0")
+        )
         return {
             "equities": equities,
             "total_eq": total_eq,
@@ -3516,9 +3520,14 @@ class AutonomousAiTrader:
                     else Decimal(str(quota_full.get("max_daily_loss_usd", "1000.00") or "1000.00"))
                 )
                 daily_rem_post = max_loss_cap_post + realized_today
-                curr_dd_post = (
+                raw_dd_post = (
                     compute_drawdown_pct(eq_bundle_post["eff_dd_eq"], eq_bundle_post["eff_dd_peak"])
                     if (eq_bundle_post["eff_dd_peak"] > Decimal("0") and eq_bundle_post["eff_dd_eq"] > Decimal("0"))
+                    else Decimal("0.00")
+                )
+                curr_dd_post = (
+                    raw_dd_post.quantize(Decimal("0.0000000001"), rounding=ROUND_CEILING)
+                    if raw_dd_post > Decimal("0")
                     else Decimal("0.00")
                 )
                 p8_view_post = {k: v for k, v in current_view.items() if k != "policy"}

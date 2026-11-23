@@ -26,7 +26,7 @@ from __future__ import annotations
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
 from enum import StrEnum
 from hashlib import sha256
 import json
@@ -66,6 +66,7 @@ MILESTONE_LADDER_SPECS: tuple[tuple[str, str, Decimal], ...] = (
     ("INSTITUTIONAL_50X", "50x Institutional Income Tier", Decimal("50")),
 )
 
+_QUANT_10DP = Decimal("0.0000000001")
 _QUANT_2DP = Decimal("0.01")
 _QUANT_1DP = Decimal("0.1")
 _HUNDRED = Decimal("100")
@@ -247,6 +248,21 @@ def _require_decimal(
     if not allow_zero and validated <= Decimal("0"):
         raise CompoundingControllerError(f"{field} must be > 0")
     return validated
+
+
+def _require_drawdown_pct(value: Any, field: str = "drawdown_pct") -> Decimal:
+    """Validate a non-negative drawdown fraction, rounding sub-10dp repeating divisions conservatively UP."""
+    if isinstance(value, bool) or not isinstance(value, Decimal) or not value.is_finite():
+        raise CompoundingControllerError(f"{field} must be a finite Decimal (never float or bool)")
+    if value < Decimal("0"):
+        raise CompoundingControllerError(f"{field} must be >= 0")
+    if value.copy_abs() >= Decimal("1e18"):
+        raise CompoundingControllerError(f"{field} exceeds the v1 magnitude/12-decimal-place boundary")
+    quantized = value.quantize(_QUANT_10DP, rounding=ROUND_CEILING) if value > Decimal("0") else Decimal("0")
+    try:
+        return decimal_value(quantized, field)
+    except ContractError as exc:
+        raise CompoundingControllerError(str(exc)) from exc
 
 
 def _require_usd(value: Any, field: str, *, positive: bool = False) -> Decimal:
@@ -1197,7 +1213,7 @@ class CompoundingAndMilestoneController:
             allow_zero=True,
             allow_negative=True,
         )
-        dd_pct = _require_decimal(drawdown_pct, "drawdown_pct", allow_zero=True, allow_negative=False)
+        dd_pct = _require_drawdown_pct(drawdown_pct, "drawdown_pct")
         margin_pct = (
             None
             if margin_level_pct is None

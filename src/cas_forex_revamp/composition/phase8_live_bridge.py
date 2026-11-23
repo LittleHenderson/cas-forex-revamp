@@ -28,7 +28,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 import logging
 import threading
 import time
@@ -557,6 +557,8 @@ class Phase8LiveTradingBridge:
         max_trades = _require_int(max_open_trades, "max_open_trades", minimum=1)
         daily_rem_dec = _require_decimal(daily_loss_remaining_usd, "daily_loss_remaining_usd")
         dd_pct_dec = _require_decimal(drawdown_pct, "drawdown_pct", non_negative=True)
+        if dd_pct_dec is not None and dd_pct_dec > Decimal("0") and dd_pct_dec < Decimal("1e18"):
+            dd_pct_dec = dd_pct_dec.quantize(Decimal("0.0000000001"), rounding=ROUND_CEILING)
         eval_utc = _normalize_utc(now_utc, "now_utc")
 
         if not isinstance(quote, QuoteSnapshot):
