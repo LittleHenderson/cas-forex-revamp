@@ -5052,6 +5052,90 @@ def load_dotenv_file(path: str | Path) -> dict[str, str]:
     return loaded
 
 
+def _poll_index_and_fx_once(
+    *,
+    router: Any,
+    feed_client: Any,
+    index_client: Any,
+    trader: Any,
+    autonomous_ai: bool,
+    stream_lock: threading.Lock,
+    latest_stream: list[dict[str, Any] | None],
+    latest_public_index_stream: list[dict[str, Any] | None],
+    latest_mt5_index_stream: list[dict[str, Any] | None],
+    poll_mt5_cache: dict[str, dict[str, Any]],
+    poll_log_throttle: dict[tuple[str, str, str], tuple[float, int]],
+    poll_state: dict[str, Any],
+    base_wait: float,
+    now_mono: float,
+    notify_updated: Callable[[], Any] | None = None,
+) -> None:
+    """Run one background poll tick keeping index reference refresh independent of FX errors.
+
+    Phase A always refreshes MT5 + public US index snapshots so Kraken FX spread spikes
+    (e.g. wide overnight USDJPY spreads) never freeze ``PUBLIC_US_INDEX_FEED`` past 60s.
+    Phase B polls the 16-pair FX feed with independent exponential backoff up to 60s.
+    """
+    with stream_lock:
+        prev_mt5_idx = latest_mt5_index_stream[0]
+        prev_pub_idx = latest_public_index_stream[0]
+    mt5_idx_snap: dict[str, Any] | None = None
+    try:
+        mt5_idx_snap, _ = _build_mt5_index_snapshot_from_router(
+            router,
+            prev_stream=prev_mt5_idx,
+            poll_cache=poll_mt5_cache,
+            log_throttle=poll_log_throttle,
+        )
+    except Exception as exc_mt5_idx:
+        if type(exc_mt5_idx).__name__ in ("LiveBrokerEndpointForbiddenError", "LiveAuthorizationError"):
+            raise
+        print(f"[feed] MT5 index poll skipped ({type(exc_mt5_idx).__name__}).")
+
+    pub_idx_snap = prev_pub_idx
+    pub_idx_updated = False
+    if index_client is not None:
+        try:
+            pub_idx_snap = stamp_public_index_provenance(index_client.fetch_index_stream())
+            pub_idx_updated = True
+        except Exception as exc_idx:
+            print(f"[feed] Index poll skipped ({type(exc_idx).__name__}).")
+
+    if pub_idx_updated or mt5_idx_snap is not None:
+        with stream_lock:
+            if pub_idx_updated:
+                latest_public_index_stream[0] = pub_idx_snap
+            if mt5_idx_snap is not None:
+                latest_mt5_index_stream[0] = mt5_idx_snap
+        if notify_updated is not None:
+            notify_updated()
+
+    if feed_client is not None and now_mono >= float(poll_state.get("next_fx_poll_mono", 0.0)):
+        try:
+            env_stream = feed_client.fetch_market_stream().to_wire_dict()
+            with stream_lock:
+                latest_stream[0] = env_stream
+                cur_mt5_idx = latest_mt5_index_stream[0]
+                cur_pub_idx = latest_public_index_stream[0]
+            idx_stream = cur_mt5_idx if cur_mt5_idx is not None else cur_pub_idx
+            if autonomous_ai:
+                try:
+                    trader.run_cycle(env_stream, index_stream=idx_stream)
+                except Exception as exc_ai:
+                    msg_ai = " ".join(str(exc_ai).split())[:140]
+                    print(f"[ai] Standard cycle skipped ({type(exc_ai).__name__}: {msg_ai}).")
+            if notify_updated is not None:
+                notify_updated()
+            poll_state["consecutive_feed_errors"] = 0
+            poll_state["next_fx_poll_mono"] = 0.0
+        except Exception as exc:
+            errs = int(poll_state.get("consecutive_feed_errors", 0)) + 1
+            poll_state["consecutive_feed_errors"] = errs
+            fx_backoff = max(base_wait, min(60.0, base_wait * (2 ** min(errs - 1, 2))))
+            poll_state["next_fx_poll_mono"] = now_mono + fx_backoff
+            print(f"[feed] Poll skipped ({type(exc).__name__}); keeping last verified snapshot.")
+
+
 def run_cockpit_cli(
     argv: list[str] | None = None,
     *,
@@ -5311,10 +5395,9 @@ def run_cockpit_cli(
         poll_mt5_cache: dict[str, dict[str, Any]] = {}
         poll_log_throttle: dict[tuple[str, str, str], tuple[float, int]] = {}
         base_wait = float(args.poll_seconds)
-        next_wait = base_wait
-        consecutive_feed_errors = 0
+        poll_state: dict[str, Any] = {"consecutive_feed_errors": 0, "next_fx_poll_mono": 0.0}
         last_reconcile_mono = 0.0
-        while not stop_flag.wait(next_wait):
+        while not stop_flag.wait(base_wait):
             if callable(getattr(router, "reconcile_unknown_mutations", None)) and router.has_any_unresolved_mutation():
                 now_rec_mono = time.monotonic()
                 if (now_rec_mono - last_reconcile_mono) >= 30.0:
@@ -5339,44 +5422,25 @@ def run_cockpit_cli(
                     raise
                 except Exception as exc_or:
                     print(f"[broker] OANDA reconnect check skipped ({type(exc_or).__name__}).")
-            if feed_client is None:
+            if feed_client is None and index_client is None:
                 break
-            try:
-                env_stream = feed_client.fetch_market_stream().to_wire_dict()
-                with stream_lock:
-                    prev_mt5_idx = latest_mt5_index_stream[0]
-                    prev_pub_idx = latest_public_index_stream[0]
-                mt5_idx_snap, _ = _build_mt5_index_snapshot_from_router(
-                    router,
-                    prev_stream=prev_mt5_idx,
-                    poll_cache=poll_mt5_cache,
-                    log_throttle=poll_log_throttle,
-                )
-                pub_idx_snap = prev_pub_idx
-                if index_client is not None:
-                    try:
-                        pub_idx_snap = stamp_public_index_provenance(index_client.fetch_index_stream())
-                    except Exception as exc_idx:
-                        print(f"[feed] Index poll skipped ({type(exc_idx).__name__}).")
-                with stream_lock:
-                    latest_stream[0] = env_stream
-                    latest_public_index_stream[0] = pub_idx_snap
-                    if mt5_idx_snap is not None:
-                        latest_mt5_index_stream[0] = mt5_idx_snap
-                idx_stream = mt5_idx_snap if mt5_idx_snap is not None else pub_idx_snap
-                if args.autonomous_ai:
-                    try:
-                        trader.run_cycle(env_stream, index_stream=idx_stream)
-                    except Exception as exc_ai:
-                        msg_ai = " ".join(str(exc_ai).split())[:140]
-                        print(f"[ai] Standard cycle skipped ({type(exc_ai).__name__}: {msg_ai}).")
-                srv.notify_stream_updated()
-                consecutive_feed_errors = 0
-                next_wait = base_wait
-            except Exception as exc:
-                consecutive_feed_errors += 1
-                next_wait = max(base_wait, min(60.0, base_wait * (2 ** min(consecutive_feed_errors - 1, 2))))
-                print(f"[feed] Poll skipped ({type(exc).__name__}); keeping last verified snapshot.")
+            _poll_index_and_fx_once(
+                router=router,
+                feed_client=feed_client,
+                index_client=index_client,
+                trader=trader,
+                autonomous_ai=bool(args.autonomous_ai),
+                stream_lock=stream_lock,
+                latest_stream=latest_stream,
+                latest_public_index_stream=latest_public_index_stream,
+                latest_mt5_index_stream=latest_mt5_index_stream,
+                poll_mt5_cache=poll_mt5_cache,
+                poll_log_throttle=poll_log_throttle,
+                poll_state=poll_state,
+                base_wait=base_wait,
+                now_mono=time.monotonic(),
+                notify_updated=srv.notify_stream_updated,
+            )
 
     def _fast_tick_loop() -> None:
         interval = max(0.05, float(args.fast_tick_ms) / 1000.0)
