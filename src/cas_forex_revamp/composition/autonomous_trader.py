@@ -24,7 +24,7 @@ import re
 import sqlite3
 from threading import RLock
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from cas_forex_revamp.contracts import (
     ActionIntent,
@@ -124,6 +124,7 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
     MT5_VOLUME_STEP,
     Mt5BridgeError,
     Mt5PaperBrokerVenue,
+    Mt5SpoolBridgeTransport,
     LiveBrokerEndpointForbiddenError,
     OandaPracticeFallbackVenue,
     OrderIntent,
@@ -654,6 +655,9 @@ class AutonomousAiTrader:
         self._last_valve_score: str | None = None
         self._last_scout: dict[str, Any] | None = None
         self._last_error: str | None = None
+        self._last_quota_status: str = ""
+        self._last_consec_losses: int = 0
+        self._last_drawdown_pct: Decimal = Decimal("0")
         self._tick_history: dict[str, deque[tuple[Decimal, Decimal]]] = {
             sym: deque(maxlen=64) for sym in EXPANDED_MARKETS
         }
@@ -840,7 +844,12 @@ class AutonomousAiTrader:
             eq_bundle = self._router_equity_bundle_unlocked()
             total_eq = eq_bundle["total_eq"]
             has_live = self._has_connected_broker_equity_unlocked() or total_eq > Decimal("0")
-            ps = self._principal_surplus_metrics(total_eq, v_snap=v_snap, equities=eq_bundle["equities"])
+            ps = self._principal_surplus_metrics(
+                total_eq,
+                v_snap=v_snap,
+                equities=eq_bundle["equities"],
+                offline_brokers=eq_bundle["offline_brokers"],
+            )
             econ_eq = ps["economic_equity_usd"]
             if ps.get("cold_offline_unknown") and econ_eq < ps["principal_usd"]:
                 econ_eq = max(
@@ -1059,22 +1068,45 @@ class AutonomousAiTrader:
     def _router_equity_bundle_unlocked(self) -> dict[str, Any]:
         equities = self._router.equities()
         total_eq = self._router.barbell.total_equity(equities)
-        offline_ids = (
-            list(self._router.offline_brokers())
-            if callable(getattr(self._router, "offline_brokers", None))
-            else []
-        )
-        online_eq_map = (
-            self._router.online_equities()
-            if callable(getattr(self._router, "online_equities", None))
-            else dict(equities)
-        )
+        if (
+            callable(getattr(self._router, "is_broker_offline", None))
+            and hasattr(self._router, "priority_order")
+        ):
+            offline_ids = [
+                b for b in self._router.priority_order if self._router.is_broker_offline(b)
+            ]
+            offline_set = set(offline_ids)
+            venues_map = self._router.venues if hasattr(self._router, "venues") else {}
+            online_eq_map = {
+                b: val
+                for b, val in equities.items()
+                if b not in offline_set and (b in venues_map or val > Decimal("0"))
+            }
+        else:
+            offline_ids = (
+                list(self._router.offline_brokers())
+                if callable(getattr(self._router, "offline_brokers", None))
+                else []
+            )
+            online_eq_map = (
+                self._router.online_equities()
+                if callable(getattr(self._router, "online_equities", None))
+                else dict(equities)
+            )
         online_total_eq = self._router.barbell.total_equity(online_eq_map)
         if callable(getattr(self._router, "effective_drawdown_state", None)):
-            eff_dd_eq, eff_dd_peak, _ = self._router.effective_drawdown_state(equities=equities)
+            eff_dd_eq, eff_dd_peak, eff_dd_pct = self._router.effective_drawdown_state(
+                equities=equities, offline_brokers=offline_ids
+            )
         else:
             eff_dd_eq = total_eq
             eff_dd_peak = self._router.peak_equity() or total_eq
+            eff_dd_pct = (
+                compute_drawdown_pct(eff_dd_eq, eff_dd_peak)
+                if (eff_dd_peak is not None and eff_dd_peak > Decimal("0"))
+                else Decimal("0")
+            )
+        self._last_drawdown_pct = eff_dd_pct
         return {
             "equities": equities,
             "total_eq": total_eq,
@@ -1084,6 +1116,57 @@ class AutonomousAiTrader:
             "eff_dd_eq": eff_dd_eq,
             "eff_dd_peak": eff_dd_peak if eff_dd_peak is not None else eff_dd_eq,
         }
+
+    def has_open_positions_fast(self) -> bool:
+        """Lock-minimal check used by the 50ms loop to skip redundant idle WAIT cycles."""
+        with self._lock:
+            if self._open_position_meta:
+                return True
+        venues_map = getattr(self._router, "venues", None)
+        if isinstance(venues_map, Mapping):
+            for venue in venues_map.values():
+                if isinstance(venue, Mt5PaperBrokerVenue) and bool(venue.positions):
+                    return True
+        return False
+
+    def metrics_summary(self) -> dict[str, Any]:
+        """Lightweight 0-broker-I/O trader summary for /api/metrics."""
+        with self._lock:
+            q_status = self._last_quota_status
+            if not q_status and hasattr(self._quota, "peek_snapshot"):
+                q_snap = self._quota.peek_snapshot(now=self._now())
+                q_status = str(q_snap.get("status", ""))
+                self._last_quota_status = q_status
+                self._last_consec_losses = max(0, int(q_snap.get("consecutive_losses", 0) or 0))
+            eff_status = (
+                q_status
+                if q_status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED, QUOTA_STATUS_LOSS_TRIPPED)
+                else self._governance_mode
+            )
+            return {
+                "governance_mode": str(self._governance_mode),
+                "effective_status": str(eff_status),
+                "cycle_count": int(self._cycle_seq),
+                "veto_count": int(self._veto_count),
+            }
+
+    def dial_context_summary(self) -> dict[str, Any]:
+        """Lightweight 0-broker-I/O context summary for /api/aggression-dial."""
+        with self._lock:
+            q_status = self._last_quota_status
+            consec = int(self._last_consec_losses)
+            if not q_status and hasattr(self._quota, "peek_snapshot"):
+                q_snap = self._quota.peek_snapshot(now=self._now())
+                q_status = str(q_snap.get("status", ""))
+                consec = max(0, int(q_snap.get("consecutive_losses", 0) or 0))
+                self._last_quota_status = q_status
+                self._last_consec_losses = consec
+            return {
+                "last_regime": str(self._last_regime or "NEUTRAL"),
+                "consecutive_losses": consec,
+                "drawdown_pct": decimal_text(self._last_drawdown_pct),
+                "last_valve_score": self._last_valve_score,
+            }
 
     @staticmethod
     def _format_offline_broker_notice(offline_ids: list[str], online_eq_q: Decimal) -> str | None:
@@ -1512,9 +1595,14 @@ class AutonomousAiTrader:
         total_eq: Decimal,
         *,
         equities: Mapping[str, Decimal] | None = None,
+        offline_brokers: Sequence[str] | None = None,
     ) -> tuple[bool, Decimal | None]:
         """Zero-SQLite in-memory principal check for the 50ms stop-protection hot path."""
-        ps_fast = self._principal_surplus_metrics(total_eq, equities=equities)
+        ps_fast = self._principal_surplus_metrics(
+            total_eq,
+            equities=equities,
+            offline_brokers=offline_brokers,
+        )
         return bool(ps_fast["in_recovery_mode"]), ps_fast["configured_initial_capital_usd"]
 
     def evaluate_fast_protection(
@@ -1522,6 +1610,7 @@ class AutonomousAiTrader:
         *,
         quotes: Mapping[str, tuple[Decimal, Decimal]] | None = None,
         now: datetime | None = None,
+        _out_equity_bundle: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Instant Snap-to-Breakeven & Monotonic Trailing Stop across all open MT5 positions (0 vault SQLite I/O on hot path)."""
         ts = self._now(now)
@@ -1538,11 +1627,17 @@ class AutonomousAiTrader:
             if self._governance_mode == GOVERNANCE_STOPPED:
                 return actions
             eq_bundle_fast = self._router_equity_bundle_unlocked()
+            if _out_equity_bundle is not None:
+                _out_equity_bundle.update(eq_bundle_fast)
             equities = eq_bundle_fast["equities"]
             total_eq = eq_bundle_fast["total_eq"]
             eff_dd_eq_fast = eq_bundle_fast["eff_dd_eq"]
             peak_eq = eq_bundle_fast["eff_dd_peak"]
-            in_rec_fast, fast_init_cap = self._fast_in_recovery_mode_unlocked(total_eq, equities=equities)
+            in_rec_fast, fast_init_cap = self._fast_in_recovery_mode_unlocked(
+                total_eq,
+                equities=equities,
+                offline_brokers=eq_bundle_fast["offline_brokers"],
+            )
             _, _, risk_mult = self._quota.evaluate_new_risk(
                 ActionKind.OPEN,
                 now=ts,
@@ -1555,11 +1650,15 @@ class AutonomousAiTrader:
             for broker_id, venue in list(self._router.venues.items()):
                 if not isinstance(venue, Mt5PaperBrokerVenue) or venue.account is None:
                     continue
-                try:
-                    venue.probe()
-                except Exception as exc:
-                    logger.warning("fast protection probe failed for %s: %s", broker_id, type(exc).__name__)
-                    continue
+                already_synced = isinstance(self._router, DualShieldBrokerRouter) and isinstance(
+                    venue._transport, Mt5SpoolBridgeTransport
+                )
+                if not already_synced:
+                    try:
+                        venue.probe()
+                    except Exception as exc:
+                        logger.warning("fast protection probe failed for %s: %s", broker_id, type(exc).__name__)
+                        continue
                 if getattr(venue, "is_offline", False):
                     continue
 
@@ -2305,6 +2404,7 @@ class AutonomousAiTrader:
         *,
         v_snap: Mapping[str, Any] | None = None,
         equities: Mapping[str, Decimal] | None = None,
+        offline_brokers: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         v_data: Mapping[str, Any] = v_snap if v_snap is not None else {}
         settled_disbursed_usd = (
@@ -2315,9 +2415,13 @@ class AutonomousAiTrader:
             else self._cached_settled_disbursed_usd
         )
         offline_ids = (
-            list(self._router.offline_brokers())
-            if callable(getattr(self._router, "offline_brokers", None))
-            else []
+            list(offline_brokers)
+            if offline_brokers is not None
+            else (
+                list(self._router.offline_brokers())
+                if callable(getattr(self._router, "offline_brokers", None))
+                else []
+            )
         )
         eq_lookup: Mapping[str, Decimal] = (
             equities
@@ -2678,7 +2782,10 @@ class AutonomousAiTrader:
         ts = self._now(now)
 
         # Phase 1a: Open-position stop protection ALWAYS executes FIRST with zero vault I/O!
-        prot_updates = self.evaluate_fast_protection(quotes=mt5_quotes, now=ts)
+        fast_bundle: dict[str, Any] = {}
+        prot_updates = self.evaluate_fast_protection(
+            quotes=mt5_quotes, now=ts, _out_equity_bundle=fast_bundle
+        )
         # Phase 1b (OUTSIDE self._lock): throttled 60s OANDA self-heal, startup vault sync, vault & dial reads
         if not fast_tick and callable(getattr(self._router, "try_reconnect_oanda", None)):
             try:
@@ -2702,13 +2809,20 @@ class AutonomousAiTrader:
                 for s, m in markets.items()
                 if "bid" in m and "ask" in m
             }
-            eq_bundle_cyc = self._router_equity_bundle_unlocked()
+            eq_bundle_cyc = (
+                fast_bundle if (fast_bundle and not prot_updates) else self._router_equity_bundle_unlocked()
+            )
             equities = eq_bundle_cyc["equities"]
             total_eq = eq_bundle_cyc["total_eq"]
             online_total_eq_cyc = eq_bundle_cyc["online_total_eq"]
             eff_dd_eq_cyc = eq_bundle_cyc["eff_dd_eq"]
             peak_eq = eq_bundle_cyc["eff_dd_peak"]
-            ps_cyc = self._principal_surplus_metrics(total_eq, v_snap=v_snap_cyc, equities=equities)
+            ps_cyc = self._principal_surplus_metrics(
+                total_eq,
+                v_snap=v_snap_cyc,
+                equities=equities,
+                offline_brokers=eq_bundle_cyc["offline_brokers"],
+            )
             in_rec_cyc = bool(ps_cyc["in_recovery_mode"])
             deployable_eq = (
                 max(Decimal("0"), online_total_eq_cyc - pending_disb_cyc)
@@ -2726,6 +2840,8 @@ class AutonomousAiTrader:
                 in_recovery_mode=in_rec_cyc,
             )
             quota_status = q_snap["status"]
+            self._last_quota_status = str(quota_status)
+            self._last_consec_losses = max(0, int(q_snap.get("consecutive_losses", 0) or 0))
             if quota_status in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_PROFIT_FLOOR_LOCKED):
                 obs_sym, obs_reg = self._observe_markets_readonly(markets)
                 top_sym = obs_sym or self._top_watch_symbol
@@ -4367,7 +4483,12 @@ class AutonomousAiTrader:
             offline_ids_snap = eq_bundle_snap["offline_brokers"]
             eff_dd_eq_snap = eq_bundle_snap["eff_dd_eq"]
             eff_dd_peak_snap = eq_bundle_snap["eff_dd_peak"]
-            ps = self._principal_surplus_metrics(total_eq, v_snap=v_snap, equities=equities)
+            ps = self._principal_surplus_metrics(
+                total_eq,
+                v_snap=v_snap,
+                equities=equities,
+                offline_brokers=offline_ids_snap,
+            )
             in_rec_snap = bool(ps["in_recovery_mode"])
             if hasattr(self._quota, "peek_snapshot"):
                 quota_snap = self._quota.peek_snapshot(
@@ -4385,6 +4506,8 @@ class AutonomousAiTrader:
                 if hasattr(self._quota, "recent_closed_trades")
                 else []
             )
+            self._last_quota_status = str(quota_snap.get("status", ""))
+            self._last_consec_losses = max(0, int(quota_snap.get("consecutive_losses", 0) or 0))
             sdate_curr = str(quota_snap.get("session_date", ""))
         sess_vault_reserved = "0"
         if self._profit_vault is not None and v_snap:

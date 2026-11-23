@@ -2429,3 +2429,32 @@ class DualShieldBrokerRouter(BrokerHierarchyRouter):
         snap["live_readiness"] = self.live_funding_readiness(equities=eq_map)
         assert_safe_json_numbers(snap)
         return snap
+
+    def reconcile_unknown_mutations(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """Reconcile any persisted OUTCOME_UNKNOWN/PENDING_DISPATCH MT5 latches per online venue."""
+        ts = self._clock() if now is None else utc_time(now, "now")
+        per_venue: dict[str, Any] = {}
+        total_checked = 0
+        total_resolved = 0
+        for broker_id in self.priority_order:
+            venue = self._venues.get(broker_id)
+            if not isinstance(venue, Mt5PaperBrokerVenue):
+                continue
+            try:
+                res = venue.reconcile_unknown_mutations(now=ts)
+            except (LiveBrokerEndpointForbiddenError, LiveAuthorizationError):
+                raise
+            except (Mt5TransportError, ContractError, PaperBrokerTransportError, OSError) as exc:
+                per_venue[broker_id] = {"error": type(exc).__name__}
+                continue
+            per_venue[broker_id] = dict(res)
+            total_checked += int(res.get("checked", 0))
+            total_resolved += int(res.get("resolved", 0))
+        remaining = self.unresolved_mutations()
+        return {
+            "checked": total_checked,
+            "resolved": total_resolved,
+            "remaining_unknown": len(remaining),
+            "has_unresolved_mutation": bool(remaining),
+            "venues": per_venue,
+        }

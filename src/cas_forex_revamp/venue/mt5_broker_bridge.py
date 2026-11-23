@@ -161,8 +161,10 @@ __all__ = [
     "derive_spool_channel_key",
     "inspect_spool_path_custody",
     "compute_mt5_market_snapshot_hmac",
+    "compute_mt5_order_history_hmac",
     "resolve_spool_key_dir",
     "sign_mt5_market_snapshot_doc",
+    "sign_mt5_order_history_doc",
     "sign_spool_valve_admission",
     "spool_channel_key_id",
     "verify_spool_path_custody",
@@ -1101,6 +1103,133 @@ def sign_mt5_market_snapshot_doc(
     elif not isinstance(out.get("snapshot_seq"), str) or not str(out.get("snapshot_seq", "")).isdigit():
         out["snapshot_seq"] = "1"
     out["snapshot_hmac_sha256"] = compute_mt5_market_snapshot_hmac(out, channel_key=eff_key)
+    return out
+
+
+def _canonical_spool_order_history_hmac_input(doc: Mapping[str, Any]) -> str:
+    """Canonical HMAC message for order_history.json matching mt5/CasForexMt5Bridge.mq5 PublishOrderHistory()."""
+    for fld in (
+        "protocol",
+        "broker_channel",
+        "channel_key_id",
+        "execution_mode",
+        "account_login",
+        "server",
+        "account_trade_mode",
+        "observed_at",
+    ):
+        if type(doc.get(fld)) is not str:
+            raise Mt5SnapshotIntegrityError(f"order_history.json {fld} must be a string")
+    if type(doc.get("connected")) is not bool:
+        raise Mt5SnapshotIntegrityError("order_history.json connected must be a boolean")
+    if type(doc.get("complete")) is not bool:
+        raise Mt5SnapshotIntegrityError("order_history.json complete must be a boolean")
+    open_tickets = doc.get("open_position_tickets")
+    if type(open_tickets) is not list or any(type(t) is not str or not t.isdigit() for t in open_tickets):
+        raise Mt5SnapshotIntegrityError("order_history.json open_position_tickets must be a list of digit strings")
+    orders = doc.get("orders")
+    if type(orders) is not list:
+        raise Mt5SnapshotIntegrityError("order_history.json orders must be a list")
+    orders_parts: list[str] = []
+    for item in orders:
+        if type(item) is not dict:
+            raise Mt5SnapshotIntegrityError("order_history.json order entries must be objects")
+        for fld in ("order_ticket", "request_id", "symbol", "time_utc"):
+            if type(item.get(fld)) is not str:
+                raise Mt5SnapshotIntegrityError(f"order_history.json order.{fld} must be a string")
+        orders_parts.append(
+            f"{item['order_ticket']}:{item['request_id']}:{item['symbol']}:{item['time_utc']}"
+        )
+    deals = doc.get("deals")
+    if type(deals) is not list:
+        raise Mt5SnapshotIntegrityError("order_history.json deals must be a list")
+    deals_parts: list[str] = []
+    for item in deals:
+        if type(item) is not dict:
+            raise Mt5SnapshotIntegrityError("order_history.json deal entries must be objects")
+        for fld in ("deal_ticket", "order_ticket", "request_id", "symbol", "time_utc"):
+            if type(item.get(fld)) is not str:
+                raise Mt5SnapshotIntegrityError(f"order_history.json deal.{fld} must be a string")
+        deals_parts.append(
+            f"{item['deal_ticket']}:{item['order_ticket']}:{item['request_id']}:{item['symbol']}:{item['time_utc']}"
+        )
+    open_sha = sha256(";".join(open_tickets).encode("utf-8")).hexdigest()
+    orders_sha = sha256(";".join(orders_parts).encode("utf-8")).hexdigest()
+    deals_sha = sha256(";".join(deals_parts).encode("utf-8")).hexdigest()
+    conn_str = "true" if doc["connected"] else "false"
+    comp_str = "true" if doc["complete"] else "false"
+    return "|".join([
+        doc["protocol"],
+        doc["broker_channel"],
+        doc["channel_key_id"],
+        doc["execution_mode"],
+        doc["account_login"],
+        doc["server"],
+        doc["account_trade_mode"],
+        conn_str,
+        comp_str,
+        doc["observed_at"],
+        open_sha,
+        orders_sha,
+        deals_sha,
+    ])
+
+
+def compute_mt5_order_history_hmac(doc: Mapping[str, Any], channel_key: bytes) -> str:
+    """Compute per-channel HMAC-SHA256 hex digest over a spool order_history.json snapshot."""
+    return _spool_hmac_hex(channel_key, _canonical_spool_order_history_hmac_input(doc))
+
+
+def sign_mt5_order_history_doc(
+    doc: Mapping[str, Any],
+    *,
+    spool_dir: str | Path | None = None,
+    key_dir: str | Path | None = None,
+    broker_channel: str | None = None,
+    channel_key: bytes | None = None,
+    channel_key_id: str | None = None,
+    observed_at: datetime | str | None = None,
+    custody_inspector: SpoolCustodyInspector | None = None,
+) -> dict[str, Any]:
+    """Return a copy of an order_history.json document signed with per-channel HMAC-SHA256."""
+    out = dict(doc)
+    out.setdefault("protocol", MT5_SPOOL_PROTOCOL)
+    if "connected" not in out:
+        out["connected"] = True
+    if "complete" not in out:
+        out["complete"] = True
+    out.setdefault("open_position_tickets", [])
+    out.setdefault("orders", [])
+    out.setdefault("deals", [])
+    if broker_channel is not None and str(broker_channel).strip():
+        ch = str(broker_channel).strip().lower()
+    elif isinstance(out.get("broker_channel"), str) and out["broker_channel"].strip():
+        ch = out["broker_channel"].strip().lower()
+    elif spool_dir is not None and Path(spool_dir).name.lower() in ("hugosway_mt5", "lhfx_mt5"):
+        ch = Path(spool_dir).name.lower()
+    elif "lhfx" in str(out.get("server", "")).lower():
+        ch = "lhfx_mt5"
+    else:
+        ch = "hugosway_mt5"
+    if ch not in ("hugosway_mt5", "lhfx_mt5"):
+        raise Mt5TransportError(f"unsupported MT5 broker channel {ch!r}")
+    out["broker_channel"] = ch
+    if channel_key is None:
+        if spool_dir is None and key_dir is None:
+            raise Mt5TransportError("sign_mt5_order_history_doc requires spool_dir, key_dir, or channel_key")
+        base_dir = Path(spool_dir) if spool_dir is not None else Path(key_dir or ".")
+        master = _load_or_create_spool_hmac_key(base_dir, key_dir=key_dir, custody_inspector=custody_inspector)
+        eff_key = derive_spool_channel_key(master, ch)
+    else:
+        eff_key = bytes(channel_key)
+    out["channel_key_id"] = channel_key_id if channel_key_id is not None else spool_channel_key_id(eff_key, ch)
+    if "execution_mode" not in out or not isinstance(out.get("execution_mode"), str):
+        out["execution_mode"] = EXECUTION_MODE_LIVE if out.get("account_trade_mode") == "REAL" else EXECUTION_MODE_DEMO
+    if observed_at is not None:
+        out["observed_at"] = observed_at if isinstance(observed_at, str) else _iso(observed_at)
+    elif not isinstance(out.get("observed_at"), str) or not out["observed_at"].strip():
+        out["observed_at"] = _iso(_utc_now())
+    out["history_hmac_sha256"] = compute_mt5_order_history_hmac(out, channel_key=eff_key)
     return out
 
 
@@ -3486,6 +3615,75 @@ class Mt5SpoolBridgeTransport:
     def positions(self) -> tuple[Mt5Position, ...]:
         return self._parse_positions_from_doc(self._market_doc())
 
+    def order_deal_history(self, login: int, server: str) -> dict[str, Any]:
+        """Read and cryptographically verify signed order_history.json published by CasForexMt5Bridge.mq5."""
+        creds = self._require_connected()
+        if int(login) != int(creds.login) or str(server).casefold() != creds.server.casefold():
+            raise Mt5SnapshotIntegrityError("order_deal_history account/server does not match bound credentials")
+        path = self.spool_dir / "order_history.json"
+        if not os.path.lexists(path):
+            raise Mt5TransportError(f"{creds.broker_id} order_history.json is not present")
+        doc = _read_spool_json(path, max_bytes=self._max_file_bytes, custody_inspector=self._custody_inspector)
+        if type(doc) is not dict:
+            raise Mt5SnapshotIntegrityError("order_history.json must be a JSON object")
+        if doc.get("protocol") != MT5_SPOOL_PROTOCOL:
+            raise Mt5SnapshotIntegrityError("order_history.json protocol mismatch")
+        expected_channel = creds.broker_id.lower()
+        if doc.get("broker_channel") != expected_channel:
+            raise Mt5SnapshotIntegrityError(f"order_history.json channel mismatch for {creds.broker_id}")
+        key, expected_key_id = self._channel_hmac_key_and_id(creds)
+        if doc.get("channel_key_id") != expected_key_id:
+            raise Mt5SnapshotIntegrityError("order_history.json channel_key_id mismatch")
+        actual_mac = str(doc.get("history_hmac_sha256", "")).lower()
+        if not _HEX64_RE.fullmatch(actual_mac):
+            raise Mt5SnapshotIntegrityError("order_history.json missing or invalid history_hmac_sha256")
+        expected_mac = compute_mt5_order_history_hmac(doc, key)
+        if not hmac.compare_digest(expected_mac, actual_mac):
+            raise Mt5SnapshotIntegrityError("order_history.json history_hmac_sha256 verification failed")
+        if doc.get("execution_mode") != creds.execution_mode:
+            raise LiveBrokerEndpointForbiddenError(
+                f"order_history.json execution_mode {doc.get('execution_mode')!r} != {creds.execution_mode!r}"
+            )
+        expected_trade_mode = "DEMO" if creds.execution_mode == EXECUTION_MODE_DEMO else "REAL"
+        if doc.get("account_trade_mode") != expected_trade_mode:
+            raise LiveBrokerEndpointForbiddenError(
+                f"order_history.json account_trade_mode {doc.get('account_trade_mode')!r} != {expected_trade_mode!r}"
+            )
+        doc_login = str(doc.get("account_login", ""))
+        if not doc_login.isdigit() or int(doc_login) != int(creds.login):
+            raise Mt5SnapshotIntegrityError("order_history.json account_login mismatch")
+        doc_server_raw = str(doc.get("server", ""))
+        if creds.execution_mode == EXECUTION_MODE_DEMO:
+            srv_norm = validate_demo_server(creds.broker_id, doc_server_raw)
+        else:
+            srv_norm = validate_mt5_server_name(
+                creds.broker_id, doc_server_raw, execution_mode=EXECUTION_MODE_LIVE, live_armed=True
+            )
+        if srv_norm.casefold() != creds.server.casefold():
+            raise Mt5SnapshotIntegrityError("order_history.json server mismatch")
+        try:
+            obs = _parse_iso(doc.get("observed_at"), "observed_at")
+        except ContractError as exc:
+            raise Mt5SnapshotIntegrityError(str(exc)) from None
+        now = self._clock()
+        if (obs - now).total_seconds() > self._max_future_skew_seconds:
+            raise Mt5SnapshotIntegrityError("order_history.json observed_at exceeds future clock skew")
+        max_hist_age_s = 120.0 if creds.execution_mode == EXECUTION_MODE_DEMO else 30.0
+        if (now - obs).total_seconds() > max_hist_age_s:
+            raise Mt5SnapshotIntegrityError("order_history.json is stale")
+        if doc.get("connected") is not True:
+            raise Mt5TransportError(f"{creds.broker_id} order_history.json reports terminal disconnected")
+        if doc.get("complete") is not True:
+            raise Mt5SnapshotIntegrityError(f"{creds.broker_id} order_history.json reports incomplete history")
+        return {
+            "account_login": int(creds.login),
+            "server": creds.server,
+            "complete": True,
+            "open_position_tickets": list(doc["open_position_tickets"]),
+            "orders": list(doc["orders"]),
+            "deals": list(doc["deals"]),
+        }
+
     def account_and_positions(self) -> tuple[Mt5AccountSnapshot, tuple[Mt5Position, ...]]:
         """Read and verify market_ticks.json ONCE and return both account snapshot and open positions."""
         doc = self._market_doc()
@@ -3722,6 +3920,8 @@ class Mt5SpoolPaperTerminalEmulator:
         self._positions: dict[str, dict[str, Any]] = {}
         self._next_ticket = 500_000_001
         self._next_deal = 700_000_001
+        self._history_orders: list[dict[str, str]] = []
+        self._history_deals: list[dict[str, str]] = []
         self.processed: list[str] = []
         self._replay_ledger = _SpoolReplayLedger(
             _spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.emu_replay.json",
@@ -4049,9 +4249,18 @@ class Mt5SpoolPaperTerminalEmulator:
                 return self._receipt(req, "REJECTED", 10019, message="no money")
             ticket = str(self._next_ticket)
             self._next_ticket += 1
+            deal_t = self._deal_ticket()
+            t_utc = _iso(self._clock())
+            req_comment = str(req.get("comment") or req_id)[:60]
+            self._history_orders.append({
+                "order_ticket": ticket, "request_id": req_comment, "symbol": symbol, "time_utc": t_utc,
+            })
+            self._history_deals.append({
+                "deal_ticket": deal_t, "order_ticket": ticket, "request_id": req_comment, "symbol": symbol, "time_utc": t_utc,
+            })
             self._positions[ticket] = {"symbol": symbol, "side": side, "volume": lots, "price_open": price, "sl": sl, "tp": tp}
             return self._receipt(
-                req, "FILLED", 10009, position_ticket=ticket, deal_ticket=self._deal_ticket(),
+                req, "FILLED", 10009, position_ticket=ticket, deal_ticket=deal_t,
                 volume=decimal_text(lots), price=decimal_text(price), sl=decimal_text(sl),
                 tp="0" if tp is None else decimal_text(tp),
             )
@@ -4086,8 +4295,19 @@ class Mt5SpoolPaperTerminalEmulator:
             del self._positions[ticket]
         else:
             pos["volume"] = pos["volume"] - lots
+        deal_t = self._deal_ticket()
+        ord_t = str(self._next_ticket)
+        self._next_ticket += 1
+        t_utc = _iso(self._clock())
+        req_comment = str(req.get("comment") or req_id)[:60]
+        self._history_orders.append({
+            "order_ticket": ord_t, "request_id": req_comment, "symbol": symbol, "time_utc": t_utc,
+        })
+        self._history_deals.append({
+            "deal_ticket": deal_t, "order_ticket": ord_t, "request_id": req_comment, "symbol": symbol, "time_utc": t_utc,
+        })
         return self._receipt(
-            req, "FILLED", 10009, position_ticket=ticket, deal_ticket=self._deal_ticket(),
+            req, "FILLED", 10009, position_ticket=ticket, deal_ticket=deal_t,
             volume=decimal_text(lots), price=decimal_text(price),
         )
 
@@ -4109,6 +4329,45 @@ class Mt5SpoolPaperTerminalEmulator:
             self.processed.append(filename_id)
             count += 1
         return count
+
+    def publish_order_history(self, *, complete: bool = True, observed_at: datetime | None = None) -> dict[str, Any]:
+        """Publish signed order_history.json for cryptographic reconciliation tests."""
+        existed = os.path.lexists(self.spool_dir)
+        if existed:
+            apply_verified_directory_mode(
+                self.spool_dir, 0o700, custody_inspector=self._custody_inspector, newly_created=False
+            )
+        else:
+            verify_spool_path_custody(self.spool_dir, inspector=self._custody_inspector, check_ancestors=True)
+            self.spool_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            apply_verified_directory_mode(
+                self.spool_dir, 0o700, custody_inspector=self._custody_inspector, newly_created=True
+            )
+        _, ch_key, key_id = self._channel_hmac_key_and_id()
+        obs = self._clock() if observed_at is None else observed_at
+        doc = sign_mt5_order_history_doc(
+            {
+                "protocol": MT5_SPOOL_PROTOCOL,
+                "broker_channel": self.broker_channel,
+                "channel_key_id": key_id,
+                "execution_mode": self.execution_mode,
+                "account_login": str(self.login),
+                "server": self.server,
+                "account_trade_mode": self.trade_mode,
+                "connected": bool(self.connected),
+                "complete": bool(self.connected and complete),
+                "open_position_tickets": sorted(self._positions.keys()) if self.connected else [],
+                "orders": list(self._history_orders) if self.connected else [],
+                "deals": list(self._history_deals) if self.connected else [],
+            },
+            broker_channel=self.broker_channel,
+            channel_key=ch_key,
+            channel_key_id=key_id,
+            observed_at=obs,
+            custody_inspector=self._custody_inspector,
+        )
+        _atomic_write_json(self.spool_dir / "order_history.json", doc, custody_inspector=self._custody_inspector)
+        return doc
 
     def sleep_hook(self, _seconds: float) -> None:
         """Drop-in replacement for ``time.sleep`` inside :class:`Mt5SpoolBridgeTransport` tests."""
@@ -4857,7 +5116,7 @@ class Mt5PaperBrokerVenue:
             )
         margin_check: Mt5MarginCheck | None = None
         request_id = self._next_request_id(order)
-        comment = f"cas-{order.kind.value.lower()}"[:31]
+        comment = f"cas-{request_id[-27:]}"[:31]
         v_channel = self.broker_id.lower()
         v_login = str(self._credentials.login)
         v_srv = self._credentials.server
@@ -5248,23 +5507,95 @@ class Mt5PaperBrokerVenue:
                             prev[0] or (None if d.get("order_ticket") is None else str(d["order_ticket"])),
                             None if d.get("deal_ticket") is None else str(d["deal_ticket"]),
                         )
+        has_open_tickets_field = isinstance(history.get("open_position_tickets"), (list, tuple))
+        open_pos_set = {str(x) for x in (history.get("open_position_tickets") or [])}
+        unmatched_sym_times: list[tuple[str, datetime | None]] = []
+        for entry_list in (history.get("orders"), history.get("deals")):
+            if isinstance(entry_list, (list, tuple)):
+                for item in entry_list:
+                    if not isinstance(item, Mapping):
+                        continue
+                    item_rid = str(item.get("request_id") or "").strip()
+                    item_sym_raw = str(item.get("symbol") or "").strip()
+                    if not item_sym_raw:
+                        continue
+                    try:
+                        item_sym = normalize_market_symbol(item_sym_raw)
+                    except ContractError:
+                        item_sym = item_sym_raw.upper()
+                    t_dt: datetime | None = None
+                    raw_t = item.get("time_utc")
+                    if isinstance(raw_t, str) and raw_t.strip():
+                        try:
+                            t_dt = _parse_iso(raw_t, "time_utc")
+                        except ContractError:
+                            t_dt = None
+                    if not item_rid:
+                        unmatched_sym_times.append((item_sym, t_dt))
+
         resolved = 0
         for row in unknowns:
             rid = str(row["request_id"])
-            if rid in matched_by_req and int(history.get("account_login", -1)) == login and str(history.get("server", "")) == srv:
-                ot, dt = matched_by_req[rid]
+            comment_key = f"cas-{rid[-27:]}"[:31]
+            match_key = rid if rid in matched_by_req else (comment_key if comment_key in matched_by_req else None)
+            if match_key is not None and int(history.get("account_login", -1)) == login and str(history.get("server", "")) == srv:
+                ot, dt = matched_by_req[match_key]
                 self._mutation_journal.mark_outcome(
                     request_id=rid, status="CONFIRMED_FILLED", now_utc=ts_str, order_ticket=ot, deal_ticket=dt
                 )
                 resolved += 1
             elif exact_account_match:
-                self._mutation_journal.mark_outcome(
-                    request_id=rid,
-                    status="CONFIRMED_ABSENT",
-                    now_utc=ts_str,
-                    error_detail="RECONCILED_ABSENT_IN_EXACT_MT5_HISTORY",
-                )
-                resolved += 1
+                action_k = str(row.get("action_kind") or "").upper()
+                pos_tkt = str(row.get("position_ticket") or "").strip()
+                if action_k in ("AMEND_STOP", "CLOSE", "REDUCE") and pos_tkt:
+                    if has_open_tickets_field and pos_tkt in open_pos_set:
+                        self._mutation_journal.mark_outcome(
+                            request_id=rid,
+                            status="OUTCOME_UNKNOWN",
+                            now_utc=ts_str,
+                            error_detail="TARGET_POSITION_STILL_OPEN_UNCONFIRMED",
+                        )
+                    else:
+                        self._mutation_journal.mark_outcome(
+                            request_id=rid,
+                            status="CONFIRMED_ABSENT",
+                            now_utc=ts_str,
+                            error_detail=(
+                                "RECONCILED_TARGET_POSITION_CLOSED_IN_EXACT_MT5_HISTORY"
+                                if has_open_tickets_field
+                                else "RECONCILED_ABSENT_IN_EXACT_MT5_HISTORY"
+                            ),
+                        )
+                        resolved += 1
+                else:
+                    row_sym = str(row.get("symbol") or "").upper()
+                    ambiguous_same_sym = False
+                    try:
+                        row_created = _parse_iso(row.get("created_at_utc"), "created_at_utc")
+                    except ContractError:
+                        row_created = None
+                    if row_sym and row_created is not None:
+                        win_lo = row_created - timedelta(seconds=60)
+                        win_hi = row_created + timedelta(seconds=600)
+                        for u_sym, u_dt in unmatched_sym_times:
+                            if u_sym == row_sym and u_dt is not None and win_lo <= u_dt <= win_hi:
+                                ambiguous_same_sym = True
+                                break
+                    if ambiguous_same_sym:
+                        self._mutation_journal.mark_outcome(
+                            request_id=rid,
+                            status="OUTCOME_UNKNOWN",
+                            now_utc=ts_str,
+                            error_detail="AMBIGUOUS_UNMATCHED_SYMBOL_ORDER_IN_WINDOW",
+                        )
+                    else:
+                        self._mutation_journal.mark_outcome(
+                            request_id=rid,
+                            status="CONFIRMED_ABSENT",
+                            now_utc=ts_str,
+                            error_detail="RECONCILED_ABSENT_IN_EXACT_MT5_HISTORY",
+                        )
+                        resolved += 1
             else:
                 self._mutation_journal.mark_outcome(
                     request_id=rid,
