@@ -8,6 +8,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -479,43 +480,49 @@ class Pr37Mt5HistoryReconcileAndPerfTests(unittest.TestCase):
                 state_dir=root / "trader_state",
                 clock=clock,
             )
+            try:
+                # 1. Single-pass _router_equity_bundle_unlocked calls equities() once and skips offline_brokers()/online_equities()
+                with (
+                    mock.patch.object(router, "equities", wraps=router.equities) as w_eq,
+                    mock.patch.object(router, "offline_brokers", wraps=router.offline_brokers) as w_off,
+                    mock.patch.object(router, "online_equities", wraps=router.online_equities) as w_on,
+                    mock.patch.object(router.venues[BROKER_LHFX_MT5], "probe", wraps=router.venues[BROKER_LHFX_MT5].probe) as w_probe,
+                ):
+                    bundle = trader._router_equity_bundle_unlocked()
+                    self.assertEqual(w_eq.call_count, 1)
+                    self.assertEqual(w_off.call_count, 0)
+                    self.assertEqual(w_on.call_count, 0)
+                    self.assertEqual(bundle["offline_brokers"], [BROKER_HUGOSWAY_MT5])
+                    self.assertEqual(bundle["online_total_eq"], D("197478.59"))
 
-            # 1. Single-pass _router_equity_bundle_unlocked calls equities() once and skips offline_brokers()/online_equities()
-            with (
-                mock.patch.object(router, "equities", wraps=router.equities) as w_eq,
-                mock.patch.object(router, "offline_brokers", wraps=router.offline_brokers) as w_off,
-                mock.patch.object(router, "online_equities", wraps=router.online_equities) as w_on,
-                mock.patch.object(router.venues[BROKER_LHFX_MT5], "probe", wraps=router.venues[BROKER_LHFX_MT5].probe) as w_probe,
-            ):
-                bundle = trader._router_equity_bundle_unlocked()
-                self.assertEqual(w_eq.call_count, 1)
-                self.assertEqual(w_off.call_count, 0)
-                self.assertEqual(w_on.call_count, 0)
-                self.assertEqual(bundle["offline_brokers"], [BROKER_HUGOSWAY_MT5])
-                self.assertEqual(bundle["online_total_eq"], D("197478.59"))
+                    # evaluate_fast_protection does NOT call extra venue.probe() for Mt5SpoolBridgeTransport on DualShieldBrokerRouter
+                    w_eq.reset_mock()
+                    w_off.reset_mock()
+                    w_probe.reset_mock()
+                    trader.run_fast_tick_cycle(mt5_quotes={
+                        "NAS100": (D("25750.00"), D("25752.00")),
+                        "US30": (D("48950.00"), D("48954.00")),
+                    })
+                    self.assertEqual(w_eq.call_count, 1)
+                    self.assertEqual(w_off.call_count, 0)
+                    self.assertEqual(w_probe.call_count, 1)
 
-                # evaluate_fast_protection does NOT call extra venue.probe() for Mt5SpoolBridgeTransport on DualShieldBrokerRouter
-                w_eq.reset_mock()
-                w_off.reset_mock()
-                w_probe.reset_mock()
-                trader.run_fast_tick_cycle(mt5_quotes={
-                    "NAS100": (D("25750.00"), D("25752.00")),
-                    "US30": (D("48950.00"), D("48954.00")),
-                })
-                self.assertEqual(w_eq.call_count, 1)
-                self.assertEqual(w_off.call_count, 0)
-                self.assertEqual(w_probe.call_count, 1)
-
-                # metrics_summary() and dial_context_summary() make ZERO equities() or status_snapshot() calls
-                w_eq.reset_mock()
-                with mock.patch.object(trader, "status_snapshot", side_effect=AssertionError("should not call status_snapshot")):
-                    msum = trader.metrics_summary()
-                    dctx = trader.dial_context_summary()
-                self.assertEqual(w_eq.call_count, 0)
-                self.assertEqual(msum["cycle_count"], 1)
-                self.assertIn("effective_status", msum)
-                self.assertIn("drawdown_pct", dctx)
-                self.assertFalse(trader.has_open_positions_fast())
+                    # metrics_summary() and dial_context_summary() make ZERO equities() or status_snapshot() calls
+                    w_eq.reset_mock()
+                    with mock.patch.object(trader, "status_snapshot", side_effect=AssertionError("should not call status_snapshot")):
+                        msum = trader.metrics_summary()
+                        dctx = trader.dial_context_summary()
+                    self.assertEqual(w_eq.call_count, 0)
+                    self.assertEqual(msum["cycle_count"], 1)
+                    self.assertIn("effective_status", msum)
+                    self.assertIn("drawdown_pct", dctx)
+                    self.assertFalse(trader.has_open_positions_fast())
+            finally:
+                self.assertTrue(trader.close())
+            self.assertEqual(
+                [t for t in threading.enumerate() if t.name.startswith("cas-eventbus-") and t.is_alive()],
+                [],
+            )
 
             # 2. _build_mt5_index_snapshot_from_router suppresses HUGOSWAY_MT5 skip logs when LHFX_MT5 provides all 4 index quotes
             buf = io.StringIO()
