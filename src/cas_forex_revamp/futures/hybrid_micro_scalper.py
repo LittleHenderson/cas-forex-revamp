@@ -1643,7 +1643,7 @@ def evaluate_phase1_matrix(
         "dataset_source": str(dataset_doc.get("source", "")),
         "dataset_sha256": dataset_sha,
         "bar_counts": {k: len(v) for k, v in sorted(bars_by_symbol.items())},
-        "primary_gate_key": "hybrid_500ms_stressed",
+        "primary_gate_scenario": "hybrid_500ms_stressed",
         "phase1_verdict": verdict,
         "phase1_reasons": reasons,
         "beats_swing_only_at_500ms": beats_swing,
