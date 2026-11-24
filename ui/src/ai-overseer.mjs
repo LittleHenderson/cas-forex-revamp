@@ -780,24 +780,36 @@ export function normalizeAiTrader(doc) {
   const quotaStatus = QUOTA_STATUSES.includes(q.status) ? q.status : 'OPEN';
   const govMode = GOVERNANCE_MODES.includes(doc.governance_mode) ? doc.governance_mode : 'STANDBY';
   const rawPositions = Array.isArray(doc.open_positions) ? doc.open_positions : [];
-  const openPositions = rawPositions.map((p) => Object.freeze({
-    broker_id: str(p.broker_id, 'MT5'),
-    ticket: numStr(p.ticket, '0'),
-    position_id: `${str(p.broker_id, 'MT5')}-${numStr(p.ticket, '0')}`,
-    instrument_id: str(p.symbol, 'UNKNOWN'),
-    symbol: str(p.symbol, 'UNKNOWN'),
-    side: p.side === 'SELL' ? 'SELL' : 'BUY',
-    volume_lots: str(p.volume_lots, '0'),
-    quantity: str(p.volume_lots, '0'),
-    entry_price: str(p.price_open, '0'),
-    price_open: str(p.price_open, '0'),
-    stop_price: p.sl === null || p.sl === undefined ? null : str(p.sl, '0'),
-    sl: p.sl === null || p.sl === undefined ? null : str(p.sl, '0'),
-    take_profit_price: p.tp === null || p.tp === undefined ? null : str(p.tp, '0'),
-    tp: p.tp === null || p.tp === undefined ? null : str(p.tp, '0'),
-    profit: numStr(p.profit, '0'),
-    protectionStage: PROTECTION_STAGES.includes(p.protection_stage) ? p.protection_stage : 'INITIAL_SL',
-  }));
+  const openPositions = rawPositions.map((p) => {
+    const rawVol = p.volume_lots ?? p.volume ?? p.quantity;
+    const rawEntry = p.entry_price ?? p.price_open;
+    const rawSl = p.stop_loss ?? p.sl ?? p.stop_price;
+    const rawTp = p.take_profit ?? p.tp ?? p.take_profit_price;
+    const normVol = (rawVol === null || rawVol === undefined || String(rawVol).trim() === '') ? '0' : str(rawVol, '0');
+    const normEntry = (rawEntry === null || rawEntry === undefined || String(rawEntry).trim() === '') ? '0' : str(rawEntry, '0');
+    const normSl = (rawSl === null || rawSl === undefined || String(rawSl).trim() === '') ? null : str(rawSl, '0');
+    const normTp = (rawTp === null || rawTp === undefined || String(rawTp).trim() === '') ? null : str(rawTp, '0');
+    return Object.freeze({
+      broker_id: str(p.broker_id, 'MT5'),
+      ticket: numStr(p.ticket, '0'),
+      position_id: `${str(p.broker_id, 'MT5')}-${numStr(p.ticket, '0')}`,
+      instrument_id: str(p.symbol, 'UNKNOWN'),
+      symbol: str(p.symbol, 'UNKNOWN'),
+      side: p.side === 'SELL' ? 'SELL' : 'BUY',
+      volume_lots: normVol,
+      quantity: normVol,
+      entry_price: normEntry,
+      price_open: normEntry,
+      stop_price: normSl,
+      stop_loss: normSl,
+      sl: normSl,
+      take_profit_price: normTp,
+      take_profit: normTp,
+      tp: normTp,
+      profit: numStr(p.profit, '0'),
+      protectionStage: PROTECTION_STAGES.includes(p.protection_stage) ? p.protection_stage : 'INITIAL_SL',
+    });
+  });
   const rawActions = Array.isArray(doc.recent_actions) ? doc.recent_actions.slice(-8) : [];
   const recentActions = rawActions.map((a) => Object.freeze({
     observedAt: str(a.observed_at, ''),

@@ -9,6 +9,7 @@ ForexMetaValveGate admission, PeakEquityStore drawdown protection, DailyQuotaGov
 """
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from contextlib import closing
@@ -26,6 +27,7 @@ import uuid
 from cas_forex_revamp.composition.trend_regime import (
     PyramidLegSnapshot,
     TrendRegimeDetector,
+    evaluate_cross_market_offset_guard,
     evaluate_house_money_pyramid_leg,
 )
 from datetime import timedelta
@@ -274,6 +276,7 @@ class ParallelTierEngine:
         self._quotas: dict[str, DailyQuotaGovernanceStore] = {}
         self._vaults: dict[str, ProfitSweepVault] = {}
         self._tier_symbol_loss_cooldown_until: dict[tuple[str, str], datetime] = {}
+        self._mid_history: dict[str, deque[Decimal]] = {}
         self._init_db(sweep_ratio=eff_sweep)
         if self._demo_high_growth.enabled:
             for q_store in self._quotas.values():
@@ -599,6 +602,8 @@ class ParallelTierEngine:
         )
 
         with self._lock, closing(self._connect()) as conn:
+            for q_sym, (q_bid, q_ask) in quotes.items():
+                self._mid_history.setdefault(q_sym, deque(maxlen=64)).append((q_bid + q_ask) / Decimal("2"))
             for spec in self._specs:
                 tid = spec.tier_id
                 raw_tier_dial = dial_tiers_map.get(tid)
@@ -960,11 +965,32 @@ class ParallelTierEngine:
                                     allowed_q = True
                                     q_mult = Decimal("0.50")
 
+                        corr_block_reason: str | None = None
+                        if allowed_q and not is_add:
+                            tier_open_rows = [
+                                {"symbol": str(r["symbol"]), "side": str(r["side"])}
+                                for r in conn.execute(
+                                    "SELECT symbol, side FROM tier_positions WHERE tier_id = ?",
+                                    (tid,),
+                                ).fetchall()
+                            ]
+                            corr_ok, corr_reason = evaluate_cross_market_offset_guard(
+                                candidate_symbol=sym,
+                                candidate_side=side,
+                                open_positions=tier_open_rows,
+                                price_history=self._mid_history,
+                                is_pyramid_add=False,
+                            )
+                            if not corr_ok:
+                                corr_block_reason = corr_reason
+
                         if not allowed_q:
                             if q_reason and q_reason.startswith("MAX_OPEN_TRADES_REACHED"):
                                 skip_reason = q_reason
                             else:
                                 skip_reason = f"DAILY_QUOTA ({q_reason})"
+                        elif corr_block_reason is not None:
+                            skip_reason = corr_block_reason
                         else:
                             qty, sz_err = self._compute_tier_quantity(
                                 tier_id=tid,

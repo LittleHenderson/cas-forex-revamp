@@ -9,6 +9,7 @@ from typing import Any
 from cas_forex_revamp.contracts import ContractError, Side, decimal_text
 from cas_forex_revamp.contracts.primitives import decimal_value
 from cas_forex_revamp.venue.live_market_stream import INDEX_INSTRUMENTS
+from cas_forex_revamp.venue.mt5_broker_bridge import normalize_market_symbol
 
 REGIME_TREND_IGNITION = "TREND_IGNITION"
 REGIME_STRONG_TREND = "STRONG_TREND"
@@ -24,6 +25,49 @@ VALID_REGIMES = (
 MAX_PYRAMID_LEGS = 3
 BREAKEVEN_LOCKED_STAGES = frozenset({"BREAKEVEN_LOCKED", "TRAILING_PROFIT"})
 
+CORRELATION_POSITIVE_THRESHOLD = Decimal("0.45")
+CORRELATION_NEGATIVE_THRESHOLD = Decimal("-0.45")
+CORRELATION_MIN_RETURN_SAMPLES = 6
+CORRELATED_OFFSET_BLOCKED_CODE = "CORRELATED_OFFSET_BLOCKED"
+
+_MICRO_TO_CAS_CORR_MAP: dict[str, str] = {
+    "MNQ": "NAS100",
+    "MES": "SPX500",
+    "MYM": "US30",
+    "MGC": "XAUUSD",
+}
+
+# Cold-start structural correlation priors (used ONLY when live rolling return correlation is unavailable).
+# Gold (XAUUSD) vs US equity indices intentionally has NO fixed prior so live rolling returns decide dynamically.
+_STRUCTURAL_CORRELATION_PRIORS: dict[frozenset[str], Decimal] = {
+    # Positively correlated US equity indices
+    frozenset({"NAS100", "SPX500"}): Decimal("0.85"),
+    frozenset({"NAS100", "US30"}): Decimal("0.85"),
+    frozenset({"SPX500", "US30"}): Decimal("0.85"),
+    # Positively correlated FX pairs
+    frozenset({"EURUSD", "GBPUSD"}): Decimal("0.75"),
+    frozenset({"AUDUSD", "NZDUSD"}): Decimal("0.75"),
+    frozenset({"EURUSD", "AUDUSD"}): Decimal("0.75"),
+    frozenset({"GBPUSD", "AUDUSD"}): Decimal("0.75"),
+    frozenset({"EURUSD", "NZDUSD"}): Decimal("0.75"),
+    frozenset({"GBPUSD", "NZDUSD"}): Decimal("0.75"),
+    frozenset({"EURJPY", "GBPJPY"}): Decimal("0.75"),
+    frozenset({"AUDJPY", "CADJPY"}): Decimal("0.75"),
+    frozenset({"EURJPY", "AUDJPY"}): Decimal("0.75"),
+    frozenset({"GBPJPY", "AUDJPY"}): Decimal("0.75"),
+    frozenset({"USDJPY", "CADJPY"}): Decimal("0.75"),
+    # Negatively correlated FX pairs (opposite-direction USD legs -> same-side positions offset each other)
+    frozenset({"EURUSD", "USDCHF"}): Decimal("-0.75"),
+    frozenset({"GBPUSD", "USDCHF"}): Decimal("-0.75"),
+    frozenset({"AUDUSD", "USDCAD"}): Decimal("-0.75"),
+    frozenset({"NZDUSD", "USDCAD"}): Decimal("-0.75"),
+    frozenset({"EURUSD", "USDCAD"}): Decimal("-0.75"),
+    frozenset({"GBPUSD", "USDCAD"}): Decimal("-0.75"),
+    frozenset({"AUDUSD", "USDCHF"}): Decimal("-0.75"),
+    frozenset({"NZDUSD", "USDCHF"}): Decimal("-0.75"),
+    frozenset({"EURCHF", "USDCHF"}): Decimal("-0.75"),
+}
+
 _USD_BASKET_SYMBOLS = frozenset({
     "EURUSD",
     "GBPUSD",
@@ -33,6 +77,87 @@ _USD_BASKET_SYMBOLS = frozenset({
     "USDCAD",
     "NZDUSD",
 })
+
+
+def _normalize_correlation_symbol(raw: str) -> str:
+    txt = str(raw or "").strip().upper()
+    if not txt:
+        return ""
+    if txt in _MICRO_TO_CAS_CORR_MAP:
+        return _MICRO_TO_CAS_CORR_MAP[txt]
+    norm = str(normalize_market_symbol(txt) or txt).strip().upper()
+    return _MICRO_TO_CAS_CORR_MAP.get(norm, norm)
+
+
+def _extract_positive_decimals(values: Sequence[Any], max_points: int) -> list[Decimal]:
+    out: list[Decimal] = []
+    tail = list(values)[-max_points:] if len(values) > max_points else list(values)
+    for item in tail:
+        try:
+            dec = item if isinstance(item, Decimal) else Decimal(str(item))
+        except Exception:
+            continue
+        if not dec.is_finite() or dec <= Decimal("0"):
+            continue
+        out.append(dec)
+    return out
+
+
+def _lookup_price_series(
+    price_history: Mapping[str, Sequence[Any]] | None,
+    raw_symbol: str,
+    norm_symbol: str,
+) -> Sequence[Any] | None:
+    if not price_history:
+        return None
+    for key in (raw_symbol, norm_symbol):
+        if key and key in price_history:
+            return price_history[key]
+    for key, seq in price_history.items():
+        if _normalize_correlation_symbol(key) == norm_symbol:
+            return seq
+    return None
+
+
+def compute_rolling_return_correlation(
+    series_a: Sequence[Any],
+    series_b: Sequence[Any],
+    *,
+    min_returns: int = CORRELATION_MIN_RETURN_SAMPLES,
+    max_points: int = 50,
+) -> Decimal | None:
+    """Compute exact Decimal Pearson correlation over trailing percentage returns, or ``None`` if insufficient/flat."""
+    if type(min_returns) is not int or min_returns < 2:
+        raise ContractError("min_returns must be an int >= 2")
+    if type(max_points) is not int or max_points <= min_returns:
+        raise ContractError("max_points must exceed min_returns")
+    da = _extract_positive_decimals(series_a, max_points)
+    db = _extract_positive_decimals(series_b, max_points)
+    n = min(len(da), len(db), max_points)
+    if n < min_returns + 1:
+        return None
+    da = da[-n:]
+    db = db[-n:]
+    with localcontext() as ctx:
+        ctx.prec = 40
+        rets_a = [(da[i] - da[i - 1]) / da[i - 1] for i in range(1, n)]
+        rets_b = [(db[i] - db[i - 1]) / db[i - 1] for i in range(1, n)]
+        cnt = Decimal(len(rets_a))
+        mean_a = sum(rets_a) / cnt
+        mean_b = sum(rets_b) / cnt
+        diffs_a = [x - mean_a for x in rets_a]
+        diffs_b = [y - mean_b for y in rets_b]
+        cov = sum(x * y for x, y in zip(diffs_a, diffs_b))
+        var_a = sum(x * x for x in diffs_a)
+        var_b = sum(y * y for y in diffs_b)
+        if var_a <= Decimal("0") or var_b <= Decimal("0"):
+            return None
+        denom = (var_a * var_b).sqrt()
+        if denom <= Decimal("0"):
+            return None
+        raw_r = cov / denom
+        clamped = max(Decimal("-1"), min(Decimal("1"), raw_r))
+        return clamped.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 
 def compute_ema(values: Sequence[Decimal], period: int) -> Decimal | None:
@@ -368,20 +493,92 @@ def usd_directional_bucket(symbol: str, side: Side) -> str | None:
     return f"FX_CROSS_{symbol[:3]}"
 
 
+def evaluate_cross_market_offset_guard(
+    *,
+    candidate_symbol: str,
+    candidate_side: Side,
+    open_positions: Sequence[Mapping[str, Any]],
+    price_history: Mapping[str, Sequence[Any]] | None = None,
+    is_pyramid_add: bool = False,
+    positive_threshold: Decimal = CORRELATION_POSITIVE_THRESHOLD,
+    negative_threshold: Decimal = CORRELATION_NEGATIVE_THRESHOLD,
+) -> tuple[bool, str]:
+    """Block concurrent self-canceling offsetting entries across live-correlated or structurally paired markets."""
+    if is_pyramid_add or not open_positions:
+        return True, "CORRELATED_OFFSET_CLEAR"
+    cand_raw = str(candidate_symbol or "")
+    cand_norm = _normalize_correlation_symbol(cand_raw)
+    if not cand_norm:
+        return True, "CORRELATED_OFFSET_CLEAR"
+    cand_series = _lookup_price_series(price_history, cand_raw, cand_norm)
+
+    for pos in open_positions:
+        pos_raw = str(pos.get("symbol") or "")
+        pos_side = str(pos.get("side") or "").strip().upper()
+        if pos_side not in ("BUY", "SELL"):
+            continue
+        pos_norm = _normalize_correlation_symbol(pos_raw)
+        if not pos_norm:
+            continue
+        if cand_norm == pos_norm:
+            if candidate_side.value != pos_side:
+                return (
+                    False,
+                    f"{CORRELATED_OFFSET_BLOCKED_CODE} ({cand_norm} {candidate_side.value} opposes open {pos_norm} {pos_side} on same market)",
+                )
+            continue
+
+        corr_r: Decimal | None = None
+        corr_src = "prior"
+        if cand_series is not None:
+            pos_series = _lookup_price_series(price_history, pos_raw, pos_norm)
+            if pos_series is not None:
+                corr_r = compute_rolling_return_correlation(cand_series, pos_series)
+                if corr_r is not None:
+                    corr_src = "live"
+        if corr_r is None:
+            corr_r = _STRUCTURAL_CORRELATION_PRIORS.get(frozenset({cand_norm, pos_norm}))
+            corr_src = "prior"
+        if corr_r is None:
+            continue
+
+        if corr_r >= positive_threshold and candidate_side.value != pos_side:
+            return (
+                False,
+                f"{CORRELATED_OFFSET_BLOCKED_CODE} ({cand_norm} {candidate_side.value} opposes open {pos_norm} {pos_side} with {corr_src} r={corr_r:+.4f} >= +{decimal_text(positive_threshold)})",
+            )
+        if corr_r <= negative_threshold and candidate_side.value == pos_side:
+            return (
+                False,
+                f"{CORRELATED_OFFSET_BLOCKED_CODE} ({cand_norm} {candidate_side.value} offsets open {pos_norm} {pos_side} with {corr_src} r={corr_r:+.4f} <= {decimal_text(negative_threshold)})",
+            )
+    return True, "CORRELATED_OFFSET_CLEAR"
+
+
 def evaluate_correlation_cap(
     *,
     candidate_symbol: str,
     candidate_side: Side,
     open_positions: Sequence[Mapping[str, Any]],
+    price_history: Mapping[str, Sequence[Any]] | None = None,
     is_pyramid_add: bool = False,
     max_bucket_symbols: int = 2,
     max_total_positions: int = 6,
 ) -> tuple[bool, str]:
-    """Prevent stacking redundant correlated USD/Index risk across multiple distinct pairs."""
+    """Prevent self-canceling offsetting exposure and redundant correlated USD/Index risk across open positions."""
     if len(open_positions) >= max_total_positions:
         return False, f"CORRELATION_MAX_POSITIONS ({len(open_positions)}/{max_total_positions})"
     if is_pyramid_add:
         return True, "CORRELATION_PYRAMID_ALLOWED"
+    offset_ok, offset_reason = evaluate_cross_market_offset_guard(
+        candidate_symbol=candidate_symbol,
+        candidate_side=candidate_side,
+        open_positions=open_positions,
+        price_history=price_history,
+        is_pyramid_add=False,
+    )
+    if not offset_ok:
+        return False, offset_reason
     bucket = usd_directional_bucket(candidate_symbol, candidate_side)
     bucket_symbols: set[str] = set()
     for pos in open_positions:

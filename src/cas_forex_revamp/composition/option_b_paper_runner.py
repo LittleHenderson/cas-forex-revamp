@@ -12,6 +12,7 @@ constitutional walls (<= 1.00% stop-loss risk, <= 10.00% hard drawdown brake).
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Mapping
 from contextlib import closing
 from datetime import datetime, timezone
@@ -22,7 +23,11 @@ from threading import RLock
 from typing import Any
 
 from cas_forex_revamp.composition.state_store import open_verified_sqlite_connection
-from cas_forex_revamp.contracts import ContractError, decimal_text
+from cas_forex_revamp.composition.trend_regime import (
+    CORRELATED_OFFSET_BLOCKED_CODE,
+    evaluate_cross_market_offset_guard,
+)
+from cas_forex_revamp.contracts import ContractError, Side, decimal_text
 from cas_forex_revamp.risk.demo_high_growth_profile import DemoHighGrowthProfile
 from cas_forex_revamp.venue.dual_shield_router import (
     MAX_CONSTITUTIONAL_DRAWDOWN_PCT,
@@ -217,6 +222,7 @@ class OptionBPaperDemoRunner:
             self._initial_starting_equity_usd * OPTION_B_HOUSE_MONEY_MULTIPLIER
         )
         self._last_quotes: dict[str, dict[str, str]] = {}
+        self._mid_history: dict[str, deque[Decimal]] = {}
 
         now = self._clock()
         restored = self._init_ledger_and_load_state(now)
@@ -635,6 +641,7 @@ class OptionBPaperDemoRunner:
                 ask_d,
                 now_utc=now,
             )
+            self._mid_history.setdefault(cas_sym, deque(maxlen=64)).append((bid_d + ask_d) / Decimal("2"))
             mid_d = _q2((bid_d + ask_d) / Decimal("2"))
             self._last_quotes[root] = {
                 "cas_symbol": cas_sym,
@@ -691,6 +698,28 @@ class OptionBPaperDemoRunner:
                 detail = f"Max open micro-futures positions reached ({len(open_pos)}/{max_open_positions})"
                 self._log_event("ENTRY_SKIPPED_MAX_POSITIONS", cas_sym, root, detail, now)
                 return {"executed": False, "status": "MAX_OPEN_POSITIONS", "detail": detail}
+
+            norm_side_str = str(side or "").strip().upper()
+            if norm_side_str in ("BUY", "SELL"):
+                open_pos_meta = [{"symbol": p.cas_symbol, "side": p.side} for p in open_pos]
+                is_pyr_opt_b = any(
+                    p.cas_symbol == cas_sym and str(p.side).strip().upper() == norm_side_str
+                    for p in open_pos
+                )
+                corr_ok, corr_reason = evaluate_cross_market_offset_guard(
+                    candidate_symbol=cas_sym,
+                    candidate_side=Side(norm_side_str),
+                    open_positions=open_pos_meta,
+                    price_history=self._mid_history,
+                    is_pyramid_add=is_pyr_opt_b,
+                )
+                if not corr_ok:
+                    self._log_event("ENTRY_BLOCKED_CORRELATED_OFFSET", cas_sym, root, corr_reason, now)
+                    return {
+                        "executed": False,
+                        "status": CORRELATED_OFFSET_BLOCKED_CODE,
+                        "detail": corr_reason,
+                    }
 
             snap_acct = self._emulator.account_snapshot(now_utc=now)
             durable_peak = self._read_durable_peak_unlocked()
