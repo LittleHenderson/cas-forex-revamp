@@ -90,12 +90,17 @@ export const STATIC_TREASURY = Object.freeze({
 export const STATIC_PARALLEL_TIERS = Object.freeze({
   connected: false,
   tierCount: 5,
+  autoReplenishEnabled: true,
+  autoReplenishFloorPct: '70.00',
+  totalReplenishmentCount: 0,
+  totalCumulativeReplenishedUsd: '0.00',
+  ownerControlsAllowed: false,
   tiers: Object.freeze([
-    Object.freeze({ tierId: 'TIER_1_CURRENT', label: 'Current Barbell ($300,000)', colorToken: 'tier-300k', startingCapitalUsd: '300000', balanceUsd: '300000', equityUsd: '300000', netGainUsd: '0', growthPct: '0', peakEquityUsd: '300000', drawdownPct: '0', openPositions: 0, closedTrades: 0, winRatePct: '0', profitFactor: '0.00', bankSweepReservedUsd: '0', retainedTradingUsd: '0', lastSkipReason: null }),
-    Object.freeze({ tierId: 'TIER_2_1000', label: 'Tier $1,000 Starter', colorToken: 'tier-1000', startingCapitalUsd: '1000', balanceUsd: '1000', equityUsd: '1000', netGainUsd: '0', growthPct: '0', peakEquityUsd: '1000', drawdownPct: '0', openPositions: 0, closedTrades: 0, winRatePct: '0', profitFactor: '0.00', bankSweepReservedUsd: '0', retainedTradingUsd: '0', lastSkipReason: null }),
-    Object.freeze({ tierId: 'TIER_3_3000', label: 'Tier $3,000 Growth', colorToken: 'tier-3000', startingCapitalUsd: '3000', balanceUsd: '3000', equityUsd: '3000', netGainUsd: '0', growthPct: '0', peakEquityUsd: '3000', drawdownPct: '0', openPositions: 0, closedTrades: 0, winRatePct: '0', profitFactor: '0.00', bankSweepReservedUsd: '0', retainedTradingUsd: '0', lastSkipReason: null }),
-    Object.freeze({ tierId: 'TIER_4_6000', label: 'Tier $6,000 Accelerator', colorToken: 'tier-6000', startingCapitalUsd: '6000', balanceUsd: '6000', equityUsd: '6000', netGainUsd: '0', growthPct: '0', peakEquityUsd: '6000', drawdownPct: '0', openPositions: 0, closedTrades: 0, winRatePct: '0', profitFactor: '0.00', bankSweepReservedUsd: '0', retainedTradingUsd: '0', lastSkipReason: null }),
-    Object.freeze({ tierId: 'TIER_5_300', label: 'Tier $300 Micro Challenge', colorToken: 'tier-300', startingCapitalUsd: '300', balanceUsd: '300', equityUsd: '300', netGainUsd: '0', growthPct: '0', peakEquityUsd: '300', drawdownPct: '0', openPositions: 0, closedTrades: 0, winRatePct: '0', profitFactor: '0.00', bankSweepReservedUsd: '0', retainedTradingUsd: '0', lastSkipReason: null }),
+    Object.freeze({ tierId: 'TIER_1_CURRENT', label: 'Current Barbell ($300,000)', colorToken: 'tier-300k', startingCapitalUsd: '300000', balanceUsd: '300000', equityUsd: '300000', netGainUsd: '0', growthPct: '0', peakEquityUsd: '300000', drawdownPct: '0', openPositions: 0, closedTrades: 0, winRatePct: '0', profitFactor: '0.00', bankSweepReservedUsd: '0', retainedTradingUsd: '0', replenishmentCount: 0, cumulativeReplenishedUsd: '0.00', lastReplenishedAt: null, autoReplenishFloorUsd: '210000.00', lastSkipReason: null }),
+    Object.freeze({ tierId: 'TIER_2_1000', label: 'Tier $1,000 Starter', colorToken: 'tier-1000', startingCapitalUsd: '1000', balanceUsd: '1000', equityUsd: '1000', netGainUsd: '0', growthPct: '0', peakEquityUsd: '1000', drawdownPct: '0', openPositions: 0, closedTrades: 0, winRatePct: '0', profitFactor: '0.00', bankSweepReservedUsd: '0', retainedTradingUsd: '0', replenishmentCount: 0, cumulativeReplenishedUsd: '0.00', lastReplenishedAt: null, autoReplenishFloorUsd: '700.00', lastSkipReason: null }),
+    Object.freeze({ tierId: 'TIER_3_3000', label: 'Tier $3,000 Growth', colorToken: 'tier-3000', startingCapitalUsd: '3000', balanceUsd: '3000', equityUsd: '3000', netGainUsd: '0', growthPct: '0', peakEquityUsd: '3000', drawdownPct: '0', openPositions: 0, closedTrades: 0, winRatePct: '0', profitFactor: '0.00', bankSweepReservedUsd: '0', retainedTradingUsd: '0', replenishmentCount: 0, cumulativeReplenishedUsd: '0.00', lastReplenishedAt: null, autoReplenishFloorUsd: '2100.00', lastSkipReason: null }),
+    Object.freeze({ tierId: 'TIER_4_6000', label: 'Tier $6,000 Accelerator', colorToken: 'tier-6000', startingCapitalUsd: '6000', balanceUsd: '6000', equityUsd: '6000', netGainUsd: '0', growthPct: '0', peakEquityUsd: '6000', drawdownPct: '0', openPositions: 0, closedTrades: 0, winRatePct: '0', profitFactor: '0.00', bankSweepReservedUsd: '0', retainedTradingUsd: '0', replenishmentCount: 0, cumulativeReplenishedUsd: '0.00', lastReplenishedAt: null, autoReplenishFloorUsd: '4200.00', lastSkipReason: null }),
+    Object.freeze({ tierId: 'TIER_5_300', label: 'Tier $300 Micro Challenge', colorToken: 'tier-300', startingCapitalUsd: '300', balanceUsd: '300', equityUsd: '300', netGainUsd: '0', growthPct: '0', peakEquityUsd: '300', drawdownPct: '0', openPositions: 0, closedTrades: 0, winRatePct: '0', profitFactor: '0.00', bankSweepReservedUsd: '0', retainedTradingUsd: '0', replenishmentCount: 0, cumulativeReplenishedUsd: '0.00', lastReplenishedAt: null, autoReplenishFloorUsd: '210.00', lastSkipReason: null }),
   ]),
   growthSeries: Object.freeze({}),
 });
@@ -286,6 +291,10 @@ export function normalizeParallelTiers(doc) {
     profitFactor: str(t.profit_factor, '0.00'),
     bankSweepReservedUsd: numStr(t.bank_sweep_reserved_usd, '0'),
     retainedTradingUsd: numStr(t.retained_trading_usd, '0'),
+    replenishmentCount: Number.isSafeInteger(t.replenishment_count) ? t.replenishment_count : 0,
+    cumulativeReplenishedUsd: numStr(t.cumulative_replenished_usd, '0.00'),
+    lastReplenishedAt: t.last_replenished_at ? str(t.last_replenished_at, '', 64) : null,
+    autoReplenishFloorUsd: numStr(t.auto_replenish_floor_usd, '0.00'),
     lastSkipReason: t.last_skip_reason ? str(t.last_skip_reason, '', 120) : null,
     riskBps: Number.isSafeInteger(t.risk_bps ?? t.aggression_dial?.risk_bps)
       ? (t.risk_bps ?? t.aggression_dial.risk_bps)
@@ -322,6 +331,11 @@ export function normalizeParallelTiers(doc) {
   return Object.freeze({
     connected: true,
     tierCount: tiers.length,
+    autoReplenishEnabled: doc.auto_replenish_enabled === undefined ? true : Boolean(doc.auto_replenish_enabled),
+    autoReplenishFloorPct: numStr(doc.auto_replenish_floor_pct, '70.00'),
+    totalReplenishmentCount: Number.isSafeInteger(doc.total_replenishment_count) ? doc.total_replenishment_count : 0,
+    totalCumulativeReplenishedUsd: numStr(doc.total_cumulative_replenished_usd, '0.00'),
+    ownerControlsAllowed: Boolean(doc.owner_controls_allowed),
     tiers: Object.freeze(tiers),
     growthSeries: Object.freeze(series),
     aggressionDial,
@@ -405,12 +419,24 @@ export function renderParallelTiersSection(state) {
     </tr>`;
   }).join('');
 
+  const ptReplEnabled = pt.autoReplenishEnabled !== false;
+  const ptFloorPct = str(pt.autoReplenishFloorPct, '70.00');
+  const ptReplCount = Number.isSafeInteger(pt.totalReplenishmentCount) ? pt.totalReplenishmentCount : 0;
+  const ptReplCumUsd = numStr(pt.totalCumulativeReplenishedUsd, '0.00');
+  const ptCanControl = Boolean(pt.connected) && !Boolean(state?.aiActionBusy);
   return `<section class="panel parallel-tiers-panel" aria-label="5-Tier Parallel Account Growth Race">
     <div class="section-heading">
       <div><p class="eyebrow">SECTION B.5 · SHARED 50MS STREAM · ZERO EXTRA AI API COST</p><h2>5-Tier Parallel Account Growth Race</h2></div>
       <span class="tag"><span class="state-rule" aria-hidden="true"></span>${pt.connected ? 'Live Parallel Engine' : 'Preview (Standby)'}</span>
     </div>
     <p class="panel-copy">All 5 account sizes ($300, $1,000, $3,000, $6,000, and $300,000) subscribe to the single 50ms stream with independent ForexMetaValveGate 1.00% stop-risk verification, ROUND_FLOOR 0.01 lot sizing, real bid/ask + ECN commissions, and 50%/50% Bank Vault sweeps.</p>
+    <div class="pt-replenish-bar" data-pt-replenish-bar="true">
+      <span class="pt-replenish-meta" data-pt-replenish-summary="true">DEMO Auto-Replenish (&lt;= ${e(ptFloorPct)}%): ${ptReplEnabled ? 'ON' : 'OFF'} · ${e(String(ptReplCount))} top-ups (+$${e(ptReplCumUsd)})</span>
+      <div class="pt-replenish-actions">
+        <button type="button" class="button button-small" data-pt-action="REPLENISH_ALL_TIERS"${ptCanControl ? '' : ' disabled'}>Replenish All 5 Tiers</button>
+        <button type="button" class="button button-small ${ptReplEnabled ? 'selected' : 'button-secondary'}" data-pt-action="TOGGLE_AUTO_REPLENISH" aria-pressed="${ptReplEnabled ? 'true' : 'false'}"${ptCanControl ? '' : ' disabled'}>Auto-Replenish &lt;= ${e(ptFloorPct)}%: ${ptReplEnabled ? 'ON' : 'OFF'}</button>
+      </div>
+    </div>
     ${renderSectionB5TierDials(resolveCockpitAggressionDial(state))}
     <div class="tier-race-chart-wrap">
       <canvas class="analytics-canvas" data-tiers-race-canvas="true" width="860" height="220" aria-label="5-Tier normalized percentage ROI growth race chart"></canvas>

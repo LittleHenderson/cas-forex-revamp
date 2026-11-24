@@ -2695,6 +2695,12 @@ class LoopbackCockpitServer:
             execution_mode=execution_mode,
         )
 
+    def _enforce_demo_replenish_allowed(self) -> None:
+        if self._broker_router_reader is not None or self._autonomous_trader is not None:
+            is_live_or_unk, mode_lbl = self._resolve_aggression_live_mode_fail_closed()
+            if is_live_or_unk or mode_lbl != "DEMO":
+                raise PermissionError("DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE")
+
     def _read_option_b_demo_snapshot(
         self,
         *,
@@ -4579,6 +4585,59 @@ class LoopbackCockpitServer:
                                 "result": mirror_res,
                                 "snapshot": snap,
                             }
+                        elif act_norm == "REPLENISH_DEMO_CAPITAL":
+                            extra_keys = sorted(set(body.keys()) - {"action", "reason"})
+                            if extra_keys:
+                                raise ContractError(f"Unexpected additional properties in POST /api/option-b-demo: {extra_keys}")
+                            outer._enforce_demo_replenish_allowed()
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                repl_res = outer._option_b_demo.replenish_demo_capital(
+                                    reason=clean_reason or "OPTION_B_OWNER_REPLENISH",
+                                    execution_mode="DEMO",
+                                    live_trading_armed=False,
+                                )
+                                snap = outer._read_option_b_demo_snapshot(
+                                    owner_controls_allowed=True,
+                                    session_scope=SESSION_SCOPE_OWNER_FULL,
+                                )
+                            action_result = {
+                                "ok": True,
+                                "action": "REPLENISH_DEMO_CAPITAL",
+                                "result": repl_res,
+                                "snapshot": snap,
+                            }
+                        elif act_norm == "SET_AUTO_REPLENISH":
+                            extra_keys = sorted(set(body.keys()) - {"action", "enabled", "floor_pct", "reason"})
+                            if extra_keys:
+                                raise ContractError(f"Unexpected additional properties in POST /api/option-b-demo: {extra_keys}")
+                            outer._enforce_demo_replenish_allowed()
+                            raw_en = body.get("enabled")
+                            if type(raw_en) is not bool:
+                                raise ContractError("enabled must be a strict JSON boolean")
+                            raw_fl = body.get("floor_pct")
+                            floor_val = (
+                                outer._parse_strict_decimal_field(raw_fl, "floor_pct")
+                                if raw_fl is not None
+                                else None
+                            )
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                cfg_res = outer._option_b_demo.set_auto_replenish(
+                                    enabled=raw_en,
+                                    floor_pct=floor_val,
+                                    reason=clean_reason or "OPTION_B_OWNER_AUTO_REPLENISH_CONFIG",
+                                    execution_mode="DEMO",
+                                    live_trading_armed=False,
+                                )
+                                snap = outer._read_option_b_demo_snapshot(
+                                    owner_controls_allowed=True,
+                                    session_scope=SESSION_SCOPE_OWNER_FULL,
+                                )
+                            action_result = {
+                                "ok": True,
+                                "action": "SET_AUTO_REPLENISH",
+                                "result": cfg_res,
+                                "snapshot": snap,
+                            }
                         else:
                             raise ContractError(f"Unsupported Option B demo action {raw_act!r}")
                         outer.notify_stream_updated()
@@ -4587,8 +4646,115 @@ class LoopbackCockpitServer:
                         self._reject_unauthorized()
                     except OwnerKeyRequiredError:
                         self._reject_insufficient_scope()
+                    except PermissionError as exc:
+                        self._write_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
                     except Exception as exc:
-                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                        code = HTTPStatus.FORBIDDEN if "DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE" in str(exc) else HTTPStatus.BAD_REQUEST
+                        self._write_json(code, {"error": str(exc)})
+                    return
+
+                if route == "/api/parallel-tiers":
+                    if outer._parallel_tiers is None:
+                        self._drain_small_request_body(max_bytes=16384)
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "Parallel Tier Engine not configured"})
+                        return
+                    try:
+                        body = self._read_json_body(max_bytes=16384)
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        if auth_scope != SESSION_SCOPE_OWNER_FULL:
+                            self._reject_insufficient_scope()
+                            return
+                        if type(body) is not dict:
+                            raise ContractError("JSON object required")
+                        raw_act = body.get("action")
+                        if not isinstance(raw_act, str) or not raw_act.strip():
+                            raise ContractError("action field required")
+                        act_norm = raw_act.strip().upper()
+                        raw_reason = body.get("reason")
+                        clean_reason: str | None = None
+                        if raw_reason is not None:
+                            if (
+                                not isinstance(raw_reason, str)
+                                or not raw_reason.strip()
+                                or len(raw_reason.strip()) > 160
+                                or any(ch in raw_reason for ch in ("\x00", "\r", "\n"))
+                            ):
+                                raise ContractError("reason must be a clean string of at most 160 characters")
+                            clean_reason = raw_reason.strip()
+                        outer._enforce_demo_replenish_allowed()
+                        if act_norm == "REPLENISH_ALL_TIERS":
+                            extra_keys = sorted(set(body.keys()) - {"action", "reason"})
+                            if extra_keys:
+                                raise ContractError(f"Unexpected additional properties in POST /api/parallel-tiers: {extra_keys}")
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                pt_res = outer._parallel_tiers.replenish_all_tiers(
+                                    reason=clean_reason or "OWNER_REPLENISH_ALL_TIERS",
+                                    execution_mode="DEMO",
+                                    live_trading_armed=False,
+                                )
+                                snap = outer._parallel_tiers.snapshot()
+                        elif act_norm == "REPLENISH_TIER":
+                            extra_keys = sorted(set(body.keys()) - {"action", "tier_id", "reason"})
+                            if extra_keys:
+                                raise ContractError(f"Unexpected additional properties in POST /api/parallel-tiers: {extra_keys}")
+                            raw_tid = body.get("tier_id")
+                            if not isinstance(raw_tid, str) or not raw_tid.strip():
+                                raise ContractError("tier_id must be a non-empty string")
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                pt_res = outer._parallel_tiers.replenish_tier(
+                                    raw_tid.strip(),
+                                    reason=clean_reason or "OWNER_REPLENISH_TIER",
+                                    execution_mode="DEMO",
+                                    live_trading_armed=False,
+                                )
+                                snap = outer._parallel_tiers.snapshot()
+                        elif act_norm == "SET_AUTO_REPLENISH":
+                            extra_keys = sorted(set(body.keys()) - {"action", "enabled", "floor_pct", "reason"})
+                            if extra_keys:
+                                raise ContractError(f"Unexpected additional properties in POST /api/parallel-tiers: {extra_keys}")
+                            raw_en = body.get("enabled")
+                            if type(raw_en) is not bool:
+                                raise ContractError("enabled must be a strict JSON boolean")
+                            raw_fl = body.get("floor_pct")
+                            floor_val = (
+                                outer._parse_strict_decimal_field(raw_fl, "floor_pct")
+                                if raw_fl is not None
+                                else None
+                            )
+                            with outer._commit_lease(supplied_tok, auth_epoch):
+                                pt_res = outer._parallel_tiers.set_auto_replenish(
+                                    enabled=raw_en,
+                                    floor_pct=floor_val,
+                                    reason=clean_reason or "OWNER_SET_AUTO_REPLENISH",
+                                    execution_mode="DEMO",
+                                    live_trading_armed=False,
+                                )
+                                snap = outer._parallel_tiers.snapshot()
+                        else:
+                            raise ContractError(f"Unsupported parallel tiers action {raw_act!r}")
+                        outer.notify_stream_updated()
+                        self._write_json(
+                            HTTPStatus.OK,
+                            assert_safe_ai_catalog_payload(
+                                {
+                                    "ok": True,
+                                    "action": act_norm,
+                                    "result": pt_res,
+                                    "snapshot": snap,
+                                }
+                            ),
+                        )
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
+                    except OwnerKeyRequiredError:
+                        self._reject_insufficient_scope()
+                    except PermissionError as exc:
+                        self._write_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+                    except Exception as exc:
+                        code = HTTPStatus.FORBIDDEN if "DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE" in str(exc) else HTTPStatus.BAD_REQUEST
+                        self._write_json(code, {"error": str(exc)})
                     return
 
                 if route == "/api/demo-high-growth-profile":
@@ -5286,6 +5452,28 @@ class LoopbackCockpitServer:
                                 res = outer._autonomous_trader.set_session_cadence(cad_val, reason=reason)
                             elif act == "EMERGENCY_CLOSE_ALL":
                                 res = outer._autonomous_trader.emergency_close_all(reason=reason)
+                            elif act == "REANCHOR_DEMO_BASELINE":
+                                if auth_scope != SESSION_SCOPE_OWNER_FULL:
+                                    raise OwnerKeyRequiredError("Owner scope required for REANCHOR_DEMO_BASELINE")
+                                outer._enforce_demo_replenish_allowed()
+                                res = outer._autonomous_trader.reanchor_demo_baseline(reason=reason)
+                            elif act == "SET_DEMO_AUTO_REPLENISH":
+                                if auth_scope != SESSION_SCOPE_OWNER_FULL:
+                                    raise OwnerKeyRequiredError("Owner scope required for SET_DEMO_AUTO_REPLENISH")
+                                outer._enforce_demo_replenish_allowed()
+                                raw_en = body.get("enabled")
+                                if type(raw_en) is not bool:
+                                    raise ContractError("enabled must be a strict JSON boolean")
+                                raw_fl = body.get("floor_pct")
+                                floor_val = (
+                                    outer._parse_strict_decimal_field(raw_fl, "floor_pct")
+                                    if raw_fl is not None
+                                    else None
+                                )
+                                res = outer._autonomous_trader.set_demo_auto_replenish(
+                                    enabled=raw_en,
+                                    floor_pct=floor_val,
+                                )
                             elif act in ("REARM_DRAWDOWN", "UNLOCK_QUOTA_SESSION"):
                                 req_id = str(body.get("owner_request_id") or "overseer-unlock-1")
                                 rec_tok = body.get("recovery_token")
@@ -5317,9 +5505,18 @@ class LoopbackCockpitServer:
                         self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(res))
                     except _SessionRevokedError:
                         self._reject_unauthorized()
+                    except OwnerKeyRequiredError:
+                        self._reject_insufficient_scope()
+                    except PermissionError as exc:
+                        self._write_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
                     except Exception as exc:
-                        code = HTTPStatus.FORBIDDEN if "OWNER_RECOVERY" in str(exc) else HTTPStatus.BAD_REQUEST
-                        self._write_json(code, {"error": str(exc)})
+                        msg_exc = str(exc)
+                        code = (
+                            HTTPStatus.FORBIDDEN
+                            if ("OWNER_RECOVERY" in msg_exc or "DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE" in msg_exc)
+                            else HTTPStatus.BAD_REQUEST
+                        )
+                        self._write_json(code, {"error": msg_exc})
                     return
 
                 if outer._ui_service is None:

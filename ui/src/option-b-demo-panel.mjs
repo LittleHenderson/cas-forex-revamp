@@ -93,6 +93,13 @@ export const STATIC_OPTION_B_DEMO = Object.freeze({
     Object.freeze({ rootSymbol: 'MES', casSymbol: 'SPX500', displayName: 'Micro E-mini S&P 500', exchange: 'CME', contractCode: 'MES', pointValueUsd: '5', tickSize: '0.25', tickValueUsd: '1.25', openContracts: 0, bid: null, ask: null, mid: null, quoteObservedAt: null }),
     Object.freeze({ rootSymbol: 'MGC', casSymbol: 'XAUUSD', displayName: 'Micro Gold', exchange: 'COMEX', contractCode: 'MGC', pointValueUsd: '10', tickSize: '0.10', tickValueUsd: '1.00', openContracts: 0, bid: null, ask: null, mid: null, quoteObservedAt: null }),
   ]),
+  autoReplenishEnabled: true,
+  autoReplenishFloorPct: '70.00',
+  autoReplenishFloorUsd: '3500.00',
+  replenishmentCount: 0,
+  cumulativeReplenishedUsd: '0.00',
+  lastReplenishedAt: null,
+  ownerControlsAllowed: true,
   auditChainValid: true,
   observedAt: null,
 });
@@ -208,6 +215,13 @@ export function normalizeOptionBDemo(raw) {
     recentClosedTrades: Object.freeze(recentClosedTrades),
     recentEvents: Object.freeze(recentEvents),
     supportedContracts: Object.freeze(contracts),
+    autoReplenishEnabled: raw.auto_replenish_enabled === undefined ? true : Boolean(raw.auto_replenish_enabled),
+    autoReplenishFloorPct: normalizeDecimalString(raw.auto_replenish_floor_pct, '70.00'),
+    autoReplenishFloorUsd: normalizeDecimalString(raw.auto_replenish_floor_usd, '3500.00'),
+    replenishmentCount: Number.isInteger(raw.replenishment_count) && raw.replenishment_count >= 0 ? raw.replenishment_count : 0,
+    cumulativeReplenishedUsd: normalizeDecimalString(raw.cumulative_replenished_usd, '0.00'),
+    lastReplenishedAt: typeof raw.last_replenished_at === 'string' ? raw.last_replenished_at : null,
+    ownerControlsAllowed: raw.owner_controls_allowed === undefined ? true : Boolean(raw.owner_controls_allowed),
     auditChainValid: raw.audit_chain_valid === true,
     observedAt: typeof raw.observed_at === 'string' ? raw.observed_at : null,
   });
@@ -258,6 +272,14 @@ export function renderOptionBDemoPanel(demo) {
         `${t.contractCode} x${t.contracts} ${formatSignedUsd(t.netPnlUsd)} (${t.status})`
       )).join(' · ')
     : 'No closed paper micro-futures trades yet.';
+  const replFloorPct = d.autoReplenishFloorPct ?? '70.00';
+  const replFloorUsd = d.autoReplenishFloorUsd ?? '3500.00';
+  const replEnabled = d.autoReplenishEnabled !== false;
+  const replCount = Number.isInteger(d.replenishmentCount) ? d.replenishmentCount : 0;
+  const replCumUsd = d.cumulativeReplenishedUsd ?? '0.00';
+  const replSummary = `${replEnabled ? 'ACTIVE' : 'PAUSED'} · ${replCount} top-ups (+${formatUsd(replCumUsd)})`;
+  const autoReplBtnText = `Auto-Replenish <= ${replFloorPct}%: ${replEnabled ? 'ON' : 'OFF'}`;
+  const canReplenishManual = d.openPositions.length === 0;
 
   return `<section class="panel ob-demo-panel" id="option-b-demo-section" data-option-b-demo="true" aria-label="Option B $5,000 US Micro Futures Paper Demo">
     <div class="ob-header-row">
@@ -305,6 +327,11 @@ export function renderOptionBDemoPanel(demo) {
     <div class="ob-footer-strip">
       <p class="ob-footer-line"><strong>Open Contracts:</strong> <span data-ob-open-summary="true">${e(openPosSummary)}</span></p>
       <p class="ob-footer-line"><strong>Recent Closed:</strong> <span data-ob-closed-summary="true">${e(closedSummary)}</span></p>
+      <p class="ob-footer-line"><strong>DEMO Auto-Replenish (&lt;= ${e(replFloorPct)}% / ${e(formatUsd(replFloorUsd))}):</strong> <span data-ob-replenish-summary="true">${e(replSummary)}</span></p>
+      <div class="ob-action-row">
+        <button type="button" class="ob-btn ob-btn-primary" data-ob-action="REPLENISH_DEMO_CAPITAL"${canReplenishManual ? '' : ' disabled'}>Replenish DEMO $5,000.00</button>
+        <button type="button" class="ob-btn ${replEnabled ? 'ob-btn-active' : 'ob-btn-muted'}" data-ob-action="TOGGLE_AUTO_REPLENISH" aria-pressed="${replEnabled ? 'true' : 'false'}">${e(autoReplBtnText)}</button>
+      </div>
       <p class="ob-footer-note">Protected by 161-rule safety valve (0.55 cutoff), &lt;= 1.00% ($50.00) stop risk, and &lt;= 10.00% (-$500.00) drawdown brake. Real US bank vault transfer rules when live: $0.00 ACH (1-3 business days) or $30.00 domestic wire (same-day cutoff 10:00 AM PT).</p>
     </div>
   </section>`;
@@ -384,6 +411,21 @@ export function patchOptionBDemoPanelInPlace(rootEl, demo) {
     : 'No closed paper micro-futures trades yet.';
   setText('[data-ob-closed-summary="true"]', closedSummary);
 
+  const replFloorPct = d.autoReplenishFloorPct ?? '70.00';
+  const replEnabled = d.autoReplenishEnabled !== false;
+  const replCount = Number.isInteger(d.replenishmentCount) ? d.replenishmentCount : 0;
+  const replCumUsd = d.cumulativeReplenishedUsd ?? '0.00';
+  setText('[data-ob-replenish-summary="true"]', `${replEnabled ? 'ACTIVE' : 'PAUSED'} · ${replCount} top-ups (+${formatUsd(replCumUsd)})`);
+  const manualBtn = panel.querySelector('[data-ob-action="REPLENISH_DEMO_CAPITAL"]');
+  if (manualBtn) manualBtn.disabled = d.openPositions.length > 0;
+  const toggleBtn = panel.querySelector('[data-ob-action="TOGGLE_AUTO_REPLENISH"]');
+  if (toggleBtn) {
+    toggleBtn.textContent = `Auto-Replenish <= ${replFloorPct}%: ${replEnabled ? 'ON' : 'OFF'}`;
+    toggleBtn.setAttribute('aria-pressed', replEnabled ? 'true' : 'false');
+    toggleBtn.classList.toggle('ob-btn-active', replEnabled);
+    toggleBtn.classList.toggle('ob-btn-muted', !replEnabled);
+  }
+
   return true;
 }
 
@@ -421,4 +463,10 @@ export const OPTION_B_DEMO_CSS_SNIPPET = `
 .ob-footer-strip { border-top: 1px solid #1e293b; padding-top: 10px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
 .ob-footer-line { margin: 0; color: #e2e8f0; }
 .ob-footer-note { margin: 4px 0 0; font-size: 11px; color: #94a3b8; }
+.ob-action-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.ob-btn { cursor: pointer; font-size: 11px; font-weight: 700; padding: 6px 12px; border-radius: 5px; border: 1px solid #334155; background: #1e293b; color: #f8fafc; }
+.ob-btn-primary { background: #0369a1; border-color: #38bdf8; color: #f8fafc; }
+.ob-btn-active { background: #064e3b; border-color: #10b981; color: #a7f3d0; }
+.ob-btn-muted { background: #1f2937; border-color: #475569; color: #cbd5e1; }
+.ob-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 `;

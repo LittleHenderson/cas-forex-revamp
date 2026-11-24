@@ -44,6 +44,8 @@ from cas_forex_revamp.futures.micro_futures_specs import (
 )
 from cas_forex_revamp.futures.tradovate_venue import (
     DEFAULT_PAPER_STARTING_EQUITY_USD,
+    DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE,
+    DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS,
     TRADOVATE_MODE_DEMO,
     TRADOVATE_SUPPORTED_CONTRACTS,
     TradovateLiveLockError,
@@ -62,6 +64,7 @@ OPTION_B_VAULT_SWEEP_RATIO = Decimal("0.50")
 OPTION_B_MAX_OPEN_POSITIONS_CEILING = 8
 OPTION_B_RECENT_TRADES_LIMIT = 20
 OPTION_B_RECENT_EVENTS_LIMIT = 25
+DEFAULT_OPTION_B_AUTO_REPLENISH_FLOOR_PCT = Decimal("0.70")
 
 _CAS_TO_MICRO_SUPPORTED: frozenset[str] = frozenset({"NAS100", "US30", "SPX500", "XAUUSD"})
 _PENNY = Decimal("0.01")
@@ -87,6 +90,22 @@ def _q10_ceil(value: Decimal) -> Decimal:
 
 def _usd_text(value: Decimal) -> str:
     return f"{_q2(value):.2f}"
+
+
+def _normalize_replenish_floor_ratio(raw: object) -> tuple[Decimal, Decimal]:
+    """Normalize replenishment floor into (ratio in [0.10, 0.99], display_pct in [10.00, 99.00])."""
+    dec = _exact_decimal(raw, "auto_replenish_floor_pct", positive=True)
+    if Decimal("0.10") <= dec <= Decimal("0.99"):
+        ratio = _q4(dec)
+        pct = _q2(dec * Decimal("100"))
+        return ratio, pct
+    if Decimal("10.00") <= dec <= Decimal("99.00"):
+        ratio = _q4(dec / Decimal("100"))
+        pct = _q2(dec)
+        return ratio, pct
+    raise ContractError(
+        "auto_replenish_floor_pct must be between 0.10 and 0.99 (or 10.00 and 99.00 percent)"
+    )
 
 
 def _exact_decimal(
@@ -155,13 +174,38 @@ class OptionBPaperDemoRunner:
         max_drawdown_pct: Decimal = MAX_CONSTITUTIONAL_DRAWDOWN_PCT,
         max_stop_loss_risk_pct: Decimal = MAX_CONSTITUTIONAL_STOP_RISK_PCT,
         demo_high_growth: DemoHighGrowthProfile | None = None,
+        auto_replenish_enabled: bool | None = None,
+        auto_replenish_floor_pct: Decimal | str | int | None = None,
+        execution_mode: str = TRADOVATE_MODE_DEMO,
+        live_trading_armed: bool = False,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         norm_mode = str(mode or "").strip().upper()
+        norm_exec_mode = str(execution_mode or "").strip().upper()
+        if auto_replenish_enabled is not None and type(auto_replenish_enabled) is not bool:
+            raise ContractError("auto_replenish_enabled must be bool or None")
+        if type(live_trading_armed) is not bool:
+            raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
         if norm_mode != TRADOVATE_MODE_DEMO:
             raise TradovateLiveLockError(
                 "OptionBPaperDemoRunner is strictly paper-demo only ($0.00 real money); LIVE mode is forbidden"
             )
+        if norm_exec_mode != TRADOVATE_MODE_DEMO or live_trading_armed:
+            raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
+        init_floor_ratio, init_floor_pct = _normalize_replenish_floor_ratio(
+            DEFAULT_OPTION_B_AUTO_REPLENISH_FLOOR_PCT
+            if auto_replenish_floor_pct is None
+            else auto_replenish_floor_pct
+        )
+        self._auto_replenish_enabled_override = auto_replenish_enabled
+        self._auto_replenish_floor_override = (
+            (init_floor_ratio, init_floor_pct) if auto_replenish_floor_pct is not None else None
+        )
+        self._auto_replenish_enabled: bool = (
+            True if auto_replenish_enabled is None else auto_replenish_enabled
+        )
+        self._auto_replenish_floor_ratio: Decimal = init_floor_ratio
+        self._auto_replenish_floor_pct: Decimal = init_floor_pct
         if valve_gate is None:
             raise ContractError("OptionBPaperDemoRunner requires an active ForexMetaValveGate")
         if demo_high_growth is not None and not isinstance(demo_high_growth, DemoHighGrowthProfile):
@@ -256,6 +300,7 @@ class OptionBPaperDemoRunner:
         self._venue.activate(mode=TRADOVATE_MODE_DEMO, now_utc=now)
         if restored_peak > emulator_start:
             self._ensure_peak_at_least(restored_peak, now)
+        self._maybe_auto_replenish_unlocked(now=now, trigger="STARTUP")
 
     @property
     def db_path(self) -> Path:
@@ -406,11 +451,26 @@ class OptionBPaperDemoRunner:
                     )
                     """
                 )
+                existing_meta_cols = {
+                    str(c["name"])
+                    for c in conn.execute("PRAGMA table_info(option_b_meta)").fetchall()
+                }
+                for col_name, col_ddl in (
+                    ("auto_replenish_enabled", "INTEGER NOT NULL DEFAULT 1"),
+                    ("auto_replenish_floor_pct", "TEXT NOT NULL DEFAULT '70.00'"),
+                    ("replenishment_count", "INTEGER NOT NULL DEFAULT 0"),
+                    ("cumulative_replenished_usd", "TEXT NOT NULL DEFAULT '0.00'"),
+                    ("last_replenished_at", "TEXT"),
+                ):
+                    if col_name not in existing_meta_cols:
+                        conn.execute(f"ALTER TABLE option_b_meta ADD COLUMN {col_name} {col_ddl}")
                 row = conn.execute(
                     "SELECT starting_equity_usd, last_balance_usd, peak_equity_usd, "
                     "total_realized_pnl_usd, total_commissions_usd, vault_50pct_reserved_usd, "
                     "retained_compounding_usd, win_count, loss_count, house_money_target_usd, "
-                    "house_money_reached_at FROM option_b_meta WHERE id = 1"
+                    "house_money_reached_at, auto_replenish_enabled, auto_replenish_floor_pct, "
+                    "replenishment_count, cumulative_replenished_usd, last_replenished_at "
+                    "FROM option_b_meta WHERE id = 1"
                 ).fetchone()
                 if row is None:
                     conn.execute(
@@ -419,10 +479,22 @@ class OptionBPaperDemoRunner:
                             id, account_id, starting_equity_usd, last_balance_usd, peak_equity_usd,
                             total_realized_pnl_usd, total_commissions_usd, vault_50pct_reserved_usd,
                             retained_compounding_usd, win_count, loss_count, house_money_target_usd,
-                            house_money_reached_at, created_at, updated_at
-                        ) VALUES (1, ?, ?, ?, ?, '0.00', '0.00', '0.00', '0.00', 0, 0, ?, NULL, ?, ?)
+                            house_money_reached_at, auto_replenish_enabled, auto_replenish_floor_pct,
+                            replenishment_count, cumulative_replenished_usd, last_replenished_at,
+                            created_at, updated_at
+                        ) VALUES (1, ?, ?, ?, ?, '0.00', '0.00', '0.00', '0.00', 0, 0, ?, NULL, ?, ?, 0, '0.00', NULL, ?, ?)
                         """,
-                        (self._account_id, start_s, start_s, start_s, target_s, ts, ts),
+                        (
+                            self._account_id,
+                            start_s,
+                            start_s,
+                            start_s,
+                            target_s,
+                            1 if self._auto_replenish_enabled else 0,
+                            _usd_text(self._auto_replenish_floor_pct),
+                            ts,
+                            ts,
+                        ),
                     )
                     res = {
                         "starting_equity_usd": self._initial_starting_equity_usd,
@@ -436,6 +508,27 @@ class OptionBPaperDemoRunner:
                     self._house_money_target_usd = _q2(
                         _exact_decimal(row["house_money_target_usd"], "house_money_target_usd", positive=True)
                     )
+                    persisted_enabled = bool(int(row["auto_replenish_enabled"]))
+                    persisted_ratio, persisted_pct = _normalize_replenish_floor_ratio(
+                        row["auto_replenish_floor_pct"]
+                    )
+                    if self._auto_replenish_enabled_override is None:
+                        self._auto_replenish_enabled = persisted_enabled
+                    if self._auto_replenish_floor_override is None:
+                        self._auto_replenish_floor_ratio = persisted_ratio
+                        self._auto_replenish_floor_pct = persisted_pct
+                    if (
+                        self._auto_replenish_enabled_override is not None
+                        or self._auto_replenish_floor_override is not None
+                    ):
+                        conn.execute(
+                            "UPDATE option_b_meta SET auto_replenish_enabled = ?, auto_replenish_floor_pct = ?, updated_at = ? WHERE id = 1",
+                            (
+                                1 if self._auto_replenish_enabled else 0,
+                                _usd_text(self._auto_replenish_floor_pct),
+                                ts,
+                            ),
+                        )
                     res = {
                         "starting_equity_usd": self._initial_starting_equity_usd,
                         "last_balance_usd": _q2(
@@ -614,6 +707,206 @@ class OptionBPaperDemoRunner:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+        self._maybe_auto_replenish_unlocked(now=now, trigger="POST_CLOSE")
+
+    def _replenish_demo_capital_unlocked(
+        self,
+        *,
+        reason: str,
+        trigger: str,
+        now: datetime,
+    ) -> dict[str, Any]:
+        if self._emulator.positions():
+            raise ContractError(DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS)
+        acct = self._emulator.account_snapshot(now_utc=now)
+        prev_bal = _q2(acct.balance_usd)
+        target = _q2(self._initial_starting_equity_usd)
+        ts = _iso_utc(now)
+        if prev_bal >= target:
+            return {
+                "replenished": False,
+                "added_usd": "0.00",
+                "previous_balance_usd": _usd_text(prev_bal),
+                "new_balance_usd": _usd_text(prev_bal),
+                "starting_equity_usd": _usd_text(target),
+                "trigger": trigger,
+                "reason": reason,
+                "observed_at": ts,
+            }
+        venue_res = self._venue.replenish_demo_capital(
+            target,
+            reason=f"{trigger}:{reason}",
+            execution_mode=TRADOVATE_MODE_DEMO,
+            live_trading_armed=False,
+            now_utc=now,
+        )
+        added = _q2(_exact_decimal(venue_res["added_usd"], "added_usd", non_negative=True))
+        with closing(self._connect_rw()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT replenishment_count, cumulative_replenished_usd FROM option_b_meta WHERE id = 1"
+                ).fetchone()
+                prev_cnt = int(row["replenishment_count"]) if row is not None else 0
+                prev_cum = (
+                    _q2(_exact_decimal(row["cumulative_replenished_usd"], "cumulative_replenished_usd", non_negative=True))
+                    if row is not None
+                    else Decimal("0.00")
+                )
+                new_cnt = prev_cnt + 1
+                new_cum = _q2(prev_cum + added)
+                conn.execute(
+                    """
+                    UPDATE option_b_meta
+                    SET last_balance_usd = ?,
+                        peak_equity_usd = ?,
+                        vault_50pct_reserved_usd = '0.00',
+                        retained_compounding_usd = '0.00',
+                        replenishment_count = ?,
+                        cumulative_replenished_usd = ?,
+                        last_replenished_at = ?,
+                        updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (
+                        _usd_text(target),
+                        _usd_text(target),
+                        new_cnt,
+                        _usd_text(new_cum),
+                        ts,
+                        ts,
+                    ),
+                )
+                self._record_event_unlocked(
+                    conn,
+                    event_type="DEMO_CAPITAL_REPLENISHED",
+                    cas_symbol="ALL",
+                    root_symbol="DEMO",
+                    detail=(
+                        f"[{trigger}] Replenished +{_usd_text(added)} USD "
+                        f"({_usd_text(prev_bal)} -> {_usd_text(target)} USD; #{new_cnt}; {reason})"
+                    ),
+                    now=now,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return {
+            "replenished": True,
+            "added_usd": _usd_text(added),
+            "previous_balance_usd": _usd_text(prev_bal),
+            "new_balance_usd": _usd_text(target),
+            "starting_equity_usd": _usd_text(target),
+            "replenishment_count": new_cnt,
+            "cumulative_replenished_usd": _usd_text(new_cum),
+            "trigger": trigger,
+            "reason": reason,
+            "observed_at": ts,
+        }
+
+    def _maybe_auto_replenish_unlocked(
+        self,
+        *,
+        now: datetime,
+        trigger: str,
+    ) -> dict[str, Any] | None:
+        if not self._auto_replenish_enabled:
+            return None
+        if self._emulator.positions():
+            return None
+        acct = self._emulator.account_snapshot(now_utc=now)
+        bal = _q2(acct.balance_usd)
+        floor_usd = _q2(self._initial_starting_equity_usd * self._auto_replenish_floor_ratio)
+        if bal > floor_usd:
+            return None
+        return self._replenish_demo_capital_unlocked(
+            reason=f"AUTO_FLOOR_{_usd_text(self._auto_replenish_floor_pct)}PCT",
+            trigger=trigger,
+            now=now,
+        )
+
+    def replenish_demo_capital(
+        self,
+        *,
+        reason: str = "OPTION_B_OWNER_REPLENISH",
+        execution_mode: str = TRADOVATE_MODE_DEMO,
+        live_trading_armed: bool = False,
+        now_utc: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Replenish flat Option B DEMO balance back to starting equity without deleting trades."""
+        if type(live_trading_armed) is not bool:
+            raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
+        if str(execution_mode or "").strip().upper() != TRADOVATE_MODE_DEMO or live_trading_armed:
+            raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
+        now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
+        clean_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "OPTION_B_OWNER_REPLENISH"
+        with self._lock:
+            return self._replenish_demo_capital_unlocked(
+                reason=clean_reason,
+                trigger="OWNER_REPLENISH",
+                now=now,
+            )
+
+    def set_auto_replenish(
+        self,
+        *,
+        enabled: bool,
+        floor_pct: Decimal | str | int | None = None,
+        reason: str = "OPTION_B_AUTO_REPLENISH_CONFIG",
+        execution_mode: str = TRADOVATE_MODE_DEMO,
+        live_trading_armed: bool = False,
+        now_utc: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Configure DEMO-only Option B auto-replenishment floor and trigger immediate check if enabled."""
+        if type(enabled) is not bool:
+            raise ContractError("enabled must be a strict bool")
+        if type(live_trading_armed) is not bool:
+            raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
+        if str(execution_mode or "").strip().upper() != TRADOVATE_MODE_DEMO or live_trading_armed:
+            raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
+        now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
+        ts = _iso_utc(now)
+        clean_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "OPTION_B_AUTO_REPLENISH_CONFIG"
+        with self._lock:
+            if floor_pct is not None:
+                ratio, pct = _normalize_replenish_floor_ratio(floor_pct)
+                self._auto_replenish_floor_ratio = ratio
+                self._auto_replenish_floor_pct = pct
+            self._auto_replenish_enabled = enabled
+            with closing(self._connect_rw()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.execute(
+                        "UPDATE option_b_meta SET auto_replenish_enabled = ?, auto_replenish_floor_pct = ?, updated_at = ? WHERE id = 1",
+                        (
+                            1 if self._auto_replenish_enabled else 0,
+                            _usd_text(self._auto_replenish_floor_pct),
+                            ts,
+                        ),
+                    )
+                    self._record_event_unlocked(
+                        conn,
+                        event_type="DEMO_AUTO_REPLENISH_CONFIGURED",
+                        cas_symbol="ALL",
+                        root_symbol="DEMO",
+                        detail=(
+                            f"Auto-replenish={self._auto_replenish_enabled} "
+                            f"floor={_usd_text(self._auto_replenish_floor_pct)}% ({clean_reason})"
+                        ),
+                        now=now,
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+            repl_event = self._maybe_auto_replenish_unlocked(now=now, trigger="CONFIG_UPDATE") if enabled else None
+            return {
+                "auto_replenish_enabled": bool(self._auto_replenish_enabled),
+                "auto_replenish_floor_pct": _usd_text(self._auto_replenish_floor_pct),
+                "replenished_event": repl_event,
+                "observed_at": ts,
+            }
 
     def ingest_spot_quote(
         self,
@@ -846,7 +1139,9 @@ class OptionBPaperDemoRunner:
                     "SELECT account_id, starting_equity_usd, last_balance_usd, peak_equity_usd, "
                     "total_realized_pnl_usd, total_commissions_usd, vault_50pct_reserved_usd, "
                     "retained_compounding_usd, win_count, loss_count, house_money_target_usd, "
-                    "house_money_reached_at, updated_at FROM option_b_meta WHERE id = 1"
+                    "house_money_reached_at, auto_replenish_enabled, auto_replenish_floor_pct, "
+                    "replenishment_count, cumulative_replenished_usd, last_replenished_at, "
+                    "updated_at FROM option_b_meta WHERE id = 1"
                 ).fetchone()
                 trade_rows = conn.execute(
                     "SELECT trade_id, cas_symbol, root_symbol, contract_code, side, contracts, "
@@ -985,6 +1280,38 @@ class OptionBPaperDemoRunner:
                 for r in event_rows
             ]
 
+            auto_enabled = (
+                bool(int(meta["auto_replenish_enabled"]))
+                if meta is not None and "auto_replenish_enabled" in meta.keys()
+                else self._auto_replenish_enabled
+            )
+            floor_pct_dec = (
+                _normalize_replenish_floor_ratio(meta["auto_replenish_floor_pct"])[1]
+                if meta is not None and "auto_replenish_floor_pct" in meta.keys()
+                else self._auto_replenish_floor_pct
+            )
+            floor_ratio_dec = (
+                _normalize_replenish_floor_ratio(meta["auto_replenish_floor_pct"])[0]
+                if meta is not None and "auto_replenish_floor_pct" in meta.keys()
+                else self._auto_replenish_floor_ratio
+            )
+            floor_usd_dec = _q2(starting * floor_ratio_dec)
+            repl_count = (
+                int(meta["replenishment_count"])
+                if meta is not None and "replenishment_count" in meta.keys()
+                else 0
+            )
+            cum_repl = (
+                _q2(_exact_decimal(meta["cumulative_replenished_usd"], "cumulative_replenished_usd", non_negative=True))
+                if meta is not None and "cumulative_replenished_usd" in meta.keys()
+                else Decimal("0.00")
+            )
+            last_repl_at = (
+                meta["last_replenished_at"]
+                if meta is not None and "last_replenished_at" in meta.keys()
+                else None
+            )
+
             return {
                 "schema": OPTION_B_DEMO_SCHEMA,
                 "account_id": self._account_id,
@@ -1022,6 +1349,12 @@ class OptionBPaperDemoRunner:
                 "recent_closed_trades": recent_trades_out,
                 "recent_events": recent_events_out,
                 "supported_contracts": contracts_list,
+                "auto_replenish_enabled": auto_enabled,
+                "auto_replenish_floor_pct": _usd_text(floor_pct_dec),
+                "auto_replenish_floor_usd": _usd_text(floor_usd_dec),
+                "replenishment_count": repl_count,
+                "cumulative_replenished_usd": _usd_text(cum_repl),
+                "last_replenished_at": last_repl_at,
                 "audit_chain_valid": bool(venue_snap.get("audit_chain_valid", False)),
                 "owner_controls_allowed": bool(owner_controls_allowed),
                 "session_scope": str(session_scope),
@@ -1030,6 +1363,9 @@ class OptionBPaperDemoRunner:
 
 
 __all__ = [
+    "DEFAULT_OPTION_B_AUTO_REPLENISH_FLOOR_PCT",
+    "DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE",
+    "DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS",
     "OPTION_B_DEFAULT_STARTING_EQUITY_USD",
     "OPTION_B_DEMO_ACCOUNT_ID",
     "OPTION_B_DEMO_SCHEMA",

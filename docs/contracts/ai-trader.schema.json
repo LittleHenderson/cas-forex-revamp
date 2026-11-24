@@ -950,6 +950,39 @@
               "maxLength": 512
             }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "observed_at",
+            "kind",
+            "symbol",
+            "detail"
+          ],
+          "properties": {
+            "observed_at": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "kind": {
+              "const": "DEMO_CAPITAL_REPLENISHED"
+            },
+            "symbol": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/symbol"
+                }
+              ]
+            },
+            "detail": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          }
         }
       ]
     },
@@ -1245,6 +1278,47 @@
         },
         "equity_incomplete_brokers_offline": {
           "type": "boolean"
+        },
+        "excluded_offline_demo_brokers": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "enum": [
+              "HUGOSWAY_MT5",
+              "LHFX_MT5",
+              "OANDA_PRACTICE",
+              "OANDA_LIVE"
+            ]
+          }
+        },
+        "demo_auto_replenish_enabled": {
+          "type": "boolean"
+        },
+        "demo_auto_replenish_floor_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "demo_baseline_reanchor_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "last_demo_reanchored_at": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/timestamp"
+            }
+          ]
+        },
+        "demo_reanchored_baseline_usd": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/decimal"
+            }
+          ]
         }
       }
     },

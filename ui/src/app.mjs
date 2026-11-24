@@ -808,13 +808,76 @@ async function readOptionBDemo() {
   } catch { /* Keep prior verified Option B paper demo snapshot. */ }
 }
 
-function syncOptionBDemoDom() {
+function syncOptionBDemoDom(focusSelector = null) {
   const scrollSnap = captureScrollSnapshot(document, window);
   const panelEl = root.querySelector('[data-option-b-demo="true"]');
   if (panelEl) {
     patchOptionBDemoPanelInPlace(panelEl, resolveCockpitOptionBDemo(state));
+    if (focusSelector) {
+      panelEl.querySelector(focusSelector)?.focus({ preventScroll: true });
+    }
   }
   restoreScrollPosition(scrollSnap);
+}
+
+async function submitOptionBDemoMutation(payload, focusSelector = null) {
+  if (!state.liveStreamConnected) return;
+  if (!isStrictOwnerCompoundingSession()) {
+    requireOwnerControlOrWarn('Option B DEMO capital replenishment');
+    syncOptionBDemoDom();
+    return;
+  }
+  try {
+    const res = await postLoopbackJson('/api/option-b-demo', payload);
+    if (res?.snapshot) {
+      state.optionBDemo = normalizeOptionBDemo(res.snapshot);
+    } else {
+      await readOptionBDemo();
+    }
+    state.aiIssue = null;
+    syncOptionBDemoDom(focusSelector);
+    announce(payload?.action === 'REPLENISH_DEMO_CAPITAL'
+      ? 'Option B DEMO paper capital replenished.'
+      : `Option B auto-replenish updated (${state.optionBDemo?.autoReplenishEnabled ? 'ON' : 'OFF'}).`);
+  } catch (error) {
+    if (error?.status === 403) {
+      state.ownerControlsAllowed = false;
+    }
+    state.aiIssue = error instanceof Error ? error.message : 'Option B replenish update failed.';
+    announce(state.aiIssue);
+    await readOptionBDemo();
+    syncOptionBDemoDom(focusSelector);
+  }
+}
+
+async function submitParallelTiersMutation(payload, focusSelector = null) {
+  if (!state.liveStreamConnected) return;
+  if (!isStrictOwnerCompoundingSession()) {
+    requireOwnerControlOrWarn('Parallel Tiers DEMO replenishment');
+    return;
+  }
+  try {
+    const res = await postLoopbackJson('/api/parallel-tiers', payload);
+    if (res?.snapshot) {
+      state.parallelTiers = normalizeParallelTiers(res.snapshot);
+    }
+    state.aiIssue = null;
+    rerenderAnalyticsInPlace(focusSelector);
+    announce(payload?.action === 'REPLENISH_ALL_TIERS'
+      ? 'All flat parallel DEMO tiers replenished back to 100% starting capital.'
+      : `Parallel tiers auto-replenish updated (${state.parallelTiers?.autoReplenishEnabled ? 'ON' : 'OFF'}).`);
+  } catch (error) {
+    if (error?.status === 403) {
+      state.ownerControlsAllowed = false;
+    }
+    state.aiIssue = error instanceof Error ? error.message : 'Parallel tiers replenish update failed.';
+    announce(state.aiIssue);
+    try {
+      const rawTiers = await readStatic(new URL('/api/parallel-tiers', window.location.origin), MAX_TREASURY_BYTES);
+      state.parallelTiers = normalizeParallelTiers(parseUniqueJSON(rawTiers, MAX_TREASURY_BYTES));
+    } catch { /* Keep previous parallel tiers snapshot. */ }
+    rerenderAnalyticsInPlace(focusSelector);
+  }
 }
 
 async function readDemoHighGrowth() {
@@ -1601,6 +1664,37 @@ root.addEventListener('click', (event) => {
         announce(notice);
       }
     })();
+    return;
+  }
+  if (target.dataset.obAction === 'REPLENISH_DEMO_CAPITAL') {
+    void submitOptionBDemoMutation(
+      { action: 'REPLENISH_DEMO_CAPITAL', reason: 'Owner cockpit replenish' },
+      '[data-ob-action="REPLENISH_DEMO_CAPITAL"]',
+    );
+    return;
+  }
+  if (target.dataset.obAction === 'TOGGLE_AUTO_REPLENISH') {
+    const curOb = resolveCockpitOptionBDemo(state);
+    void submitOptionBDemoMutation(
+      { action: 'SET_AUTO_REPLENISH', enabled: !(curOb.autoReplenishEnabled !== false) },
+      '[data-ob-action="TOGGLE_AUTO_REPLENISH"]',
+    );
+    return;
+  }
+  if (target.dataset.ptAction === 'REPLENISH_ALL_TIERS') {
+    void submitParallelTiersMutation(
+      { action: 'REPLENISH_ALL_TIERS', reason: 'Owner cockpit replenish all tiers' },
+      '[data-pt-action="REPLENISH_ALL_TIERS"]',
+    );
+    return;
+  }
+  if (target.dataset.ptAction === 'TOGGLE_AUTO_REPLENISH') {
+    const curPt = state.parallelTiers ?? null;
+    const nextPtAuto = !(curPt?.autoReplenishEnabled !== false);
+    void submitParallelTiersMutation(
+      { action: 'SET_AUTO_REPLENISH', enabled: nextPtAuto },
+      '[data-pt-action="TOGGLE_AUTO_REPLENISH"]',
+    );
     return;
   }
   if (target.dataset.dhgAction === 'TOGGLE_ENABLED') {
