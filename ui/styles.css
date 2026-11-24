@@ -2674,3 +2674,14 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
 .dhg-label { font-size: 10px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; }
 .dhg-val { font-size: 14px; font-weight: 800; color: #f8fafc; }
 .dhg-sub { font-size: 11px; color: #94a3b8; }
+
+/* PR #46 / Update 47: DEMO Auto-Replenish Controls (Strict CSP, Dark Obsidian) */
+.ob-action-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.ob-btn { cursor: pointer; font-size: 11px; font-weight: 700; padding: 6px 12px; border-radius: 5px; border: 1px solid #334155; background: #1e293b; color: #f8fafc; }
+.ob-btn-primary { background: #0369a1; border-color: #38bdf8; color: #f8fafc; }
+.ob-btn-active { background: #064e3b; border-color: #10b981; color: #a7f3d0; }
+.ob-btn-muted { background: #1f2937; border-color: #475569; color: #cbd5e1; }
+.ob-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.pt-replenish-bar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 12px; margin: 10px 0 12px; background: #0f172a; border: 1px solid #1e293b; border-radius: 6px; }
+.pt-replenish-meta { font-size: 12px; font-weight: 600; color: #e2e8f0; }
+.pt-replenish-actions { display: flex; flex-wrap: wrap; gap: 8px; }

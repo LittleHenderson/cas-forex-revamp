@@ -132,6 +132,8 @@ __all__ = [
     "DEFAULT_MAX_QUOTE_AGE_SECONDS",
     "DEFAULT_MAX_QUOTE_FUTURE_SKEW_SECONDS",
     "DEFAULT_PAPER_STARTING_EQUITY_USD",
+    "DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE",
+    "DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS",
     "ENV_LIVE_ARM_PHRASE",
     "ENV_TRADOVATE_ACCOUNT_ID",
     "ENV_TRADOVATE_ACCOUNT_SPEC",
@@ -238,6 +240,8 @@ CONNECTION_STATUS_STANDBY = "STANDBY_DORMANT"
 
 VALVE_ADMISSIBILITY_CUTOFF = Decimal("0.55")
 DEFAULT_PAPER_STARTING_EQUITY_USD = Decimal("5000.00")
+DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE = "DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE"
+DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS = "DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS"
 GENESIS_AUDIT_SHA256 = "0" * 64
 
 def _tradovate_env_var(*parts: str) -> str:
@@ -3859,6 +3863,50 @@ class TradovateMicroFuturesPaperEmulator:
                     )
                 )
         return tuple(receipts)
+
+    def replenish_demo_capital(
+        self,
+        target_balance_usd: Decimal,
+        *,
+        reason: str = "DEMO_CAPITAL_REPLENISHED",
+        now_utc: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Restore flat DEMO paper balance & peak equity to target_balance_usd without deleting history."""
+        now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
+        clean_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "DEMO_CAPITAL_REPLENISHED"
+        with self._lock:
+            self._require_connected()
+            if self._mode != TRADOVATE_MODE_DEMO:
+                raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
+            if self._positions:
+                raise ContractError(DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS)
+            target = _q2(_exact_decimal(target_balance_usd, "target_balance_usd", positive=True))
+            prev_bal = _q2(self._balance_usd)
+            prev_peak = _q2(self._peak_equity_usd)
+            added = _q2(target - prev_bal)
+            if added <= Decimal("0.00"):
+                return {
+                    "replenished": False,
+                    "added_usd": "0.00",
+                    "previous_balance_usd": decimal_text(prev_bal),
+                    "new_balance_usd": decimal_text(prev_bal),
+                    "previous_peak_equity_usd": decimal_text(prev_peak),
+                    "new_peak_equity_usd": decimal_text(prev_peak),
+                    "reason": clean_reason,
+                    "observed_at": _iso_utc(now),
+                }
+            self._balance_usd = target
+            self._peak_equity_usd = target
+            return {
+                "replenished": True,
+                "added_usd": decimal_text(added),
+                "previous_balance_usd": decimal_text(prev_bal),
+                "new_balance_usd": decimal_text(target),
+                "previous_peak_equity_usd": decimal_text(prev_peak),
+                "new_peak_equity_usd": decimal_text(target),
+                "reason": clean_reason,
+                "observed_at": _iso_utc(now),
+            }
 
     @property
     def submitted_oso_payloads(self) -> tuple[dict[str, Any], ...]:
@@ -7548,6 +7596,57 @@ class TradovateMicroFuturesVenue:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
                 raise
+
+    def replenish_demo_capital(
+        self,
+        target_balance_usd: Decimal,
+        *,
+        reason: str = "DEMO_CAPITAL_REPLENISHED",
+        execution_mode: str = TRADOVATE_MODE_DEMO,
+        live_trading_armed: bool = False,
+        now_utc: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Replenish DEMO paper balance & re-anchor venue peak equity with hash-chained audit trail."""
+        now = self._clock() if now_utc is None else utc_time(now_utc, "now_utc")
+        if type(live_trading_armed) is not bool:
+            raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
+        norm_exec_mode = str(execution_mode).strip().upper()
+        if self._mode != TRADOVATE_MODE_DEMO or norm_exec_mode != TRADOVATE_MODE_DEMO or live_trading_armed:
+            raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
+        if not isinstance(self._transport, TradovateMicroFuturesPaperEmulator):
+            raise ContractError("DEMO_REPLENISH_REQUIRES_PAPER_EMULATOR")
+        clean_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "DEMO_CAPITAL_REPLENISHED"
+        with self._lock:
+            if not self._transport.is_connected():
+                raise TradovateTransportError("Tradovate paper emulator is disconnected")
+            if self._transport.positions():
+                raise ContractError(DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS)
+            res = self._transport.replenish_demo_capital(
+                target_balance_usd,
+                reason=clean_reason,
+                now_utc=now,
+            )
+            if res["replenished"]:
+                ts_str = _iso_utc(now)
+                with closing(self._connect_rw()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        conn.execute(
+                            "UPDATE venue_meta SET peak_equity_usd = ?, updated_at = ? WHERE id = 1",
+                            (str(res["new_peak_equity_usd"]), ts_str),
+                        )
+                        self._append_audit_unlocked(
+                            conn,
+                            event_type="DEMO_CAPITAL_REPLENISHED",
+                            entity_id=self._authorized_account_id(),
+                            payload=res,
+                            occurred_at=now,
+                        )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        conn.execute("ROLLBACK")
+                        raise
+            return res
 
     # -- Strictly 0-Write Read-Only Snapshot & SHA-256 Audit Chain Verification --
 

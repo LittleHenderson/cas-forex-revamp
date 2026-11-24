@@ -57,6 +57,18 @@
           "$ref": "#/$defs/parallelTiersDialSummary"
         }
       ]
+    },
+    "auto_replenish_enabled": {
+      "type": "boolean"
+    },
+    "auto_replenish_floor_pct": {
+      "$ref": "#/$defs/decimal"
+    },
+    "total_replenishment_count": {
+      "$ref": "#/$defs/nonNegativeInt"
+    },
+    "total_cumulative_replenished_usd": {
+      "$ref": "#/$defs/decimal"
     }
   },
   "$defs": {
@@ -227,6 +239,25 @@
               "$ref": "#/$defs/tierAggressionDial"
             }
           ]
+        },
+        "replenishment_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "cumulative_replenished_usd": {
+          "$ref": "#/$defs/decimal"
+        },
+        "last_replenished_at": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/timestamp"
+            }
+          ]
+        },
+        "auto_replenish_floor_usd": {
+          "$ref": "#/$defs/decimal"
         }
       }
     },

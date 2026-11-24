@@ -124,7 +124,7 @@ from cas_forex_revamp.composition.trend_regime import (
     evaluate_cross_market_offset_guard,
     evaluate_house_money_pyramid_leg,
 )
-from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
+from cas_forex_revamp.venue.dual_shield_router import BROKER_HUGOSWAY_MT5, DualShieldBrokerRouter
 from cas_forex_revamp.venue.live_auth_ticket import LiveAuthorizationError
 from cas_forex_revamp.venue.live_market_stream import EXPANDED_MARKETS, INDEX_INSTRUMENTS
 from cas_forex_revamp.venue.mt5_broker_bridge import (
@@ -156,6 +156,10 @@ CAPITAL_STATUS_RECOVERY_MODE = "RECOVERY_MODE"
 CAPITAL_STATUS_AT_PRINCIPAL = "AT_PRINCIPAL"
 CAPITAL_STATUS_IN_SURPLUS = "IN_SURPLUS"
 DEFAULT_DEMO_3BROKER_CAPITAL_USD = Decimal("300000.00")
+DEFAULT_DEMO_PER_BROKER_CAPITAL_USD = Decimal("100000.00")
+DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE = "DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE"
+DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS = "DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS"
+DEFAULT_DEMO_BASELINE_REANCHOR_FLOOR_PCT = Decimal("0.70")
 DEFAULT_STARTUP_VAULT_RETRY_COOLDOWN_SECONDS = 5.0
 DEFAULT_AI_INFERENCE_COOLDOWN_SECONDS = 0.0
 DEFAULT_LIVE_AI_INFERENCE_COOLDOWN_SECONDS = 60.0
@@ -190,6 +194,66 @@ COMPOUNDING_BROKER_LABELS: tuple[str, ...] = ("Hugo's Way", "LHFX", "OANDA")
 _PHASE8_SUPPORTED_BROKERS: frozenset[str] = frozenset(
     {"HUGOSWAY_MT5", "LHFX_MT5", "OANDA", "OANDA_PRACTICE", "OANDA_LIVE"}
 )
+
+
+def _normalize_demo_replenish_floor_ratio(raw: object) -> tuple[Decimal, Decimal]:
+    """Normalize replenishment floor into (ratio in [0.10, 0.99], display_pct in [10.00, 99.00])."""
+    if isinstance(raw, bool):
+        raise ContractError("demo_auto_replenish_floor_pct must not be bool")
+    try:
+        dec = Decimal(str(raw).strip()) if not isinstance(raw, Decimal) else raw
+    except (InvalidOperation, ValueError) as exc:
+        raise ContractError("demo_auto_replenish_floor_pct must be a finite decimal") from exc
+    if not dec.is_finite() or dec <= Decimal("0"):
+        raise ContractError("demo_auto_replenish_floor_pct must be positive")
+    if Decimal("0.10") <= dec <= Decimal("0.99"):
+        return dec.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP), (
+            dec * Decimal("100")
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if Decimal("10.00") <= dec <= Decimal("99.00"):
+        return (dec / Decimal("100")).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP), (
+            dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        )
+    raise ContractError(
+        "demo_auto_replenish_floor_pct must be between 0.10 and 0.99 (or 10.00 and 99.00 percent)"
+    )
+
+
+class _DemoBaselineRearmVerifier:
+    """Scoped verifier permitting PeakEquityStore re-arm ONLY for verified DEMO baseline re-anchor."""
+
+    def __init__(
+        self,
+        *,
+        expected_scope_id: str,
+        expected_request_id: str,
+        expected_peak: Decimal,
+        execution_mode: str,
+        live_trading_armed: bool,
+    ) -> None:
+        self._scope_id = expected_scope_id
+        self._request_id = expected_request_id
+        self._peak = expected_peak
+        self._execution_mode = str(execution_mode or "").strip().upper()
+        self._live_armed = bool(live_trading_armed)
+
+    def verify_drawdown_rearm(
+        self,
+        *,
+        scope_id: str,
+        request_id: str,
+        new_peak_equity: Decimal,
+        now: datetime,
+    ) -> bool:
+        del now
+        if self._execution_mode != "DEMO" or self._live_armed:
+            return False
+        return (
+            scope_id == self._scope_id
+            and request_id == self._request_id
+            and request_id.startswith("DEMO_CAPITAL_REPLENISHED_")
+            and Decimal(new_peak_equity) == self._peak
+        )
 
 
 def _enrich_milestone_dict(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -697,6 +761,8 @@ class AutonomousAiTrader:
         phase8_bridge: Phase8LiveTradingBridge | None = None,
         demo_high_growth: DemoHighGrowthProfile | None = None,
         option_b_demo: Any | None = None,
+        demo_auto_replenish_enabled: bool | None = None,
+        demo_auto_replenish_floor_pct: Decimal | str | int = DEFAULT_DEMO_BASELINE_REANCHOR_FLOOR_PCT,
         state_dir: str | Path | None = None,
     ) -> None:
         if not isinstance(router, DualShieldBrokerRouter):
@@ -755,6 +821,25 @@ class AutonomousAiTrader:
                     live_trading_armed=is_live_armed,
                     live_trading_locked=not is_live_armed,
                 )
+        if demo_auto_replenish_enabled is not None and type(demo_auto_replenish_enabled) is not bool:
+            raise ContractError("demo_auto_replenish_enabled must be bool or None")
+        demo_floor_ratio, demo_floor_pct = _normalize_demo_replenish_floor_ratio(
+            demo_auto_replenish_floor_pct
+        )
+        is_demo_exec = str(router.execution_mode).strip().upper() == "DEMO" and not is_live_armed
+        if not is_demo_exec and demo_auto_replenish_enabled is True:
+            raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
+        self._demo_auto_replenish_enabled: bool = (
+            (True if demo_auto_replenish_enabled is None else demo_auto_replenish_enabled)
+            if is_demo_exec
+            else False
+        )
+        self._demo_auto_replenish_floor_ratio: Decimal = demo_floor_ratio
+        self._demo_auto_replenish_floor_pct: Decimal = demo_floor_pct
+        self._demo_baseline_reanchor_count: int = 0
+        self._last_demo_reanchored_at: str | None = None
+        self._demo_reanchored_baseline_usd: Decimal | None = None
+        self._excluded_offline_demo_brokers: tuple[str, ...] = ()
         self._demo_high_growth: DemoHighGrowthProfile = init_dhg
         self._option_b_demo: Any | None = option_b_demo
         self._symbol_loss_cooldown_until: dict[str, datetime] = {}
@@ -981,6 +1066,206 @@ class AutonomousAiTrader:
     def demo_high_growth_snapshot(self) -> dict[str, Any]:
         with self._lock:
             return self._demo_high_growth.to_wire_dict()
+
+    def _router_open_positions_count_unlocked(self) -> int:
+        open_cnt = len(self._open_position_meta)
+        venues_map = getattr(self._router, "venues", None)
+        if isinstance(venues_map, Mapping):
+            for venue in venues_map.values():
+                if isinstance(venue, Mt5PaperBrokerVenue):
+                    open_cnt += len(venue.positions)
+                elif isinstance(venue, OandaPracticeFallbackVenue):
+                    if isinstance(venue.summary, Mapping):
+                        try:
+                            raw_oa_cnt = venue.summary.get(
+                                "openTradeCount",
+                                venue.summary.get("openPositionCount", 0),
+                            )
+                            open_cnt += int(raw_oa_cnt or 0)
+                        except (TypeError, ValueError) as exc_oa_cnt:
+                            logger.debug("oanda open count parse skipped: %s", type(exc_oa_cnt).__name__)
+        return open_cnt
+
+    def _reanchor_demo_baseline_unlocked(
+        self,
+        *,
+        reason: str,
+        trigger: str,
+        now: datetime,
+    ) -> dict[str, Any]:
+        if str(self._router.execution_mode).strip().upper() != "DEMO" or bool(
+            getattr(self._router, "_live_armed", False)
+        ):
+            raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
+        open_cnt = self._router_open_positions_count_unlocked()
+        if open_cnt > 0:
+            raise ContractError(f"{DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS}: {open_cnt} open")
+        eq_bundle = self._router_equity_bundle_unlocked()
+        online_eq = Decimal(eq_bundle["online_total_eq"]).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        total_eq = Decimal(eq_bundle["total_eq"]).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        target_eq = online_eq if online_eq > Decimal("0.00") else total_eq
+        if target_eq <= Decimal("0.00"):
+            raise ContractError("DEMO_BASELINE_REANCHOR_REQUIRES_POSITIVE_ONLINE_EQUITY")
+        prev_peak = Decimal(eq_bundle["eff_dd_peak"]).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        main_scope = str(getattr(self._router, "_drawdown_scope_id", "dual-shield-barbell") or "dual-shield-barbell")
+        eff_scope = str(eq_bundle.get("eff_dd_scope") or main_scope)
+        next_cnt = self._demo_baseline_reanchor_count + 1
+        ts_iso = _iso(now)
+
+        stores: list[Any] = [self._peak_store]
+        router_pk_store = getattr(self._router, "_peak_store", None)
+        if router_pk_store is not None and router_pk_store is not self._peak_store:
+            stores.append(router_pk_store)
+        scopes: list[str] = [eff_scope]
+        if main_scope != eff_scope:
+            scopes.append(main_scope)
+        for st_obj in stores:
+            if not callable(getattr(st_obj, "rearm_after_drawdown", None)):
+                continue
+            for idx_sc, sc_id in enumerate(scopes):
+                req_id = f"DEMO_CAPITAL_REPLENISHED_{next_cnt}_{idx_sc}"
+                st_obj.rearm_after_drawdown(
+                    sc_id,
+                    new_peak_equity=target_eq,
+                    owner_verifier=_DemoBaselineRearmVerifier(
+                        expected_scope_id=sc_id,
+                        expected_request_id=req_id,
+                        expected_peak=target_eq,
+                        execution_mode=str(self._router.execution_mode),
+                        live_trading_armed=bool(getattr(self._router, "_live_armed", False)),
+                    ),
+                    owner_request_id=req_id,
+                    now=now,
+                )
+        self._router._initial_peak_equity = target_eq
+        self._cold_offline_baseline_eq.clear()
+        self._last_drawdown_pct = Decimal("0")
+        self._symbol_loss_cooldown_until.clear()
+
+        if hasattr(self._quota, "peek_snapshot"):
+            q_snap = self._quota.peek_snapshot(now=now)
+            if str(q_snap.get("status", "")) in (QUOTA_STATUS_LOCKED, QUOTA_STATUS_LOSS_TRIPPED):
+                q_req = f"DEMO_CAPITAL_REPLENISHED_Q_{next_cnt}"
+                tok = f"demo-reanchor-{next_cnt}-{int(now.timestamp())}"
+                self._quota.unlock_session(
+                    owner_request_id=q_req,
+                    reason=f"DEMO_CAPITAL_REPLENISHED:{trigger}:{reason}",
+                    recovery_verifier=lambda sc, rid, tkn, _n: (
+                        sc == "UNLOCK_QUOTA_SESSION" and rid == q_req and tkn == tok
+                    ),
+                    recovery_token=tok,
+                    now=now,
+                )
+
+        self._demo_baseline_reanchor_count = next_cnt
+        self._last_demo_reanchored_at = ts_iso
+        self._demo_reanchored_baseline_usd = target_eq
+        self._recent_actions.appendleft(
+            {
+                "observed_at": ts_iso,
+                "kind": "DEMO_CAPITAL_REPLENISHED",
+                "symbol": None,
+                "detail": (
+                    f"[{trigger}] DEMO baseline re-anchored: {decimal_text(prev_peak)} -> "
+                    f"{decimal_text(target_eq)} USD ({reason})"
+                )[:512],
+            }
+        )
+        return {
+            "reanchored": True,
+            "trigger": trigger,
+            "reason": reason,
+            "previous_peak_equity_usd": decimal_text(prev_peak),
+            "new_baseline_equity_usd": decimal_text(target_eq),
+            "reanchor_count": next_cnt,
+            "observed_at": ts_iso,
+        }
+
+    def _maybe_reanchor_demo_baseline_unlocked(
+        self,
+        *,
+        online_eq: Decimal,
+        eff_eq: Decimal,
+        eff_peak: Decimal,
+        eff_scope: str,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        del eff_scope
+        if not self._demo_auto_replenish_enabled:
+            return None
+        if eff_eq <= Decimal("0") or eff_peak <= Decimal("0"):
+            return None
+        floor_usd = (eff_peak * self._demo_auto_replenish_floor_ratio).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        if eff_eq > floor_usd:
+            return None
+        if self._router_open_positions_count_unlocked() > 0:
+            return None
+        return self._reanchor_demo_baseline_unlocked(
+            reason=f"AUTO_FLOOR_{self._demo_auto_replenish_floor_pct:.2f}PCT",
+            trigger="AUTO_BASELINE_REANCHOR",
+            now=now,
+        )
+
+    def reanchor_demo_baseline(
+        self,
+        *,
+        reason: str = "OWNER_DEMO_BASELINE_REANCHOR",
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Re-anchor DEMO drawdown peak/baseline to current online broker equity (strictly forbidden in LIVE)."""
+        if str(self._router.execution_mode).strip().upper() != "DEMO" or bool(
+            getattr(self._router, "_live_armed", False)
+        ):
+            raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
+        ts = self._now(now)
+        clean_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "OWNER_DEMO_BASELINE_REANCHOR"
+        with self._lock:
+            return self._reanchor_demo_baseline_unlocked(
+                reason=clean_reason,
+                trigger="OWNER_REANCHOR",
+                now=ts,
+            )
+
+    def set_demo_auto_replenish(
+        self,
+        *,
+        enabled: bool,
+        floor_pct: Decimal | str | int | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Enable/disable DEMO baseline auto-reanchor and trigger immediate check if enabled and flat."""
+        if type(enabled) is not bool:
+            raise ContractError("enabled must be a strict bool")
+        if str(self._router.execution_mode).strip().upper() != "DEMO" or bool(
+            getattr(self._router, "_live_armed", False)
+        ):
+            raise ContractError(DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE)
+        ts = self._now(now)
+        with self._lock:
+            if floor_pct is not None:
+                ratio, pct = _normalize_demo_replenish_floor_ratio(floor_pct)
+                self._demo_auto_replenish_floor_ratio = ratio
+                self._demo_auto_replenish_floor_pct = pct
+            self._demo_auto_replenish_enabled = enabled
+            reanchor_ev: dict[str, Any] | None = None
+            if enabled:
+                eq_bundle = self._router_equity_bundle_unlocked()
+                reanchor_ev = self._maybe_reanchor_demo_baseline_unlocked(
+                    online_eq=eq_bundle["online_total_eq"],
+                    eff_eq=eq_bundle["eff_dd_eq"],
+                    eff_peak=eq_bundle["eff_dd_peak"],
+                    eff_scope=str(eq_bundle.get("eff_dd_scope") or ""),
+                    now=ts,
+                )
+            return {
+                "ok": True,
+                "demo_auto_replenish_enabled": bool(self._demo_auto_replenish_enabled),
+                "demo_auto_replenish_floor_pct": f"{self._demo_auto_replenish_floor_pct:.2f}",
+                "reanchor_event": reanchor_ev,
+                "observed_at": _iso(ts),
+            }
 
     def _effective_stop_risk_ceiling_pct(self) -> Decimal:
         with self._lock:
@@ -2887,6 +3172,8 @@ class AutonomousAiTrader:
         v_snap: Mapping[str, Any] | None = None,
         *,
         allow_vault_io: bool = True,
+        equities: Mapping[str, Decimal] | None = None,
+        offline_brokers: Sequence[str] | None = None,
     ) -> Decimal | None:
         if self._profit_vault is not None:
             if v_snap is not None and v_snap.get("initial_capital_usd") not in (None, ""):
@@ -2913,13 +3200,58 @@ class AutonomousAiTrader:
                     return parsed_cap.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             except (ValueError, ArithmeticError):
                 pass
-        configured_count = sum(
-            1
-            for b_id in self._router.priority_order
-            if self._router.is_configured(b_id) or b_id in self._router.venues
-        )
-        if self._router.execution_mode == "DEMO" and configured_count == 3:
-            return DEFAULT_DEMO_3BROKER_CAPITAL_USD
+        if self._router.execution_mode == "DEMO":
+            configured_brokers = [
+                b_id
+                for b_id in self._router.priority_order
+                if self._router.is_configured(b_id) or b_id in self._router.venues
+            ]
+            status_map = getattr(self._router, "_status", {}) or {}
+            off_set: set[str] = set(offline_brokers or ())
+            for b_id, st in status_map.items():
+                if st in ("BROKER_OFFLINE", "FAILED", "NOT_CONFIGURED", "SNAPSHOT_UNVERIFIED"):
+                    off_set.add(b_id)
+            if offline_brokers is None and callable(getattr(self._router, "is_broker_offline", None)):
+                for b_id in configured_brokers:
+                    if self._router.is_broker_offline(b_id):
+                        off_set.add(b_id)
+            eq_map: Mapping[str, Decimal] = equities or getattr(self._router, "_last_equity", {}) or {}
+            attestations = getattr(self._router, "_attestations", {}) or {}
+            if (
+                BROKER_HUGOSWAY_MT5 in configured_brokers
+                and BROKER_HUGOSWAY_MT5 in eq_map
+                and eq_map.get(BROKER_HUGOSWAY_MT5, Decimal("0")) <= Decimal("0")
+                and BROKER_HUGOSWAY_MT5 not in attestations
+            ):
+                off_set.add(BROKER_HUGOSWAY_MT5)
+            excluded: list[str] = []
+            if BROKER_HUGOSWAY_MT5 not in configured_brokers or BROKER_HUGOSWAY_MT5 in off_set:
+                active_demo = [
+                    b_id
+                    for b_id in configured_brokers
+                    if b_id != BROKER_HUGOSWAY_MT5 and b_id not in off_set
+                ]
+                if BROKER_HUGOSWAY_MT5 in configured_brokers and BROKER_HUGOSWAY_MT5 in off_set:
+                    excluded.append(BROKER_HUGOSWAY_MT5)
+                if active_demo:
+                    online_eq_sum = sum(
+                        (Decimal(eq_map.get(b_id, Decimal("0"))) for b_id in active_demo),
+                        Decimal("0.00"),
+                    )
+                    if (
+                        excluded
+                        or (
+                            len(active_demo) == 2
+                            and (not eq_map or online_eq_sum >= Decimal("25000.00"))
+                        )
+                    ):
+                        self._excluded_offline_demo_brokers = tuple(excluded)
+                        return (
+                            DEFAULT_DEMO_PER_BROKER_CAPITAL_USD * Decimal(len(active_demo))
+                        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            self._excluded_offline_demo_brokers = tuple(excluded)
+            if len(configured_brokers) == 3 and BROKER_HUGOSWAY_MT5 not in off_set:
+                return DEFAULT_DEMO_3BROKER_CAPITAL_USD
         if self._router.execution_mode == "LIVE":
             if self._router._initial_peak_equity is not None and self._router._initial_peak_equity > Decimal("0"):
                 return self._router._initial_peak_equity.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -2963,12 +3295,22 @@ class AutonomousAiTrader:
             if equities is not None
             else (self._router.equities() if offline_ids else {})
         )
+        eff_init_cap = self._resolve_initial_capital_usd(
+            v_data,
+            allow_vault_io=False,
+            equities=eq_lookup,
+            offline_brokers=offline_ids,
+        )
+        excluded_offline = set(self._excluded_offline_demo_brokers)
         cold_unknown = tuple(
-            sorted(b for b in offline_ids if eq_lookup.get(b, Decimal("0")) <= Decimal("0"))
+            sorted(
+                b
+                for b in offline_ids
+                if b not in excluded_offline and eq_lookup.get(b, Decimal("0")) <= Decimal("0")
+            )
         )
         if not cold_unknown and self._cold_offline_baseline_eq:
             self._cold_offline_baseline_eq.clear()
-        eff_init_cap = self._resolve_initial_capital_usd(v_data, allow_vault_io=False)
         eq_q = total_eq.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         economic_eq = (eq_q + settled_disbursed_usd).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         if eff_init_cap is not None:
@@ -3442,6 +3784,25 @@ class AutonomousAiTrader:
             online_total_eq_cyc = eq_bundle_cyc["online_total_eq"]
             eff_dd_eq_cyc = eq_bundle_cyc["eff_dd_eq"]
             peak_eq = eq_bundle_cyc["eff_dd_peak"]
+            if (
+                self._demo_auto_replenish_enabled
+                and self._router.execution_mode == "DEMO"
+                and not bool(getattr(self._router, "_live_armed", False))
+            ):
+                reanchored_cyc = self._maybe_reanchor_demo_baseline_unlocked(
+                    online_eq=online_total_eq_cyc,
+                    eff_eq=eff_dd_eq_cyc,
+                    eff_peak=peak_eq,
+                    eff_scope=str(eq_bundle_cyc.get("eff_dd_scope") or ""),
+                    now=ts,
+                )
+                if reanchored_cyc is not None:
+                    eq_bundle_cyc = self._router_equity_bundle_unlocked()
+                    equities = eq_bundle_cyc["equities"]
+                    total_eq = eq_bundle_cyc["total_eq"]
+                    online_total_eq_cyc = eq_bundle_cyc["online_total_eq"]
+                    eff_dd_eq_cyc = eq_bundle_cyc["eff_dd_eq"]
+                    peak_eq = eq_bundle_cyc["eff_dd_peak"]
             ps_cyc = self._principal_surplus_metrics(
                 total_eq,
                 v_snap=v_snap_cyc,
@@ -5482,6 +5843,16 @@ class AutonomousAiTrader:
                 "offline_broker_notice": offline_notice_snap,
                 "online_equity_usd": decimal_text(online_eq_q_snap),
                 "equity_incomplete_brokers_offline": len(offline_ids_snap) > 0,
+                "excluded_offline_demo_brokers": list(self._excluded_offline_demo_brokers),
+                "demo_auto_replenish_enabled": bool(self._demo_auto_replenish_enabled),
+                "demo_auto_replenish_floor_pct": f"{self._demo_auto_replenish_floor_pct:.2f}",
+                "demo_baseline_reanchor_count": int(self._demo_baseline_reanchor_count),
+                "last_demo_reanchored_at": self._last_demo_reanchored_at,
+                "demo_reanchored_baseline_usd": (
+                    decimal_text(self._demo_reanchored_baseline_usd)
+                    if self._demo_reanchored_baseline_usd is not None
+                    else None
+                ),
             }
             cat_snap = self._registry.catalog_snapshot()
             payload = {
