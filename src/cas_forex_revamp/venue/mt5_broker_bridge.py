@@ -170,6 +170,10 @@ __all__ = [
     "verify_spool_path_custody",
     "verify_spool_valve_admission",
     "ENV_INDEX_CONTRACT_SIZE",
+    "ENV_SPX500_CONTRACT_SIZE",
+    "ENV_NAS100_CONTRACT_SIZE",
+    "ENV_US30_CONTRACT_SIZE",
+    "MT5_SPX500_CONTRACT_SIZE_MULTI",
     "ENV_INDEX_LEVERAGE",
     "EXPANDED_MARKETS",
     "INDEX_INSTRUMENTS",
@@ -201,6 +205,7 @@ MT5_SPOOL_PROTOCOL = "cas-forex-mt5-spool/2"
 STATUS_BROKER_OFFLINE = "BROKER_OFFLINE"
 MT5_CONTRACT_SIZE = Decimal("100000")
 MT5_INDEX_CONTRACT_SIZE = Decimal("1")
+MT5_SPX500_CONTRACT_SIZE_MULTI = Decimal("100")
 MT5_GOLD_CONTRACT_SIZE = Decimal("100")
 MT5_VOLUME_STEP = Decimal("0.01")
 MT5_MIN_VOLUME = Decimal("0.01")
@@ -209,6 +214,9 @@ MAX_DEMO_LEVERAGE = 500
 DEFAULT_MT5_INDEX_LEVERAGE = 200
 ENV_INDEX_LEVERAGE = "CAS_FOREX_INDEX_LEVERAGE"
 ENV_INDEX_CONTRACT_SIZE = "CAS_FOREX_INDEX_CONTRACT_SIZE"
+ENV_SPX500_CONTRACT_SIZE = "CAS_FOREX_SPX500_CONTRACT_SIZE"
+ENV_NAS100_CONTRACT_SIZE = "CAS_FOREX_NAS100_CONTRACT_SIZE"
+ENV_US30_CONTRACT_SIZE = "CAS_FOREX_US30_CONTRACT_SIZE"
 DEFAULT_WINDOWS_PORTABLE_SPOOL_DIR = Path(r"D:\MetaTrader5\cas_forex_spool")
 _INDEX_SYMBOL_ALIASES: dict[str, str] = {
     "NAS100": "NAS100",
@@ -2057,6 +2065,7 @@ class Mt5MarginCalculator:
         index_leverage: int = DEFAULT_MT5_INDEX_LEVERAGE,
         index_contract_size: Decimal = MT5_INDEX_CONTRACT_SIZE,
         gold_contract_size: Decimal = MT5_GOLD_CONTRACT_SIZE,
+        symbol_contract_sizes: Mapping[str, Decimal] | None = None,
     ) -> None:
         if type(leverage) is not int or not (1 <= leverage <= MAX_DEMO_LEVERAGE):
             raise ContractError(f"leverage must be an integer in 1..{MAX_DEMO_LEVERAGE}")
@@ -2070,6 +2079,18 @@ class Mt5MarginCalculator:
         self.contract_size = decimal_value(contract_size, "contract_size", positive=True)
         self.index_contract_size = decimal_value(index_contract_size, "index_contract_size", positive=True)
         self.gold_contract_size = decimal_value(gold_contract_size, "gold_contract_size", positive=True)
+        parsed_overrides: dict[str, Decimal] = {}
+        if symbol_contract_sizes is not None:
+            if not isinstance(symbol_contract_sizes, Mapping):
+                raise ContractError("symbol_contract_sizes must be a mapping when provided")
+            for raw_sym, raw_val in symbol_contract_sizes.items():
+                sym_name = normalize_market_symbol(str(raw_sym)) or str(raw_sym).strip().upper()
+                if not sym_name:
+                    raise ContractError("symbol_contract_sizes symbol name cannot be empty")
+                parsed_overrides[sym_name] = decimal_value(
+                    raw_val, f"symbol_contract_sizes[{sym_name}]", positive=True
+                )
+        self.symbol_contract_sizes: dict[str, Decimal] = parsed_overrides
 
     @staticmethod
     def split_symbol(symbol: str) -> tuple[str, str]:
@@ -2082,9 +2103,17 @@ class Mt5MarginCalculator:
         raise ContractError(f"unsupported MT5 symbol {symbol!r}; expected one of the {len(EXPANDED_MARKETS)} EXPANDED_MARKETS")
 
     def contract_size_for(self, symbol: str | None) -> Decimal:
-        if symbol == "XAUUSD":
+        norm_sym = normalize_market_symbol(symbol) if isinstance(symbol, str) else None
+        lookup_sym = norm_sym or (symbol.strip().upper() if isinstance(symbol, str) else "")
+        if lookup_sym and lookup_sym in self.symbol_contract_sizes:
+            return self.symbol_contract_sizes[lookup_sym]
+        if lookup_sym == "XAUUSD" or symbol == "XAUUSD":
             return self.gold_contract_size
-        return self.index_contract_size if symbol in INDEX_INSTRUMENTS else self.contract_size
+        if lookup_sym == "SPX500" or symbol == "SPX500":
+            if self.index_contract_size > Decimal("1") and self.index_contract_size < MT5_SPX500_CONTRACT_SIZE_MULTI:
+                return MT5_SPX500_CONTRACT_SIZE_MULTI
+            return self.index_contract_size
+        return self.index_contract_size if lookup_sym in INDEX_INSTRUMENTS else self.contract_size
 
     def leverage_for(self, symbol: str | None) -> int:
         return self.index_leverage if symbol in INDEX_INSTRUMENTS else self.leverage
@@ -4996,6 +5025,7 @@ class Mt5PaperBrokerVenue:
                 index_leverage=self._calc.index_leverage,
                 index_contract_size=self._calc.index_contract_size,
                 gold_contract_size=self._calc.gold_contract_size,
+                symbol_contract_sizes=self._calc.symbol_contract_sizes,
             )
         applied = self._apply_account_snapshot(snap, self._transport.positions())
         self._audit.append("MT5_CONNECTED", self._clock(), {
@@ -6274,10 +6304,22 @@ class BrokerHierarchyRouter:
             if raw_idx_csize
             else MT5_INDEX_CONTRACT_SIZE
         )
+        sym_csizes: dict[str, Decimal] = {}
+        for env_sym, env_var in (
+            ("SPX500", ENV_SPX500_CONTRACT_SIZE),
+            ("NAS100", ENV_NAS100_CONTRACT_SIZE),
+            ("US30", ENV_US30_CONTRACT_SIZE),
+        ):
+            raw_sym_csize = str(self._env.get(env_var, "")).strip()
+            if raw_sym_csize:
+                sym_csizes[env_sym] = decimal_value(
+                    parse_decimal(raw_sym_csize, env_var), env_var, positive=True
+                )
         calc = Mt5MarginCalculator(
             leverage=BROKER_SPECS[broker_id].max_leverage,
             index_leverage=idx_lev,
             index_contract_size=idx_csize,
+            symbol_contract_sizes=sym_csizes or None,
         )
         return Mt5PaperBrokerVenue(
             broker_id=broker_id,

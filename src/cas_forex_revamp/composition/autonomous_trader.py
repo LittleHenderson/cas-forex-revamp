@@ -532,6 +532,9 @@ def _default_protection_params(
             (tp_dist * DEMO_HIGH_GROWTH_TP_SCALE).quantize(t_sz, rounding=ROUND_HALF_UP),
             (sl_dist * Decimal("2.20")).quantize(t_sz, rounding=ROUND_HALF_UP),
         )
+        be_trig = max(be_trig, sl_dist)
+        be_off = max(be_off, (sl_dist * Decimal("0.15")).quantize(t_sz, rounding=ROUND_HALF_UP))
+        trail_act = max(trail_act, (sl_dist * Decimal("1.50")).quantize(t_sz, rounding=ROUND_HALF_UP))
     elif risk_multiplier < Decimal("1") and risk_multiplier > Decimal("0"):
         trail_dist = max(t_sz, (trail_dist * Decimal("0.60")).quantize(t_sz, rounding=ROUND_HALF_UP))
     return {
@@ -542,6 +545,76 @@ def _default_protection_params(
         "sl_distance": sl_dist,
         "tp_distance": tp_dist,
     }
+
+
+def _resolve_position_protection_thresholds(
+    cfg: Mapping[str, Decimal],
+    *,
+    initial_sl_distance: Decimal | None,
+    tick_size: Decimal,
+    let_winners_run: bool,
+) -> dict[str, Decimal]:
+    """Scale breakeven and trailing thresholds dynamically off the position's true 1R stop distance."""
+    be_trigger = cfg["be_trigger"]
+    be_offset = cfg["be_offset"]
+    trail_activation = cfg["trail_activation"]
+    trail_distance = cfg["trail_distance"]
+    if initial_sl_distance is not None and initial_sl_distance > Decimal("0"):
+        if let_winners_run:
+            be_trigger = max(
+                be_trigger,
+                (initial_sl_distance * Decimal("1.00")).quantize(tick_size, rounding=ROUND_HALF_UP),
+            )
+            be_offset = max(
+                be_offset,
+                (initial_sl_distance * Decimal("0.15")).quantize(tick_size, rounding=ROUND_HALF_UP),
+            )
+            trail_activation = max(
+                trail_activation,
+                (initial_sl_distance * Decimal("1.50")).quantize(tick_size, rounding=ROUND_HALF_UP),
+            )
+            trail_distance = max(
+                trail_distance,
+                (initial_sl_distance * Decimal("0.75")).quantize(tick_size, rounding=ROUND_HALF_UP),
+            )
+        else:
+            be_trigger = max(
+                be_trigger,
+                (initial_sl_distance * Decimal("0.54")).quantize(tick_size, rounding=ROUND_HALF_UP),
+            )
+            trail_activation = max(
+                trail_activation,
+                (initial_sl_distance * Decimal("1.00")).quantize(tick_size, rounding=ROUND_HALF_UP),
+            )
+    return {
+        "be_trigger": be_trigger,
+        "be_offset": be_offset,
+        "trail_activation": trail_activation,
+        "trail_distance": trail_distance,
+    }
+
+
+def _parse_positive_decimal_opt(raw: Any) -> Decimal | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        dec = raw if isinstance(raw, Decimal) else Decimal(str(raw).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return dec if (dec.is_finite() and dec > Decimal("0")) else None
+
+
+def _latest_candle_high_low(candles_m1: Any) -> tuple[Decimal, Decimal] | None:
+    if not isinstance(candles_m1, Sequence) or isinstance(candles_m1, (str, bytes)) or not candles_m1:
+        return None
+    last_bar = candles_m1[-1]
+    if not isinstance(last_bar, Mapping):
+        return None
+    hi = _parse_positive_decimal_opt(last_bar.get("h") if last_bar.get("h") is not None else last_bar.get("high"))
+    lo = _parse_positive_decimal_opt(last_bar.get("l") if last_bar.get("l") is not None else last_bar.get("low"))
+    if hi is None or lo is None or hi < lo:
+        return None
+    return hi, lo
 
 
 def _compute_ema(values: list[Decimal], period: int) -> Decimal | None:
@@ -1978,14 +2051,26 @@ class AutonomousAiTrader:
                     excursion = (peak - pos.price_open) if pos.side is Side.BUY else (pos.price_open - peak)
 
                     stage = self._protection_stage.get(pos.ticket, "INITIAL_SL")
+                    prev_meta = self._open_position_meta.get(pos.ticket, {})
+                    init_sl_dist = _parse_positive_decimal_opt(prev_meta.get("initial_sl_distance"))
+                    if init_sl_dist is None and stage == "INITIAL_SL" and pos.stop_loss is not None:
+                        recon_sl = abs(pos.price_open - pos.stop_loss)
+                        if recon_sl > Decimal("0"):
+                            init_sl_dist = recon_sl
+                    eff_prot = _resolve_position_protection_thresholds(
+                        cfg,
+                        initial_sl_distance=init_sl_dist if init_sl_dist is not None else cfg["sl_distance"],
+                        tick_size=t_sz,
+                        let_winners_run=bool(self._demo_high_growth.enabled and self._demo_high_growth.let_winners_run),
+                    )
                     candidate_sl: Decimal | None = None
                     new_stage = stage
 
-                    if excursion >= cfg["be_trigger"]:
+                    if excursion >= eff_prot["be_trigger"]:
                         be_sl = (
-                            (pos.price_open + cfg["be_offset"]).quantize(t_sz, rounding=ROUND_HALF_UP)
+                            (pos.price_open + eff_prot["be_offset"]).quantize(t_sz, rounding=ROUND_HALF_UP)
                             if pos.side is Side.BUY
-                            else (pos.price_open - cfg["be_offset"]).quantize(t_sz, rounding=ROUND_HALF_UP)
+                            else (pos.price_open - eff_prot["be_offset"]).quantize(t_sz, rounding=ROUND_HALF_UP)
                         )
                         if pos.side is Side.BUY and be_sl < bid - t_sz and (pos.stop_loss is None or be_sl > pos.stop_loss):
                             candidate_sl = be_sl
@@ -1994,11 +2079,11 @@ class AutonomousAiTrader:
                             candidate_sl = be_sl
                             new_stage = "BREAKEVEN_LOCKED"
 
-                    if excursion >= cfg["trail_activation"]:
+                    if excursion >= eff_prot["trail_activation"]:
                         trail_sl = (
-                            (peak - cfg["trail_distance"]).quantize(t_sz, rounding=ROUND_HALF_UP)
+                            (peak - eff_prot["trail_distance"]).quantize(t_sz, rounding=ROUND_HALF_UP)
                             if pos.side is Side.BUY
-                            else (peak + cfg["trail_distance"]).quantize(t_sz, rounding=ROUND_HALF_UP)
+                            else (peak + eff_prot["trail_distance"]).quantize(t_sz, rounding=ROUND_HALF_UP)
                         )
                         if pos.side is Side.BUY and trail_sl < bid - t_sz:
                             floor_sl = candidate_sl if candidate_sl is not None else pos.stop_loss
@@ -2011,7 +2096,7 @@ class AutonomousAiTrader:
                                 candidate_sl = trail_sl
                                 new_stage = "TRAILING_ACTIVE"
 
-                    prev_meta = self._open_position_meta.get(pos.ticket, {})
+                    resolved_sl_dist = init_sl_dist if init_sl_dist is not None else cfg["sl_distance"]
                     self._open_position_meta[pos.ticket] = {
                         **prev_meta,
                         "ticket": pos.ticket,
@@ -2024,6 +2109,7 @@ class AutonomousAiTrader:
                         "take_profit": None if pos.take_profit is None else decimal_text(pos.take_profit),
                         "profit": decimal_text(pos.profit),
                         "protection_stage": stage,
+                        "initial_sl_distance": decimal_text(resolved_sl_dist),
                     }
 
                     if candidate_sl is None:
@@ -2378,14 +2464,9 @@ class AutonomousAiTrader:
             and self._router.offline_brokers()
         ):
             raise ContractError("no online verified broker equity available for sizing")
-        sizing_equity = min(total_equity, eff_eq) if eff_eq > Decimal("0") else total_equity
-        constitutional_max_budget = (sizing_equity * self._effective_stop_risk_ceiling_pct()) / Decimal("100")
-        budget = min(
-            self._router.barbell.max_stop_risk_amount(sizing_equity) * risk_multiplier,
-            constitutional_max_budget,
-        )
         active_mt5: tuple[str, Mt5PaperBrokerVenue] | None = None
         first_mt5: Mt5PaperBrokerVenue | None = None
+        active_oanda_eq: Decimal | None = None
         for bid_id in self._router.priority_order:
             venue = self._router.venues.get(bid_id)
             if isinstance(venue, Mt5PaperBrokerVenue):
@@ -2393,6 +2474,29 @@ class AutonomousAiTrader:
                     first_mt5 = venue
                 if venue.account is not None and not getattr(venue, "is_offline", False) and active_mt5 is None:
                     active_mt5 = (bid_id, venue)
+            elif isinstance(venue, OandaPracticeFallbackVenue) and active_oanda_eq is None:
+                oa_eq = online_eq_map.get(bid_id)
+                if oa_eq is not None and oa_eq > Decimal("0"):
+                    active_oanda_eq = oa_eq
+        barbell_eq = min(total_equity, eff_eq) if eff_eq > Decimal("0") else total_equity
+        target_venue_eq: Decimal | None = None
+        if active_mt5 is not None:
+            mt5_id, mt5_venue = active_mt5
+            target_venue_eq = online_eq_map.get(mt5_id)
+            if target_venue_eq is None and mt5_venue.account is not None:
+                target_venue_eq = mt5_venue.account.equity
+        elif active_oanda_eq is not None:
+            target_venue_eq = active_oanda_eq
+        sizing_equity = (
+            min(barbell_eq, target_venue_eq)
+            if (target_venue_eq is not None and target_venue_eq > Decimal("0"))
+            else barbell_eq
+        )
+        constitutional_max_budget = (sizing_equity * self._effective_stop_risk_ceiling_pct()) / Decimal("100")
+        budget = min(
+            self._router.barbell.max_stop_risk_amount(sizing_equity) * risk_multiplier,
+            constitutional_max_budget,
+        )
         calc_venue = active_mt5[1] if active_mt5 is not None else first_mt5
         if calc_venue is not None:
             csize = calc_venue.margin_calculator.contract_size_for(symbol)
@@ -2416,7 +2520,7 @@ class AutonomousAiTrader:
                     raw_units = min(raw_units, v_max_lots * csize)
                     min_ml = venue.min_margin_level_pct
                     max_used_ml = (acct.equity * Decimal("100")) / max(min_ml, Decimal("100"))
-                    sleeve_lim = self._router.barbell.share_for(bid_id) * sizing_equity
+                    sleeve_lim = self._router.barbell.share_for(bid_id) * barbell_eq
                     rem_margin = min(
                         max(Decimal("0"), max_used_ml - acct.margin),
                         max(Decimal("0"), sleeve_lim - acct.margin),
@@ -2512,6 +2616,19 @@ class AutonomousAiTrader:
             if ask <= bid:
                 continue
             spread = ask - bid
+            if (
+                allow_cold_open
+                and self._demo_high_growth.enabled
+                and now is not None
+                and self._demo_high_growth.block_us_close_chop
+                and sym in ("NAS100", "US30", "SPX500")
+                and _is_us_equity_pre_close_chop(now)
+                and not any(m.get("symbol") == sym for m in open_meta_list)
+            ):
+                dial_cap_block = (
+                    f"DEMO_US_CLOSE_CHOP_GUARD ({sym}: 20:30-21:00 UTC pre-close chop filter)"
+                )
+                continue
             params = self._protection_cfg(sym, max(risk_mult, Decimal("0.50")))
             hist = list(self._tick_history.get(sym, ()))
             if len(hist) < 3:
@@ -2530,19 +2647,10 @@ class AutonomousAiTrader:
                 best_sym = sym
                 best_reg = regime_res.regime
             if regime_res.regime in (REGIME_SPREAD_SPIKE, REGIME_CHOP_RANGE) or regime_res.direction is None:
-                # Preserve direct 3-tick fast-ignition burst detection when mids delta >= 3x spread
-                tail_mids = mids[-5:]
-                burst = tail_mids[-1] - tail_mids[0]
-                exp_min = spread * Decimal("3") if sym in INDEX_INSTRUMENTS else spread * Decimal("4")
-                if not (abs(burst) >= exp_min and spread <= params["sl_distance"] * Decimal("0.25")):
-                    continue
-                side = Side.BUY if burst > Decimal("0") else Side.SELL
-                regime_name = REGIME_TREND_IGNITION
-                setup_note = f"50ms burst delta={decimal_text(burst)} > spread-gate={decimal_text(exp_min)}"
-            else:
-                side = regime_res.direction
-                regime_name = regime_res.regime
-                setup_note = regime_res.reason
+                continue
+            side = regime_res.direction
+            regime_name = regime_res.regime
+            setup_note = regime_res.reason
 
             if any(m.get("symbol") == sym and m.get("side") != side.value for m in open_meta_list):
                 continue
@@ -2600,14 +2708,27 @@ class AutonomousAiTrader:
                 )
                 _, q_ccy = self._router.barbell._calc.split_symbol(sym)
                 conv = self._router.barbell._calc.conversion_rate(q_ccy, quotes_map) if quotes_map else Decimal("1")
+                mt5_venues = [
+                    self._router.venues.get(b)
+                    for b in self._router.priority_order
+                    if isinstance(self._router.venues.get(b), Mt5PaperBrokerVenue)
+                ]
+                online_mt5_v = next(
+                    (v for v in mt5_venues if v.account is not None and not getattr(v, "is_offline", False)),
+                    mt5_venues[0] if mt5_venues else None,
+                )
+                if online_mt5_v is not None:
+                    pyr_csize = online_mt5_v.margin_calculator.contract_size_for(sym)
+                elif sym == "XAUUSD":
+                    pyr_csize = MT5_GOLD_CONTRACT_SIZE
+                else:
+                    pyr_csize = MT5_INDEX_CONTRACT_SIZE if sym in INDEX_INSTRUMENTS else MT5_CONTRACT_SIZE
                 legs = [
                     PyramidLegSnapshot(
                         ticket=str(m["ticket"]),
                         symbol=sym,
                         side=side,
-                        units=Decimal(str(m.get("volume_lots", "1"))) * (
-                            Decimal("1") if sym in INDEX_INSTRUMENTS else Decimal("100000")
-                        ),
+                        units=Decimal(str(m.get("volume_lots", "1"))) * pyr_csize,
                         entry_price=Decimal(str(m["entry_price"])),
                         stop_loss=Decimal(str(m["stop_loss"])) if m.get("stop_loss") else None,
                         protection_stage=str(m.get("protection_stage", "INITIAL_SL")),
@@ -2661,6 +2782,55 @@ class AutonomousAiTrader:
                         f"DEMO_US_CLOSE_CHOP_GUARD ({sym}: 20:30-21:00 UTC pre-close chop filter)"
                     )
                     continue
+            t_sz_sym = _tick_size(sym)
+            eff_sl_collar = params["sl_distance"]
+            candles_m1 = info.get("candles_m1")
+            live_atr_m1 = _compute_live_candle_atr(candles_m1)
+            entry_px_est = ask if side is Side.BUY else bid
+            if self._demo_high_growth.enabled and self._demo_high_growth.let_winners_run:
+                if live_atr_m1 is not None and live_atr_m1 > Decimal("0"):
+                    atr_sl_est = min(live_atr_m1 * Decimal("2.50"), entry_px_est * Decimal("0.0100")).quantize(
+                        t_sz_sym, rounding=ROUND_HALF_UP
+                    )
+                    if atr_sl_est > eff_sl_collar:
+                        eff_sl_collar = atr_sl_est
+            apply_ema21_stretch_collar = len(mids) >= 21 and (
+                regime_name == REGIME_TREND_IGNITION or self._demo_high_growth.enabled
+            )
+            if apply_ema21_stretch_collar:
+                max_ema21_stretch = eff_sl_collar * Decimal("0.60")
+                if side is Side.BUY:
+                    ema_stretch = ask - regime_res.ema_21
+                    if ema_stretch > max_ema21_stretch:
+                        dial_cap_block = (
+                            f"ANTI_CHASE_STRETCH_BLOCKED ({sym} BUY stretched {decimal_text(ema_stretch)} "
+                            f"> {decimal_text(max_ema21_stretch)} above EMA21)"
+                        )
+                        continue
+                else:
+                    ema_stretch = regime_res.ema_21 - bid
+                    if ema_stretch > max_ema21_stretch:
+                        dial_cap_block = (
+                            f"ANTI_CHASE_STRETCH_BLOCKED ({sym} SELL stretched {decimal_text(ema_stretch)} "
+                            f"> {decimal_text(max_ema21_stretch)} below EMA21)"
+                        )
+                        continue
+            if live_atr_m1 is not None and live_atr_m1 > Decimal("0"):
+                last_hl = _latest_candle_high_low(candles_m1)
+                if last_hl is not None:
+                    c_hi, c_lo = last_hl
+                    c_range = c_hi - c_lo
+                    if c_range > live_atr_m1 * Decimal("2.00"):
+                        if side is Side.BUY and ask >= c_hi - (c_range * Decimal("0.10")):
+                            dial_cap_block = (
+                                f"ANTI_CHASE_IMPULSE_EXTREME_BLOCKED ({sym} BUY at top 10% of >2.0x ATR M1 impulse bar)"
+                            )
+                            continue
+                        if side is Side.SELL and bid <= c_lo + (c_range * Decimal("0.10")):
+                            dial_cap_block = (
+                                f"ANTI_CHASE_IMPULSE_EXTREME_BLOCKED ({sym} SELL at bottom 10% of >2.0x ATR M1 impulse bar)"
+                            )
+                            continue
             corr_ok, corr_reason = evaluate_correlation_cap(
                 candidate_symbol=sym,
                 candidate_side=side,
@@ -3676,6 +3846,8 @@ class AutonomousAiTrader:
                 symbol=sym,
                 is_pyramid_add=is_pyramid_add,
             )
+            if self._demo_high_growth.enabled and active_id != "gemini-decision-1" and eff_depth == "low":
+                eff_depth = "medium"
             self._last_regime = regime_name
             self._last_effective_effort = eff_depth
             self._last_pyramid_leg = is_pyramid_add
@@ -4295,6 +4467,9 @@ class AutonomousAiTrader:
                 "entry_price": decimal_text(fill_px),
                 "stop_loss": decimal_text(sl_price),
                 "take_profit": decimal_text(tp_price),
+                "initial_sl_distance": decimal_text(
+                    abs(fill_px - sl_price) if abs(fill_px - sl_price) > Decimal("0") else params["sl_distance"]
+                ),
                 "profit": "0",
                 "protection_stage": "INITIAL_SL",
                 "leg_index": leg_index,
@@ -4365,15 +4540,12 @@ class AutonomousAiTrader:
                         Decimal("1.00"),
                         abs(tp_price - entry_ref).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
                     )
-                    ob_risk = (
-                        (
-                            self._demo_high_growth.max_risk_pct
-                            if regime_name == REGIME_STRONG_TREND
-                            else self._demo_high_growth.target_risk_pct
+                    if self._demo_high_growth.enabled and self._demo_high_growth.let_winners_run:
+                        ob_tp_pts = max(
+                            ob_tp_pts,
+                            (ob_stop_pts * Decimal("2.20")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
                         )
-                        if self._demo_high_growth.enabled
-                        else None
-                    )
+                    ob_risk = self._demo_high_growth.target_risk_pct if self._demo_high_growth.enabled else None
                     self._option_b_demo.mirror_entry_signal(
                         symbol=sym,
                         side=side.value,

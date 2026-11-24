@@ -291,18 +291,33 @@ class TrendRegimeDetector:
                 reason=f"Bearish EMA 9<21<50 alignment (sep={decimal_text(-sep_9_21)}, delta={decimal_text(delta)})",
             )
 
+        buy_aligned = ema_9 >= ema_21 and ema_21 >= ema_50
+        sell_aligned = ema_9 <= ema_21 and ema_21 <= ema_50
         if abs(delta) >= burst_thresh:
             side = Side.BUY if delta > Decimal("0") else Side.SELL
+            aligned = buy_aligned if side is Side.BUY else sell_aligned
+            if aligned:
+                return RegimeAssessment(
+                    regime=REGIME_TREND_IGNITION,
+                    direction=side,
+                    ema_9=ema_9,
+                    ema_21=ema_21,
+                    ema_50=ema_50,
+                    spread=spread,
+                    spread_to_sl_ratio=spread_ratio,
+                    momentum_delta=delta,
+                    reason=f"Aligned momentum ignition delta={decimal_text(delta)} >= {decimal_text(burst_thresh)}",
+                )
             return RegimeAssessment(
-                regime=REGIME_TREND_IGNITION,
-                direction=side,
+                regime=REGIME_CHOP_RANGE,
+                direction=None,
                 ema_9=ema_9,
                 ema_21=ema_21,
                 ema_50=ema_50,
                 spread=spread,
                 spread_to_sl_ratio=spread_ratio,
                 momentum_delta=delta,
-                reason=f"Fast momentum ignition delta={decimal_text(delta)} >= {decimal_text(burst_thresh)}",
+                reason=f"Counter-trend {side.value} 5-tick burst blocked against EMA 9/21/50 structure (delta={decimal_text(delta)})",
             )
 
         if up_stacked and sep_9_21 >= spread:
