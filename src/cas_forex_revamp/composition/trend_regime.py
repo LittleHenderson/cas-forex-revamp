@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP, localcontext
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from typing import Any
 
 from cas_forex_revamp.contracts import ContractError, Side, decimal_text
@@ -93,13 +93,13 @@ def _extract_positive_decimals(values: Sequence[Any], max_points: int) -> list[D
     out: list[Decimal] = []
     tail = list(values)[-max_points:] if len(values) > max_points else list(values)
     for item in tail:
+        dec: Decimal | None = None
         try:
             dec = item if isinstance(item, Decimal) else Decimal(str(item))
-        except Exception:
-            continue
-        if not dec.is_finite() or dec <= Decimal("0"):
-            continue
-        out.append(dec)
+        except (InvalidOperation, ValueError, TypeError):
+            dec = None
+        if dec is not None and dec.is_finite() and dec > Decimal("0"):
+            out.append(dec)
     return out
 
 

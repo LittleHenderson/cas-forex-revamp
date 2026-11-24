@@ -2458,12 +2458,13 @@ class AutonomousAiTrader:
                         raw_c = bar.get("c") if bar.get("c") is not None else bar.get("close")
                         if raw_c is None:
                             continue
+                        c_px: Decimal | None = None
                         try:
                             c_px = Decimal(str(raw_c))
-                            if c_px.is_finite() and c_px > Decimal("0"):
-                                closes.append(c_px)
-                        except Exception:
-                            continue
+                        except (InvalidOperation, ValueError, TypeError):
+                            c_px = None
+                        if c_px is not None and c_px.is_finite() and c_px > Decimal("0"):
+                            closes.append(c_px)
             if len(closes) >= 7:
                 history[sym] = closes
                 continue
