@@ -112,6 +112,7 @@ from cas_forex_revamp.valve.tks_meta_valve_controller import (
     compute_drawdown_pct,
 )
 from cas_forex_revamp.composition.trend_regime import (
+    CORRELATED_OFFSET_BLOCKED_CODE,
     MAX_PYRAMID_LEGS,
     PyramidLegSnapshot,
     REGIME_CHOP_RANGE,
@@ -120,6 +121,7 @@ from cas_forex_revamp.composition.trend_regime import (
     REGIME_TREND_IGNITION,
     TrendRegimeDetector,
     evaluate_correlation_cap,
+    evaluate_cross_market_offset_guard,
     evaluate_house_money_pyramid_leg,
 )
 from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
@@ -2436,6 +2438,44 @@ class AutonomousAiTrader:
             qty -= step_units
         return qty.normalize()
 
+    def _build_correlation_price_history(
+        self,
+        markets: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, list[Decimal]]:
+        """Build trailing Decimal price series per symbol (prefer >=7 M1 closes, else tick mids)."""
+        history: dict[str, list[Decimal]] = {}
+        seen_syms: set[str] = set()
+        if isinstance(markets, Mapping):
+            seen_syms.update(str(k) for k in markets.keys())
+        seen_syms.update(self._tick_history.keys())
+        for sym in seen_syms:
+            closes: list[Decimal] = []
+            info = markets.get(sym) if isinstance(markets, Mapping) else None
+            if isinstance(info, Mapping):
+                raw_bars = info.get("candles_m1") or ()
+                for bar in list(raw_bars)[-50:]:
+                    if isinstance(bar, Mapping):
+                        raw_c = bar.get("c") if bar.get("c") is not None else bar.get("close")
+                        if raw_c is None:
+                            continue
+                        c_px: Decimal | None = None
+                        try:
+                            c_px = Decimal(str(raw_c))
+                        except (InvalidOperation, ValueError, TypeError):
+                            c_px = None
+                        if c_px is not None and c_px.is_finite() and c_px > Decimal("0"):
+                            closes.append(c_px)
+            if len(closes) >= 7:
+                history[sym] = closes
+                continue
+            ticks = list(self._tick_history.get(sym, ()))[-50:]
+            mids = [(b + a) / Decimal("2") for b, a in ticks if a >= b and (b + a) > Decimal("0")]
+            if mids:
+                history[sym] = mids
+            elif closes:
+                history[sym] = closes
+        return history
+
     def _assess_setup_and_pyramid(
         self,
         markets: Mapping[str, Mapping[str, Any]],
@@ -2455,6 +2495,7 @@ class AutonomousAiTrader:
         self._last_dial_skip_reason = None
         ordered_syms = list(INDEX_INSTRUMENTS) + [s for s in markets if s not in INDEX_INSTRUMENTS]
         open_meta_list = list(self._open_position_meta.values())
+        corr_hist = self._build_correlation_price_history(markets)
         best_ratio = Decimal("-1")
         best_sym: str | None = None
         best_reg: str | None = None
@@ -2620,13 +2661,16 @@ class AutonomousAiTrader:
                         f"DEMO_US_CLOSE_CHOP_GUARD ({sym}: 20:30-21:00 UTC pre-close chop filter)"
                     )
                     continue
-            corr_ok, _ = evaluate_correlation_cap(
+            corr_ok, corr_reason = evaluate_correlation_cap(
                 candidate_symbol=sym,
                 candidate_side=side,
                 open_positions=open_meta_list,
+                price_history=corr_hist,
                 is_pyramid_add=False,
             )
             if not corr_ok:
+                if CORRELATED_OFFSET_BLOCKED_CODE in corr_reason:
+                    dial_cap_block = corr_reason
                 continue
             if fast_tick and sym not in INDEX_INSTRUMENTS and abs(mids[-1] - mids[-min(len(mids), 5)]) < spread * Decimal("4"):
                 continue
@@ -3980,6 +4024,45 @@ class AutonomousAiTrader:
                 self._last_symbol = sym
                 self._last_reason = dec_result.selection.reason
                 self._last_cycle_ms = call_ms
+                if self._parallel_tiers is not None and quotes_map:
+                    self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
+                report = {
+                    "schema": "cas-forex.ai-cycle/1",
+                    "cycle_id": cycle_id,
+                    "observed_at": _iso(ts),
+                    "model_id": active_id,
+                    "cadence": self._last_cadence,
+                    "thinking_depth": eff_depth,
+                    "regime": regime_name,
+                    "action": "WAIT",
+                    "symbol": sym,
+                    "reason": self._last_reason,
+                    "valve_score": self._last_valve_score,
+                    "protection_updates": prot_updates,
+                }
+                self._append_journal_cycle(report)
+                return report
+
+            corr_guard_ok, corr_guard_reason = evaluate_cross_market_offset_guard(
+                candidate_symbol=sym,
+                candidate_side=side,
+                open_positions=list(self._open_position_meta.values()),
+                price_history=self._build_correlation_price_history(markets),
+                is_pyramid_add=is_pyramid_add,
+            )
+            if not corr_guard_ok:
+                self._record_ai_cooldown_unlocked(cd_key, ts, "correlation offset veto")
+                self._veto_count += 1
+                self._last_action = "WAIT"
+                self._last_symbol = sym
+                self._last_reason = corr_guard_reason
+                self._last_cycle_ms = call_ms
+                self._recent_actions.appendleft({
+                    "observed_at": _iso(ts),
+                    "kind": "CORRELATION_VETO",
+                    "symbol": sym,
+                    "detail": corr_guard_reason,
+                })
                 if self._parallel_tiers is not None and quotes_map:
                     self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
                 report = {
