@@ -362,7 +362,7 @@ class TestOptionBMicroFuturesIntegration(unittest.TestCase):
         )
         self.assertEqual(len(mgc_tp), 1)
         self.assertEqual(mgc_tp[0].realized_pnl_usd, Decimal("100.00"))
-        self.assertEqual(mgc_tp[0].net_pnl_usd, Decimal("98.76"))
+        self.assertEqual(mgc_tp[0].net_pnl_usd, Decimal("97.58"))
 
         # 3. Constitutional risk_pct=1.01% MUST fail closed on both engine & venue.
         with self.assertRaises(MicroFuturesSizingRefusalError):

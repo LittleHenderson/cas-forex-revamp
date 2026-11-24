@@ -87,9 +87,9 @@ class TestMicroFuturesCatalogAndTranslation(unittest.TestCase):
         self.assertEqual(mgc.tick_value_usd, Decimal("1.00"))
         self.assertEqual(mgc.roll_months, (2, 4, 6, 8, 10, 12))
         self.assertEqual(mgc.roll_month_codes, ("G", "J", "M", "Q", "V", "Z"))
-        self.assertEqual(mgc.default_intraday_margin_usd, Decimal("100.00"))
+        self.assertEqual(mgc.default_intraday_margin_usd, Decimal("200.00"))
         self.assertEqual(mgc.default_exchange_initial_margin_usd, Decimal("1200.00"))
-        self.assertEqual(mgc.default_round_turn_commission_usd, Decimal("1.24"))
+        self.assertEqual(mgc.default_round_turn_commission_usd, Decimal("2.42"))
         self.assertEqual(mgc.cas_aliases, ("XAUUSD", "XAU_USD", "GOLD", "MGC"))
 
     def test_cme_month_codes_and_constitutional_constants(self) -> None:
@@ -372,10 +372,10 @@ class TestTickAlignmentAndPnL(unittest.TestCase):
             compute_contract_pnl_usd("MES", "BUY", Decimal("6000.00"), Decimal("6010.25"), 1),
             Decimal("50.01"),
         )
-        # MGC: 12.40-pt SELL profit on 3 contracts -> +$372.00 gross, -$3.72 comm = +$368.28 net
+        # MGC: 12.40-pt SELL profit on 3 contracts -> +$372.00 gross, -$7.26 comm = +$364.74 net
         self.assertEqual(
             compute_contract_pnl_usd("XAUUSD", Side.SELL, Decimal("2650.00"), Decimal("2637.60"), 3),  # type: ignore[arg-type]
-            Decimal("368.28"),
+            Decimal("364.74"),
         )
 
         # Reject float prices, bool contracts, zero contracts, bad side
@@ -448,7 +448,7 @@ class TestConstitutionalSizingEngine(unittest.TestCase):
         self.assertEqual(mes_1.contracts, 1)
         self.assertEqual(mes_1.total_stop_risk_usd, Decimal("50.00"))
 
-        # $5,000.00 @ 1.00% risk, MGC 5-pt stop -> 1 contract ($50.00 risk)
+        # $5,000.00 @ 1.00% risk, MGC 5-pt stop -> 1 contract ($50.00 risk, $200.00 intraday margin, $2.42 RT fee)
         mgc_1 = size_micro_futures_order(
             symbol_or_root="XAUUSD",
             equity_usd=Decimal("5000.00"),
@@ -457,6 +457,8 @@ class TestConstitutionalSizingEngine(unittest.TestCase):
         self.assertEqual(mgc_1.root, "MGC")
         self.assertEqual(mgc_1.contracts, 1)
         self.assertEqual(mgc_1.total_stop_risk_usd, Decimal("50.00"))
+        self.assertEqual(mgc_1.margin_per_contract_usd, Decimal("200.00"))
+        self.assertEqual(mgc_1.estimated_round_turn_commission_usd, Decimal("2.42"))
 
     def test_3000_usd_honest_refusal_never_rounds_up(self) -> None:
         # $3,000 @ 1.00% = $30.00 budget; MNQ 25-pt stop = $50.00/contract -> honest refusal!
