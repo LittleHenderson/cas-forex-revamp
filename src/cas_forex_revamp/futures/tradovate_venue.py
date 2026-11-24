@@ -3362,7 +3362,7 @@ class TradovateMicroFuturesPaperEmulator:
 
     Tracks exact ``Decimal`` equity, balance, peak equity, drawdown, intraday/
     exchange margin, OCO Stop-Loss / Take-Profit triggers on ``set_quote()``,
-    round-turn commissions (``$1.24``/contract from ``micro_futures_specs``),
+    round-turn commissions (per-contract defaults from ``micro_futures_specs``, e.g. ``$1.24`` equity micros / ``$2.42`` COMEX ``MGC``),
     protective stop amendments, manual closes, and emergency flatten-all.
     """
 
