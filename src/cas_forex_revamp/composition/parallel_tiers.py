@@ -383,6 +383,7 @@ class ParallelTierEngine:
                         entry_price TEXT NOT NULL,
                         stop_loss TEXT NOT NULL,
                         take_profit TEXT,
+                        initial_stop_loss TEXT,
                         peak_favorable TEXT NOT NULL,
                         protection_stage TEXT NOT NULL,
                         entry_commission_usd TEXT NOT NULL,
@@ -425,6 +426,12 @@ class ParallelTierEngine:
                     conn.execute("ALTER TABLE tier_accounts ADD COLUMN color_class TEXT NOT NULL DEFAULT 'tier-300k'")
                     if "color_token" in cols:
                         conn.execute("UPDATE tier_accounts SET color_class = color_token")
+                pos_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(tier_positions)").fetchall()}
+                if "initial_stop_loss" not in pos_cols:
+                    conn.execute("ALTER TABLE tier_positions ADD COLUMN initial_stop_loss TEXT")
+                    conn.execute(
+                        "UPDATE tier_positions SET initial_stop_loss = stop_loss WHERE initial_stop_loss IS NULL AND protection_stage = 'INITIAL_SL'"
+                    )
                 ts = _iso(self._clock())
                 for spec in self._specs:
                     row = conn.execute("SELECT tier_id FROM tier_accounts WHERE tier_id = ?", (spec.tier_id,)).fetchone()
@@ -739,6 +746,13 @@ class ParallelTierEngine:
                         peak = max(prev_peak, cur_px) if side is Side.BUY else min(prev_peak, cur_px)
                         excursion = (peak - entry_p) if side is Side.BUY else (entry_p - peak)
                         t_sz = _tick_size(sym)
+                        raw_init_sl = pos["initial_stop_loss"] if "initial_stop_loss" in pos.keys() else None
+                        if raw_init_sl is not None:
+                            init_sl_dist = abs(entry_p - Decimal(str(raw_init_sl)))
+                        elif str(pos["protection_stage"]) == "INITIAL_SL":
+                            init_sl_dist = abs(entry_p - sl_p)
+                        else:
+                            init_sl_dist = Decimal("0")
                         be_trig = Decimal("10.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("120")
                         be_off = Decimal("1.50") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("10")
                         trail_act = Decimal("22.00") if sym in INDEX_INSTRUMENTS else t_sz * Decimal("220")
@@ -747,6 +761,14 @@ class ParallelTierEngine:
                             be_trig = (be_trig * DEMO_HIGH_GROWTH_BE_SCALE).quantize(t_sz, rounding=ROUND_HALF_UP)
                             trail_act = (trail_act * DEMO_HIGH_GROWTH_TRAIL_SCALE).quantize(t_sz, rounding=ROUND_HALF_UP)
                             trail_dist = (trail_dist * DEMO_HIGH_GROWTH_TRAIL_SCALE).quantize(t_sz, rounding=ROUND_HALF_UP)
+                            if init_sl_dist > Decimal("0"):
+                                be_trig = max(be_trig, (init_sl_dist * Decimal("1.00")).quantize(t_sz, rounding=ROUND_HALF_UP))
+                                be_off = max(be_off, (init_sl_dist * Decimal("0.15")).quantize(t_sz, rounding=ROUND_HALF_UP))
+                                trail_act = max(trail_act, (init_sl_dist * Decimal("1.50")).quantize(t_sz, rounding=ROUND_HALF_UP))
+                                trail_dist = max(trail_dist, (init_sl_dist * Decimal("0.75")).quantize(t_sz, rounding=ROUND_HALF_UP))
+                        elif init_sl_dist > Decimal("0"):
+                            be_trig = max(be_trig, (init_sl_dist * Decimal("0.54")).quantize(t_sz, rounding=ROUND_HALF_UP))
+                            trail_act = max(trail_act, (init_sl_dist * Decimal("1.00")).quantize(t_sz, rounding=ROUND_HALF_UP))
 
                         new_sl = sl_p
                         new_stage = str(pos["protection_stage"])
@@ -1144,6 +1166,7 @@ class ParallelTierEngine:
                                             decimal_text(entry_px),
                                             decimal_text(sl_p),
                                             None if tp_p is None else decimal_text(tp_p),
+                                            decimal_text(sl_p),
                                             decimal_text(entry_px),
                                             decimal_text(entry_comm),
                                             len(existing_rows) + 1,
@@ -1160,9 +1183,9 @@ class ParallelTierEngine:
                             """
                             INSERT INTO tier_positions(
                                 ticket, tier_id, symbol, side, units, entry_price,
-                                stop_loss, take_profit, peak_favorable, protection_stage,
+                                stop_loss, take_profit, initial_stop_loss, peak_favorable, protection_stage,
                                 entry_commission_usd, leg_index, opened_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'INITIAL_SL', ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'INITIAL_SL', ?, ?, ?)
                             """,
                             pending_entry,
                         )
