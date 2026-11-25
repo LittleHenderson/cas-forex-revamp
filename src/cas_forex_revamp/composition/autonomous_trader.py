@@ -160,6 +160,20 @@ DEFAULT_DEMO_PER_BROKER_CAPITAL_USD = Decimal("100000.00")
 DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE = "DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE"
 DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS = "DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS"
 DEFAULT_DEMO_BASELINE_REANCHOR_FLOOR_PCT = Decimal("0.70")
+_DEFAULT_TELEGRAM_STANDBY_SNAPSHOT: dict[str, Any] = {
+    "schema": "cas-forex.telegram-alerts/1",
+    "read_only": True,
+    "trading_authority": "NONE",
+    "enabled": False,
+    "configured": False,
+    "status": "STANDBY",
+    "sent_count": 0,
+    "dropped_count": 0,
+    "error_count": 0,
+    "last_sent_at": None,
+    "last_event_kind": None,
+    "recent_alerts": [],
+}
 DEFAULT_STARTUP_VAULT_RETRY_COOLDOWN_SECONDS = 5.0
 DEFAULT_AI_INFERENCE_COOLDOWN_SECONDS = 0.0
 DEFAULT_LIVE_AI_INFERENCE_COOLDOWN_SECONDS = 60.0
@@ -764,6 +778,7 @@ class AutonomousAiTrader:
         demo_auto_replenish_enabled: bool | None = None,
         demo_auto_replenish_floor_pct: Decimal | str | int = DEFAULT_DEMO_BASELINE_REANCHOR_FLOOR_PCT,
         state_dir: str | Path | None = None,
+        telegram_notifier: Any | None = None,
     ) -> None:
         if not isinstance(router, DualShieldBrokerRouter):
             raise ContractError("AutonomousAiTrader requires a DualShieldBrokerRouter")
@@ -836,6 +851,7 @@ class AutonomousAiTrader:
         )
         self._demo_auto_replenish_floor_ratio: Decimal = demo_floor_ratio
         self._demo_auto_replenish_floor_pct: Decimal = demo_floor_pct
+        self._telegram_notifier = telegram_notifier
         self._demo_baseline_reanchor_count: int = 0
         self._last_demo_reanchored_at: str | None = None
         self._demo_reanchored_baseline_usd: Decimal | None = None
@@ -1171,6 +1187,17 @@ class AutonomousAiTrader:
                 )[:512],
             }
         )
+        if self._telegram_notifier is not None:
+            try:
+                self._telegram_notifier.notify_demo_replenished(
+                    lane="MAIN_DEMO_BASELINE",
+                    previous_balance_usd=decimal_text(prev_peak),
+                    added_usd="0.00",
+                    new_balance_usd=decimal_text(target_eq),
+                    trigger=trigger,
+                )
+            except Exception as exc_tg:
+                logger.warning("Telegram baseline reanchor notification skipped: %s", type(exc_tg).__name__)
         return {
             "reanchored": True,
             "trigger": trigger,
@@ -2440,6 +2467,18 @@ class AutonomousAiTrader:
                         self._protection_stage[pos.ticket] = new_stage
                         self._open_position_meta[pos.ticket]["stop_loss"] = decimal_text(candidate_sl)
                         self._open_position_meta[pos.ticket]["protection_stage"] = new_stage
+                        if self._telegram_notifier is not None:
+                            try:
+                                self._telegram_notifier.notify_breakeven_locked(
+                                    execution_mode=str(self._router.execution_mode),
+                                    broker_id=broker_id,
+                                    symbol=sym,
+                                    ticket=str(pos.ticket),
+                                    new_stop_loss=decimal_text(candidate_sl),
+                                    stage=new_stage,
+                                )
+                            except Exception as exc_tg_be:
+                                logger.warning("Telegram protection alert skipped: %s", type(exc_tg_be).__name__)
                         if self._phase8_bridge is not None:
                             p8_act = (
                                 TradeActionType.MOVE_BREAKEVEN
@@ -2552,6 +2591,25 @@ class AutonomousAiTrader:
                                         f"Floor {q_closed['protected_profit_floor_usd']} USD) · "
                                         f"Observing {self._top_watch_symbol or '20 MARKETS'}"
                                     )
+                                if self._telegram_notifier is not None:
+                                    try:
+                                        self._telegram_notifier.notify_trade_closed(
+                                            execution_mode=str(self._router.execution_mode),
+                                            broker_id=broker_id,
+                                            symbol=sym_closed,
+                                            ticket=safe_ticket,
+                                            realized_pnl_usd=decimal_text(pnl_dec),
+                                            reason=str(q_closed.get("status", "CLOSED")),
+                                        )
+                                        if q_closed["status"] == QUOTA_STATUS_PROFIT_FLOOR_LOCKED:
+                                            self._telegram_notifier.notify_profit_floor_locked(
+                                                execution_mode=str(self._router.execution_mode),
+                                                realized_net_pnl_usd=q_closed.get("realized_net_pnl_usd", "0"),
+                                                protected_floor_usd=q_closed.get("protected_profit_floor_usd", "0"),
+                                                session_date=str(q_closed.get("session_date", "")),
+                                            )
+                                    except Exception as exc_tg_cl:
+                                        logger.warning("Telegram close notification skipped: %s", type(exc_tg_cl).__name__)
                             except ContractError as exc:
                                 logger.warning(
                                     "fast protection close accounting skipped for %s: %s",
@@ -4937,6 +4995,25 @@ class AutonomousAiTrader:
                 "reason": self._last_reason[:200],
             }
             self._recent_actions.appendleft(entry_log)
+            if self._telegram_notifier is not None:
+                try:
+                    open_lots = (
+                        decimal_text(exec_res.result.receipt.volume_lots)
+                        if (exec_res.result.receipt is not None and exec_res.result.receipt.volume_lots)
+                        else "1"
+                    )
+                    self._telegram_notifier.notify_trade_opened(
+                        execution_mode=str(self._router.execution_mode),
+                        broker_id=str(exec_res.executed_on),
+                        symbol=sym,
+                        side=side.value,
+                        volume_lots=open_lots,
+                        entry_price=decimal_text(fill_px),
+                        stop_loss=decimal_text(sl_price),
+                        take_profit=decimal_text(tp_price),
+                    )
+                except Exception as exc_tg_op:
+                    logger.warning("Telegram open notification skipped: %s", type(exc_tg_op).__name__)
             report = {
                 "schema": "cas-forex.ai-cycle/1",
                 **entry_log,
@@ -5940,6 +6017,11 @@ class AutonomousAiTrader:
                 focus_sym = str(self._top_watch_symbol or EXPANDED_MARKETS[0])
                 focus_status = f"SCANNING {len(EXPANDED_MARKETS)} MARKETS · Top Watch: {focus_sym}"
             self._current_focus_status = focus_status
+            payload["telegram_alerts"] = (
+                self._telegram_notifier.snapshot()
+                if self._telegram_notifier is not None
+                else {**_DEFAULT_TELEGRAM_STANDBY_SNAPSHOT, "recent_alerts": []}
+            )
             payload["current_focus_symbol"] = focus_sym
             payload["current_focus_status"] = focus_status
             payload["market_sessions"] = compute_market_sessions_status(

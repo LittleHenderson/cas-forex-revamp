@@ -56,6 +56,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from cas_forex_revamp.operator.decisions import OperatorUnavailable
 from cas_forex_revamp.operator.frontier_backends import assert_safe_ai_catalog_payload
+from cas_forex_revamp.operator.telegram_alert_notifier import TelegramAlertNotifier
 from cas_forex_revamp.composition.autonomous_trader import build_enriched_compounding_payload
 from cas_forex_revamp.composition.option_b_paper_runner import OptionBPaperDemoRunner
 from cas_forex_revamp.risk.demo_high_growth_profile import (
@@ -1616,6 +1617,7 @@ _KNOWN_METRICS_ROUTES: frozenset[str] = frozenset({
     "/api/compounding",
     "/api/option-b-demo",
     "/api/demo-high-growth-profile",
+    "/api/telegram-alerts",
 })
 
 _CONTENT_TYPES: dict[str, str] = {
@@ -1720,6 +1722,7 @@ class LoopbackCockpitServer:
         compounding_controller: Any | None = None,
         option_b_demo: Any | None = None,
         demo_high_growth_store: DemoHighGrowthProfileStore | None = None,
+        telegram_notifier: TelegramAlertNotifier | None = None,
         phase8_bridge: Any | None = None,
         owner_recovery: Any | None = None,
         model_execution_gate: Any | None = None,
@@ -1780,6 +1783,7 @@ class LoopbackCockpitServer:
         self._compounding_controller = inferred_comp
         self._option_b_demo = option_b_demo
         self._demo_high_growth_store: DemoHighGrowthProfileStore | None = demo_high_growth_store
+        self._telegram_notifier: TelegramAlertNotifier | None = telegram_notifier
         inferred_p8 = phase8_bridge
         if inferred_p8 is None and autonomous_trader is not None:
             inferred_p8 = getattr(autonomous_trader, "phase8_bridge", None) or getattr(
@@ -3438,6 +3442,36 @@ class LoopbackCockpitServer:
                             self._write_json(
                                 HTTPStatus.INTERNAL_SERVER_ERROR,
                                 {"error": "Option B paper demo snapshot unavailable"},
+                            )
+                        return
+                    if route == "/api/telegram-alerts":
+                        try:
+                            tg_obj = outer._telegram_notifier
+                            if tg_obj is None and outer._autonomous_trader is not None:
+                                tg_obj = getattr(outer._autonomous_trader, "_telegram_notifier", None)
+                            if tg_obj is not None and callable(getattr(tg_obj, "snapshot", None)):
+                                tg_snap = tg_obj.snapshot()
+                            else:
+                                tg_snap = {
+                                    "schema": "cas-forex.telegram-alerts/1",
+                                    "read_only": True,
+                                    "trading_authority": "NONE",
+                                    "enabled": False,
+                                    "configured": False,
+                                    "status": "STANDBY",
+                                    "sent_count": 0,
+                                    "dropped_count": 0,
+                                    "error_count": 0,
+                                    "last_sent_at": None,
+                                    "last_event_kind": None,
+                                    "recent_alerts": [],
+                                }
+                            self._write_json(HTTPStatus.OK, assert_safe_ai_catalog_payload(tg_snap))
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(
+                                HTTPStatus.INTERNAL_SERVER_ERROR,
+                                {"error": "Telegram alert status unavailable"},
                             )
                         return
                     if route == "/api/demo-high-growth-profile":
@@ -5519,6 +5553,14 @@ class LoopbackCockpitServer:
                         self._write_json(code, {"error": msg_exc})
                     return
 
+                if route == "/api/telegram-alerts":
+                    self._drain_small_request_body(max_bytes=4096)
+                    self._write_json(
+                        HTTPStatus.METHOD_NOT_ALLOWED,
+                        {"error": "/api/telegram-alerts is strictly read-only; no trading or control mutations permitted"},
+                    )
+                    return
+
                 if outer._ui_service is None:
                     self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "ScopedUIService not attached"})
                     return
@@ -6099,6 +6141,11 @@ def run_cockpit_cli(
                 live_trading_armed=is_live_boot,
                 live_trading_locked=not is_live_boot,
             )
+    telegram_notifier = TelegramAlertNotifier.from_env(merged)
+    if runtime_state.parallel_tiers is not None and callable(
+        getattr(runtime_state.parallel_tiers, "bind_telegram_notifier", None)
+    ):
+        runtime_state.parallel_tiers.bind_telegram_notifier(telegram_notifier)
     trader = AutonomousAiTrader(
         router=router,
         model_registry=registry,
@@ -6117,6 +6164,7 @@ def run_cockpit_cli(
         initial_capital_usd=cli_init_cap,
         demo_high_growth=active_dhg,
         state_dir=runtime_state.state_dir,
+        telegram_notifier=telegram_notifier,
     )
     if not args.autonomous_ai:
         trader.stop_automation(reason="CLI launched with --no-autonomous-ai")
@@ -6192,6 +6240,7 @@ def run_cockpit_cli(
         db_path=runtime_state.state_dir / "option_b_paper_demo.sqlite3",
         valve_gate=gate,
         demo_high_growth=active_dhg,
+        telegram_notifier=telegram_notifier,
     )
     trader.bind_option_b_demo(option_b_demo)
     if active_dhg.enabled:
@@ -6212,6 +6261,7 @@ def run_cockpit_cli(
         aggression_dial=aggression_dial,
         option_b_demo=option_b_demo,
         demo_high_growth_store=demo_high_growth_store,
+        telegram_notifier=telegram_notifier,
         owner_recovery=runtime_state.owner_recovery,
         model_execution_gate=runtime_state.model_gate,
         token_file=str(merged.get("CAS_FOREX_COCKPIT_TOKEN_FILE", "")).strip() or None,
@@ -6327,6 +6377,7 @@ def run_cockpit_cli(
     finally:
         stop_flag.set()
         srv.stop()
+        telegram_notifier.close()
     return 0
 
 

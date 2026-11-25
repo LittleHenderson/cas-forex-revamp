@@ -9,6 +9,7 @@ ForexMetaValveGate admission, PeakEquityStore drawdown protection, DailyQuotaGov
 """
 from __future__ import annotations
 
+import logging
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -89,6 +90,8 @@ from cas_forex_revamp.venue.mt5_broker_bridge import (
 
 DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE = "DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE"
 DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS = "DEMO_REPLENISH_REQUIRES_FLAT_POSITIONS"
+logger = logging.getLogger(__name__)
+
 DEFAULT_PARALLEL_TIER_AUTO_REPLENISH_FLOOR_PCT = Decimal("0.70")
 _GENESIS_REPLENISH_SHA256 = "0" * 64
 
@@ -315,6 +318,7 @@ class ParallelTierEngine:
         execution_mode: str = "DEMO",
         live_trading_armed: bool = False,
         clock: Callable[[], datetime] | None = None,
+        telegram_notifier: Any | None = None,
     ) -> None:
         if not isinstance(db_path, Path):
             db_path = Path(str(db_path))
@@ -354,6 +358,7 @@ class ParallelTierEngine:
         self._fx_min_lot = decimal_value(fx_min_lot, "fx_min_lot", positive=True)
         self._index_min_lot = decimal_value(index_min_lot, "index_min_lot", positive=True)
         self._clock = clock or _utc_now
+        self._telegram_notifier = telegram_notifier
         self._lock = RLock()
         self._regime = TrendRegimeDetector()
         self._peak_store = PeakEquityStore(db_path)
@@ -390,6 +395,10 @@ class ParallelTierEngine:
             raise ContractError("aggression_dial must be an AggressionDialStore or None")
         with self._lock:
             self._aggression_dial = store
+
+    def bind_telegram_notifier(self, notifier: Any | None) -> None:
+        """Attach optional read-only Telegram alert notifier without altering execution flow."""
+        self._telegram_notifier = notifier
 
     def set_demo_high_growth_profile(
         self,
@@ -1529,6 +1538,17 @@ class ParallelTierEngine:
                 )
         for c_key in [k for k in self._tier_symbol_loss_cooldown_until if k[0] == tid]:
             self._tier_symbol_loss_cooldown_until.pop(c_key, None)
+        if self._telegram_notifier is not None:
+            try:
+                self._telegram_notifier.notify_demo_replenished(
+                    lane=tid,
+                    previous_balance_usd=f"{cur_bal:.2f}",
+                    added_usd=f"{added:.2f}",
+                    new_balance_usd=start_txt,
+                    trigger=trigger,
+                )
+            except Exception as exc_tg:
+                logger.warning("Telegram tier replenish notification skipped for %s: %s", tid, type(exc_tg).__name__)
         return {
             "tier_id": tid,
             "replenished": True,

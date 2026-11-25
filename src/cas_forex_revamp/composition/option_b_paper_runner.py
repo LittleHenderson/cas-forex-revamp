@@ -16,6 +16,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from contextlib import closing
 from datetime import datetime, timezone
+import logging
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
 from pathlib import Path
 import sqlite3
@@ -64,6 +65,8 @@ OPTION_B_VAULT_SWEEP_RATIO = Decimal("0.50")
 OPTION_B_MAX_OPEN_POSITIONS_CEILING = 8
 OPTION_B_RECENT_TRADES_LIMIT = 20
 OPTION_B_RECENT_EVENTS_LIMIT = 25
+logger = logging.getLogger(__name__)
+
 DEFAULT_OPTION_B_AUTO_REPLENISH_FLOOR_PCT = Decimal("0.70")
 
 _CAS_TO_MICRO_SUPPORTED: frozenset[str] = frozenset({"NAS100", "US30", "SPX500", "XAUUSD"})
@@ -179,6 +182,7 @@ class OptionBPaperDemoRunner:
         execution_mode: str = TRADOVATE_MODE_DEMO,
         live_trading_armed: bool = False,
         clock: Callable[[], datetime] | None = None,
+        telegram_notifier: Any | None = None,
     ) -> None:
         norm_mode = str(mode or "").strip().upper()
         norm_exec_mode = str(execution_mode or "").strip().upper()
@@ -215,6 +219,7 @@ class OptionBPaperDemoRunner:
 
         self._account_id = account_id.strip()
         self._clock = clock if clock is not None else _utc_now
+        self._telegram_notifier = telegram_notifier
         self._lock = RLock()
         self._db_path = Path(db_path)
         self._venue_db_path = (
@@ -792,6 +797,17 @@ class OptionBPaperDemoRunner:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+        if self._telegram_notifier is not None:
+            try:
+                self._telegram_notifier.notify_demo_replenished(
+                    lane="OPTION_B_DEMO",
+                    previous_balance_usd=_usd_text(prev_bal),
+                    added_usd=_usd_text(added),
+                    new_balance_usd=_usd_text(target),
+                    trigger=trigger,
+                )
+            except Exception as exc_tg:
+                logger.warning("Telegram Option B replenish notification skipped: %s", type(exc_tg).__name__)
         return {
             "replenished": True,
             "added_usd": _usd_text(added),

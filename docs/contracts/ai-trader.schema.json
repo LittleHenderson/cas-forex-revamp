@@ -284,6 +284,9 @@
           "$ref": "#/$defs/aggressionDialSummary"
         }
       ]
+    },
+    "telegram_alerts": {
+      "$ref": "#/$defs/telegramAlertsSummary"
     }
   },
   "$defs": {
@@ -1324,7 +1327,7 @@
     },
     "forexSessionLabel": {
       "enum": [
-        "Asia / Tokyo–Sydney",
+        "Asia / Tokyo\u2013Sydney",
         "London",
         "New York / US"
       ]
@@ -1781,6 +1784,106 @@
         },
         "audit_head_sha256": {
           "$ref": "#/$defs/sha256Hex"
+        }
+      }
+    },
+    "telegramAlertsSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "read_only",
+        "trading_authority",
+        "enabled",
+        "configured",
+        "status",
+        "sent_count",
+        "dropped_count",
+        "error_count",
+        "last_sent_at",
+        "last_event_kind",
+        "recent_alerts"
+      ],
+      "properties": {
+        "schema": {
+          "const": "cas-forex.telegram-alerts/1"
+        },
+        "read_only": {
+          "const": true
+        },
+        "trading_authority": {
+          "const": "NONE"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "configured": {
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "ACTIVE",
+            "STANDBY"
+          ]
+        },
+        "sent_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "dropped_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "error_count": {
+          "$ref": "#/$defs/nonNegativeInt"
+        },
+        "last_sent_at": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/timestamp"
+            }
+          ]
+        },
+        "last_event_kind": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 48
+            }
+          ]
+        },
+        "recent_alerts": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "observed_at",
+              "event_kind",
+              "summary"
+            ],
+            "properties": {
+              "observed_at": {
+                "$ref": "#/$defs/timestamp"
+              },
+              "event_kind": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 48
+              },
+              "summary": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 240
+              }
+            }
+          }
         }
       }
     }

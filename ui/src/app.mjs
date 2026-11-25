@@ -2,6 +2,7 @@ import { createExplainer } from './explainer.mjs';
 import { decodeCockpit, parseUniqueJSON, MAX_SNAPSHOT_BYTES } from './wire.mjs';
 import { resetInspection, reviewRecords, inspectRecord } from './model.mjs';
 import { displayFreshness } from './freshness.mjs';
+import { RADAR_FILTERS, renderLiveFeedStrip, renderTacticalValveHud, renderMarketRadarTable } from './tactical-hud.mjs';
 import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose, replaceSafeHTML, resolveCockpitCompounding, resolveCockpitDemoHighGrowth, resolveCockpitOptionBDemo } from './render.mjs';
 import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decision-read.mjs';
 import { ScopedBridge, createAuthenticatedLoopbackBridge } from './bridge.mjs';
@@ -210,7 +211,7 @@ let state = {
   error: null, loading: false, route: routeFromHash(), theme: 'system',
   reviewView: 'list', reviewFilter: 'all', explainerIssue: null, inspection: resetInspection(),
   reviewEnvelope: null, reviewIssue: null, reviewSchemaReady: false, lastLoaded: null, transport: null,
-  marketStream: null, chartPair: 'EURUSD', chartTimeframe: 'M5', chartLayout: 'single', chartCategory: 'all',
+  marketStream: null, chartPair: 'EURUSD', chartTimeframe: 'M5', chartLayout: 'single', chartCategory: 'all', radarFilter: 'all', telegramAlerts: null,
   liveStreamConnected: false, chartMicroBars: {}, brokerRouting: null,
   aiModels: null, aiTrader: null, indexStream: null, aiActionBusy: false, aiIssue: bootSecurityIssue,
   treasury: null, parallelTiers: null, chartZoomBars: 60, inspectedTradeIdx: 0,
@@ -325,6 +326,21 @@ function rerenderAiSectionsInPlace(focusSelector = null) {
   if (currentOverseer) {
     const nextOverseer = new DOMParser().parseFromString(renderAiOverseerPanel(state), 'text/html').body.firstElementChild;
     if (nextOverseer) currentOverseer.replaceWith(nextOverseer);
+  }
+  const currentLiveFeed = root.querySelector('[data-tactical-live-feed="true"]');
+  if (currentLiveFeed) {
+    const nextLiveFeed = new DOMParser().parseFromString(renderLiveFeedStrip(state), 'text/html').body.firstElementChild;
+    if (nextLiveFeed) currentLiveFeed.replaceWith(nextLiveFeed);
+  }
+  const currentHud = root.querySelector('[data-tactical-valve-hud="true"]');
+  if (currentHud) {
+    const nextHud = new DOMParser().parseFromString(renderTacticalValveHud(state), 'text/html').body.firstElementChild;
+    if (nextHud) currentHud.replaceWith(nextHud);
+  }
+  const currentRadar = root.querySelector('[data-market-radar="true"]');
+  if (currentRadar) {
+    const nextRadar = new DOMParser().parseFromString(renderMarketRadarTable(state), 'text/html').body.firstElementChild;
+    if (nextRadar) currentRadar.replaceWith(nextRadar);
   }
   if (currentAnalytics) {
     const nextAnalytics = new DOMParser().parseFromString(renderEquityAndAnalyticsSection(state), 'text/html').body.firstElementChild;
@@ -951,12 +967,31 @@ async function pollLiveCockpitState() {
     await readCompounding();
     await readOptionBDemo();
     await readDemoHighGrowth();
+    try {
+      const rawTg = await readStatic(new URL('/api/telegram-alerts', window.location.origin), MAX_AI_PAYLOAD_BYTES);
+      state.telegramAlerts = parseUniqueJSON(rawTg, MAX_AI_PAYLOAD_BYTES);
+    } catch { /* Optional read-only endpoint. */ }
     if (!isDialSliderDragging()) {
       syncAggressionDialDom();
     }
     syncCompoundingDom();
     syncOptionBDemoDom();
     syncDemoHighGrowthDom();
+    const curFeed = root.querySelector('[data-tactical-live-feed="true"]');
+    if (curFeed) {
+      const nxtFeed = new DOMParser().parseFromString(renderLiveFeedStrip(state), 'text/html').body.firstElementChild;
+      if (nxtFeed) curFeed.replaceWith(nxtFeed);
+    }
+    const curHud = root.querySelector('[data-tactical-valve-hud="true"]');
+    if (curHud) {
+      const nxtHud = new DOMParser().parseFromString(renderTacticalValveHud(state), 'text/html').body.firstElementChild;
+      if (nxtHud) curHud.replaceWith(nxtHud);
+    }
+    const curRadar = root.querySelector('[data-market-radar="true"]');
+    if (curRadar && !isInteractiveFormActive()) {
+      const nxtRadar = new DOMParser().parseFromString(renderMarketRadarTable(state), 'text/html').body.firstElementChild;
+      if (nxtRadar) curRadar.replaceWith(nxtRadar);
+    }
   } finally {
     liveCockpitPollInFlight = false;
   }
@@ -1947,6 +1982,17 @@ root.addEventListener('click', (event) => {
     const maxRisk = Math.min(1, Number(state.aiTrader?.riskGear?.ownerMaxRiskPct ?? 1) || 1);
     state.moneyFlow = stepMoneyFlowSimulation(state.moneyFlow, safeStep, maxRisk);
     rerenderMoneyFlowInPlace(`[data-mf-step="${safeStep}"]`);
+    return;
+  }
+  if (target.dataset.radarFilter && RADAR_FILTERS.includes(target.dataset.radarFilter)) {
+    state.radarFilter = target.dataset.radarFilter;
+    rerenderAiSectionsInPlace(`[data-radar-filter="${state.radarFilter}"]`);
+    return;
+  }
+  if (target.dataset.radarInspect && ALL_WATCHLIST_MARKETS.includes(target.dataset.radarInspect)) {
+    state.chartPair = target.dataset.radarInspect;
+    render();
+    root.querySelector(`[data-chart-pair="${state.chartPair}"]`)?.focus({ preventScroll: true });
     return;
   }
   if (target.dataset.chartPair && ALL_WATCHLIST_MARKETS.includes(target.dataset.chartPair)) {

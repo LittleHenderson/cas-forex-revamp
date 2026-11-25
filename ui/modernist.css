@@ -51,50 +51,57 @@
   font-family: var(--font-body);
   font-synthesis: none;
 }
+/* Midnight Blueprint Dark Palette */
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --canvas: #201e1d;
-  --panel: #262423;
-  --panel-soft: #2d2b2b;
-  --ink: #f3f2f2;
-  --muted: #bab6b6;
-  --line: rgba(243, 242, 242, .18);
-  --divider: rgba(243, 242, 242, .4);
-  --rule: #f3f2f2;
-  --navy: #201e1d;
-  --orange: #ff7900;
-  --orange-hover: #ff9a40;
-  --accent-deep: #ff9a40;
-  --accent-soft: #ff9a40;
-  --on-orange: #201e1d;
-  --warning-surface: #2d2b2b;
-  --warning-text: #bab6b6;
-  --focus: #ff7900;
+  --canvas: #060b14;
+  --panel: #0b1220;
+  --panel-soft: #0f182a;
+  --ink: #eef4ff;
+  --muted: #8fa3bf;
+  --line: rgba(96, 165, 250, .18);
+  --divider: rgba(96, 165, 250, .34);
+  --rule: rgba(148, 163, 184, .32);
+  --navy: #060b14;
+  --orange: #3b82f6;
+  --orange-hover: #60a5fa;
+  --accent-deep: #93c5fd;
+  --accent-soft: #60a5fa;
+  --on-orange: #f8fafc;
+  --warning-surface: #1e1910;
+  --warning-text: #fbbf24;
+  --focus: #60a5fa;
+  --bp-emerald: #22c55e;
+  --bp-amber: #f59e0b;
+  --bp-crimson: #ef4444;
   --shadow: none;
-  --pattern-opacity: 0;
+  --pattern-opacity: 0.7;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]):not([data-theme="dark"]) {
     color-scheme: dark;
-    --canvas: #201e1d;
-    --panel: #262423;
-    --panel-soft: #2d2b2b;
-    --ink: #f3f2f2;
-    --muted: #bab6b6;
-    --line: rgba(243, 242, 242, .18);
-    --divider: rgba(243, 242, 242, .4);
-    --rule: #f3f2f2;
-    --navy: #201e1d;
-    --orange: #ff7900;
-    --orange-hover: #ff9a40;
-    --accent-deep: #ff9a40;
-    --accent-soft: #ff9a40;
-    --on-orange: #201e1d;
-    --warning-surface: #2d2b2b;
-    --warning-text: #bab6b6;
-    --focus: #ff7900;
+    --canvas: #060b14;
+    --panel: #0b1220;
+    --panel-soft: #0f182a;
+    --ink: #eef4ff;
+    --muted: #8fa3bf;
+    --line: rgba(96, 165, 250, .18);
+    --divider: rgba(96, 165, 250, .34);
+    --rule: rgba(148, 163, 184, .32);
+    --navy: #060b14;
+    --orange: #3b82f6;
+    --orange-hover: #60a5fa;
+    --accent-deep: #93c5fd;
+    --accent-soft: #60a5fa;
+    --on-orange: #f8fafc;
+    --warning-surface: #1e1910;
+    --warning-text: #fbbf24;
+    --focus: #60a5fa;
+    --bp-emerald: #22c55e;
+    --bp-amber: #f59e0b;
+    --bp-crimson: #ef4444;
     --shadow: none;
-    --pattern-opacity: 0;
+    --pattern-opacity: 0.7;
   }
 }
 body {
@@ -107,6 +114,28 @@ body {
   line-height: 1.55;
 }
 body::before { content: none; display: none; background: none; opacity: 0; }
+:root[data-theme="dark"] body::before {
+  content: "";
+  display: block;
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: url("./assets/blueprint-grid.svg") repeat 0 0 / 32px 32px;
+  opacity: var(--pattern-opacity, 0.7);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not([data-theme="dark"]) body::before {
+    content: "";
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background: url("./assets/blueprint-grid.svg") repeat 0 0 / 32px 32px;
+    opacity: var(--pattern-opacity, 0.7);
+  }
+}
 *, *::before, *::after { box-sizing: border-box; }
 h1, h2, h3, h4 { font-family: var(--font-heading); font-weight: 800; }
 h1 { font-size: clamp(32px, 3.1vw, 44px); letter-spacing: -.035em; line-height: 1.08; }
