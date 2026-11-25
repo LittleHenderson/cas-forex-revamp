@@ -813,7 +813,7 @@ export function normalizeAiTrader(doc) {
   const rawActions = Array.isArray(doc.recent_actions) ? doc.recent_actions.slice(-8) : [];
   const recentActions = rawActions.map((a) => Object.freeze({
     observedAt: str(a.observed_at, ''),
-    kind: str(a.kind, 'INFO'),
+    kind: str(a.kind ?? a.action, 'INFO'),
     symbol: str(a.symbol ?? '', ''),
     detail: str(a.detail ?? a.reason ?? a.outcome ?? '', 'Recorded', 240),
   }));
@@ -948,6 +948,7 @@ export function normalizeAiTrader(doc) {
     aggressionDial: doc.aggression_dial && typeof doc.aggression_dial === 'object'
       ? normalizeAggressionDial(doc.aggression_dial)
       : null,
+    telegramAlerts: doc.telegram_alerts && typeof doc.telegram_alerts === 'object' ? Object.freeze({ ...doc.telegram_alerts }) : null,
     openPositions: Object.freeze(openPositions),
     recentActions: Object.freeze(recentActions),
   });
