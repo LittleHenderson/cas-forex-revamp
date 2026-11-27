@@ -141,14 +141,45 @@ class _FakeOandaTransport:
             bid, ask = self.quotes[sym]
             price = ask if not str(order["units"]).startswith("-") else bid
             return json.dumps({
-                "orderCreateTransaction": {"id": "10"},
-                "orderFillTransaction": {"id": "11", "price": str(price)},
+                "orderCreateTransaction": {"id": "10", "clientExtensions": order.get("clientExtensions", {})},
+                "orderFillTransaction": {
+                    "id": "11",
+                    "instrument": order["instrument"],
+                    "units": order["units"],
+                    "price": str(price),
+                    "clientExtensions": order.get("clientExtensions", {}),
+                },
                 "lastTransactionID": "11",
             }).encode()
+        if method == "GET" and url.endswith("/openTrades"):
+            trades = []
+            for idx, o in enumerate(self.orders, start=1):
+                if "instrument" in o:
+                    sl_p = (o.get("stopLossOnFill") or {}).get("price")
+                    trades.append({
+                        "id": str(idx),
+                        "instrument": o["instrument"],
+                        "currentUnits": str(o["units"]),
+                        "price": "1.10010",
+                        "unrealizedPL": "0.00",
+                        "state": "OPEN",
+                        **({"stopLossOrder": {"price": str(sl_p)}} if sl_p else {}),
+                    })
+            return json.dumps({"trades": trades, "lastTransactionID": "11"}).encode()
         if method == "PUT" and "/trades/" in url and url.endswith("/orders"):
             amend = json.loads(body)
             self.orders.append(amend)
-            return json.dumps({"stopLossOrderTransaction": {"id": "12"}, "lastTransactionID": "12"}).encode()
+            tid_a = url.split("/")[-2]
+            sl_b = amend.get("stopLoss") or {}
+            return json.dumps({
+                "stopLossOrderTransaction": {
+                    "id": "12",
+                    "tradeID": tid_a,
+                    "price": str(sl_b.get("price", "1.09800")),
+                    "clientExtensions": sl_b.get("clientExtensions", {}),
+                },
+                "lastTransactionID": "12",
+            }).encode()
         raise RuntimeError(f"Unexpected OANDA route {method} {url}")
 
 
@@ -343,7 +374,7 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
                 "chart": {
                     "result": [{
                         "meta": {"regularMarketPrice": 20501.25},
-                        "timestamp": [1794834000, 1794834060],
+                        "timestamp": [int(T0.timestamp()) - 60, int(T0.timestamp())],
                         "indicators": {"quote": [{"open": [20495.0, 20499.0], "high": [20502.0, 20505.0],
                                                   "low": [20494.0, 20498.0], "close": [20499.0, 20501.25], "volume": [12, 18]}]},
                     }]
@@ -353,7 +384,7 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
                 "chart": {
                     "result": [{
                         "meta": {"regularMarketPrice": 43802.00},
-                        "timestamp": [1794834000, 1794834060],
+                        "timestamp": [int(T0.timestamp()) - 60, int(T0.timestamp())],
                         "indicators": {"quote": [{"open": [43790.0, 43798.0], "high": [43805.0, 43810.0],
                                                   "low": [43788.0, 43795.0], "close": [43798.0, 43802.0], "volume": [10, 15]}]},
                     }]
@@ -363,7 +394,7 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
                 "chart": {
                     "result": [{
                         "meta": {"regularMarketPrice": 6000.25},
-                        "timestamp": [1794834000, 1794834060],
+                        "timestamp": [int(T0.timestamp()) - 60, int(T0.timestamp())],
                         "indicators": {"quote": [{"open": [5995.0, 5998.0], "high": [6002.0, 6004.0],
                                                   "low": [5994.0, 5997.0], "close": [5998.0, 6000.25], "volume": [8, 12]}]},
                     }]
@@ -373,7 +404,7 @@ class AutonomousAiTraderAndMarketsTests(unittest.TestCase):
                 "chart": {
                     "result": [{
                         "meta": {"regularMarketPrice": 2600.30},
-                        "timestamp": [1794834000, 1794834060],
+                        "timestamp": [int(T0.timestamp()) - 60, int(T0.timestamp())],
                         "indicators": {"quote": [{"open": [2598.0, 2599.0], "high": [2601.0, 2602.0],
                                                   "low": [2597.0, 2598.5], "close": [2599.0, 2600.30], "volume": [9, 11]}]},
                     }]

@@ -479,7 +479,7 @@ class Pr38LhfxValveScopeScoutLockAndFuturesRefTests(unittest.TestCase):
                 "chart": {
                     "result": [{
                         "meta": {"regularMarketPrice": price},
-                        "timestamp": [1795416780, 1795416840],
+                        "timestamp": [int(T0.timestamp()) - 60, int(T0.timestamp())],
                         "indicators": {"quote": [{"open": [price, price], "high": [price, price],
                                                   "low": [price, price], "close": [price, price], "volume": [10, 12]}]},
                     }]

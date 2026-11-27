@@ -275,14 +275,45 @@ class StubOandaTransport:
             bid, ask = self.quotes[order["instrument"].replace("_", "")]
             fill_px = ask if not str(order["units"]).startswith("-") else bid
             return json.dumps({
-                "orderCreateTransaction": {"id": "101"},
-                "orderFillTransaction": {"id": "102", "price": str(fill_px)},
+                "orderCreateTransaction": {"id": "101", "clientExtensions": order.get("clientExtensions", {})},
+                "orderFillTransaction": {
+                    "id": "102",
+                    "instrument": order["instrument"],
+                    "units": order["units"],
+                    "price": str(fill_px),
+                    "clientExtensions": order.get("clientExtensions", {}),
+                },
                 "lastTransactionID": "102",
             }).encode("utf-8")
+        if method == "GET" and url.endswith("/openTrades"):
+            trades = []
+            for idx, o in enumerate(self.orders, start=1):
+                if "instrument" in o:
+                    sl_p = (o.get("stopLossOnFill") or {}).get("price")
+                    trades.append({
+                        "id": str(idx),
+                        "instrument": o["instrument"],
+                        "currentUnits": str(o["units"]),
+                        "price": "1.10010",
+                        "unrealizedPL": "0.00",
+                        "state": "OPEN",
+                        **({"stopLossOrder": {"price": str(sl_p)}} if sl_p else {}),
+                    })
+            return json.dumps({"trades": trades, "lastTransactionID": "102"}).encode("utf-8")
         if method == "PUT" and "/trades/" in url:
             amend = json.loads((body or b"{}").decode("utf-8"))
             self.orders.append(amend)
-            return json.dumps({"stopLossOrderTransaction": {"id": "103"}, "lastTransactionID": "103"}).encode("utf-8")
+            tid_e = url.split("/")[-2]
+            sl_b = amend.get("stopLoss") or {}
+            return json.dumps({
+                "stopLossOrderTransaction": {
+                    "id": "103",
+                    "tradeID": tid_e,
+                    "price": str(sl_b.get("price", "1.09800")),
+                    "clientExtensions": sl_b.get("clientExtensions", {}),
+                },
+                "lastTransactionID": "103",
+            }).encode("utf-8")
         raise RuntimeError(f"Unexpected OANDA stub request: {method} {url}")
 
 

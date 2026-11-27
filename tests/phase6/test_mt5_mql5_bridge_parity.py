@@ -126,6 +126,7 @@ def _grant_for_req(req: Mt5OrderRequest, *, broker_id: str = BROKER_HUGOSWAY_MT5
             volume=req.volume_lots,
             stop_loss=req.stop_loss,
             take_profit=req.take_profit,
+            previous_stop_loss=(D("1.09400") if req.action == "AMEND_STOP" else None),
             now=eff_now,
         )
     units = (req.volume_lots * D("100000")) if req.volume_lots is not None else D("10000")

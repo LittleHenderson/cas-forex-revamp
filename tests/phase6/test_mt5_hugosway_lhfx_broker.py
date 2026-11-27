@@ -125,7 +125,12 @@ def proposal_for(order: OrderIntent, *, reason: str = "Trend entry", quantity=No
 
 
 def clear(order: OrderIntent, max_qty: str = "500000"):
-    return GATE.require_admissible(proposal_for(order), current_view=VIEW, policy=policy(max_qty), now=T0 + timedelta(seconds=1))
+    view_eff = dict(VIEW)
+    if order.position_ticket is not None:
+        view_eff["position_inventory"] = json.dumps([
+            {"ticket": str(order.position_ticket), "symbol": order.symbol, "side": "BUY", "stop_loss": "1.09500"}
+        ])
+    return GATE.require_admissible(proposal_for(order), current_view=view_eff, policy=policy(max_qty), now=T0 + timedelta(seconds=1))
 
 
 def _grant_for_req(req: Mt5OrderRequest, *, broker_id: str = BROKER_HUGOSWAY_MT5, login: int = 7001234, server: str = "Hugo demo PRO5", now: datetime | None = None):
@@ -269,6 +274,7 @@ class FakeOandaTransport:
         self.margin_available = margin_available
         self.calls: list[tuple[str, str]] = []
         self.orders: list[dict] = []
+        self._tx = 100
 
     def __call__(self, method, url, headers, body, timeout, max_bytes):
         self.calls.append((method, url))
@@ -277,7 +283,7 @@ class FakeOandaTransport:
         if url.endswith("/summary"):
             return json.dumps({"account": {"id": OANDA_ACCOUNT, "currency": "USD", "balance": self.nav, "NAV": self.nav,
                                            "unrealizedPL": "0", "marginAvailable": self.margin_available,
-                                           "openPositionCount": 0, "lastTransactionID": "1"}}).encode()
+                                           "openPositionCount": len(self.orders), "lastTransactionID": str(self._tx)}}).encode()
         if "/pricing?" in url:
             insts = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["instruments"][0].split(",")
             prices = []
@@ -290,16 +296,51 @@ class FakeOandaTransport:
             self.orders.append(order)
             bid, ask = self.quotes[order["instrument"].replace("_", "")]
             price = ask if not order["units"].startswith("-") else bid
-            return json.dumps({"orderCreateTransaction": {"id": "10"}, "orderFillTransaction": {"id": "11", "price": str(price)},
-                               "lastTransactionID": "11"}).encode()
+            self._tx += 1
+            cid = str(self._tx)
+            self._tx += 1
+            fid = str(self._tx)
+            return json.dumps({
+                "orderCreateTransaction": {"id": cid, "clientExtensions": order.get("clientExtensions", {})},
+                "orderFillTransaction": {
+                    "id": fid,
+                    "instrument": order["instrument"],
+                    "units": order["units"],
+                    "price": str(price),
+                    "clientExtensions": order.get("clientExtensions", {}),
+                },
+                "lastTransactionID": fid,
+            }).encode()
         if method == "PUT" and "/trades/" in url and url.endswith("/orders"):
             amend = json.loads(body)
             self.orders.append(amend)
-            return json.dumps({"stopLossOrderTransaction": {"id": "12"}, "lastTransactionID": "12"}).encode()
+            tid_a = url.split("/")[-2]
+            sl_b = amend.get("stopLoss") or {}
+            tp_b = amend.get("takeProfit") or {}
+            resp_a: dict[str, object] = {}
+            if sl_b:
+                self._tx += 1
+                resp_a["stopLossOrderTransaction"] = {
+                    "id": str(self._tx),
+                    "tradeID": tid_a,
+                    "price": str(sl_b["price"]),
+                    "clientExtensions": sl_b.get("clientExtensions", {}),
+                }
+            if tp_b:
+                self._tx += 1
+                resp_a["takeProfitOrderTransaction"] = {
+                    "id": str(self._tx),
+                    "tradeID": tid_a,
+                    "price": str(tp_b["price"]),
+                    "clientExtensions": tp_b.get("clientExtensions", {}),
+                }
+            resp_a["lastTransactionID"] = str(self._tx)
+            return json.dumps(resp_a).encode()
         if method == "GET" and url.endswith("/openTrades"):
             trades = []
             for idx, ord_item in enumerate(self.orders, start=1):
                 if "instrument" in ord_item and "units" in ord_item:
+                    sl_p = (ord_item.get("stopLossOnFill") or {}).get("price")
                     trades.append({
                         "id": str(idx),
                         "instrument": ord_item["instrument"],
@@ -307,15 +348,26 @@ class FakeOandaTransport:
                         "price": "1.10010",
                         "unrealizedPL": "0.00",
                         "state": "OPEN",
+                        **({"stopLossOrder": {"price": str(sl_p)}} if sl_p else {}),
                     })
-            return json.dumps({"trades": trades, "lastTransactionID": "12"}).encode()
+            return json.dumps({"trades": trades, "lastTransactionID": str(self._tx)}).encode()
         if method == "PUT" and "/trades/" in url and url.endswith("/close"):
             close_doc = json.loads(body)
             self.orders.append(close_doc)
+            tid_c = url.split("/")[-2]
+            self._tx += 1
+            cid_c = str(self._tx)
+            self._tx += 1
+            fid_c = str(self._tx)
             return json.dumps({
-                "orderCreateTransaction": {"id": "13"},
-                "orderFillTransaction": {"id": "14", "price": "1.10000", "pl": "0.00"},
-                "lastTransactionID": "14",
+                "orderCreateTransaction": {"id": cid_c},
+                "orderFillTransaction": {
+                    "id": fid_c,
+                    "price": "1.10000",
+                    "pl": "0.00",
+                    "tradesClosed": [{"tradeID": tid_c, "realizedPL": "0.00"}],
+                },
+                "lastTransactionID": fid_c,
             }).encode()
         raise RuntimeError("unexpected OANDA call")
 
@@ -1284,8 +1336,8 @@ class Mql5BridgeSourceContractTests(unittest.TestCase):
     def test_cas_forex_mt5_bridge_all_receipt_json_calls_pass_11_typed_args(self) -> None:
         mq5_path = REPO_ROOT / "mt5" / "CasForexMt5Bridge.mq5"
         src = mq5_path.read_text(encoding="utf-8")
-        _, calls = self._assert_receipt_json_contract(src, expected_min_calls=18)
-        self.assertEqual(len(calls), 18)
+        _, calls = self._assert_receipt_json_contract(src, expected_min_calls=19)
+        self.assertEqual(len(calls), 19)
 
     def test_receipt_json_contract_catches_10_arg_and_untyped_number_regressions(self) -> None:
         sig_header = (

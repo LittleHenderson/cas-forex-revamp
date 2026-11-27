@@ -131,7 +131,9 @@ class ValveQuotaVaultE2ETests(unittest.TestCase):
             target_id="pos-ticket-101",
             reason="ID=0act-amend-1 Tighten protective stop",
         )
-        dec = gate.evaluate(prop, current_view=default_view(), policy=default_policy(), now=T0 + timedelta(seconds=1))
+        cv = dict(default_view())
+        cv["position_inventory"] = [{"position_id": "pos-ticket-101", "instrument_id": "EURUSD", "side": "BUY", "stop_price": "1.09500"}]
+        dec = gate.evaluate(prop, current_view=cv, policy=default_policy(), now=T0 + timedelta(seconds=1))
         self.assertTrue(dec.admitted)
         self.assertEqual(dec.weights_sha256, gate.weights_sha256)
 

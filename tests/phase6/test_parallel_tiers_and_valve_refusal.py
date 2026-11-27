@@ -574,7 +574,16 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                     intent_sha256=prep4["intent_sha256"],
                 )
 
-            # 4. Retry recovery from OUTCOME_UNKNOWN reuses exact original idempotency_key and settles once
+            # 4. Reconcile NOT_EXECUTED then retry recovery reuses exact original idempotency_key and settles once
+            vault.reconcile_withdrawal_outcome(
+                transfer_id=transfer_id,
+                exchange_history_checker=lambda q: {
+                    "status": "NOT_EXECUTED",
+                    "history_complete": True,
+                    "queried_client_reference_id": q["idempotency_key"],
+                },
+                owner_request_id="req-ach-reconcile",
+            )
             fail_mode["fail"] = False
             prep5 = vault.prepare_offramp_ach_payout(
                 rail=RAIL_COINBASE_ACH,
@@ -995,13 +1004,14 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
             )
         self.assertIn("MISSING_POSITION_SIDE", ctx_str_mkt.exception.decision.hard_veto_reasons)
 
-        # 6. Valid quote-less AMEND_STOP with string-only inventory (RehearsalWiring pattern) remains ADMITTED
-        dec_rehearsal_ok = gate.require_admissible(
-            _make_amend_proposal(stop_price=D("1.1020"), target_id="pos-1"),
-            current_view=_clean_view(extra={"position_inventory": ["pos-1"]}),
-            now=now_t,
-        )
-        self.assertTrue(dec_rehearsal_ok.admitted)
+        # 6. Quote-less AMEND_STOP with string-only inventory (missing side/prev_stop) MUST veto (Finding [1])
+        with self.assertRaises(ValveRefusalError) as ctx_quoteless_str:
+            gate.require_admissible(
+                _make_amend_proposal(stop_price=D("1.1020"), target_id="pos-1"),
+                current_view=_clean_view(extra={"position_inventory": ["pos-1"]}),
+                now=now_t,
+            )
+        self.assertIn("MISSING_POSITION_SIDE", ctx_quoteless_str.exception.decision.hard_veto_reasons)
 
         # 7. OPEN with limit_price=None and BUY stop >= obs_bid is vetoed (INVERTED_BUY_PROTECTIVE_STOP)
         eur_mkt_view = _clean_view(
@@ -1295,19 +1305,15 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
             )
         self.assertIn("MISSING_POSITION_SIDE", ctx_prev_stop_noside.exception.decision.hard_veto_reasons)
 
-        # 4. Quote-less RehearsalWiring pattern (["pos-1"] / [] without stop_price) remains ADMITTED
-        dec_rehearsal_list = gate.require_admissible(
-            _make_amend_proposal(stop_price=D("1.0900"), side=None, target_id="pos-1"),
-            current_view=_clean_view(extra={"position_inventory": ["pos-1"]}),
-            now=now_t,
-        )
-        self.assertTrue(dec_rehearsal_list.admitted)
-        dec_rehearsal_empty = gate.require_admissible(
-            _make_amend_proposal(stop_price=D("1.0900"), side=None, target_id="pos-1"),
-            current_view=_clean_view(extra={"position_inventory": []}),
-            now=now_t,
-        )
-        self.assertTrue(dec_rehearsal_empty.admitted)
+        # 4. Quote-less AMEND_STOP with ["pos-1"] or [] without authoritative side & prev_stop MUST veto (Finding [1])
+        for empty_inv in (["pos-1"], []):
+            with self.assertRaises(ValveRefusalError) as ctx_empty:
+                gate.require_admissible(
+                    _make_amend_proposal(stop_price=D("1.0900"), side=None, target_id="pos-1"),
+                    current_view=_clean_view(extra={"position_inventory": empty_inv}),
+                    now=now_t,
+                )
+            self.assertIn("MISSING_POSITION_SIDE", ctx_empty.exception.decision.hard_veto_reasons)
 
 
     def test_parallel_tier_open_spread_stop_and_marketable_vs_passive_limit_price_valve_guards(self) -> None:
@@ -2080,7 +2086,12 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                 DecisionFact(
                     "observed-available_margin-1", "available_margin", '{"amount": "9000", "currency": "USD"}', ("ev-m1-1",)
                 ),
-                DecisionFact("observed-position_inventory-1", "position_inventory", "[]", ("ev-m1-1",)),
+                DecisionFact(
+                    "observed-position_inventory-1",
+                    "position_inventory",
+                    json.dumps([{"position_id": "pos-1", "instrument_id": "EURUSD", "side": "BUY", "stop_price": "1.0950"}]),
+                    ("ev-m1-1",),
+                ),
             )
             dec_facts_ok = gate.require_admissible(
                 _proposal_for(action, facts=valid_json_facts), current_view=None, now=T0
@@ -2093,6 +2104,7 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                     "equity": '{"amount": "10000", "currency": "USD"}',
                     "peak_equity": '{"amount": "10000", "currency": "USD"}',
                     "available_margin": '{"amount": "9000", "currency": "USD"}',
+                    "position_inventory": [{"position_id": "pos-1", "instrument_id": "EURUSD", "side": "BUY", "stop_price": "1.0950"}],
                 }
             )
             dec_view_ok = gate.require_admissible(_proposal_for(action), current_view=valid_json_view, now=T0)
@@ -2291,7 +2303,7 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                         gate.require_admissible(_proposal_for(action, facts=tuple(facts.values())), current_view=None, now=T0)
                     self.assertIn("MISSING_REQUIRED_ACCOUNTING", ctx_df.exception.decision.hard_veto_reasons)
 
-            # Valid position_inventory JSON lists remain admitted (0x, 1x, 2x outer-quoted and populated)
+            # Valid position_inventory JSON lists remain admitted (0x/1x/2x for non-AMEND_STOP; populated for all actions incl. AMEND_STOP)
             for valid_pos_inv in (
                 [],
                 "[]",
@@ -2307,8 +2319,12 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                     "available_margin": "9000",
                     "position_inventory": valid_pos_inv,
                 }
-                dec_ok = gate.require_admissible(_proposal_for(action), current_view=cv_ok, now=T0)
-                self.assertTrue(dec_ok.admitted)
+                if action is ActionKind.AMEND_STOP and "pos-1" not in str(valid_pos_inv):
+                    with self.assertRaises(ValveRefusalError):
+                        gate.require_admissible(_proposal_for(action), current_view=cv_ok, now=T0)
+                else:
+                    dec_ok = gate.require_admissible(_proposal_for(action), current_view=cv_ok, now=T0)
+                    self.assertTrue(dec_ok.admitted)
 
     def test_valve_amend_stop_ambiguous_position_vetoed_even_when_intent_side_supplied(self) -> None:
         gate = load_default_forex_valve_gate()
@@ -2552,7 +2568,7 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
             "equity": "10000",
             "peak_equity": "10000",
             "available_margin": "9000",
-            "position_inventory": [],
+            "position_inventory": [{"position_id": "pos-1", "instrument_id": "EURUSD", "side": "BUY", "stop_price": "1.0950"}],
         }
         valid_acct_fact = (
             DecisionFact(
@@ -2564,7 +2580,7 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                         "equity": "10000",
                         "peak_equity": "10000",
                         "available_margin": "9000",
-                        "position_inventory": [],
+                        "position_inventory": [{"position_id": "pos-1", "instrument_id": "EURUSD", "side": "BUY", "stop_price": "1.0950"}],
                     }
                 ),
                 ("ev-m1-1",),
@@ -2717,7 +2733,7 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                         gate.require_admissible(_proposal_for(action, facts=acct_bad), current_view=None, now=T0)
                     self.assertIn("MISSING_REQUIRED_ACCOUNTING", ctx_acct.exception.decision.hard_veto_reasons)
 
-        # Valid empty and populated position_inventory remain admitted (including tightening AMEND_STOP)
+        # Empty position_inventory admits CLOSE/OPEN while tightening AMEND_STOP requires populated position_inventory (Finding [1])
         for ok_pinv in ("[]", [], json.dumps("[]")):
             cv_ok = {
                 "account_id": "acct-m1",
@@ -2727,7 +2743,10 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                 "available_margin": "9000",
                 "position_inventory": ok_pinv,
             }
-            self.assertTrue(gate.require_admissible(_make_amend_proposal(stop_price=D("1.0980"), side=Side.BUY), current_view=cv_ok, now=T0).admitted)
+            self.assertTrue(gate.require_admissible(_proposal_for(ActionKind.OPEN), current_view=cv_ok, now=T0).admitted)
+            with self.assertRaises(ValveRefusalError) as ctx_emp:
+                gate.require_admissible(_make_amend_proposal(stop_price=D("1.0980"), side=Side.BUY), current_view=cv_ok, now=T0)
+            self.assertIn("MISSING_POSITION_SIDE", ctx_emp.exception.decision.hard_veto_reasons)
 
         cv_pos = {
             "account_id": "acct-m1",
@@ -2771,10 +2790,10 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
             base.update(extra)
             return base
 
-        # Empty tuple remains valid empty position_inventory
+        # Empty tuple remains valid empty position_inventory (OPEN admitted; AMEND_STOP without position refused per Finding [1])
         self.assertTrue(
             gate.require_admissible(
-                _make_amend_proposal(stop_price=D("1.0980"), side=Side.BUY),
+                _make_order_proposal(kind=ActionKind.OPEN, side=Side.BUY, limit_price=None, stop_price=D("1.0950"), take_profit_price=D("1.1150")),
                 current_view=_cv({}),
                 now=T0,
             ).admitted
@@ -3001,7 +3020,7 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                         "equity": "10000",
                         "peak_equity": "10000",
                         "available_margin": "9000",
-                        "position_inventory": [],
+                        "position_inventory": [{"position_id": "pos-1", "instrument_id": "EURUSD", "side": "BUY", "stop_price": "1.0950"}],
                     }
                 ),
                 ("ev-m1-1",),
@@ -3087,12 +3106,14 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
             [{"position_id": "pos-1", "instrument_id": "EURUSD", "side": "BUY"}],
             ({"position_id": "pos-1", "instrument_id": "EURUSD", "side": "BUY"},),
         ):
-            dec = gate.require_admissible(
-                _make_amend_proposal(stop_price=D("1.0980"), side=Side.BUY, target_id="pos-1", facts=stale_sell_fact),
-                current_view=_base_cv(position_inventory=pinv),
-                now=T0,
-            )
-            self.assertTrue(dec.admitted)
+            # Missing stop_price in authoritative current_view refuses AMEND_STOP instead of falling back to stale SELL stop
+            with self.assertRaises(ValveRefusalError) as ctx_noprev:
+                gate.require_admissible(
+                    _make_amend_proposal(stop_price=D("1.0980"), side=Side.BUY, target_id="pos-1", facts=stale_sell_fact),
+                    current_view=_base_cv(position_inventory=pinv),
+                    now=T0,
+                )
+            self.assertIn("MISSING_AUTHORITATIVE_PREVIOUS_STOP", ctx_noprev.exception.decision.hard_veto_reasons)
 
         # 2. Closed target_id absent from non-empty current_view: stale fact must NOT supply closed pos-1
         cv_only_pos2 = _base_cv(
@@ -3155,9 +3176,10 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
                 ("ev-m1-1",),
             ),
         )
+        sell_pos_inv = [{"position_id": "pos-1", "instrument_id": "EURUSD", "side": "SELL", "stop_price": "1.1050"}]
         for mkt_cv in (
-            _base_cv(current_market=[{"instrument_id": "EURUSD", "bid": "1.1000"}]),
-            _base_cv(instrument_id="EURUSD", bid="1.1000"),
+            _base_cv(current_market=[{"instrument_id": "EURUSD", "bid": "1.1000"}], position_inventory=sell_pos_inv),
+            _base_cv(instrument_id="EURUSD", bid="1.1000", position_inventory=sell_pos_inv),
         ):
             dec_mkt = gate.require_admissible(
                 _make_amend_proposal(stop_price=D("1.1020"), side=Side.SELL, target_id="pos-1", facts=stale_ask_fact),
@@ -3384,7 +3406,12 @@ class ParallelTiersAndValveRefusalTests(unittest.TestCase):
             DecisionFact("acct-snapshot-1", "\ufeffaccount", json.dumps({"balance": "10000"}), ("ev-m1-1",)),
             DecisionFact("f-eq", "\ufeffequity", "10000", ("ev-m1-1",)),
             DecisionFact("f-mgn", "\ufeffavailable_margin", "9000", ("ev-m1-1",)),
-            DecisionFact("f-inv", "\ufeffposition_inventory", "[]", ("ev-m1-1",)),
+            DecisionFact(
+                "f-inv",
+                "\ufeffposition_inventory",
+                json.dumps([{"position_id": "pos-1", "instrument_id": "EURUSD", "side": "BUY", "stop_price": "1.0950"}]),
+                ("ev-m1-1",),
+            ),
         )
         for action in all_6_actions:
             self.assertTrue(gate.require_admissible(_proposal_for(action, facts=split_facts), current_view=None, now=T0).admitted)

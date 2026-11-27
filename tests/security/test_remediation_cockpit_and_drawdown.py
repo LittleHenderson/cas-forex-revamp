@@ -149,8 +149,12 @@ class DrawdownGateRemediationTests(unittest.TestCase):
                         )
                     self.assertIn("MAX_DRAWDOWN_EXCEEDED", ctx.exception.decision.hard_veto_reasons)
 
-            # WAIT, REDUCE, CLOSE, and AMEND_STOP remain permitted during 12% drawdown
-            view_dd = {**view_clean, "equity": "88000"}
+            # WAIT, REDUCE, CLOSE, and tightening AMEND_STOP remain permitted during 12% drawdown
+            view_dd = {
+                **view_clean,
+                "equity": "88000",
+                "position_inventory": [{"ticket": "pos-1", "symbol": "EURUSD", "side": "BUY", "stop_loss": "1.09400"}],
+            }
             wait_dec = gate.require_admissible(
                 _make_proposal(kind=None),
                 current_view=view_dd,

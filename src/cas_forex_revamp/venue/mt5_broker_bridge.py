@@ -1475,16 +1475,112 @@ def verify_spool_valve_admission(
 
 
 class _SpoolReplayLedger:
-    """Durable JSON replay & monotonic nonce ledger stored outside the terminal inbox directory."""
+    """Durable JSON replay & monotonic nonce ledger stored in isolated custody dir with sealed HWM (Finding [5])."""
 
-    def __init__(self, path: Path, *, custody_inspector: SpoolCustodyInspector | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        custody_inspector: SpoolCustodyInspector | None = None,
+        require_sealed_init: bool = False,
+        hmac_key_loader: Callable[[], bytes] | None = None,
+    ) -> None:
         self.path = path
+        self._hwm_path = path.with_name(path.name + ".hwm")
         self._custody_inspector = custody_inspector
+        self._require_sealed_init = bool(require_sealed_init)
+        self._hmac_key_loader = hmac_key_loader
+        self._mem_hwm_nonce: int = 0
         self._lock = threading.RLock()
+
+    def set_require_sealed_init(self, enabled: bool) -> None:
+        with self._lock:
+            self._require_sealed_init = bool(enabled)
+
+    def _derive_hwm_key(self) -> bytes:
+        base_key: bytes | None = None
+        if self._hmac_key_loader is not None:
+            try:
+                cand = self._hmac_key_loader()
+                if isinstance(cand, (bytes, bytearray)) and len(cand) >= 32:
+                    base_key = bytes(cand)
+            except Exception:
+                base_key = None
+        if base_key is None:
+            try:
+                resolved = str(self.path.resolve())
+            except OSError:
+                resolved = str(self.path)
+            base_key = sha256(f"cas-forex-hwm-fallback:{resolved}".encode("utf-8")).digest()
+        return hmac.new(base_key, f"replay-hwm:{self.path.name}".encode("utf-8"), sha256).digest()
+
+    def _compute_hwm_mac(self, nonce: int, seen_count: int) -> str:
+        msg = f"cas-forex-replay-hwm/1|{self.path.name}|{nonce}|{seen_count}"
+        return _spool_hmac_hex(self._derive_hwm_key(), msg)
+
+    def _read_and_verify_hwm(self) -> int:
+        hwm_doc = _read_spool_json(self._hwm_path, max_bytes=16_384, custody_inspector=self._custody_inspector)
+        if type(hwm_doc) is not dict:
+            raise Mt5TransportError("MT5_REPLAY_LEDGER_ROLLBACK_OR_DELETED: corrupted .hwm sentinel")
+        h_nonce_raw = hwm_doc.get("hwm_nonce", "")
+        h_seen_raw = hwm_doc.get("seen_count", "")
+        h_mac = str(hwm_doc.get("hmac_sha256", "")).lower()
+        if (
+            type(h_nonce_raw) is not str
+            or not h_nonce_raw.isdigit()
+            or type(h_seen_raw) is not str
+            or not h_seen_raw.isdigit()
+            or not _HEX64_RE.fullmatch(h_mac)
+        ):
+            raise Mt5TransportError("MT5_REPLAY_LEDGER_ROLLBACK_OR_DELETED: malformed .hwm fields")
+        h_nonce = int(h_nonce_raw)
+        h_seen = int(h_seen_raw)
+        expected_mac = self._compute_hwm_mac(h_nonce, h_seen)
+        if not hmac.compare_digest(expected_mac, h_mac):
+            raise Mt5TransportError("MT5_REPLAY_LEDGER_ROLLBACK_OR_DELETED: .hwm HMAC verification failed")
+        return h_nonce
+
+    def ensure_sealed_initialized(self, *, initial_nonce: int = 0) -> None:
+        with self._lock:
+            ledger_exists = os.path.lexists(self.path)
+            hwm_exists = os.path.lexists(self._hwm_path)
+            if ledger_exists and hwm_exists:
+                self.load()
+                return
+            if hwm_exists and not ledger_exists:
+                raise Mt5TransportError("MT5_REPLAY_LEDGER_ROLLBACK_OR_DELETED: ledger missing while .hwm exists")
+            if ledger_exists and not hwm_exists:
+                data = _read_spool_json(self.path, max_bytes=262_144, custody_inspector=self._custody_inspector)
+                if type(data) is not dict:
+                    raise Mt5TransportError("corrupted MT5 spool replay ledger during seal")
+                n_raw = data.get("last_monotonic_nonce", "0")
+                if type(n_raw) is not str or not n_raw.isdigit():
+                    raise Mt5TransportError("corrupted MT5 spool replay ledger nonce during seal")
+                seen_raw = data.get("seen_request_ids", [])
+                if type(seen_raw) is not list or any(type(x) is not str for x in seen_raw):
+                    raise Mt5TransportError("corrupted MT5 spool replay ledger seen_request_ids during seal")
+                nonce_eff = max(int(n_raw), int(initial_nonce))
+                self._persist_and_verify(nonce=nonce_eff, seen=list(seen_raw[-2048:]))
+                return
+            self._persist_and_verify(nonce=max(0, int(initial_nonce)), seen=[])
 
     def load(self) -> tuple[int, list[str]]:
         with self._lock:
-            if not os.path.lexists(self.path):
+            ledger_exists = os.path.lexists(self.path)
+            hwm_exists = os.path.lexists(self._hwm_path)
+            if hwm_exists and not ledger_exists:
+                raise Mt5TransportError(
+                    "MT5_REPLAY_LEDGER_ROLLBACK_OR_DELETED: replay ledger file deleted while sealed .hwm exists"
+                )
+            if self._mem_hwm_nonce > 0 and not ledger_exists:
+                raise Mt5TransportError(
+                    "MT5_REPLAY_LEDGER_MEMORY_HWM_ROLLBACK: replay ledger file deleted after in-process advancement"
+                )
+            if self._require_sealed_init and (not ledger_exists or not hwm_exists):
+                raise Mt5TransportError(
+                    "MT5_LIVE_REPLAY_LEDGER_MISSING_OR_DELETED: LIVE execution requires provisioned sealed replay ledger (.hwm)"
+                )
+            if not ledger_exists:
                 return 0, []
             data = _read_spool_json(self.path, max_bytes=262_144, custody_inspector=self._custody_inspector)
             if type(data) is not dict:
@@ -1498,6 +1594,20 @@ class _SpoolReplayLedger:
             seen_raw = data.get("seen_request_ids", [])
             if type(seen_raw) is not list or any(type(x) is not str for x in seen_raw):
                 raise Mt5TransportError("corrupted MT5 spool replay ledger seen_request_ids")
+            if hwm_exists:
+                hwm_nonce = self._read_and_verify_hwm()
+                if last_nonce < hwm_nonce:
+                    raise Mt5TransportError(
+                        f"MT5_REPLAY_LEDGER_ROLLBACK_OR_DELETED: ledger nonce {last_nonce} < sealed .hwm {hwm_nonce}"
+                    )
+                if hwm_nonce > self._mem_hwm_nonce:
+                    self._mem_hwm_nonce = hwm_nonce
+            if last_nonce < self._mem_hwm_nonce:
+                raise Mt5TransportError(
+                    f"MT5_REPLAY_LEDGER_MEMORY_HWM_ROLLBACK: ledger nonce {last_nonce} < memory HWM {self._mem_hwm_nonce}"
+                )
+            if last_nonce > self._mem_hwm_nonce:
+                self._mem_hwm_nonce = last_nonce
             return last_nonce, list(seen_raw[-2048:])
 
     def _persist_and_verify(
@@ -1512,11 +1622,22 @@ class _SpoolReplayLedger:
             {"last_monotonic_nonce": str(nonce), "seen_request_ids": seen},
             custody_inspector=self._custody_inspector,
         )
+        hwm_payload = {
+            "hwm_nonce": str(nonce),
+            "seen_count": str(len(seen)),
+            "hmac_sha256": self._compute_hwm_mac(nonce, len(seen)),
+        }
+        _atomic_write_json(
+            self._hwm_path,
+            hwm_payload,
+            custody_inspector=self._custody_inspector,
+        )
         persisted_nonce, persisted_seen = self.load()
         if persisted_nonce != nonce:
             raise Mt5TransportError("MT5 replay ledger persistence verification failed (nonce mismatch)")
         if expected_request_id is not None and expected_request_id not in persisted_seen:
             raise Mt5TransportError("MT5 replay ledger persistence verification failed (request_id missing)")
+        self._mem_hwm_nonce = max(self._mem_hwm_nonce, persisted_nonce)
 
     def next_nonce(self) -> int:
         with self._lock:
@@ -1552,6 +1673,43 @@ class _SpoolReplayLedger:
                 seen=seen[-2048:],
                 expected_request_id=request_id,
             )
+
+
+def provision_sealed_replay_ledger(
+    spool_dir: str | Path,
+    *,
+    key_dir: str | Path | None = None,
+    broker_channel: str | None = None,
+    initial_nonce: int = 0,
+    custody_inspector: SpoolCustodyInspector | None = None,
+) -> Path:
+    """Pre-provision and HMAC-seal MT5 outbound, emulator, and global replay ledgers in key_dir (Finding [5])."""
+    sp_dir = Path(spool_dir)
+    k_dir = resolve_spool_key_dir(sp_dir, key_dir=key_dir)
+    if os.path.lexists(k_dir):
+        verify_spool_path_custody(k_dir, expect_dir=True, inspector=custody_inspector, check_ancestors=True)
+    else:
+        verify_spool_path_custody(k_dir, inspector=custody_inspector, check_ancestors=True)
+        k_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        apply_verified_directory_mode(k_dir, 0o700, custody_inspector=custody_inspector, newly_created=True)
+    hmac_key = _load_or_create_spool_hmac_key(sp_dir, key_dir=k_dir, custody_inspector=custody_inspector)
+    chan = (broker_channel or sp_dir.name).strip().lower() or "hugosway_mt5"
+    def _k() -> bytes:
+        return hmac_key
+    for fname in (
+        f".{sp_dir.name}.outbound_nonce.json",
+        f".{chan}.outbound_nonce.json",
+        f".{sp_dir.name}.emu_replay.json",
+        ".global_outbound_nonce.json",
+        ".global_emu_replay.json",
+    ):
+        ledger = _SpoolReplayLedger(
+            k_dir / fname,
+            custody_inspector=custody_inspector,
+            hmac_key_loader=_k,
+        )
+        ledger.ensure_sealed_initialized(initial_nonce=initial_nonce)
+    return k_dir
 
 
 def apply_verified_directory_mode(
@@ -3033,6 +3191,33 @@ class Mt5NativePythonTransport:
         check_now = self._clock() if now is None else utc_time(now, "now")
         self._assert_live_dispatch_authorized(now=check_now)
         self._verify_terminal_binding_before_send(sdk, creds)
+        prev_stop_loss: Decimal | None = None
+        if request.action == "AMEND_STOP":
+            pos_rows = sdk.positions_get()
+            target_tkt_str = str(request.position_ticket)
+            pos_list = [p for p in (pos_rows or ()) if str(_sdk_field(p, "ticket")) == target_tkt_str]
+            if not pos_list:
+                raise ContractError(f"AMEND_STOP requires open native MT5 position {request.position_ticket}")
+            pos_obj = pos_list[0]
+            const_chk = _sdk_constants(sdk)
+            pos_type = int(_sdk_field(pos_obj, "type"))
+            buy_code = int(const_chk["POSITION_TYPE_BUY"])
+            auth_side = Side.BUY if pos_type == buy_code else Side.SELL
+            if auth_side is not request.side:
+                raise ContractError(f"AMEND_STOP side mismatch on ticket {request.position_ticket}: {request.side.value} != {auth_side.value}")
+            pos_sym = normalize_market_symbol(str(_sdk_field(pos_obj, "symbol")))
+            if pos_sym != request.symbol:
+                raise ContractError(f"AMEND_STOP symbol mismatch on ticket {request.position_ticket}: {request.symbol} != {pos_sym}")
+            raw_old_sl = _sdk_field(pos_obj, "sl")
+            old_sl_dec = Decimal("0") if raw_old_sl is None else parse_decimal(str(raw_old_sl), "native.position.sl")
+            if request.stop_loss is not None:
+                if old_sl_dec <= Decimal("0"):
+                    raise ContractError(f"AMEND_STOP requires existing positive protective stop_loss on ticket {request.position_ticket}")
+                if auth_side is Side.BUY and request.stop_loss < old_sl_dec:
+                    raise ContractError(f"AMEND_STOP cannot widen BUY stop_loss on ticket {request.position_ticket}: {request.stop_loss} < {old_sl_dec}")
+                if auth_side is Side.SELL and request.stop_loss > old_sl_dec:
+                    raise ContractError(f"AMEND_STOP cannot widen SELL stop_loss on ticket {request.position_ticket}: {request.stop_loss} > {old_sl_dec}")
+            prev_stop_loss = old_sl_dec if old_sl_dec > Decimal("0") else None
         verify_and_consume_valve_order_grant(
             valve_grant,
             broker_id=creds.broker_id,
@@ -3045,6 +3230,7 @@ class Mt5NativePythonTransport:
             volume=request.volume_lots,
             stop_loss=request.stop_loss,
             take_profit=request.take_profit,
+            previous_stop_loss=prev_stop_loss,
             position_ticket=request.position_ticket,
             now=check_now,
             require_risk_reducing=require_risk_reducing,
@@ -3157,12 +3343,22 @@ class Mt5SpoolBridgeTransport:
         self._credentials: Mt5Credentials | None = None
         self._hmac_key: bytes | None = None
         self._nonce_ledger = _SpoolReplayLedger(
-            _spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.outbound_nonce.json",
+            self.key_dir / f".{self.spool_dir.name}.outbound_nonce.json",
             custody_inspector=custody_inspector,
+            hmac_key_loader=lambda: (
+                self._hmac_key
+                if self._hmac_key is not None
+                else _load_or_create_spool_hmac_key(self.spool_dir, key_dir=self.key_dir, custody_inspector=self._custody_inspector)
+            ),
         )
         self._global_nonce_ledger = _SpoolReplayLedger(
             self.key_dir / ".global_outbound_nonce.json",
             custody_inspector=custody_inspector,
+            hmac_key_loader=lambda: (
+                self._hmac_key
+                if self._hmac_key is not None
+                else _load_or_create_spool_hmac_key(self.spool_dir, key_dir=self.key_dir, custody_inspector=self._custody_inspector)
+            ),
         )
         self._snapshot_seq_lock = threading.RLock()
         self._snapshot_seq_path = (
@@ -3222,6 +3418,12 @@ class Mt5SpoolBridgeTransport:
             live_armed=(credentials.execution_mode == EXECUTION_MODE_LIVE),
         )
         self.prepare_spool_directory()
+        is_live_mode = credentials.execution_mode == EXECUTION_MODE_LIVE
+        self._nonce_ledger.set_require_sealed_init(is_live_mode)
+        self._global_nonce_ledger.set_require_sealed_init(is_live_mode)
+        if is_live_mode:
+            self._nonce_ledger.load()
+            self._global_nonce_ledger.load()
         ticket_file = self.spool_dir / "live_auth_ticket.json"
         if credentials.execution_mode == EXECUTION_MODE_DEMO:
             if os.path.lexists(ticket_file):
@@ -3952,13 +4154,21 @@ class Mt5SpoolPaperTerminalEmulator:
         self._history_orders: list[dict[str, str]] = []
         self._history_deals: list[dict[str, str]] = []
         self.processed: list[str] = []
+        def _emu_hmac_loader() -> bytes:
+            return _load_or_create_spool_hmac_key(self.spool_dir, key_dir=self.key_dir, custody_inspector=self._custody_inspector)
+
+        is_emu_live = self.execution_mode == EXECUTION_MODE_LIVE
         self._replay_ledger = _SpoolReplayLedger(
-            _spool_meta_root(self.spool_dir) / f".{self.spool_dir.name}.emu_replay.json",
+            self.key_dir / f".{self.spool_dir.name}.emu_replay.json",
             custody_inspector=custody_inspector,
+            require_sealed_init=is_emu_live,
+            hmac_key_loader=_emu_hmac_loader,
         )
         self._global_replay_ledger = _SpoolReplayLedger(
-            _spool_meta_root(self.spool_dir) / ".global_emu_replay.json",
+            self.key_dir / ".global_emu_replay.json",
             custody_inspector=custody_inspector,
+            require_sealed_init=is_emu_live,
+            hmac_key_loader=_emu_hmac_loader,
         )
         self._snapshot_seq_lock = threading.RLock()
         self._snapshot_seq_path = (
@@ -4298,6 +4508,14 @@ class Mt5SpoolPaperTerminalEmulator:
         if pos is None or pos["symbol"] != symbol:
             return self._receipt(req, "REJECTED", 10036, message="position not found")
         if action == "AMEND_STOP":
+            old_sl = pos.get("sl")
+            if sl is not None:
+                if old_sl is None or old_sl <= Decimal("0"):
+                    return self._receipt(req, "REJECTED", 10016, message="cannot widen or add missing protective stop")
+                if pos["side"] is Side.BUY and sl < old_sl:
+                    return self._receipt(req, "REJECTED", 10016, message="cannot widen BUY stop loss")
+                if pos["side"] is Side.SELL and sl > old_sl:
+                    return self._receipt(req, "REJECTED", 10016, message="cannot widen SELL stop loss")
             eff_sl = sl if sl is not None else pos["sl"]
             eff_tp = tp if tp is not None else pos.get("tp")
             if eff_sl is None and eff_tp is None:
@@ -5232,6 +5450,13 @@ class Mt5PaperBrokerVenue:
                 tick = self._transport.symbol_tick(order.symbol)
                 if quote_guard is not None:
                     quote_guard(self.broker_id, tick)
+                if order.stop_price is not None:
+                    if pos.stop_loss is None or pos.stop_loss <= Decimal("0"):
+                        raise ContractError("AMEND_STOP requires existing positive protective stop_loss on MT5 position")
+                    if pos.side is Side.BUY and order.stop_price < pos.stop_loss:
+                        raise ContractError("AMEND_STOP cannot widen BUY stop_loss on MT5 position")
+                    if pos.side is Side.SELL and order.stop_price > pos.stop_loss:
+                        raise ContractError("AMEND_STOP cannot widen SELL stop_loss on MT5 position")
                 eff_stop = order.stop_price if order.stop_price is not None else pos.stop_loss
                 eff_tp = order.take_profit_price if order.take_profit_price is not None else pos.take_profit
                 if eff_stop is None and eff_tp is None:
@@ -5308,6 +5533,7 @@ class Mt5PaperBrokerVenue:
                 volume=request.volume_lots,
                 stop_loss=request.stop_loss,
                 take_profit=request.take_profit,
+                previous_stop_loss=(pos.stop_loss if order.kind is ActionKind.AMEND_STOP else None),
                 position_ticket=request.position_ticket,
                 order_action_ref=order.action_ref,
                 order_quantity_units=order.quantity_units,
@@ -5918,6 +6144,7 @@ class OandaPracticeFallbackVenue:
             volume: Decimal | str | None,
             stop_loss: Decimal | None,
             take_profit: Decimal | None,
+            previous_stop_loss: Decimal | None = None,
             position_ticket: str | None,
             req_rr: bool,
         ) -> ValveOrderGrant:
@@ -5939,6 +6166,7 @@ class OandaPracticeFallbackVenue:
                 volume=volume,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
+                previous_stop_loss=previous_stop_loss,
                 position_ticket=position_ticket,
                 order_action_ref=order.action_ref,
                 order_quantity_units=order.quantity_units,
@@ -5952,12 +6180,26 @@ class OandaPracticeFallbackVenue:
 
         if order.kind is ActionKind.AMEND_STOP:
             tid = str(order.position_ticket)
+            open_list = self.positions(refresh=True)
+            pos_match = next((p for p in open_list if str(p.ticket) == tid), None)
+            if pos_match is None:
+                raise ContractError(f"AMEND_STOP requires open OANDA position {tid}")
+            if pos_match.symbol != order.symbol:
+                raise ContractError(f"AMEND_STOP symbol mismatch on OANDA position {tid}: {order.symbol} != {pos_match.symbol}")
+            if order.stop_price is not None:
+                if pos_match.stop_loss is None or pos_match.stop_loss <= Decimal("0"):
+                    raise ContractError(f"AMEND_STOP requires existing positive protective stop_loss on OANDA position {tid}")
+                if pos_match.side is Side.BUY and order.stop_price < pos_match.stop_loss:
+                    raise ContractError(f"AMEND_STOP cannot widen BUY stop_loss on OANDA position {tid}")
+                if pos_match.side is Side.SELL and order.stop_price > pos_match.stop_loss:
+                    raise ContractError(f"AMEND_STOP cannot widen SELL stop_loss on OANDA position {tid}")
             grant = _mint_oanda_grant(
                 action_kind="AMEND_STOP",
-                side=None,
+                side=pos_match.side,
                 volume=None,
                 stop_loss=order.stop_price,
                 take_profit=order.take_profit_price,
+                previous_stop_loss=pos_match.stop_loss,
                 position_ticket=tid,
                 req_rr=True,
             )
