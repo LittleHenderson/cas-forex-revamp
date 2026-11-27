@@ -2989,3 +2989,75 @@ dialog pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-
 .radar-inspect-btn {
   min-height: 34px;
 }
+
+/* Update 49: Self-Learning AI Strategy Lab & Two-Way Field Notebook */
+.sl-lab-panel {
+  margin-top: 1.25rem;
+  overflow-anchor: none;
+  font-variant-numeric: tabular-nums;
+}
+.sl-summary-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+.sl-kpi {
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.sl-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.sl-scroll-box {
+  max-height: 280px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  padding-right: 0.25rem;
+}
+.sl-card, .sl-note-item {
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 8px;
+  padding: 0.75rem;
+}
+.sl-card-head, .sl-metrics-row, .sl-attrib-row, .sl-note-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
+  font-size: 0.82rem;
+}
+.sl-blueprint {
+  font-size: 0.8rem;
+  opacity: 0.88;
+  margin: 0.35rem 0;
+}
+.sl-notebook-wrap {
+  display: grid;
+  grid-template-columns: 1.6fr 1fr;
+  gap: 1rem;
+}
+.sl-field-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-bottom: 0.6rem;
+  font-size: 0.85rem;
+}
+.sl-grad-progress {
+  width: 100%;
+  height: 8px;
+  margin-top: 0.35rem;
+}

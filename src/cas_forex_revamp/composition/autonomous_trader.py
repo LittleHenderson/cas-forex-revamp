@@ -74,6 +74,11 @@ from cas_forex_revamp.risk.news_shock_shield import (
     NewsShockShield,
     TradeActionType,
 )
+from cas_forex_revamp.strategy.adaptive_strategy_lab import (
+    AdaptiveStrategyLab,
+    StrategyCandidateDecision,
+    is_us_equity_pre_close_chop_ny,
+)
 from cas_forex_revamp.treasury.compounding_controller import (
     CompoundingAndMilestoneController,
     CompoundingControllerError,
@@ -550,9 +555,8 @@ def _point_unit(symbol: str) -> Decimal:
 
 
 def _is_us_equity_pre_close_chop(ts: datetime) -> bool:
-    """Return True during the 20:30-20:59 UTC weekday Wall Street pre-close chop window."""
-    utc_ts = utc_time(ts, "ts")
-    return utc_ts.weekday() < 5 and utc_ts.hour == 20 and utc_ts.minute >= 30
+    """Return True during the DST-aware 15:30-15:59 America/New_York Wall Street pre-close chop window."""
+    return is_us_equity_pre_close_chop_ny(ts)
 
 
 def _compute_live_candle_atr(candles: Any, *, max_bars: int = 10) -> Decimal | None:
@@ -779,6 +783,7 @@ class AutonomousAiTrader:
         demo_auto_replenish_floor_pct: Decimal | str | int = DEFAULT_DEMO_BASELINE_REANCHOR_FLOOR_PCT,
         state_dir: str | Path | None = None,
         telegram_notifier: Any | None = None,
+        adaptive_lab: AdaptiveStrategyLab | None = None,
     ) -> None:
         if not isinstance(router, DualShieldBrokerRouter):
             raise ContractError("AutonomousAiTrader requires a DualShieldBrokerRouter")
@@ -858,6 +863,8 @@ class AutonomousAiTrader:
         self._excluded_offline_demo_brokers: tuple[str, ...] = ()
         self._demo_high_growth: DemoHighGrowthProfile = init_dhg
         self._option_b_demo: Any | None = option_b_demo
+        self._adaptive_lab: AdaptiveStrategyLab | None = adaptive_lab
+        self._pending_lab_decision: StrategyCandidateDecision | None = None
         self._symbol_loss_cooldown_until: dict[str, datetime] = {}
         self._fast_tick_ms = fast_tick_ms
         self._clock = clock or _utc_now
@@ -1301,6 +1308,14 @@ class AutonomousAiTrader:
     def _effective_drawdown_ceiling_pct(self) -> Decimal:
         with self._lock:
             return self._demo_high_growth.effective_drawdown_ceiling_pct()
+
+    def bind_adaptive_strategy_lab(self, lab: AdaptiveStrategyLab | None) -> None:
+        with self._lock:
+            self._adaptive_lab = lab
+
+    @property
+    def adaptive_strategy_lab(self) -> AdaptiveStrategyLab | None:
+        return self._adaptive_lab
 
     def bind_option_b_demo(self, option_b_demo: Any | None) -> None:
         with self._lock:
@@ -2296,6 +2311,7 @@ class AutonomousAiTrader:
         ts = self._now(now)
         actions: list[dict[str, Any]] = []
         deferred_vault_closes: list[tuple[str, str, str, Decimal, str, Decimal, Decimal | None]] = []
+        deferred_lab_closes: list[tuple[str, str, Side, Decimal, Decimal, Decimal | None]] = []
         deferred_p8_protections: list[
             tuple[str, str, TradeActionType, str, str, Side, Decimal, Decimal, Decimal, Decimal | None, str]
         ] = []
@@ -2373,14 +2389,45 @@ class AutonomousAiTrader:
                         recon_sl = abs(pos.price_open - pos.stop_loss)
                         if recon_sl > Decimal("0"):
                             init_sl_dist = recon_sl
+                    true_1r = init_sl_dist if init_sl_dist is not None else cfg["sl_distance"]
+                    lwr_on = bool(self._demo_high_growth.enabled and self._demo_high_growth.let_winners_run)
                     eff_prot = _resolve_position_protection_thresholds(
                         cfg,
-                        initial_sl_distance=init_sl_dist if init_sl_dist is not None else cfg["sl_distance"],
+                        initial_sl_distance=true_1r,
                         tick_size=t_sz,
-                        let_winners_run=bool(self._demo_high_growth.enabled and self._demo_high_growth.let_winners_run),
+                        let_winners_run=lwr_on,
                     )
+                    if self._adaptive_lab is not None:
+                        self._adaptive_lab.on_open_position_tick_fast(
+                            ticket=pos.ticket,
+                            side=pos.side,
+                            entry_price=pos.price_open,
+                            initial_sl_distance=true_1r,
+                            bid=bid,
+                            ask=ask,
+                        )
+                        lab_prof = self._adaptive_lab.protection_profile_for_ticket(pos.ticket)
+                    else:
+                        lab_prof = None
                     candidate_sl: Decimal | None = None
                     new_stage = stage
+
+                    # Two-Step Profit Ratchet Step 1: at +0.60R MFE, cut downside stop risk by 60% (-0.40R)
+                    if stage == "INITIAL_SL" and true_1r > Decimal("0") and self._adaptive_lab is not None:
+                        dr_trig_r = lab_prof["derisk_trigger_r"] if lab_prof is not None else Decimal("0.60")
+                        dr_rem_r = abs(lab_prof["derisk_stop_r"]) if lab_prof is not None else Decimal("0.40")
+                        dr_trig_pts = (true_1r * dr_trig_r).quantize(t_sz, rounding=ROUND_HALF_UP)
+                        dr_rem_pts = (true_1r * dr_rem_r).quantize(t_sz, rounding=ROUND_HALF_UP)
+                        if dr_trig_pts <= excursion < eff_prot["be_trigger"]:
+                            dr_sl = (
+                                (pos.price_open - dr_rem_pts).quantize(t_sz, rounding=ROUND_HALF_UP)
+                                if pos.side is Side.BUY
+                                else (pos.price_open + dr_rem_pts).quantize(t_sz, rounding=ROUND_HALF_UP)
+                            )
+                            if pos.side is Side.BUY and dr_sl < bid - t_sz and (pos.stop_loss is None or dr_sl > pos.stop_loss):
+                                candidate_sl = dr_sl
+                            elif pos.side is Side.SELL and dr_sl > ask + t_sz and (pos.stop_loss is None or dr_sl < pos.stop_loss):
+                                candidate_sl = dr_sl
 
                     if excursion >= eff_prot["be_trigger"]:
                         be_sl = (
@@ -2579,6 +2626,16 @@ class AutonomousAiTrader:
                                         pnl_dec,
                                         eq_post,
                                     ))
+                                raw_side_lab = str(meta.get("side") or "BUY").strip().upper()
+                                side_lab = Side.SELL if raw_side_lab == Side.SELL.value else Side.BUY
+                                deferred_lab_closes.append((
+                                    safe_ticket,
+                                    sym_closed,
+                                    side_lab,
+                                    pnl_dec,
+                                    eq_post,
+                                    cap_post if cap_post is not None else fast_init_cap,
+                                ))
                                 if pnl_dec > Decimal("0"):
                                     deferred_vault_closes.append((
                                         safe_ticket,
@@ -2696,6 +2753,24 @@ class AutonomousAiTrader:
                 with self._lock:
                     self._last_vault_sync_error = type(exc_vsync).__name__
                 logger.warning("fast protection post-lock vault sync deferred: %s", type(exc_vsync).__name__)
+        if deferred_lab_closes and self._adaptive_lab is not None:
+            for l_tkt, l_sym, l_side, l_pnl, l_eq, l_cap in deferred_lab_closes:
+                try:
+                    eff_p_cap = l_cap if (l_cap is not None and l_cap > Decimal("0")) else Decimal("200000.00")
+                    sw_r = Decimal("0.00") if self._demo_high_growth.enabled else Decimal("0.50")
+                    self._adaptive_lab.record_trade_close(
+                        source_channel="LIVE_DEMO",
+                        trade_id=l_tkt,
+                        symbol=l_sym,
+                        side=l_side,
+                        net_pnl_usd=l_pnl,
+                        current_equity_usd=l_eq if l_eq > Decimal("0") else eff_p_cap,
+                        starting_principal_usd=eff_p_cap,
+                        vault_sweep_ratio=sw_r,
+                        now=ts,
+                    )
+                except Exception as exc_lab_cl:
+                    logger.warning("adaptive lab close attribution skipped for %s: %s", l_tkt, type(exc_lab_cl).__name__)
         return actions
 
     def _collect_market_quotes(
@@ -2944,13 +3019,129 @@ class AutonomousAiTrader:
     ) -> tuple[str, Side, Decimal, Decimal, str, str, bool, str | None, int] | None:
         """Scan watchlist with TrendRegimeDetector, House-Money ADD pyramiding, and correlation cap."""
         self._last_dial_skip_reason = None
+        self._pending_lab_decision = None
         ordered_syms = list(INDEX_INSTRUMENTS) + [s for s in markets if s not in INDEX_INSTRUMENTS]
         open_meta_list = list(self._open_position_meta.values())
+        known_open_tickets = {str(m.get("ticket", "")) for m in open_meta_list}
+        for brk_id_chk, ven_chk in self._router.venues.items():
+            if isinstance(ven_chk, Mt5PaperBrokerVenue) and ven_chk.account is not None and not getattr(ven_chk, "is_offline", False):
+                for live_p in ven_chk.positions:
+                    if str(live_p.ticket) not in known_open_tickets:
+                        open_meta_list.append(
+                            {
+                                "ticket": str(live_p.ticket),
+                                "broker_id": brk_id_chk,
+                                "symbol": live_p.symbol,
+                                "side": live_p.side.value,
+                                "volume_lots": decimal_text(live_p.volume_lots),
+                                "entry_price": decimal_text(live_p.price_open),
+                                "stop_loss": decimal_text(live_p.stop_loss) if live_p.stop_loss is not None else None,
+                                "protection_stage": self._protection_stage.get(str(live_p.ticket), "INITIAL_SL"),
+                            }
+                        )
+                        known_open_tickets.add(str(live_p.ticket))
         corr_hist = self._build_correlation_price_history(markets)
         best_ratio = Decimal("-1")
         best_sym: str | None = None
         best_reg: str | None = None
         dial_cap_block: str | None = None
+
+        # Update 49: When AdaptiveStrategyLab is bound and cold entries are allowed, evaluate all 20
+        # watchlist markets fairly (ending G10 FX starvation), enforce G0 US Holiday/NY-09:30-Whipsaw
+        # stand-aside shields, and rank S1..S4 + evolved active playbooks by Dual-Objective Bandit Utility.
+        if self._adaptive_lab is not None and allow_cold_open:
+            ts_eval = self._now(now)
+            is_live_exec = str(self._router.execution_mode).strip().upper() == "LIVE"
+            init_cap_eval = self._configured_initial_capital_usd or Decimal("200000.00")
+            dd_ratio_eval = (
+                compute_drawdown_pct(total_eq, peak_eq) / Decimal("100")
+                if (peak_eq is not None and peak_eq > Decimal("0") and total_eq > Decimal("0"))
+                else Decimal("0.00")
+            )
+            ranked_cands = self._adaptive_lab.rank_market_candidates(
+                markets=markets,
+                tick_history=self._tick_history,
+                regime_classifier=lambda m_seq, sp_v, sl_v: self._trend_detector.classify(
+                    mids=m_seq, spread=sp_v, normal_sl_distance=sl_v
+                ),
+                default_sl_lookup=lambda s_id: self._protection_cfg(s_id, Decimal("1.00"))["sl_distance"],
+                starting_balance_usd=init_cap_eval,
+                current_equity_usd=total_eq if total_eq > Decimal("0") else init_cap_eval,
+                vaulted_profit_usd=self._cached_settled_disbursed_usd,
+                sweep_ratio=Decimal("0.00") if self._demo_high_growth.enabled else Decimal("0.50"),
+                drawdown_ratio=dd_ratio_eval,
+                user_risk_cap_pct=self._effective_stop_risk_ceiling_pct(),
+                is_live_mode=is_live_exec,
+                session_code=str((quota_snap or {}).get("session_date") or ""),
+                cycle_id=f"cyc-{self._cycle_seq}",
+                now=ts_eval,
+            )
+            for lab_cand in ranked_cands:
+                c_sym = str(lab_cand.symbol or "")
+                c_side = lab_cand.side
+                if not c_sym or c_side is None or lab_cand.snapshot is None:
+                    continue
+                if fast_tick and c_sym not in INDEX_INSTRUMENTS:
+                    continue
+                # Strict 1 initial leg per symbol in tournament cold-open path (pyramid adds handled below)
+                if any(m.get("symbol") == c_sym for m in open_meta_list):
+                    continue
+                if self._demo_high_growth.enabled and self._demo_high_growth.post_loss_cooldown_seconds > 0:
+                    cd_u = self._symbol_loss_cooldown_until.get(c_sym)
+                    if cd_u is not None and ts_eval < cd_u:
+                        continue
+                c_dial = (
+                    self._resolve_master_dial_summary_unlocked(
+                        regime=str(lab_cand.regime or REGIME_STRONG_TREND),
+                        total_eq=deployable_eq if deployable_eq > Decimal("0") else total_eq,
+                        peak_eq=peak_eq if peak_eq is not None else total_eq,
+                        quota_snap=quota_snap or {},
+                        raw_dial=raw_dial,
+                        dd_curr_eq=total_eq,
+                    )
+                    if raw_dial is not None
+                    else None
+                )
+                if c_dial is not None:
+                    max_op_c = int(c_dial["max_open_trades"])
+                    if self._demo_high_growth.enabled:
+                        max_op_c = max(max_op_c, 3) if self._demo_high_growth.pyramiding_enabled else 1
+                    if len(open_meta_list) >= max_op_c:
+                        dial_cap_block = (
+                            f"DIAL_MAX_OPEN_TRADES_REACHED ({len(open_meta_list)}>={max_op_c} "
+                            f"at {c_dial['effective_risk_pct']}% {c_dial['effective_label']})"
+                        )
+                        continue
+                corr_ok_c, corr_rsn_c = evaluate_correlation_cap(
+                    candidate_symbol=c_sym,
+                    candidate_side=c_side,
+                    open_positions=open_meta_list,
+                    price_history=corr_hist,
+                    is_pyramid_add=False,
+                )
+                if not corr_ok_c:
+                    if CORRELATED_OFFSET_BLOCKED_CODE in corr_rsn_c:
+                        dial_cap_block = corr_rsn_c
+                    continue
+                self._pending_lab_decision = lab_cand
+                self._last_evaluated_symbol = c_sym
+                self._last_evaluated_regime = str(lab_cand.regime or REGIME_STRONG_TREND)
+                self._top_watch_symbol = c_sym
+                return (
+                    c_sym,
+                    c_side,
+                    lab_cand.snapshot.bid,
+                    lab_cand.snapshot.ask,
+                    lab_cand.setup_note,
+                    str(lab_cand.regime or REGIME_STRONG_TREND),
+                    False,
+                    None,
+                    1,
+                )
+            # If AdaptiveStrategyLab explicitly stood aside across all cold opens (e.g. US Holiday / Dead Tape),
+            # only allow valid House-Money pyramid adds on already-open breakeven-locked legs below.
+            allow_cold_open = False
+
         for sym in ordered_syms:
             info = markets.get(sym)
             if not info:
@@ -3615,6 +3806,29 @@ class AutonomousAiTrader:
                 with self._lock:
                     self._last_vault_sync_error = type(exc_vsync).__name__
                 logger.warning("record_closed_pnl vault sync deferred for %s: %s", ticket, type(exc_vsync).__name__)
+        if self._adaptive_lab is not None:
+            try:
+                raw_s_rc = (
+                    str(popped_meta.get("side") or "BUY").strip().upper()
+                    if isinstance(popped_meta, Mapping)
+                    else "BUY"
+                )
+                side_rc_lab = Side.SELL if raw_s_rc == Side.SELL.value else Side.BUY
+                eff_cap_lab = init_cap_arg if (init_cap_arg is not None and init_cap_arg > Decimal("0")) else Decimal("200000.00")
+                sw_r_lab = Decimal("0.00") if self._demo_high_growth.enabled else Decimal("0.50")
+                self._adaptive_lab.record_trade_close(
+                    source_channel="LIVE_DEMO",
+                    trade_id=str(ticket),
+                    symbol=symbol,
+                    side=side_rc_lab,
+                    net_pnl_usd=pnl_usd,
+                    current_equity_usd=total_eq if total_eq > Decimal("0") else eff_cap_lab,
+                    starting_principal_usd=eff_cap_lab,
+                    vault_sweep_ratio=sw_r_lab,
+                    now=ts,
+                )
+            except Exception as exc_rc_lab:
+                logger.warning("record_closed_pnl adaptive lab attribution skipped for %s: %s", ticket, type(exc_rc_lab).__name__)
         return snap
 
     def _record_ai_cooldown_unlocked(self, key: tuple[str, str, bool], ts: datetime, reason: str) -> None:
@@ -3653,6 +3867,20 @@ class AutonomousAiTrader:
         self._last_cycle_ms = max(1, (time.monotonic_ns() - t0_ns) // 1_000_000)
         if self._parallel_tiers is not None and quotes_map:
             self._parallel_tiers.process_tick(quotes=quotes_map, signal=None, now=ts)
+        if self._adaptive_lab is not None and not fast_tick and quotes_map:
+            try:
+                synth_mkts = {k_s: {"bid": decimal_text(v_s[0]), "ask": decimal_text(v_s[1])} for k_s, v_s in quotes_map.items()}
+                self._adaptive_lab.process_shadow_tick(
+                    markets=synth_mkts,
+                    tick_history=self._tick_history,
+                    regime_classifier=lambda m_seq, sp_v, sl_v: self._trend_detector.classify(
+                        mids=m_seq, spread=sp_v, normal_sl_distance=sl_v
+                    ),
+                    default_sl_lookup=lambda s_id: self._protection_cfg(s_id, Decimal("1.00"))["sl_distance"],
+                    now=ts,
+                )
+            except Exception as exc_shd_w:
+                logger.debug("shadow incubator tick skipped on WAIT: %s", type(exc_shd_w).__name__)
         report: dict[str, Any] = {
             "schema": "cas-forex.ai-cycle/1",
             "cycle_id": cycle_id,
@@ -4188,10 +4416,26 @@ class AutonomousAiTrader:
                 base_mult = Decimal("0.50") if (strong_runner_eligible or realized_today >= gear_soft_q) else risk_mult
                 gear_scale = Decimal(gear_info["risk_scale_factor"])
                 eff_mult = max(Decimal("0.05"), (base_mult * gear_scale).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR))
+            lab_dec = self._pending_lab_decision
+            if (
+                lab_dec is not None
+                and lab_dec.symbol == sym
+                and lab_dec.side is side
+                and not is_pyramid_add
+            ):
+                eff_mult = max(
+                    Decimal("0.05"),
+                    (eff_mult * lab_dec.risk_weight_multiplier).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR),
+                )
+            else:
+                lab_dec = None
             params = self._protection_cfg(sym, eff_mult)
             t_sz = _tick_size(sym)
             spread = max(t_sz, ask - bid)
             entry_ref = ask if side is Side.BUY else bid
+            if lab_dec is not None and lab_dec.sl_distance is not None and lab_dec.tp_distance is not None:
+                params["sl_distance"] = max(t_sz, lab_dec.sl_distance.quantize(t_sz, rounding=ROUND_HALF_UP))
+                params["tp_distance"] = max(t_sz * Decimal("2"), lab_dec.tp_distance.quantize(t_sz, rounding=ROUND_HALF_UP))
             if self._demo_high_growth.enabled and self._demo_high_growth.let_winners_run:
                 live_atr = _compute_live_candle_atr((markets.get(sym) or {}).get("candles_m1"))
                 if live_atr is not None and live_atr > Decimal("0"):
@@ -4502,7 +4746,16 @@ class AutonomousAiTrader:
                 return report
 
             ev_id = f"ev-{cycle_id}-{sym.lower()}"
-            fact_obj = {
+            chosen_strategy_id = (
+                "ai-pyramid-runner"
+                if is_pyramid_add
+                else (
+                    str(lab_dec.strategy_id)
+                    if (lab_dec is not None and lab_dec.strategy_id)
+                    else "ai-momentum-tp-sl"
+                )
+            )
+            fact_obj: dict[str, Any] = {
                 "new_risk": True,
                 "management": True,
                 "equity": decimal_text(total_eq),
@@ -4512,11 +4765,25 @@ class AutonomousAiTrader:
                 "ask": decimal_text(ask),
                 "signal": setup_note,
                 "regime": regime_name,
+                "strategy_id": chosen_strategy_id,
                 "pyramid_leg": leg_index,
                 "thinking_depth": eff_depth,
                 "sl": decimal_text(sl_price),
                 "tp": decimal_text(tp_price),
             }
+            if self._adaptive_lab is not None and "qwen3" not in active_id.lower():
+                sess_reg_prompt = (
+                    lab_dec.snapshot.session_region
+                    if (lab_dec is not None and lab_dec.snapshot is not None)
+                    else "NEW_YORK"
+                )
+                fact_obj["field_notebook"] = self._adaptive_lab.build_prompt_memory_block(
+                    symbol=sym,
+                    session_region=sess_reg_prompt,
+                    entry_regime=regime_name,
+                    strategy_id=chosen_strategy_id,
+                    max_bytes=950,
+                )
             req = DecisionRequest(
                 request_id=f"req-{cycle_id}",
                 opportunity_set_id=f"set-{cycle_id}",
@@ -4524,7 +4791,7 @@ class AutonomousAiTrader:
                 options=(
                     ActionOption(
                         action_ref,
-                        "ai-pyramid-runner" if is_pyramid_add else "ai-momentum-tp-sl",
+                        chosen_strategy_id,
                         req_timeframe,
                         f"{req_kind.value} {side.value} {sym} {setup_note}"[:200],
                         intent,
@@ -4797,6 +5064,8 @@ class AutonomousAiTrader:
                     proposal_box, current_view=current_view, now=ts
                 )
             except ValveRefusalError:
+                if self._adaptive_lab is not None:
+                    self._adaptive_lab.record_valve_veto()
                 self._record_ai_cooldown_unlocked(cd_key, ts, "valve veto")
                 self._veto_count += 1
                 self._last_action = "VALVE_VETOED"
@@ -4902,6 +5171,25 @@ class AutonomousAiTrader:
             }
             self._peak_favorable[str(ticket)] = fill_px
             self._protection_stage[str(ticket)] = "INITIAL_SL"
+            if self._adaptive_lab is not None:
+                try:
+                    est_risk_usd = max(
+                        Decimal("10.00"),
+                        (deployable_eq * self._router.barbell.max_stop_loss_equity_risk_pct * eff_mult) / Decimal("100"),
+                    )
+                    self._adaptive_lab.register_open_trade(
+                        ticket=str(ticket),
+                        strategy_id=chosen_strategy_id,
+                        symbol=sym,
+                        side=side,
+                        entry_price=fill_px,
+                        initial_sl_distance=abs(fill_px - sl_price) if abs(fill_px - sl_price) > Decimal("0") else params["sl_distance"],
+                        risk_budget_usd=est_risk_usd,
+                        snapshot=lab_dec.snapshot if lab_dec is not None else None,
+                        now=ts,
+                    )
+                except Exception as exc_reg_lab:
+                    logger.warning("adaptive lab open registration skipped for %s: %s", ticket, type(exc_reg_lab).__name__)
             if self._phase8_bridge is not None:
                 try:
                     filled_lots_p8 = (
