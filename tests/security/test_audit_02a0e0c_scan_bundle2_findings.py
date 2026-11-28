@@ -759,12 +759,10 @@ class TestFinding07EmergencyChannelAntiStarvation(unittest.TestCase):
                 emergency_unix_socket="" if os.name != "posix" else (Path(td) / "emerg.sock"),
             )
             srv.start()
-            self.addCleanup(srv.stop)
-            emerg_port = srv.emergency_port
-
             # Blast 80 concurrent churning unauthenticated partial-header TCP sockets (>64 queue limit)
             churn_socks: list[socket.socket] = []
             try:
+                emerg_port = srv.emergency_port
                 for _ in range(80):
                     try:
                         s = socket.create_connection(("127.0.0.1", emerg_port), timeout=1.0)
@@ -791,6 +789,7 @@ class TestFinding07EmergencyChannelAntiStarvation(unittest.TestCase):
                         s.close()
                     except OSError:
                         pass
+                srv.stop()
 
 
 if __name__ == "__main__":

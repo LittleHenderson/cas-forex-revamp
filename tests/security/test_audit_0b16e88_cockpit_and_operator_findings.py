@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import secrets
 import select
+import selectors
 import socket
 import subprocess
 import tempfile
@@ -164,8 +165,10 @@ class Audit0b16e88CockpitAndOperatorFindingsTests(unittest.TestCase):
             trickle_sock.sendall(req_head)
             for _ in range(4):
                 time.sleep(0.05)
-                if select.select([trickle_sock], [], [], 0.0)[0]:
-                    break
+                with selectors.DefaultSelector() as _sel:
+                    _sel.register(trickle_sock, selectors.EVENT_READ)
+                    if _sel.select(timeout=0.0):
+                        break
                 try:
                     trickle_sock.sendall(b"a")
                 except OSError:
