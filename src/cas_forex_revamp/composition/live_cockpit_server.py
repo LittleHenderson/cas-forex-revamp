@@ -2787,6 +2787,16 @@ class LoopbackCockpitServer:
             except (InvalidOperation, ValueError, TypeError, Exception) as exc_tr:
                 self._last_routing_error = type(exc_tr).__name__
 
+        tier_contexts: dict[str, dict[str, Any]] | None = None
+        if self._parallel_tiers is not None and callable(
+            getattr(self._parallel_tiers, "tier_dial_contexts", None)
+        ):
+            try:
+                tier_contexts = self._parallel_tiers.tier_dial_contexts()
+            except Exception as exc_tc:
+                self._last_routing_error = type(exc_tc).__name__
+                tier_contexts = None
+
         doc = dict(
             self._aggression_dial.snapshot(
                 regime=regime,
@@ -2794,6 +2804,7 @@ class LoopbackCockpitServer:
                 drawdown_pct=dd_dec,
                 valve_score=vs_dec,
                 owner_controls_allowed=bool(owner_controls_allowed),
+                tier_contexts=tier_contexts,
             )
         )
         doc["live_mode"] = execution_mode == "LIVE"
@@ -4460,6 +4471,57 @@ class LoopbackCockpitServer:
                                 outer._aggression_dial.set_tier_risk_bps(
                                     tid_raw,
                                     t_bps_raw,
+                                    live_mode=live_mode_flag,
+                                    high_risk_confirmed=eff_hrc,
+                                    owner_controls_allowed=True,
+                                    actor=actor_str,
+                                )
+                            elif raw_action in ("SET_TIER_AI_DISCRETION", "TOGGLE_TIER_AI_DISCRETION"):
+                                tid_raw = body.get("tier_id")
+                                cur_snap = outer._aggression_dial.snapshot()
+                                cur_ceil = int(cur_snap["ai_discretion_ceiling_bps"])
+                                if "ai_discretion_enabled" in body:
+                                    t_en_val = body["ai_discretion_enabled"]
+                                elif "enabled" in body:
+                                    t_en_val = body["enabled"]
+                                else:
+                                    t_map = cur_snap.get("tiers_by_id") or {}
+                                    t_cur = t_map.get(str(tid_raw or "")) or {}
+                                    t_en_val = not bool(t_cur.get("ai_discretion_enabled", cur_snap["ai_discretion_enabled"]))
+                                need_hr = bool(t_en_val) and cur_ceil >= HIGH_RISK_MIN_BPS
+                                eff_hrc = _enforce_bound_live_dial_confirm(
+                                    "SET_TIER_AI_DISCRETION",
+                                    tier_id=None if tid_raw is None else str(tid_raw),
+                                    ai_ceiling_bps=cur_ceil,
+                                    requires_confirm=need_hr,
+                                )
+                                outer._aggression_dial.set_tier_ai_discretion(
+                                    tid_raw,
+                                    t_en_val,
+                                    live_mode=live_mode_flag,
+                                    high_risk_confirmed=eff_hrc,
+                                    owner_controls_allowed=True,
+                                    actor=actor_str,
+                                )
+                            elif raw_action == "SET_ALL_TIERS_AI_DISCRETION":
+                                cur_snap = outer._aggression_dial.snapshot()
+                                cur_ceil = int(cur_snap["ai_discretion_ceiling_bps"])
+                                if "ai_discretion_enabled" in body:
+                                    all_en_val = body["ai_discretion_enabled"]
+                                elif "enabled" in body:
+                                    all_en_val = body["enabled"]
+                                else:
+                                    t_list = cur_snap.get("tiers") or []
+                                    all_on = all(bool(t.get("ai_discretion_enabled", True)) for t in t_list) if t_list else True
+                                    all_en_val = not all_on
+                                need_hr = bool(all_en_val) and cur_ceil >= HIGH_RISK_MIN_BPS
+                                eff_hrc = _enforce_bound_live_dial_confirm(
+                                    "SET_ALL_TIERS_AI_DISCRETION",
+                                    ai_ceiling_bps=cur_ceil,
+                                    requires_confirm=need_hr,
+                                )
+                                outer._aggression_dial.set_all_tiers_ai_discretion(
+                                    all_en_val,
                                     live_mode=live_mode_flag,
                                     high_risk_confirmed=eff_hrc,
                                     owner_controls_allowed=True,

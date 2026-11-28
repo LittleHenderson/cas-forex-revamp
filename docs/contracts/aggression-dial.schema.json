@@ -560,6 +560,27 @@
         "risk_bps": {
           "$ref": "#/$defs/riskBps"
         },
+        "chosen_risk_pct": {
+          "$ref": "#/$defs/decimal"
+        },
+        "chosen_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "ai_discretion_enabled": {
+          "type": "boolean"
+        },
+        "ai_discretion_ceiling_bps": {
+          "$ref": "#/$defs/riskBps"
+        },
+        "ai_discretion_shifted": {
+          "type": "boolean"
+        },
+        "ai_discretion_direction": {
+          "type": "string",
+          "enum": ["UP", "DOWN", "HOLD"]
+        },
         "effective_risk_bps": {
           "$ref": "#/$defs/riskBps"
         },
