@@ -59,6 +59,7 @@ from cas_forex_revamp.operator.frontier_backends import assert_safe_ai_catalog_p
 from cas_forex_revamp.operator.telegram_alert_notifier import TelegramAlertNotifier
 from cas_forex_revamp.composition.autonomous_trader import build_enriched_compounding_payload
 from cas_forex_revamp.composition.option_b_paper_runner import OptionBPaperDemoRunner
+from cas_forex_revamp.strategy.adaptive_strategy_lab import AdaptiveStrategyLab
 from cas_forex_revamp.risk.demo_high_growth_profile import (
     DEMO_HIGH_GROWTH_FORBIDDEN_LIVE_CODE,
     DemoHighGrowthProfile,
@@ -1759,6 +1760,7 @@ _KNOWN_METRICS_ROUTES: frozenset[str] = frozenset({
     "/api/option-b-demo",
     "/api/demo-high-growth-profile",
     "/api/telegram-alerts",
+    "/api/ai-strategy-lab",
 })
 
 _CONTENT_TYPES: dict[str, str] = {
@@ -1864,6 +1866,7 @@ class LoopbackCockpitServer:
         option_b_demo: Any | None = None,
         demo_high_growth_store: DemoHighGrowthProfileStore | None = None,
         telegram_notifier: TelegramAlertNotifier | None = None,
+        adaptive_strategy_lab: AdaptiveStrategyLab | None = None,
         phase8_bridge: Any | None = None,
         owner_recovery: Any | None = None,
         model_execution_gate: Any | None = None,
@@ -1925,6 +1928,9 @@ class LoopbackCockpitServer:
         self._option_b_demo = option_b_demo
         self._demo_high_growth_store: DemoHighGrowthProfileStore | None = demo_high_growth_store
         self._telegram_notifier: TelegramAlertNotifier | None = telegram_notifier
+        if adaptive_strategy_lab is None and autonomous_trader is not None:
+            adaptive_strategy_lab = getattr(autonomous_trader, "adaptive_strategy_lab", None)
+        self._adaptive_strategy_lab = adaptive_strategy_lab
         inferred_p8 = phase8_bridge
         if inferred_p8 is None and autonomous_trader is not None:
             inferred_p8 = getattr(autonomous_trader, "phase8_bridge", None) or getattr(
@@ -2866,6 +2872,54 @@ class LoopbackCockpitServer:
         snap["session_scope"] = str(session_scope)
         return assert_safe_ai_catalog_payload(snap)
 
+    def _read_ai_strategy_lab_snapshot(
+        self,
+        *,
+        owner_controls_allowed: bool,
+        session_scope: str,
+        notes_limit: int = 25,
+        include_decommissioned: bool = True,
+    ) -> dict[str, Any] | None:
+        lab = self._adaptive_strategy_lab
+        if lab is None and self._autonomous_trader is not None:
+            lab = getattr(self._autonomous_trader, "adaptive_strategy_lab", None)
+        if lab is None:
+            return None
+        is_live_or_unk, mode_lbl = self._resolve_aggression_live_mode_fail_closed()
+        exec_mode = "DEMO" if (not is_live_or_unk and mode_lbl == "DEMO") else "LIVE"
+        start_bal = Decimal("200000.00")
+        curr_eq = Decimal("200000.00")
+        ledger_net = Decimal("0.00")
+        eff_stop_cap = Decimal("1.00")
+        news_on = True
+        if self._autonomous_trader is not None:
+            try:
+                t_snap = self._autonomous_trader.status_snapshot()
+                bs = t_snap.get("banked_session") or {}
+                if bs.get("initial_capital_usd") is not None:
+                    start_bal = Decimal(str(bs["initial_capital_usd"]))
+                if bs.get("current_total_equity_usd") is not None:
+                    curr_eq = Decimal(str(bs["current_total_equity_usd"]))
+                entries = (t_snap.get("realized_pnl_ledger") or {}).get("entries") or []
+                ledger_net = sum((Decimal(str(e.get("realized_pnl_usd", "0"))) for e in entries), Decimal("0.00"))
+                eff_stop_cap = self._autonomous_trader._effective_stop_risk_ceiling_pct()
+                news_on = getattr(self._autonomous_trader, "_phase8_bridge", None) is not None
+            except Exception as exc_tsnap:
+                self._last_routing_error = type(exc_tsnap).__name__
+        snap = lab.snapshot(
+            execution_mode=exec_mode,
+            effective_stop_risk_ceiling_pct=eff_stop_cap,
+            starting_balance_usd=start_bal,
+            current_online_equity_usd=curr_eq,
+            total_ledger_net_pnl_usd=ledger_net,
+            news_shock_shield_active=news_on,
+            owner_controls_allowed=bool(owner_controls_allowed),
+            session_scope=str(session_scope),
+            notes_limit=notes_limit,
+            include_decommissioned=include_decommissioned,
+        )
+        return assert_safe_ai_catalog_payload(snap)
+
     def _read_demo_high_growth_snapshot(
         self,
         *,
@@ -3619,6 +3673,36 @@ class LoopbackCockpitServer:
                                 {"error": "Telegram alert status unavailable"},
                             )
                         return
+                    if route == "/api/ai-strategy-lab":
+                        try:
+                            q_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+                            raw_lim = (q_params.get("notes_limit") or ["25"])[0]
+                            try:
+                                notes_lim = max(1, min(100, int(raw_lim)))
+                            except ValueError:
+                                notes_lim = 25
+                            raw_inc = str((q_params.get("include_decommissioned") or ["true"])[0]).strip().lower()
+                            inc_dec = raw_inc not in ("false", "0", "no")
+                            lab_snap = outer._read_ai_strategy_lab_snapshot(
+                                owner_controls_allowed=(auth_scope == SESSION_SCOPE_OWNER_FULL),
+                                session_scope=auth_scope,
+                                notes_limit=notes_lim,
+                                include_decommissioned=inc_dec,
+                            )
+                            if lab_snap is None:
+                                self._write_json(
+                                    HTTPStatus.NOT_FOUND,
+                                    {"error": "AI Strategy Lab not configured"},
+                                )
+                            else:
+                                self._write_json(HTTPStatus.OK, lab_snap)
+                        except Exception as exc:
+                            outer._last_routing_error = type(exc).__name__
+                            self._write_json(
+                                HTTPStatus.INTERNAL_SERVER_ERROR,
+                                {"error": "AI Strategy Lab snapshot unavailable"},
+                            )
+                        return
                     if route == "/api/demo-high-growth-profile":
                         try:
                             dhg_snap = outer._read_demo_high_growth_snapshot(
@@ -3688,6 +3772,8 @@ class LoopbackCockpitServer:
                             last_parallel_tiers_mono = 0.0
                             last_aggression_dial_json = ""
                             last_aggression_dial_mono = 0.0
+                            last_strategy_lab_json = ""
+                            last_strategy_lab_mono = 0.0
                             last_compounding_json = ""
                             last_compounding_mono = 0.0
                             last_option_b_json = ""
@@ -3893,6 +3979,32 @@ class LoopbackCockpitServer:
                                             except Exception as exc:
                                                 outer._last_routing_error = type(exc).__name__
                                                 eframe = f"event: error\ndata: {json.dumps({'source': 'demo_high_growth_profile', 'error': 'DEMO high-growth profile snapshot unavailable'})}\n\n".encode("utf-8")
+                                                self.wfile.write(eframe)
+                                                emitted_events += 1
+                                        if outer._adaptive_strategy_lab is not None or (
+                                            outer._autonomous_trader is not None
+                                            and getattr(outer._autonomous_trader, "adaptive_strategy_lab", None) is not None
+                                        ):
+                                            try:
+                                                labsnap = outer._read_ai_strategy_lab_snapshot(
+                                                    owner_controls_allowed=(auth_scope == SESSION_SCOPE_OWNER_FULL),
+                                                    session_scope=auth_scope,
+                                                )
+                                                if labsnap is not None:
+                                                    labjson = json.dumps(labsnap, sort_keys=False)
+                                                    if (
+                                                        not last_strategy_lab_json
+                                                        or labjson != last_strategy_lab_json
+                                                        or (now_mono - last_strategy_lab_mono) >= 2.0
+                                                    ):
+                                                        last_strategy_lab_json = labjson
+                                                        last_strategy_lab_mono = now_mono
+                                                        labframe = f"event: ai_strategy_lab\ndata: {labjson}\n\n".encode("utf-8")
+                                                        self.wfile.write(labframe)
+                                                        emitted_events += 1
+                                            except Exception as exc:
+                                                outer._last_routing_error = type(exc).__name__
+                                                eframe = f"event: error\ndata: {json.dumps({'source': 'ai_strategy_lab', 'error': 'AI Strategy Lab snapshot unavailable'})}\n\n".encode("utf-8")
                                                 self.wfile.write(eframe)
                                                 emitted_events += 1
                                         if emitted_events > 0:
@@ -4934,6 +5046,102 @@ class LoopbackCockpitServer:
                     except Exception as exc:
                         code = HTTPStatus.FORBIDDEN if "DEMO_AUTO_REPLENISH_FORBIDDEN_IN_LIVE_MODE" in str(exc) else HTTPStatus.BAD_REQUEST
                         self._write_json(code, {"error": str(exc)})
+                    return
+
+                if route == "/api/ai-strategy-lab":
+                    lab_inst = outer._adaptive_strategy_lab
+                    if lab_inst is None and outer._autonomous_trader is not None:
+                        lab_inst = getattr(outer._autonomous_trader, "adaptive_strategy_lab", None)
+                    if lab_inst is None:
+                        self._drain_small_request_body(max_bytes=16384)
+                        self._write_json(HTTPStatus.NOT_FOUND, {"error": "AI Strategy Lab not configured"})
+                        return
+                    try:
+                        body = self._read_json_body(max_bytes=16384)
+                        if not outer._verify_commit_epoch(supplied_tok, auth_epoch):
+                            self._reject_unauthorized()
+                            return
+                        if auth_scope != SESSION_SCOPE_OWNER_FULL:
+                            self._reject_insufficient_scope()
+                            return
+                        if type(body) is not dict:
+                            raise ContractError("JSON object required")
+                        raw_act = body.get("action")
+                        if not isinstance(raw_act, str) or not raw_act.strip():
+                            raise ContractError("action field required")
+                        act_norm = raw_act.strip().upper()
+                        with outer._commit_lease(supplied_tok, auth_epoch):
+                            if act_norm == "LEAVE_OWNER_NOTE":
+                                allowed_fields = {
+                                    "action",
+                                    "headline",
+                                    "body_plain_english",
+                                    "related_strategy_id",
+                                    "related_symbol",
+                                    "pin_for_ai",
+                                }
+                                extra = sorted(set(body.keys()) - allowed_fields)
+                                if extra:
+                                    raise ContractError(f"Unexpected properties in LEAVE_OWNER_NOTE: {extra}")
+                                pin_val = body.get("pin_for_ai", True)
+                                if type(pin_val) is not bool:
+                                    raise ContractError("pin_for_ai must be a strict boolean")
+                                note_res = lab_inst.leave_owner_note(
+                                    headline=str(body.get("headline") or ""),
+                                    body_plain_english=str(body.get("body_plain_english") or ""),
+                                    related_strategy_id=body.get("related_strategy_id"),
+                                    related_symbol=body.get("related_symbol"),
+                                    pin_for_ai=pin_val,
+                                )
+                                audit_h = str(note_res["entry_sha256"])
+                            elif act_norm == "QUARANTINE_STRATEGY":
+                                extra = sorted(set(body.keys()) - {"action", "strategy_id", "reason"})
+                                if extra:
+                                    raise ContractError(f"Unexpected properties in QUARANTINE_STRATEGY: {extra}")
+                                note_res = lab_inst.quarantine_strategy(
+                                    strategy_id=str(body.get("strategy_id") or ""),
+                                    reason=str(body.get("reason") or "Owner manual quarantine"),
+                                )
+                                audit_h = str(note_res["entry_sha256"])
+                            elif act_norm == "RESUME_TO_SHADOW":
+                                extra = sorted(set(body.keys()) - {"action", "strategy_id", "reason"})
+                                if extra:
+                                    raise ContractError(f"Unexpected properties in RESUME_TO_SHADOW: {extra}")
+                                note_res = lab_inst.resume_to_shadow(
+                                    strategy_id=str(body.get("strategy_id") or ""),
+                                    reason=str(body.get("reason") or "Owner resumed to shadow incubator"),
+                                )
+                                audit_h = str(note_res["entry_sha256"])
+                            elif act_norm == "ACKNOWLEDGE_NOTE":
+                                extra = sorted(set(body.keys()) - {"action", "note_id"})
+                                if extra:
+                                    raise ContractError(f"Unexpected properties in ACKNOWLEDGE_NOTE: {extra}")
+                                lab_inst.acknowledge_note(note_id=str(body.get("note_id") or ""))
+                                audit_h = lab_inst._audit_head_sha256
+                            else:
+                                raise ContractError(f"Unsupported AI Strategy Lab action {act_norm!r}")
+                            snap = outer._read_ai_strategy_lab_snapshot(
+                                owner_controls_allowed=True,
+                                session_scope=SESSION_SCOPE_OWNER_FULL,
+                            )
+                        outer.notify_stream_updated()
+                        self._write_json(
+                            HTTPStatus.OK,
+                            assert_safe_ai_catalog_payload(
+                                {
+                                    "ok": True,
+                                    "action": act_norm,
+                                    "audit_entry_sha256": audit_h,
+                                    "snapshot": snap,
+                                }
+                            ),
+                        )
+                    except _SessionRevokedError:
+                        self._reject_unauthorized()
+                    except OwnerKeyRequiredError:
+                        self._reject_insufficient_scope()
+                    except Exception as exc:
+                        self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
 
                 if route == "/api/demo-high-growth-profile":
@@ -6398,11 +6606,20 @@ def run_cockpit_cli(
 
     if callable(getattr(registry, "bind_execution_gate", None)):
         registry.bind_execution_gate(runtime_state.model_gate)
+    adaptive_strategy_lab = AdaptiveStrategyLab(
+        db_path=runtime_state.state_dir / "adaptive_strategy_lab.sqlite3",
+    )
+    trader.bind_adaptive_strategy_lab(adaptive_strategy_lab)
+    if runtime_state.parallel_tiers is not None and callable(
+        getattr(runtime_state.parallel_tiers, "bind_adaptive_strategy_lab", None)
+    ):
+        runtime_state.parallel_tiers.bind_adaptive_strategy_lab(adaptive_strategy_lab)
     option_b_demo = OptionBPaperDemoRunner(
         db_path=runtime_state.state_dir / "option_b_paper_demo.sqlite3",
         valve_gate=gate,
         demo_high_growth=active_dhg,
         telegram_notifier=telegram_notifier,
+        adaptive_lab=adaptive_strategy_lab,
     )
     trader.bind_option_b_demo(option_b_demo)
     if active_dhg.enabled:
@@ -6424,6 +6641,7 @@ def run_cockpit_cli(
         option_b_demo=option_b_demo,
         demo_high_growth_store=demo_high_growth_store,
         telegram_notifier=telegram_notifier,
+        adaptive_strategy_lab=adaptive_strategy_lab,
         owner_recovery=runtime_state.owner_recovery,
         model_execution_gate=runtime_state.model_gate,
         token_file=str(merged.get("CAS_FOREX_COCKPIT_TOKEN_FILE", "")).strip() or None,

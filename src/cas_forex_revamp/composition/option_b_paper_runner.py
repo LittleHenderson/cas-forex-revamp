@@ -183,6 +183,7 @@ class OptionBPaperDemoRunner:
         live_trading_armed: bool = False,
         clock: Callable[[], datetime] | None = None,
         telegram_notifier: Any | None = None,
+        adaptive_lab: Any | None = None,
     ) -> None:
         norm_mode = str(mode or "").strip().upper()
         norm_exec_mode = str(execution_mode or "").strip().upper()
@@ -220,6 +221,7 @@ class OptionBPaperDemoRunner:
         self._account_id = account_id.strip()
         self._clock = clock if clock is not None else _utc_now
         self._telegram_notifier = telegram_notifier
+        self._adaptive_lab = adaptive_lab
         self._lock = RLock()
         self._db_path = Path(db_path)
         self._venue_db_path = (
@@ -638,6 +640,22 @@ class OptionBPaperDemoRunner:
                         wins += 1
                     else:
                         losses += 1
+                    if self._adaptive_lab is not None and callable(getattr(self._adaptive_lab, "record_trade_close", None)):
+                        try:
+                            ob_side = Side.SELL if str(r.side or "BUY").upper() == "SELL" else Side.BUY
+                            self._adaptive_lab.record_trade_close(
+                                source_channel="OPTION_B",
+                                trade_id=str(trade_id),
+                                symbol=str(r.cas_symbol),
+                                side=ob_side,
+                                net_pnl_usd=net,
+                                current_equity_usd=acct.equity_usd,
+                                starting_principal_usd=starting,
+                                vault_sweep_ratio=Decimal("0.00"),
+                                now=now,
+                            )
+                        except Exception as exc_ob_lab:
+                            logger.debug("Option B adaptive lab close note skipped: %s", type(exc_ob_lab).__name__)
                     conn.execute(
                         """
                         INSERT INTO option_b_closed_trades (

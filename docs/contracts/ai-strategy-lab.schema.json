@@ -1,0 +1,854 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cas-forex:ai-strategy-lab:1.0",
+  "title": "CAS Forex AI Strategy Lab & Field Notes Snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "observed_at_utc",
+    "observed_at_pacific",
+    "execution_mode",
+    "accounting_basis",
+    "session_scope",
+    "owner_controls_allowed",
+    "governance_safety",
+    "capital_attribution_summary",
+    "counts",
+    "active_strategies",
+    "shadow_strategies",
+    "quarantined_strategies",
+    "field_notes"
+  ],
+  "properties": {
+    "schema": {
+      "const": "cas-forex.ai-strategy-lab/1"
+    },
+    "observed_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "observed_at_pacific": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "execution_mode": {
+      "enum": [
+        "DEMO",
+        "LIVE"
+      ]
+    },
+    "accounting_basis": {
+      "const": "INTERNAL_LEDGER_NOT_CONFIRMED_PAYOUT"
+    },
+    "session_scope": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "owner_controls_allowed": {
+      "type": "boolean"
+    },
+    "governance_safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "valve_controller",
+        "valve_parameters",
+        "valve_threshold",
+        "all_intents_valve_gated",
+        "news_shock_shield_active",
+        "correlated_offset_guard_threshold",
+        "single_broker_equity_sizing",
+        "live_constitutional_ceilings",
+        "effective_stop_risk_ceiling_pct",
+        "owner_controls_allowed",
+        "audit_head_sha256",
+        "audit_entry_count"
+      ],
+      "properties": {
+        "valve_controller": {
+          "const": "tks_meta_valve_controller"
+        },
+        "valve_parameters": {
+          "type": "integer",
+          "const": 161
+        },
+        "valve_threshold": {
+          "type": "string",
+          "const": "0.55"
+        },
+        "all_intents_valve_gated": {
+          "type": "boolean",
+          "const": true
+        },
+        "news_shock_shield_active": {
+          "type": "boolean"
+        },
+        "correlated_offset_guard_threshold": {
+          "type": "string",
+          "const": "0.45"
+        },
+        "single_broker_equity_sizing": {
+          "type": "boolean",
+          "const": true
+        },
+        "live_constitutional_ceilings": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_stop_risk_pct",
+            "max_drawdown_pct",
+            "auto_replenish_allowed_in_live"
+          ],
+          "properties": {
+            "max_stop_risk_pct": {
+              "type": "string",
+              "const": "1.00"
+            },
+            "max_drawdown_pct": {
+              "type": "string",
+              "const": "10.00"
+            },
+            "auto_replenish_allowed_in_live": {
+              "type": "boolean",
+              "const": false
+            }
+          }
+        },
+        "effective_stop_risk_ceiling_pct": {
+          "$ref": "#/$defs/decimalString"
+        },
+        "owner_controls_allowed": {
+          "type": "boolean"
+        },
+        "audit_head_sha256": {
+          "$ref": "#/$defs/sha256Hex"
+        },
+        "audit_entry_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "capital_attribution_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "starting_balance_usd",
+        "current_online_equity_usd",
+        "capital_status",
+        "vault_sweeps_paused_for_recovery",
+        "total_strategy_net_pnl_usd",
+        "total_starting_balance_contribution_usd",
+        "total_vaulted_profit_contribution_usd",
+        "unattributed_legacy_pnl_usd"
+      ],
+      "properties": {
+        "starting_balance_usd": {
+          "$ref": "#/$defs/decimalString"
+        },
+        "current_online_equity_usd": {
+          "$ref": "#/$defs/decimalString"
+        },
+        "capital_status": {
+          "enum": [
+            "RECOVERY_MODE",
+            "AT_PRINCIPAL",
+            "IN_SURPLUS"
+          ]
+        },
+        "vault_sweeps_paused_for_recovery": {
+          "type": "boolean"
+        },
+        "total_strategy_net_pnl_usd": {
+          "$ref": "#/$defs/decimalString"
+        },
+        "total_starting_balance_contribution_usd": {
+          "$ref": "#/$defs/decimalString"
+        },
+        "total_vaulted_profit_contribution_usd": {
+          "$ref": "#/$defs/decimalString"
+        },
+        "unattributed_legacy_pnl_usd": {
+          "$ref": "#/$defs/decimalString"
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "active_count",
+        "shadow_count",
+        "quarantined_count",
+        "field_notes_total",
+        "shadow_trades_total",
+        "vetoed_proposals_total"
+      ],
+      "properties": {
+        "active_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "shadow_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quarantined_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "field_notes_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "shadow_trades_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "vetoed_proposals_total": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "active_strategies": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/activeStrategy"
+      }
+    },
+    "shadow_strategies": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/shadowStrategy"
+      }
+    },
+    "quarantined_strategies": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/quarantinedStrategy"
+      }
+    },
+    "field_notes": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "$ref": "#/$defs/fieldNote"
+      }
+    }
+  },
+  "$defs": {
+    "decimalString": {
+      "type": "string",
+      "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "safeId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,63}$"
+    },
+    "regimeName": {
+      "enum": [
+        "TREND_IGNITION",
+        "STRONG_TREND",
+        "CHOP_RANGE",
+        "SPREAD_SPIKE"
+      ]
+    },
+    "activeStrategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy_id",
+        "display_name",
+        "version",
+        "origin",
+        "status",
+        "archetype",
+        "target_markets",
+        "preferred_regimes",
+        "blueprint_summary",
+        "risk_profile",
+        "metrics",
+        "attribution",
+        "promoted_at_utc",
+        "status_reason"
+      ],
+      "properties": {
+        "strategy_id": {
+          "$ref": "#/$defs/safeId"
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "origin": {
+          "enum": [
+            "CORE_BASELINE",
+            "AI_EVOLVED"
+          ]
+        },
+        "status": {
+          "const": "ACTIVE"
+        },
+        "archetype": {
+          "enum": [
+            "TREND_FOLLOW",
+            "MEAN_REVERT",
+            "VOL_BREAKOUT"
+          ]
+        },
+        "target_markets": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "type": "string"
+          }
+        },
+        "preferred_regimes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/regimeName"
+          }
+        },
+        "blueprint_summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "risk_profile": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "risk_weight_multiplier",
+            "max_stop_risk_pct",
+            "min_valve_score",
+            "allow_pyramiding"
+          ],
+          "properties": {
+            "risk_weight_multiplier": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "max_stop_risk_pct": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "min_valve_score": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "allow_pyramiding": {
+              "type": "boolean"
+            }
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "closed_trades",
+            "win_count",
+            "loss_count",
+            "win_rate_pct",
+            "r_expectancy",
+            "profit_factor",
+            "cusum_drift",
+            "max_drawdown_r"
+          ],
+          "properties": {
+            "closed_trades": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "win_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "loss_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "win_rate_pct": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "r_expectancy": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "profit_factor": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "cusum_drift": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "max_drawdown_r": {
+              "$ref": "#/$defs/decimalString"
+            }
+          }
+        },
+        "attribution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "net_pnl_usd",
+            "starting_balance_contribution_usd",
+            "vaulted_profit_contribution_usd",
+            "open_positions_count",
+            "last_trade_at_utc"
+          ],
+          "properties": {
+            "net_pnl_usd": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "starting_balance_contribution_usd": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "vaulted_profit_contribution_usd": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "open_positions_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "last_trade_at_utc": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            }
+          }
+        },
+        "promoted_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "status_reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      }
+    },
+    "shadowStrategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy_id",
+        "display_name",
+        "version",
+        "origin",
+        "status",
+        "archetype",
+        "hypothesis_plain_english",
+        "target_markets",
+        "preferred_regimes",
+        "blueprint_summary",
+        "shadow_metrics",
+        "graduation",
+        "created_at_utc",
+        "last_shadow_trade_at_utc"
+      ],
+      "properties": {
+        "strategy_id": {
+          "$ref": "#/$defs/safeId"
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "origin": {
+          "enum": [
+            "CORE_BASELINE",
+            "AI_EVOLVED"
+          ]
+        },
+        "status": {
+          "const": "SHADOW_INCUBATING"
+        },
+        "archetype": {
+          "enum": [
+            "TREND_FOLLOW",
+            "MEAN_REVERT",
+            "VOL_BREAKOUT"
+          ]
+        },
+        "hypothesis_plain_english": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 280
+        },
+        "target_markets": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "type": "string"
+          }
+        },
+        "preferred_regimes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/regimeName"
+          }
+        },
+        "blueprint_summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "shadow_metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "shadow_trades",
+            "shadow_win_count",
+            "shadow_loss_count",
+            "shadow_win_rate_pct",
+            "shadow_r_expectancy",
+            "shadow_profit_factor",
+            "shadow_net_pnl_usd",
+            "shadow_max_drawdown_r",
+            "simulated_valve_pass_rate_pct"
+          ],
+          "properties": {
+            "shadow_trades": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "shadow_win_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "shadow_loss_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "shadow_win_rate_pct": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "shadow_r_expectancy": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "shadow_profit_factor": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "shadow_net_pnl_usd": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "shadow_max_drawdown_r": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "simulated_valve_pass_rate_pct": {
+              "$ref": "#/$defs/decimalString"
+            }
+          }
+        },
+        "graduation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "required_trades",
+            "completed_trades",
+            "required_min_profit_factor",
+            "required_min_r_expectancy",
+            "required_max_drawdown_r",
+            "progress_pct",
+            "progress_bucket",
+            "ready_for_promotion",
+            "blocking_reason"
+          ],
+          "properties": {
+            "required_trades": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "completed_trades": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "required_min_profit_factor": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "required_min_r_expectancy": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "required_max_drawdown_r": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "progress_pct": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "progress_bucket": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "multipleOf": 5
+            },
+            "ready_for_promotion": {
+              "type": "boolean"
+            },
+            "blocking_reason": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 200
+            }
+          }
+        },
+        "created_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "last_shadow_trade_at_utc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "quarantinedStrategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy_id",
+        "display_name",
+        "version",
+        "origin",
+        "status",
+        "archetype",
+        "retired_by",
+        "retirement_reason_code",
+        "retirement_reason_plain_english",
+        "final_metrics",
+        "quarantined_at_utc",
+        "cooldown_until_utc"
+      ],
+      "properties": {
+        "strategy_id": {
+          "$ref": "#/$defs/safeId"
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "origin": {
+          "enum": [
+            "CORE_BASELINE",
+            "AI_EVOLVED"
+          ]
+        },
+        "status": {
+          "enum": [
+            "QUARANTINED",
+            "DECOMMISSIONED"
+          ]
+        },
+        "archetype": {
+          "enum": [
+            "TREND_FOLLOW",
+            "MEAN_REVERT",
+            "VOL_BREAKOUT"
+          ]
+        },
+        "retired_by": {
+          "enum": [
+            "AI_SELF_AUDIT",
+            "OWNER_MANUAL",
+            "VALVE_SAFETY_BREACH"
+          ]
+        },
+        "retirement_reason_code": {
+          "type": "string",
+          "pattern": "^[A-Z0-9_]{3,64}$"
+        },
+        "retirement_reason_plain_english": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 280
+        },
+        "final_metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "closed_trades",
+            "win_rate_pct",
+            "r_expectancy",
+            "net_pnl_usd",
+            "starting_balance_contribution_usd",
+            "vaulted_profit_contribution_usd",
+            "max_drawdown_r"
+          ],
+          "properties": {
+            "closed_trades": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "win_rate_pct": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "r_expectancy": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "net_pnl_usd": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "starting_balance_contribution_usd": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "vaulted_profit_contribution_usd": {
+              "$ref": "#/$defs/decimalString"
+            },
+            "max_drawdown_r": {
+              "$ref": "#/$defs/decimalString"
+            }
+          }
+        },
+        "quarantined_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "cooldown_until_utc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "fieldNote": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "note_id",
+        "seq_no",
+        "observed_at_utc",
+        "observed_at_pacific",
+        "author_role",
+        "note_category",
+        "headline",
+        "body_plain_english",
+        "related_strategy_id",
+        "related_symbol",
+        "related_ticket",
+        "impact_pnl_usd",
+        "pinned_by_owner",
+        "acknowledged_by_ai",
+        "entry_sha256"
+      ],
+      "properties": {
+        "note_id": {
+          "$ref": "#/$defs/safeId"
+        },
+        "seq_no": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "observed_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "observed_at_pacific": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "author_role": {
+          "enum": [
+            "AI_STRATEGIST",
+            "OWNER_WAKIL",
+            "META_VALVE_GUARD"
+          ]
+        },
+        "note_category": {
+          "enum": [
+            "TRADE_LESSON",
+            "MARKET_SHIFT",
+            "STRATEGY_PROMOTED",
+            "STRATEGY_SHADOW_CREATED",
+            "STRATEGY_QUARANTINED",
+            "OWNER_DIRECTIVE",
+            "SAFETY_VETO"
+          ]
+        },
+        "headline": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "body_plain_english": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "related_strategy_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64
+        },
+        "related_symbol": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 16
+        },
+        "related_ticket": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64
+        },
+        "impact_pnl_usd": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "pinned_by_owner": {
+          "type": "boolean"
+        },
+        "acknowledged_by_ai": {
+          "type": "boolean"
+        },
+        "entry_sha256": {
+          "$ref": "#/$defs/sha256Hex"
+        }
+      }
+    }
+  }
+}

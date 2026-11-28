@@ -3,7 +3,7 @@ import { decodeCockpit, parseUniqueJSON, MAX_SNAPSHOT_BYTES } from './wire.mjs';
 import { resetInspection, reviewRecords, inspectRecord } from './model.mjs';
 import { displayFreshness } from './freshness.mjs';
 import { RADAR_FILTERS, renderLiveFeedStrip, renderTacticalValveHud, renderMarketRadarTable } from './tactical-hud.mjs';
-import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose, replaceSafeHTML, resolveCockpitCompounding, resolveCockpitDemoHighGrowth, resolveCockpitOptionBDemo } from './render.mjs';
+import { renderApp, renderControlDialog, renderCloseDialog, renderPreparedClose, replaceSafeHTML, resolveCockpitCompounding, resolveCockpitDemoHighGrowth, resolveCockpitOptionBDemo, resolveCockpitAiStrategyLab } from './render.mjs';
 import { decodeDecisionRead, envelopeRecords, MAX_REVIEW_BYTES } from './decision-read.mjs';
 import { ScopedBridge, createAuthenticatedLoopbackBridge } from './bridge.mjs';
 import { ALL_WATCHLIST_MARKETS, CHART_LAYOUTS, CHART_TIMEFRAMES, decodeMarketStream, MAX_MARKET_STREAM_BYTES, mountMarketCharts, releaseDetachedCanvases } from './chart.mjs';
@@ -82,6 +82,11 @@ import {
   normalizeDemoHighGrowth,
   patchDemoHighGrowthPanelInPlace,
 } from './demo-high-growth-panel.mjs';
+import {
+  STATIC_AI_STRATEGY_LAB,
+  normalizeAiStrategyLab,
+  patchAiStrategyLabPanelInPlace,
+} from './ai-strategy-lab-panel.mjs';
 import {
   attachScrollActivityListeners,
   captureScrollSnapshot,
@@ -221,6 +226,7 @@ let state = {
   compounding: STATIC_COMPOUNDING_PANEL,
   optionBDemo: STATIC_OPTION_B_DEMO,
   demoHighGrowth: STATIC_DEMO_HIGH_GROWTH,
+  aiStrategyLab: STATIC_AI_STRATEGY_LAB,
   unlockDraft: '',
   unlockKeyVisible: false,
   sessionScope: initialSessionScope,
@@ -609,6 +615,11 @@ function handleSseEvent(eventName, dataText) {
       state.demoHighGrowth = normalizeDemoHighGrowth(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
       syncDemoHighGrowthDom();
     } catch { /* Ignore malformed DEMO high-growth profile frame. */ }
+  } else if (eventName === 'ai_strategy_lab') {
+    try {
+      state.aiStrategyLab = normalizeAiStrategyLab(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
+      syncAiStrategyLabDom();
+    } catch { /* Ignore malformed AI Strategy Lab frame. */ }
   }
 }
 
@@ -778,6 +789,7 @@ async function readAiCockpitFeeds() {
   await readCompounding();
   await readOptionBDemo();
   await readDemoHighGrowth();
+  await readAiStrategyLab();
 }
 
 const LIVE_COCKPIT_POLL_MS = 4000;
@@ -822,6 +834,59 @@ async function readOptionBDemo() {
     const rawOb = await readStatic(new URL('/api/option-b-demo', window.location.origin), MAX_AI_PAYLOAD_BYTES);
     state.optionBDemo = normalizeOptionBDemo(parseUniqueJSON(rawOb, MAX_AI_PAYLOAD_BYTES));
   } catch { /* Keep prior verified Option B paper demo snapshot. */ }
+}
+
+async function readAiStrategyLab() {
+  try {
+    const rawLab = await readStatic(new URL('/api/ai-strategy-lab', window.location.origin), MAX_AI_PAYLOAD_BYTES);
+    state.aiStrategyLab = normalizeAiStrategyLab(parseUniqueJSON(rawLab, MAX_AI_PAYLOAD_BYTES));
+  } catch { /* Keep prior verified AI Strategy Lab snapshot. */ }
+}
+
+function syncAiStrategyLabDom(focusSelector = null) {
+  const scrollSnap = captureScrollSnapshot(document, window);
+  const panelEl = root.querySelector('[data-ai-strategy-lab="true"]');
+  if (panelEl) {
+    patchAiStrategyLabPanelInPlace(panelEl, resolveCockpitAiStrategyLab(state));
+    if (focusSelector) {
+      panelEl.querySelector(focusSelector)?.focus({ preventScroll: true });
+    }
+  }
+  restoreScrollPosition(scrollSnap);
+}
+
+async function submitAiStrategyLabMutation(payload, { clearForm = false, focusSelector = null } = {}) {
+  if (!state.liveStreamConnected) return;
+  if (!isStrictOwnerCompoundingSession()) {
+    requireOwnerControlOrWarn('AI Strategy Lab control');
+    return;
+  }
+  try {
+    const res = await postLoopbackJson('/api/ai-strategy-lab', payload);
+    if (res?.snapshot) {
+      state.aiStrategyLab = normalizeAiStrategyLab(res.snapshot);
+    } else {
+      await readAiStrategyLab();
+    }
+    if (clearForm) {
+      const panelEl = root.querySelector('[data-ai-strategy-lab="true"]');
+      const hIn = panelEl?.querySelector('[data-sl-input="headline"]');
+      const bIn = panelEl?.querySelector('[data-sl-input="body"]');
+      if (hIn) hIn.value = '';
+      if (bIn) bIn.value = '';
+    }
+    state.aiIssue = null;
+    syncAiStrategyLabDom(focusSelector);
+    announce('AI Strategy Lab updated.');
+  } catch (error) {
+    if (error?.status === 403) {
+      state.ownerControlsAllowed = false;
+    }
+    state.aiIssue = error instanceof Error ? error.message : 'AI Strategy Lab update failed.';
+    announce(state.aiIssue);
+    await readAiStrategyLab();
+    syncAiStrategyLabDom(focusSelector);
+  }
 }
 
 function syncOptionBDemoDom(focusSelector = null) {
@@ -967,6 +1032,7 @@ async function pollLiveCockpitState() {
     await readCompounding();
     await readOptionBDemo();
     await readDemoHighGrowth();
+    await readAiStrategyLab();
     try {
       const rawTg = await readStatic(new URL('/api/telegram-alerts', window.location.origin), MAX_AI_PAYLOAD_BYTES);
       state.telegramAlerts = parseUniqueJSON(rawTg, MAX_AI_PAYLOAD_BYTES);
@@ -1721,6 +1787,41 @@ root.addEventListener('click', (event) => {
       { action: 'REPLENISH_ALL_TIERS', reason: 'Owner cockpit replenish all tiers' },
       '[data-pt-action="REPLENISH_ALL_TIERS"]',
     );
+    return;
+  }
+  if (target.dataset.slAction === 'LEAVE_OWNER_NOTE') {
+    const panelEl = root.querySelector('[data-ai-strategy-lab="true"]');
+    const headline = String(panelEl?.querySelector('[data-sl-input="headline"]')?.value ?? '').trim();
+    const bodyPlain = String(panelEl?.querySelector('[data-sl-input="body"]')?.value ?? '').trim();
+    if (!headline || !bodyPlain) {
+      announce('Enter both a short headline and a note for the AI.');
+      return;
+    }
+    void submitAiStrategyLabMutation(
+      {
+        action: 'LEAVE_OWNER_NOTE',
+        headline,
+        body_plain_english: bodyPlain,
+        pin_for_ai: true,
+      },
+      { clearForm: true, focusSelector: '[data-sl-action="LEAVE_OWNER_NOTE"]' },
+    );
+    return;
+  }
+  if (target.dataset.slAction === 'QUARANTINE_STRATEGY' && target.dataset.slStrategyId) {
+    void submitAiStrategyLabMutation({
+      action: 'QUARANTINE_STRATEGY',
+      strategy_id: target.dataset.slStrategyId,
+      reason: 'Owner retired strategy from cockpit',
+    });
+    return;
+  }
+  if (target.dataset.slAction === 'RESUME_TO_SHADOW' && target.dataset.slStrategyId) {
+    void submitAiStrategyLabMutation({
+      action: 'RESUME_TO_SHADOW',
+      strategy_id: target.dataset.slStrategyId,
+      reason: 'Owner returned strategy to Shadow Incubator',
+    });
     return;
   }
   if (target.dataset.ptAction === 'TOGGLE_AUTO_REPLENISH') {

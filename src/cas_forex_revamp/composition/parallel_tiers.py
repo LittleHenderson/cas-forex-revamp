@@ -319,6 +319,7 @@ class ParallelTierEngine:
         live_trading_armed: bool = False,
         clock: Callable[[], datetime] | None = None,
         telegram_notifier: Any | None = None,
+        adaptive_lab: Any | None = None,
     ) -> None:
         if not isinstance(db_path, Path):
             db_path = Path(str(db_path))
@@ -359,6 +360,7 @@ class ParallelTierEngine:
         self._index_min_lot = decimal_value(index_min_lot, "index_min_lot", positive=True)
         self._clock = clock or _utc_now
         self._telegram_notifier = telegram_notifier
+        self._adaptive_lab = adaptive_lab
         self._lock = RLock()
         self._regime = TrendRegimeDetector()
         self._peak_store = PeakEquityStore(db_path)
@@ -389,6 +391,10 @@ class ParallelTierEngine:
     def aggression_dial(self) -> AggressionDialStore | None:
         with self._lock:
             return self._aggression_dial
+
+    def bind_adaptive_strategy_lab(self, lab: Any | None) -> None:
+        with self._lock:
+            self._adaptive_lab = lab
 
     def bind_aggression_dial(self, store: AggressionDialStore | None) -> None:
         if store is not None and not isinstance(store, AggressionDialStore):
