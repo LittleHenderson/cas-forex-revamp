@@ -3052,7 +3052,11 @@ class AutonomousAiTrader:
         if self._adaptive_lab is not None and allow_cold_open:
             ts_eval = self._now(now)
             is_live_exec = str(self._router.execution_mode).strip().upper() == "LIVE"
-            init_cap_eval = self._configured_initial_capital_usd or Decimal("200000.00")
+            init_cap_eval = (
+                self._resolve_initial_capital_usd(allow_vault_io=False)
+                or self._explicit_initial_capital_usd
+                or Decimal("200000.00")
+            )
             dd_ratio_eval = (
                 compute_drawdown_pct(total_eq, peak_eq) / Decimal("100")
                 if (peak_eq is not None and peak_eq > Decimal("0") and total_eq > Decimal("0"))

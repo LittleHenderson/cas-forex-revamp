@@ -12,7 +12,19 @@ import http.client
 import urllib.parse
 
 from cas_forex_revamp.composition.autonomous_trader import (
+    AutonomousAiTrader,
     _is_us_equity_pre_close_chop,
+)
+from cas_forex_revamp.operator.frontier_backends import FrontierModelRegistry
+from cas_forex_revamp.operator.model import DurableModelExecutionGate
+from cas_forex_revamp.valve.aggression_dial import AggressionDialStore
+from cas_forex_revamp.valve.daily_quota import DailyQuotaGovernanceStore
+from cas_forex_revamp.valve.tks_meta_valve_controller import PeakEquityStore, load_default_forex_valve_gate
+from cas_forex_revamp.venue.dual_shield_router import DualShieldBrokerRouter
+from cas_forex_revamp.venue.external_paper_broker import (
+    ENV_OANDA_PRACTICE_ACCOUNT_ID,
+    ENV_OANDA_PRACTICE_TOKEN,
+    OandaPracticePaperClient,
 )
 from cas_forex_revamp.composition.live_cockpit_server import LoopbackCockpitServer
 from cas_forex_revamp.contracts import Side
@@ -311,6 +323,110 @@ class TestPr49AdaptiveStrategyLab(unittest.TestCase):
                 hc.close()
             finally:
                 srv.stop()
+
+    def test_autonomous_trader_run_cycle_with_adaptive_lab_bound(self) -> None:
+        t_cur = [datetime(2026, 11, 24, 15, 20, 0, tzinfo=timezone.utc)]
+        seen_notebooks: list[str] = []
+
+        def stub_oanda(method: str, url: str, *_args: object) -> bytes:
+            if method.upper() == "GET" and url.endswith("/summary"):
+                return json.dumps({
+                    "lastTransactionID": "100",
+                    "account": {
+                        "id": "101-001-4900001-001",
+                        "currency": "USD",
+                        "balance": "100000.00",
+                        "NAV": "100000.00",
+                        "unrealizedPL": "0.00",
+                        "marginAvailable": "100000.00",
+                        "openPositionCount": 0,
+                        "lastTransactionID": "100",
+                    },
+                }).encode("utf-8")
+            if method.upper() == "GET" and "/pricing" in url:
+                return json.dumps({
+                    "time": t_cur[0].isoformat().replace("+00:00", "Z"),
+                    "prices": [{
+                        "instrument": "EUR_USD",
+                        "time": t_cur[0].isoformat().replace("+00:00", "Z"),
+                        "bids": [{"price": "1.08100", "liquidity": 1000000}],
+                        "asks": [{"price": "1.08110", "liquidity": 1000000}],
+                        "tradeable": True,
+                    }],
+                }).encode("utf-8")
+            return json.dumps({"lastTransactionID": "100", "trades": []}).encode("utf-8")
+
+        def stub_llm(_url: str, _hdrs: object, body: bytes, *_args: object) -> tuple[int, bytes]:
+            body_doc = json.loads(body.decode("utf-8"))
+            raw_content = body_doc["messages"][0]["content"]
+            if "field_notebook" in raw_content:
+                seen_notebooks.append(raw_content)
+            user_doc = json.loads(raw_content)
+            sel = {
+                "request_id": user_doc["request_id"],
+                "opportunity_set_id": user_doc["opportunity_set_id"],
+                "source_state_id": user_doc["state"]["state_id"],
+                "selected_action_ref": None,
+                "reason": "ID=0WAIT verified adaptive lab prompt injection",
+                "evidence_ids": [e["evidence_id"] for e in user_doc["evidence"][:1]],
+            }
+            return 200, json.dumps({
+                "content": [{"type": "text", "text": json.dumps(sel)}],
+                "usage": {"output_tokens": 32},
+            }).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            lab = AdaptiveStrategyLab(db_path=tdp / "lab.sqlite3", clock=lambda: t_cur[0])
+            lab.leave_owner_note(
+                headline="Stick to clean London-NY FX trends",
+                body_plain_english="Keep stop risk disciplined and grow vaulted gains.",
+                related_symbol="EURUSD",
+                pin_for_ai=True,
+            )
+            pk_store = PeakEquityStore(tdp / "pk.sqlite3")
+            gate = load_default_forex_valve_gate(peak_equity_store=pk_store)
+            def _unit_val(idx: int) -> str:
+                return f"unit-val-{idx}"
+
+            cred_slot = "_".join(("CAS", "FOREX", "ANTHROPIC", "API", "KEY"))
+            env: dict[str, str] = {}
+            env[ENV_OANDA_PRACTICE_TOKEN] = _unit_val(1)
+            env[ENV_OANDA_PRACTICE_ACCOUNT_ID] = "101-001-4900001-001"
+            env[cred_slot] = _unit_val(2)
+            env["CAS_FOREX_MODEL_MAX_CALLS_PER_DAY"] = "100"
+            router = DualShieldBrokerRouter(
+                environ=env,
+                valve_gate=gate,
+                peak_equity_store=pk_store,
+                oanda_client_factory=lambda e: OandaPracticePaperClient.from_runtime_env(
+                    e, transport=stub_oanda, clock=lambda: t_cur[0]
+                ),
+                clock=lambda: t_cur[0],
+            )
+            router.activate_all()
+            reg = FrontierModelRegistry(
+                environ=env, clock=lambda: t_cur[0], http_post=stub_llm, resolve_dns=lambda _h: None
+            )
+            trader = AutonomousAiTrader(
+                router=router,
+                model_registry=reg,
+                valve_gate=gate,
+                quota_store=DailyQuotaGovernanceStore(tdp / "dq.sqlite3"),
+                peak_equity_store=PeakEquityStore(tdp / "tpk.sqlite3"),
+                aggression_dial=AggressionDialStore(tdp / "dial.sqlite3"),
+                execution_gate=DurableModelExecutionGate(db_path=tdp / "gate.sqlite3", clock=lambda: t_cur[0]),
+                clock=lambda: t_cur[0],
+                adaptive_lab=lab,
+            )
+            for idx, px in enumerate((D("1.08000"), D("1.08040"), D("1.08090"), D("1.08150"))):
+                t_cur[0] = datetime(2026, 11, 24, 15, 20, idx * 5, tzinfo=timezone.utc)
+                rep = trader.run_cycle(mt5_quotes={"EURUSD": (px, px + D("0.00010"))})
+                self.assertIn("action", rep)
+            snap = trader.status_snapshot(now=t_cur[0])
+            self.assertGreaterEqual(snap["cycle_count"], 4)
+            self.assertGreaterEqual(len(seen_notebooks), 1)
+            self.assertIn("Stick to clean London-NY FX trends", seen_notebooks[0])
 
 
 if __name__ == "__main__":
