@@ -776,13 +776,17 @@ class ParallelTierEngine:
                 sig_regime = str(signal.get("regime") or "TREND_IGNITION")
                 self._last_signal_regime = sig_regime
                 raw_sig_vs = signal.get("valve_score")
-                if raw_sig_vs is not None:
+                if raw_sig_vs is not None and not isinstance(raw_sig_vs, bool):
                     try:
-                        parsed_sig_vs = Decimal(str(raw_sig_vs))
-                        if parsed_sig_vs.is_finite() and Decimal("0") <= parsed_sig_vs <= Decimal("1"):
-                            self._last_signal_valve_score = parsed_sig_vs
-                    except Exception:
-                        pass
+                        parsed_sig_vs: Decimal | None = Decimal(str(raw_sig_vs))
+                    except (InvalidOperation, ValueError, TypeError):
+                        parsed_sig_vs = None
+                    if (
+                        parsed_sig_vs is not None
+                        and parsed_sig_vs.is_finite()
+                        and Decimal("0") <= parsed_sig_vs <= Decimal("1")
+                    ):
+                        self._last_signal_valve_score = parsed_sig_vs
 
         dial_store = self.aggression_dial
         dial_snap = dial_store.snapshot() if dial_store is not None else None
