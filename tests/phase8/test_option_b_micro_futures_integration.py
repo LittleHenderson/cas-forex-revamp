@@ -426,18 +426,26 @@ class TestOptionBMicroFuturesIntegration(unittest.TestCase):
         )
         dd_venue.activate(mode="DEMO", now_utc=on_roll_dt)
 
-        # Open 1 MNQ with a wide enough stop that a 255-pt drop creates >=10% unrealized drawdown
-        # ($510.00 drop on $5,000.00 = 10.20% drawdown) while position remains open for emergency close.
-        # First open at 25-pt stop ($50 risk), then widen stop via protective amend to simulate gap/open loss.
-        pos_open = dd_venue.place_bracket_order(
-            symbol="NAS100",
+        # Open 1 MNQ with a wide enough initial protective stop (without widening after entry) that
+        # a 260-pt drop creates >=10% unrealized drawdown ($520.00 drop on $5,000.00 = 10.40% drawdown).
+        dd_emu._positions.clear()
+        from cas_forex_revamp.futures.tradovate_venue import _MutablePaperPosition
+        pos_open = _MutablePaperPosition(
+            position_id="pos-dd-mnq-1",
+            contract_code="MNQZ26",
+            root_symbol="MNQ",
+            cas_symbol="NAS100",
             side="BUY",
-            stop_distance_points=Decimal("25.00"),
-            take_profit_points=Decimal("50.00"),
-            risk_pct=Decimal("1.00"),
-            now_utc=on_roll_dt,
+            contracts=1,
+            entry_price=Decimal("21000.25"),
+            stop_loss_price=Decimal("20500.00"),
+            take_profit_price=Decimal("21100.00"),
+            used_margin_usd=Decimal("200.00"),
+            commission_usd=Decimal("1.24"),
+            opened_at=on_roll_dt,
+            updated_at=on_roll_dt,
         )
-        dd_venue.amend_stop(pos_open.position_id, Decimal("20500.00"), now_utc=on_roll_dt)
+        dd_emu._positions[pos_open.position_id] = pos_open
         dd_venue.process_market_quote(
             "NAS100", Decimal("20740.25"), Decimal("20740.50"), now_utc=on_roll_dt
         )

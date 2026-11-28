@@ -142,10 +142,16 @@ class _OandaTransportStub:
             self.orders.append(spec)
             self._tx += 2
             return json.dumps({
-                "orderCreateTransaction": {"id": str(self._tx - 1)},
+                "orderCreateTransaction": {
+                    "id": str(self._tx - 1),
+                    "clientExtensions": spec.get("clientExtensions", {}),
+                },
                 "orderFillTransaction": {
                     "id": str(self._tx),
+                    "instrument": spec["instrument"],
+                    "units": spec["units"],
                     "price": "1.09877" if not spec["units"].startswith("-") else "1.09876",
+                    "clientExtensions": spec.get("clientExtensions", {}),
                 },
                 "lastTransactionID": str(self._tx),
             }).encode("utf-8")
@@ -375,6 +381,12 @@ class DualModeBrokerTests(unittest.TestCase):
                     balance=Decimal("8000"), trade_mode="REAL", clock=clock,
                 ),
             }
+            from cas_forex_revamp.venue.mt5_broker_bridge import provision_sealed_replay_ledger
+            provision_sealed_replay_ledger(spool / "hugosway_mt5", broker_channel="hugosway_mt5")
+            provision_sealed_replay_ledger(spool / "lhfx_mt5", broker_channel="lhfx_mt5")
+            from cas_forex_revamp.venue.mt5_broker_bridge import provision_sealed_replay_ledger
+            provision_sealed_replay_ledger(spool / "hugosway_mt5", broker_channel="hugosway_mt5")
+            provision_sealed_replay_ledger(spool / "lhfx_mt5", broker_channel="lhfx_mt5")
             for emu in emus.values():
                 emu.publish_market()
 
@@ -438,7 +450,11 @@ class DualModeBrokerTests(unittest.TestCase):
 
             # 2b. Full lifecycle AMEND_STOP -> REDUCE -> CLOSE on Hugo's Way live (Hugo PRO5).
             p_amend, o_amend = _clear_proposal("req-live-amend", ActionKind.AMEND_STOP, Decimal("0"), Decimal("1.09600"))
-            d_amend = GATE.require_admissible(p_amend, current_view=_VIEW, policy=_POLICY, now=_T0 + timedelta(seconds=2))
+            _view_amend = {
+                **_VIEW,
+                "position_inventory": [{"position_id": o_amend.position_ticket or "500000001", "symbol": "EURUSD", "side": "BUY", "stop_loss": "1.09377"}],
+            }
+            d_amend = GATE.require_admissible(p_amend, current_view=_view_amend, policy=_POLICY, now=_T0 + timedelta(seconds=2))
             self.assertEqual(router.execute_management(BROKER_HUGOSWAY_MT5, o_amend, valve_decision=d_amend).receipt.status, "MODIFIED")
             p_red, o_red = _clear_proposal("req-live-reduce", ActionKind.REDUCE, Decimal("40000"), None)
             d_red = GATE.require_admissible(p_red, current_view=_VIEW, policy=_POLICY, now=_T0 + timedelta(seconds=3))

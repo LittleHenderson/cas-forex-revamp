@@ -1847,11 +1847,17 @@ class PublicUsIndexFeedClient:
         timeout_seconds: float = 10.0,
         max_wire_bytes: int = MAX_STREAM_WIRE_BYTES,
         clock: Callable[[], datetime] | None = None,
+        max_candle_age_seconds: int = 300,
+        max_quote_age_seconds: int = 300,
+        max_future_skew_seconds: int = 30,
     ) -> None:
         self._transport = transport
         self._timeout = float(timeout_seconds)
         self._max_wire_bytes = integer(max_wire_bytes, "max_wire_bytes", minimum=1024)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._max_candle_age_seconds = integer(max_candle_age_seconds, "max_candle_age_seconds", minimum=1)
+        self._max_quote_age_seconds = integer(max_quote_age_seconds, "max_quote_age_seconds", minimum=1)
+        self._max_future_skew_seconds = integer(max_future_skew_seconds, "max_future_skew_seconds", minimum=0)
 
     def _get(self, url: str) -> bytes:
         safe_url = validate_pinned_public_feed_url(url, allow_yahoo_chart=True)
@@ -1862,19 +1868,61 @@ class PublicUsIndexFeedClient:
             return raw
         return _https_get_pinned_host(safe_url, timeout_seconds=self._timeout, max_bytes=self._max_wire_bytes)
 
+    def _validate_provider_timestamps(
+        self,
+        *,
+        sym: str,
+        meta: Mapping[str, Any],
+        candle_epochs: Sequence[int],
+        received_dt: datetime,
+    ) -> datetime:
+        received_epoch = received_dt.timestamp()
+        provider_dts: list[datetime] = []
+        if candle_epochs:
+            newest_epoch = candle_epochs[-1]
+            candle_age = received_epoch - float(newest_epoch)
+            if candle_age > float(self._max_candle_age_seconds):
+                raise ContractError(
+                    f"Yahoo index candle stream stale for {sym}: age={candle_age:.1f}s > {self._max_candle_age_seconds}s"
+                )
+            provider_dts.append(datetime.fromtimestamp(newest_epoch, tz=timezone.utc))
+        if "regularMarketTime" in meta and meta.get("regularMarketTime") is not None:
+            raw_rmt = meta.get("regularMarketTime")
+            if isinstance(raw_rmt, bool):
+                raise ContractError(f"Yahoo index regularMarketTime invalid for {sym}: {raw_rmt!r}")
+            try:
+                rmt_epoch = int(str(raw_rmt))
+            except (TypeError, ValueError):
+                raise ContractError(f"Yahoo index regularMarketTime invalid for {sym}: {raw_rmt!r}") from None
+            if rmt_epoch <= 0:
+                raise ContractError(f"Yahoo index regularMarketTime non-positive for {sym}: {rmt_epoch}")
+            if float(rmt_epoch) > received_epoch + float(self._max_future_skew_seconds):
+                raise ContractError(f"Yahoo index regularMarketTime is in the future for {sym}: {rmt_epoch}")
+            quote_age = received_epoch - float(rmt_epoch)
+            if quote_age > float(self._max_quote_age_seconds):
+                raise ContractError(
+                    f"Yahoo index regularMarketTime stale for {sym}: age={quote_age:.1f}s > {self._max_quote_age_seconds}s"
+                )
+            provider_dts.append(datetime.fromtimestamp(rmt_epoch, tz=timezone.utc))
+        if not provider_dts:
+            raise ContractError(f"Yahoo index response for {sym} missing provider timestamp (candle timestamp or regularMarketTime)")
+        return min(provider_dts)
+
     def fetch_index_stream(self, *, sequence: int = 1) -> dict[str, Any]:
-        now_dt = utc_time(self._clock(), "index observed_at")
-        observed_str = now_dt.isoformat().replace("+00:00", "Z")
         rows: list[dict[str, Any]] = []
+        top_provider_dts: list[datetime] = []
+        top_received_dts: list[datetime] = []
         for sym in INDEX_INSTRUMENTS:
             spec = INDEX_MARKET_SPECS[sym]
             tick = spec["tick"]
             last_exc: Exception | None = None
             chart_doc: dict[str, Any] | None = None
+            received_dt: datetime | None = None
             for ypath in spec["yahoo_paths"]:
                 url = f"https://query1.finance.yahoo.com{ypath}?interval=1m&range=1d"
                 try:
                     raw = self._get(url)
+                    received_dt = utc_time(self._clock(), "index received_at")
                     parsed = json.loads(raw.decode("utf-8"))
                     result_list = ((parsed.get("chart") or {}).get("result") or [])
                     if result_list and isinstance(result_list[0], dict):
@@ -1882,8 +1930,9 @@ class PublicUsIndexFeedClient:
                         break
                 except Exception as exc:
                     last_exc = exc
-            if chart_doc is None:
+            if chart_doc is None or received_dt is None:
                 raise ContractError(f"pinned reference feed unavailable for {sym}: {type(last_exc).__name__ if last_exc else 'empty'}")
+            received_epoch = received_dt.timestamp()
             meta = chart_doc.get("meta") or {}
             timestamps = chart_doc.get("timestamp") or []
             quote_block = (((chart_doc.get("indicators") or {}).get("quote") or [{}])[0])
@@ -1893,22 +1942,43 @@ class PublicUsIndexFeedClient:
             closes = quote_block.get("close") or []
             vols = quote_block.get("volume") or []
             candles_m1: list[dict[str, Any]] = []
-            for idx, ts_val in enumerate(timestamps[-60:]):
-                if ts_val is None or idx >= len(closes):
+            candle_epochs: list[int] = []
+            prev_ts_epoch: int | None = None
+            ts_slice = timestamps[-60:]
+            offset = len(timestamps) - len(ts_slice)
+            for idx, ts_val in enumerate(ts_slice):
+                if ts_val is None or isinstance(ts_val, bool):
+                    if ts_val is not None:
+                        raise ContractError(f"Yahoo index candle timestamp invalid for {sym}: {ts_val!r}")
                     continue
-                c_raw = closes[-len(timestamps[-60:]) + idx] if len(timestamps) >= 60 else closes[idx]
-                o_raw = opens[-len(timestamps[-60:]) + idx] if len(timestamps) >= 60 and idx < len(opens) else opens[idx] if idx < len(opens) else c_raw
-                h_raw = highs[-len(timestamps[-60:]) + idx] if len(timestamps) >= 60 and idx < len(highs) else highs[idx] if idx < len(highs) else c_raw
-                l_raw = lows[-len(timestamps[-60:]) + idx] if len(timestamps) >= 60 and idx < len(lows) else lows[idx] if idx < len(lows) else c_raw
-                v_raw = vols[-len(timestamps[-60:]) + idx] if len(timestamps) >= 60 and idx < len(vols) else vols[idx] if idx < len(vols) else 0
+                try:
+                    ts_epoch = int(str(ts_val))
+                except (TypeError, ValueError):
+                    raise ContractError(f"Yahoo index candle timestamp invalid for {sym}: {ts_val!r}") from None
+                if ts_epoch <= 0:
+                    raise ContractError(f"Yahoo index candle timestamp non-positive for {sym}: {ts_epoch}")
+                if prev_ts_epoch is not None and ts_epoch < prev_ts_epoch:
+                    raise ContractError(f"Yahoo index non-monotonic candle timestamps for {sym}: {ts_epoch} < {prev_ts_epoch}")
+                if float(ts_epoch) > received_epoch + float(self._max_future_skew_seconds):
+                    raise ContractError(f"Yahoo index future candle timestamp for {sym}: {ts_epoch}")
+                prev_ts_epoch = ts_epoch
+                abs_idx = offset + idx
+                if abs_idx >= len(closes):
+                    continue
+                c_raw = closes[abs_idx]
+                o_raw = opens[abs_idx] if abs_idx < len(opens) else c_raw
+                h_raw = highs[abs_idx] if abs_idx < len(highs) else c_raw
+                l_raw = lows[abs_idx] if abs_idx < len(lows) else c_raw
+                v_raw = vols[abs_idx] if abs_idx < len(vols) else 0
                 if None in (o_raw, h_raw, l_raw, c_raw):
                     continue
-                t_iso = datetime.fromtimestamp(int(ts_val), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+                t_iso = datetime.fromtimestamp(ts_epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
                 o_dec = Decimal(str(o_raw)).quantize(tick)
                 h_dec = Decimal(str(h_raw)).quantize(tick)
                 l_dec = Decimal(str(l_raw)).quantize(tick)
                 c_dec = Decimal(str(c_raw)).quantize(tick)
                 v_dec = Decimal(str(v_raw or 0)).quantize(Decimal("0.01"))
+                candle_epochs.append(ts_epoch)
                 candles_m1.append({
                     "t": t_iso,
                     "o": decimal_text(o_dec),
@@ -1918,6 +1988,16 @@ class PublicUsIndexFeedClient:
                     "v": decimal_text(max(Decimal("0"), v_dec)),
                     "n": 1,
                 })
+            prov_obs_dt = self._validate_provider_timestamps(
+                sym=sym,
+                meta=meta,
+                candle_epochs=candle_epochs,
+                received_dt=received_dt,
+            )
+            prov_obs_str = prov_obs_dt.isoformat().replace("+00:00", "Z")
+            recv_str = received_dt.isoformat().replace("+00:00", "Z")
+            top_provider_dts.append(prov_obs_dt)
+            top_received_dts.append(received_dt)
             raw_mid = meta.get("regularMarketPrice") or (candles_m1[-1]["c"] if candles_m1 else None)
             if raw_mid is None:
                 raise ContractError(f"index price missing for {sym}")
@@ -1942,15 +2022,21 @@ class PublicUsIndexFeedClient:
                 "ask": decimal_text(ask),
                 "mid": decimal_text(mid),
                 "spread_points": decimal_text(ask - bid),
-                "observed_at": observed_str,
+                "provider_observed_at": prov_obs_str,
+                "received_at": recv_str,
+                "observed_at": prov_obs_str,
                 "candles_m1": candles_m1,
                 "candles_m5": candles_m1[-12:],
                 "candles_h1": candles_m1[-2:],
             })
+        top_prov_str = min(top_provider_dts).isoformat().replace("+00:00", "Z")
+        top_recv_str = max(top_received_dts).isoformat().replace("+00:00", "Z")
         return {
             "schema": "cas-forex.index-stream/1",
             "sequence": int(sequence),
-            "observed_at": observed_str,
+            "provider_observed_at": top_prov_str,
+            "received_at": top_recv_str,
+            "observed_at": top_prov_str,
             "instruments": list(INDEX_INSTRUMENTS),
             "markets": rows,
         }

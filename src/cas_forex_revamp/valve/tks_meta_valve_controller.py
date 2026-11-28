@@ -111,9 +111,12 @@ MAX_VALVE_GRANT_TTL_SECONDS = 300.0
 DEFAULT_VALVE_DECISION_TTL_SECONDS = 300.0
 MAX_VALVE_REPLAY_LEDGER_ENTRIES = 16384
 
-RISK_REDUCING_ACTION_KINDS: frozenset[str] = frozenset({"CLOSE", "REDUCE", "AMEND_STOP"})
+RISK_REDUCING_ACTION_KINDS: frozenset[str] = frozenset({"CLOSE", "REDUCE"})
+CONDITIONAL_MANAGEMENT_ACTION_KINDS: frozenset[str] = frozenset({"AMEND_STOP"})
 RISK_INCREASING_ACTION_KINDS: frozenset[str] = frozenset({"OPEN", "ADD"})
-ALLOWED_VALVE_GRANT_ACTIONS: frozenset[str] = RISK_REDUCING_ACTION_KINDS | RISK_INCREASING_ACTION_KINDS
+ALLOWED_VALVE_GRANT_ACTIONS: frozenset[str] = (
+    RISK_REDUCING_ACTION_KINDS | CONDITIONAL_MANAGEMENT_ACTION_KINDS | RISK_INCREASING_ACTION_KINDS
+)
 
 
 class ValveRefusalError(ContractError):
@@ -224,6 +227,31 @@ def _norm_grant_execution_mode(raw: Any) -> str:
     return norm
 
 
+def _is_monotonic_tightening_amend(
+    *,
+    side: Any,
+    stop_loss: Decimal | str | None,
+    previous_stop_loss: Decimal | str | None,
+) -> bool:
+    norm_side = _norm_grant_side(side)
+    if norm_side not in ("BUY", "SELL"):
+        return False
+    norm_sl = _norm_grant_decimal(stop_loss)
+    if not norm_sl:
+        # Take-profit-only amendment does not alter the protective stop.
+        return True
+    norm_prev = _norm_grant_decimal(previous_stop_loss)
+    if not norm_prev:
+        return False
+    new_d = Decimal(norm_sl)
+    prev_d = Decimal(norm_prev)
+    if new_d <= Decimal("0") or prev_d <= Decimal("0"):
+        return False
+    if norm_side == "BUY":
+        return new_d >= prev_d
+    return new_d <= prev_d
+
+
 def _canonical_grant_order_digest(
     *,
     broker_id: str,
@@ -240,6 +268,7 @@ def _canonical_grant_order_digest(
     grant_nonce: str,
     issued_at: datetime,
     expires_at: datetime,
+    previous_stop_loss: str = "",
 ) -> str:
     payload = {
         "protocol": "cas-forex-valve-order-grant/1",
@@ -254,6 +283,7 @@ def _canonical_grant_order_digest(
         "stop_loss": _norm_grant_decimal(stop_loss),
         "take_profit": _norm_grant_decimal(take_profit),
         "position_ticket": str(position_ticket or "").strip(),
+        "previous_stop_loss": _norm_grant_decimal(previous_stop_loss),
         "grant_nonce": grant_nonce.strip(),
         "issued_at": _iso_utc(issued_at),
         "expires_at": _iso_utc(expires_at),
@@ -543,7 +573,7 @@ class ValveDecision:
                 decision=self,
             )
         ord_ticket = str(position_ticket or "").strip()
-        if ord_kind in RISK_REDUCING_ACTION_KINDS:
+        if ord_kind in (RISK_REDUCING_ACTION_KINDS | CONDITIONAL_MANAGEMENT_ACTION_KINDS):
             if self._bound_target_id and ord_ticket and self._bound_target_id != ord_ticket:
                 raise ValveGrantError(
                     f"ValveDecision bound target_id {self._bound_target_id!r} does not match position_ticket {ord_ticket!r}",
@@ -589,6 +619,7 @@ class ValveOrderGrant:
     risk_reducing: bool
     order_digest_sha256: str
     signature_hmac_sha256: str
+    previous_stop_loss: str = ""
     _mint_token: object = field(default=None, repr=False, compare=False)
     _gate_id: str = field(default="", repr=False, compare=False)
 
@@ -605,8 +636,15 @@ class ValveOrderGrant:
             raise ValveGrantError("ValveOrderGrant requires a non-empty server")
         _norm_grant_execution_mode(self.execution_mode)
         act = _norm_grant_action(self.action_kind)
-        if type(self.risk_reducing) is not bool or self.risk_reducing != (act in RISK_REDUCING_ACTION_KINDS):
+        if type(self.risk_reducing) is not bool:
+            raise ValveGrantError("ValveOrderGrant risk_reducing flag must be bool")
+        if act in RISK_REDUCING_ACTION_KINDS and not self.risk_reducing:
             raise ValveGrantError("ValveOrderGrant risk_reducing flag does not match action_kind")
+        if act in RISK_INCREASING_ACTION_KINDS and self.risk_reducing:
+            raise ValveGrantError("ValveOrderGrant risk_reducing flag does not match action_kind")
+        if act == "AMEND_STOP" and self.risk_reducing:
+            if not _is_monotonic_tightening_amend(side=self.side, stop_loss=self.stop_loss, previous_stop_loss=self.previous_stop_loss):
+                raise ValveGrantError("ValveOrderGrant risk_reducing AMEND_STOP requires proven non-widening stop vs previous_stop_loss")
         if not isinstance(self.symbol, str) or not self.symbol.strip():
             raise ValveGrantError("ValveOrderGrant requires a non-empty symbol")
         if not isinstance(self.grant_nonce, str) or len(self.grant_nonce.strip()) < 16:
@@ -631,6 +669,7 @@ class ValveOrderGrant:
             grant_nonce=self.grant_nonce,
             issued_at=issued,
             expires_at=expires,
+            previous_stop_loss=self.previous_stop_loss,
         )
         if not hmac.compare_digest(expected_digest, self.order_digest_sha256.lower()):
             raise ValveGrantError("ValveOrderGrant order_digest_sha256 verification failed")
@@ -669,6 +708,7 @@ def verify_and_consume_valve_order_grant(
     stop_loss: Decimal | str | None = None,
     take_profit: Decimal | str | None = None,
     position_ticket: str | None = None,
+    previous_stop_loss: Decimal | str | None = None,
     now: datetime | None = None,
     require_risk_reducing: bool = False,
     expected_weights_sha256: str | None = None,
@@ -689,12 +729,23 @@ def verify_and_consume_valve_order_grant(
     norm_sl = _norm_grant_decimal(stop_loss)
     norm_tp = _norm_grant_decimal(take_profit)
     norm_ticket = str(position_ticket or "").strip()
-    if require_risk_reducing and (norm_act not in RISK_REDUCING_ACTION_KINDS or not grant.risk_reducing):
+    norm_prev_sl = _norm_grant_decimal(previous_stop_loss) if previous_stop_loss is not None else grant.previous_stop_loss
+    eff_rr_allowed = RISK_REDUCING_ACTION_KINDS | CONDITIONAL_MANAGEMENT_ACTION_KINDS
+    if require_risk_reducing and (norm_act not in eff_rr_allowed or not grant.risk_reducing):
         raise ValveGrantError(
             f"Management/protective broker sink refuses non-risk-reducing action {norm_act!r}"
         )
-    if grant.risk_reducing != (grant.action_kind in RISK_REDUCING_ACTION_KINDS):
+    if grant.action_kind in RISK_REDUCING_ACTION_KINDS and not grant.risk_reducing:
         raise ValveGrantError("ValveOrderGrant risk_reducing invariant violated")
+    if grant.action_kind in RISK_INCREASING_ACTION_KINDS and grant.risk_reducing:
+        raise ValveGrantError("ValveOrderGrant risk_reducing invariant violated")
+    if grant.action_kind == "AMEND_STOP" and grant.risk_reducing:
+        if not _is_monotonic_tightening_amend(
+            side=(norm_side or grant.side),
+            stop_loss=norm_sl,
+            previous_stop_loss=norm_prev_sl,
+        ):
+            raise ValveGrantError("ValveOrderGrant risk_reducing AMEND_STOP fails monotonic non-widening check")
     if expected_weights_sha256 is not None and not hmac.compare_digest(
         grant.weights_sha256.lower(), expected_weights_sha256.lower()
     ):
@@ -723,6 +774,7 @@ def verify_and_consume_valve_order_grant(
         grant_nonce=grant.grant_nonce,
         issued_at=grant.issued_at,
         expires_at=grant.expires_at,
+        previous_stop_loss=norm_prev_sl,
     )
     if not hmac.compare_digest(expected_digest, grant.order_digest_sha256.lower()):
         raise ValveGrantError(
@@ -1473,170 +1525,6 @@ def extract_forex_valve_features(
     if intent is not None and missing_count > 0:
         vetoes.append("MISSING_REQUIRED_ACCOUNTING")
 
-    # 1b. Peak-equity / maximum drawdown hard-floor gate on new-risk entries (OPEN / ADD).
-    # WAIT (intent is None) and risk-reducing/protective management (REDUCE, CLOSE, AMEND_STOP, CANCEL_ORDER)
-    # remain available during drawdown.
-    # Constitutional invariant (Finding [5]): max_drawdown_pct can NEVER exceed 0.10 (10.00%);
-    # policy overrides may ONLY tighten below the immutable 10.00% ceiling.
-    if (
-        not isinstance(demo_max_drawdown_ceiling, Decimal)
-        or not demo_max_drawdown_ceiling.is_finite()
-        or demo_max_drawdown_ceiling <= Decimal("0")
-        or demo_max_drawdown_ceiling > DEMO_HIGH_GROWTH_MAX_DRAWDOWN_PCT
-    ):
-        raise ContractError(
-            f"demo_max_drawdown_ceiling must be Decimal in (0, {DEMO_HIGH_GROWTH_MAX_DRAWDOWN_PCT}]"
-        )
-    if intent is not None and intent.kind in (ActionKind.OPEN, ActionKind.ADD):
-        pol_dict = policy if isinstance(policy, Mapping) else {}
-        eff_dd_ceiling = demo_max_drawdown_ceiling
-        dd_threshold: Decimal | None = None
-        dd_invalid = False
-        dd_ceiling_exceeded = False
-        gate_dd: Decimal | None = None
-        if max_drawdown_pct is not None:
-            gate_dd = _safe_decimal(max_drawdown_pct)
-            if gate_dd is None or gate_dd <= Decimal("0") or gate_dd >= Decimal("1"):
-                dd_invalid = True
-            elif gate_dd > eff_dd_ceiling:
-                dd_ceiling_exceeded = True
-                gate_dd = eff_dd_ceiling
-        if "max_drawdown_pct" in pol_dict:
-            pol_dd = _safe_decimal(pol_dict.get("max_drawdown_pct"))
-            if pol_dd is None or pol_dd <= Decimal("0") or pol_dd >= Decimal("1"):
-                dd_invalid = True
-            elif pol_dd > eff_dd_ceiling:
-                dd_ceiling_exceeded = True
-                dd_threshold = (
-                    min(gate_dd, eff_dd_ceiling)
-                    if gate_dd is not None
-                    else eff_dd_ceiling
-                )
-            else:
-                dd_threshold = min(pol_dd, gate_dd) if gate_dd is not None else pol_dd
-        elif gate_dd is not None:
-            dd_threshold = min(gate_dd, eff_dd_ceiling)
-
-        if dd_ceiling_exceeded:
-            vetoes.append("CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED")
-        if dd_invalid:
-            missing_ratio = max(missing_ratio, 0.25)
-            vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
-        if not dd_invalid and dd_threshold is not None:
-            require_explicit_peak = bool(pol_dict.get("require_peak_equity", False))
-            if current_view is not None:
-                cur_eq = _extract_money_decimal(current_view.get("equity"))
-                bal_eq = _extract_money_decimal(current_view.get("balance"))
-                explicit_peak = "peak_equity" in current_view
-                peak_eq = _extract_money_decimal(current_view.get("peak_equity")) if explicit_peak else None
-            else:
-                cur_eq, bal_eq, peak_eq, explicit_peak = _extract_fact_accounting(request)
-
-            if cur_eq is None or (explicit_peak and (peak_eq is None or peak_eq <= Decimal("0"))):
-                missing_ratio = max(missing_ratio, 0.25)
-                vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
-            elif not explicit_peak and require_explicit_peak:
-                missing_ratio = max(missing_ratio, 0.25)
-                vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
-            else:
-                resolved_peak = peak_eq
-                scope_id = _proposal_scope_id(proposal, current_view)
-                if resolved_peak is None:
-                    if bal_eq is None or max(cur_eq, bal_eq) <= Decimal("0"):
-                        missing_ratio = max(missing_ratio, 0.25)
-                        vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
-                    elif peak_equity_store is not None:
-                        resolved_peak = peak_equity_store.observe_equity(
-                            scope_id,
-                            current_equity=cur_eq,
-                            opening_balance=bal_eq,
-                            now=now,
-                        )
-                    else:
-                        resolved_peak = max(cur_eq, bal_eq)
-                elif peak_equity_store is not None:
-                    stored_peak = peak_equity_store.observe_equity(
-                        scope_id,
-                        current_equity=cur_eq,
-                        opening_balance=resolved_peak,
-                        now=now,
-                    )
-                    resolved_peak = max(resolved_peak, stored_peak)
-
-                if resolved_peak is not None and "MISSING_DRAWDOWN_ACCOUNTING" not in vetoes:
-                    dd_pct = compute_drawdown_pct(cur_eq, resolved_peak)
-                    if dd_pct >= dd_threshold:
-                        vetoes.append("MAX_DRAWDOWN_EXCEEDED")
-
-    # 2. Policy permission violation (from explicit policy OR observed-* JSON fact)
-    perm_violation = 0.0
-    if intent is not None:
-        if policy is not None:
-            if intent.kind in (ActionKind.OPEN, ActionKind.ADD):
-                if policy.get("new_risk_permission") != "ALLOWED":
-                    perm_violation = 1.0
-                    vetoes.append("NEW_RISK_NOT_ALLOWED")
-            else:
-                if policy.get("management_permission") != "ALLOWED":
-                    perm_violation = 1.0
-                    vetoes.append("MANAGEMENT_NOT_ALLOWED")
-        if current_view is None:
-            for f in request.facts:
-                f_label_lower = _strip_bom_and_ws(f.label).lower() if isinstance(f.label, str) else ""
-                if f.fact_id.startswith("observed-") or f_label_lower == "account":
-                    obs_obj = _unwrap_observed_json(f.value)
-                    if isinstance(obs_obj, dict):
-                        if intent.kind in (ActionKind.OPEN, ActionKind.ADD) and obs_obj.get("new_risk") is False:
-                            perm_violation = 1.0
-                            if "NEW_RISK_NOT_ALLOWED" not in vetoes:
-                                vetoes.append("NEW_RISK_NOT_ALLOWED")
-                        elif intent.kind not in (ActionKind.OPEN, ActionKind.ADD) and obs_obj.get("management") is False:
-                            perm_violation = 1.0
-                            if "MANAGEMENT_NOT_ALLOWED" not in vetoes:
-                                vetoes.append("MANAGEMENT_NOT_ALLOWED")
-
-    # 3. Entry quantity excess ratio
-    qty_excess = 0.0
-    if intent is not None and intent.kind in (ActionKind.OPEN, ActionKind.ADD):
-        qty = _safe_decimal(intent.quantity)
-        if qty is None or qty <= Decimal("0"):
-            qty_excess = 1.0
-            vetoes.append("INVALID_ENTRY_QUANTITY")
-        elif policy is not None and "max_entry_quantity" in policy:
-            max_q = _safe_decimal(policy["max_entry_quantity"])
-            if max_q is not None and max_q <= Decimal("0"):
-                qty_excess = 1.0
-                vetoes.append("ZERO_MAX_ENTRY_POLICY")
-            elif max_q is not None and qty > max_q:
-                qty_excess = _clamp01(float((qty - max_q) / max_q))
-                if qty_excess == 0.0:
-                    qty_excess = 0.01
-                vetoes.append("QUANTITY_EXCEEDS_MAX_ENTRY")
-
-    # 4. Unbacked or missing evidence citations on action proposals
-    supplied_eids = {e.evidence_id for e in request.evidence}
-    cited_eids = tuple(selection.evidence_ids)
-    if intent is not None:
-        if not cited_eids or any(eid not in supplied_eids for eid in cited_eids):
-            unbacked_ev = 1.0
-            vetoes.append("UNBACKED_OR_EMPTY_EVIDENCE")
-        else:
-            unbacked_ev = 0.0
-    else:
-        unbacked_ev = 1.0 if any(eid not in supplied_eids for eid in cited_eids) else 0.0
-
-    # 5 & 8. Prompt injection pressure & reasoning drift
-    fact_texts = [selection.reason]
-    for f in request.facts:
-        if "presentation" in f.fact_id or "untrusted" in f.fact_id or "untrusted" in f.label.lower():
-            fact_texts.append(f.value)
-    inj_signal, drift_score = _text_drift_and_injection(fact_texts)
-    reason_inj, _ = _text_drift_and_injection([selection.reason])
-    if intent is not None and reason_inj > 0.0:
-        vetoes.append("PROMPT_INJECTION_IN_REASON")
-
-    # 6. Protective stop and resting take-profit geometry checks
-    stop_deficit = 0.0
     obs_bid: Decimal | None = None
     obs_ask: Decimal | None = None
     obs_pos_side: str | None = None
@@ -1788,7 +1676,7 @@ def extract_forex_valve_features(
 
     for f in request.facts:
         f_label_lower = _strip_bom_and_ws(f.label).lower() if isinstance(f.label, str) else ""
-        if f.fact_id.startswith("observed-") or f_label_lower == "account":
+        if f.fact_id.startswith("observed-") or f_label_lower in ("account", "position_inventory", "positions", "current_market", "market"):
             obs_meta = _unwrap_observed_json(f.value)
             if isinstance(obs_meta, dict):
                 _consume_obs_dict(
@@ -1797,10 +1685,10 @@ def extract_forex_valve_features(
                     allow_positions=not cv_has_positions,
                 )
             elif isinstance(obs_meta, (list, tuple)):
-                if f.fact_id.startswith("observed-current_market") or f.fact_id.startswith("observed-market"):
+                if f.fact_id.startswith("observed-current_market") or f.fact_id.startswith("observed-market") or f_label_lower in ("current_market", "market"):
                     if not cv_has_market:
                         _consume_market_list(obs_meta)
-                elif f.fact_id.startswith("observed-position_inventory") or f.fact_id.startswith("observed-positions"):
+                elif f.fact_id.startswith("observed-position_inventory") or f.fact_id.startswith("observed-positions") or f_label_lower in ("position_inventory", "positions"):
                     if not cv_has_positions:
                         _consume_position_list(obs_meta)
                 else:
@@ -1809,6 +1697,192 @@ def extract_forex_valve_features(
                     if not cv_has_positions and any(isinstance(it, dict) and any(k in it for k in ("side", "position_side", "stop_price", "stop", "stop_loss")) for it in obs_meta):
                         _consume_position_list(obs_meta)
 
+    _amend_is_monotonic_tightening = False
+    if intent is not None and intent.kind is ActionKind.AMEND_STOP:
+        _raw_am_stop = getattr(intent, "stop_price", None)
+        _am_stop_p = _safe_decimal(_raw_am_stop)
+        _am_side = obs_pos_side.upper() if isinstance(obs_pos_side, str) else None
+        if _raw_am_stop is None:
+            _amend_is_monotonic_tightening = True
+        elif (
+            _am_stop_p is not None
+            and _am_stop_p > Decimal("0")
+            and _am_side in ("BUY", "SELL")
+            and obs_prev_stop is not None
+            and obs_prev_stop > Decimal("0")
+        ):
+            if _am_side == "BUY":
+                _amend_is_monotonic_tightening = _am_stop_p >= obs_prev_stop and (obs_bid is None or _am_stop_p < obs_bid)
+            else:
+                _amend_is_monotonic_tightening = _am_stop_p <= obs_prev_stop and (obs_ask is None or _am_stop_p > obs_ask)
+
+    # 1b. Peak-equity / maximum drawdown hard-floor gate on new-risk entries & non-tightening AMEND_STOP.
+    # WAIT (intent is None) and risk-reducing/protective management (REDUCE, CLOSE, AMEND_STOP, CANCEL_ORDER)
+    # remain available during drawdown.
+    # Constitutional invariant (Finding [5]): max_drawdown_pct can NEVER exceed 0.10 (10.00%);
+    # policy overrides may ONLY tighten below the immutable 10.00% ceiling.
+    if (
+        not isinstance(demo_max_drawdown_ceiling, Decimal)
+        or not demo_max_drawdown_ceiling.is_finite()
+        or demo_max_drawdown_ceiling <= Decimal("0")
+        or demo_max_drawdown_ceiling > DEMO_HIGH_GROWTH_MAX_DRAWDOWN_PCT
+    ):
+        raise ContractError(
+            f"demo_max_drawdown_ceiling must be Decimal in (0, {DEMO_HIGH_GROWTH_MAX_DRAWDOWN_PCT}]"
+        )
+    if intent is not None and (
+        intent.kind in (ActionKind.OPEN, ActionKind.ADD)
+        or (intent.kind is ActionKind.AMEND_STOP and not _amend_is_monotonic_tightening)
+    ):
+        pol_dict = policy if isinstance(policy, Mapping) else {}
+        eff_dd_ceiling = demo_max_drawdown_ceiling
+        dd_threshold: Decimal | None = None
+        dd_invalid = False
+        dd_ceiling_exceeded = False
+        gate_dd: Decimal | None = None
+        if max_drawdown_pct is not None:
+            gate_dd = _safe_decimal(max_drawdown_pct)
+            if gate_dd is None or gate_dd <= Decimal("0") or gate_dd >= Decimal("1"):
+                dd_invalid = True
+            elif gate_dd > eff_dd_ceiling:
+                dd_ceiling_exceeded = True
+                gate_dd = eff_dd_ceiling
+        if "max_drawdown_pct" in pol_dict:
+            pol_dd = _safe_decimal(pol_dict.get("max_drawdown_pct"))
+            if pol_dd is None or pol_dd <= Decimal("0") or pol_dd >= Decimal("1"):
+                dd_invalid = True
+            elif pol_dd > eff_dd_ceiling:
+                dd_ceiling_exceeded = True
+                dd_threshold = (
+                    min(gate_dd, eff_dd_ceiling)
+                    if gate_dd is not None
+                    else eff_dd_ceiling
+                )
+            else:
+                dd_threshold = min(pol_dd, gate_dd) if gate_dd is not None else pol_dd
+        elif gate_dd is not None:
+            dd_threshold = min(gate_dd, eff_dd_ceiling)
+
+        if dd_ceiling_exceeded:
+            vetoes.append("CONSTITUTIONAL_DRAWDOWN_CEILING_EXCEEDED")
+        if dd_invalid:
+            missing_ratio = max(missing_ratio, 0.25)
+            vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
+        if not dd_invalid and dd_threshold is not None:
+            require_explicit_peak = bool(pol_dict.get("require_peak_equity", False))
+            if current_view is not None:
+                cur_eq = _extract_money_decimal(current_view.get("equity"))
+                bal_eq = _extract_money_decimal(current_view.get("balance"))
+                explicit_peak = "peak_equity" in current_view
+                peak_eq = _extract_money_decimal(current_view.get("peak_equity")) if explicit_peak else None
+            else:
+                cur_eq, bal_eq, peak_eq, explicit_peak = _extract_fact_accounting(request)
+
+            if cur_eq is None or (explicit_peak and (peak_eq is None or peak_eq <= Decimal("0"))):
+                missing_ratio = max(missing_ratio, 0.25)
+                vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
+            elif not explicit_peak and require_explicit_peak:
+                missing_ratio = max(missing_ratio, 0.25)
+                vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
+            else:
+                resolved_peak = peak_eq
+                scope_id = _proposal_scope_id(proposal, current_view)
+                if resolved_peak is None:
+                    if bal_eq is None or max(cur_eq, bal_eq) <= Decimal("0"):
+                        missing_ratio = max(missing_ratio, 0.25)
+                        vetoes.append("MISSING_DRAWDOWN_ACCOUNTING")
+                    elif peak_equity_store is not None:
+                        resolved_peak = peak_equity_store.observe_equity(
+                            scope_id,
+                            current_equity=cur_eq,
+                            opening_balance=bal_eq,
+                            now=now,
+                        )
+                    else:
+                        resolved_peak = max(cur_eq, bal_eq)
+                elif peak_equity_store is not None:
+                    stored_peak = peak_equity_store.observe_equity(
+                        scope_id,
+                        current_equity=cur_eq,
+                        opening_balance=resolved_peak,
+                        now=now,
+                    )
+                    resolved_peak = max(resolved_peak, stored_peak)
+
+                if resolved_peak is not None and "MISSING_DRAWDOWN_ACCOUNTING" not in vetoes:
+                    dd_pct = compute_drawdown_pct(cur_eq, resolved_peak)
+                    if dd_pct >= dd_threshold:
+                        vetoes.append("MAX_DRAWDOWN_EXCEEDED")
+
+    # 2. Policy permission violation (from explicit policy OR observed-* JSON fact)
+    perm_violation = 0.0
+    if intent is not None:
+        if policy is not None:
+            if intent.kind in (ActionKind.OPEN, ActionKind.ADD):
+                if policy.get("new_risk_permission") != "ALLOWED":
+                    perm_violation = 1.0
+                    vetoes.append("NEW_RISK_NOT_ALLOWED")
+            else:
+                if policy.get("management_permission") != "ALLOWED":
+                    perm_violation = 1.0
+                    vetoes.append("MANAGEMENT_NOT_ALLOWED")
+        if current_view is None:
+            for f in request.facts:
+                f_label_lower = _strip_bom_and_ws(f.label).lower() if isinstance(f.label, str) else ""
+                if f.fact_id.startswith("observed-") or f_label_lower == "account":
+                    obs_obj = _unwrap_observed_json(f.value)
+                    if isinstance(obs_obj, dict):
+                        if intent.kind in (ActionKind.OPEN, ActionKind.ADD) and obs_obj.get("new_risk") is False:
+                            perm_violation = 1.0
+                            if "NEW_RISK_NOT_ALLOWED" not in vetoes:
+                                vetoes.append("NEW_RISK_NOT_ALLOWED")
+                        elif intent.kind not in (ActionKind.OPEN, ActionKind.ADD) and obs_obj.get("management") is False:
+                            perm_violation = 1.0
+                            if "MANAGEMENT_NOT_ALLOWED" not in vetoes:
+                                vetoes.append("MANAGEMENT_NOT_ALLOWED")
+
+    # 3. Entry quantity excess ratio
+    qty_excess = 0.0
+    if intent is not None and intent.kind in (ActionKind.OPEN, ActionKind.ADD):
+        qty = _safe_decimal(intent.quantity)
+        if qty is None or qty <= Decimal("0"):
+            qty_excess = 1.0
+            vetoes.append("INVALID_ENTRY_QUANTITY")
+        elif policy is not None and "max_entry_quantity" in policy:
+            max_q = _safe_decimal(policy["max_entry_quantity"])
+            if max_q is not None and max_q <= Decimal("0"):
+                qty_excess = 1.0
+                vetoes.append("ZERO_MAX_ENTRY_POLICY")
+            elif max_q is not None and qty > max_q:
+                qty_excess = _clamp01(float((qty - max_q) / max_q))
+                if qty_excess == 0.0:
+                    qty_excess = 0.01
+                vetoes.append("QUANTITY_EXCEEDS_MAX_ENTRY")
+
+    # 4. Unbacked or missing evidence citations on action proposals
+    supplied_eids = {e.evidence_id for e in request.evidence}
+    cited_eids = tuple(selection.evidence_ids)
+    if intent is not None:
+        if not cited_eids or any(eid not in supplied_eids for eid in cited_eids):
+            unbacked_ev = 1.0
+            vetoes.append("UNBACKED_OR_EMPTY_EVIDENCE")
+        else:
+            unbacked_ev = 0.0
+    else:
+        unbacked_ev = 1.0 if any(eid not in supplied_eids for eid in cited_eids) else 0.0
+
+    # 5 & 8. Prompt injection pressure & reasoning drift
+    fact_texts = [selection.reason]
+    for f in request.facts:
+        if "presentation" in f.fact_id or "untrusted" in f.fact_id or "untrusted" in f.label.lower():
+            fact_texts.append(f.value)
+    inj_signal, drift_score = _text_drift_and_injection(fact_texts)
+    reason_inj, _ = _text_drift_and_injection([selection.reason])
+    if intent is not None and reason_inj > 0.0:
+        vetoes.append("PROMPT_INJECTION_IN_REASON")
+
+    # 6. Protective stop and resting take-profit geometry checks
+    stop_deficit = 0.0
     raw_tp = getattr(intent, "take_profit_price", None) if intent is not None else None
     tp_p = _safe_decimal(raw_tp) if intent is not None else None
     if intent is not None and intent.kind in (ActionKind.OPEN, ActionKind.ADD):
@@ -1853,41 +1927,34 @@ def extract_forex_valve_features(
     elif intent is not None and intent.kind is ActionKind.AMEND_STOP:
         raw_stop = getattr(intent, "stop_price", None)
         stop_p = _safe_decimal(raw_stop)
-        if obs_pos_side is not None:
-            raw_amend_side: str | None = obs_pos_side
-        elif obs_pos_ambiguous:
-            raw_amend_side = None
-        else:
-            raw_amend_side = (
-                intent.side.value
-                if hasattr(intent.side, "value")
-                else (None if intent.side is None else str(intent.side))
-            )
-        amend_side = raw_amend_side.upper() if isinstance(raw_amend_side, str) else None
+        amend_side = obs_pos_side.upper() if isinstance(obs_pos_side, str) else None
         if raw_stop is None:
             stop_deficit = 1.0
             vetoes.append("MISSING_PROTECTIVE_STOP")
         elif stop_p is None or stop_p <= Decimal("0"):
             stop_deficit = 1.0
             vetoes.append("INVALID_PROTECTIVE_STOP")
+        elif amend_side not in ("BUY", "SELL"):
+            stop_deficit = 1.0
+            vetoes.append("MISSING_POSITION_SIDE")
+        elif obs_prev_stop is None or obs_prev_stop <= Decimal("0"):
+            stop_deficit = 1.0
+            vetoes.append("MISSING_AUTHORITATIVE_PREVIOUS_STOP")
         else:
             if amend_side == "BUY":
                 if obs_bid is not None and stop_p >= obs_bid:
                     stop_deficit = 1.0
                     vetoes.append("INVERTED_BUY_PROTECTIVE_STOP")
-                elif obs_prev_stop is not None and obs_prev_stop > Decimal("0") and stop_p < obs_prev_stop:
+                elif stop_p < obs_prev_stop:
                     stop_deficit = 1.0
                     vetoes.append("LOOSENED_BUY_PROTECTIVE_STOP")
             elif amend_side == "SELL":
                 if obs_ask is not None and stop_p <= obs_ask:
                     stop_deficit = 1.0
                     vetoes.append("INVERTED_SELL_PROTECTIVE_STOP")
-                elif obs_prev_stop is not None and obs_prev_stop > Decimal("0") and stop_p > obs_prev_stop:
+                elif stop_p > obs_prev_stop:
                     stop_deficit = 1.0
                     vetoes.append("LOOSENED_SELL_PROTECTIVE_STOP")
-            elif obs_bid is not None or obs_ask is not None or obs_pos_ambiguous or obs_prev_stop is not None:
-                stop_deficit = 1.0
-                vetoes.append("MISSING_POSITION_SIDE")
         if raw_tp is not None:
             if tp_p is None or tp_p <= Decimal("0"):
                 stop_deficit = 1.0
@@ -2357,6 +2424,8 @@ class ForexMetaValveGate:
         decision_sha256: str,
         now: datetime | None,
         ttl_seconds: float,
+        previous_stop_loss: Decimal | str | None = None,
+        require_risk_reducing: bool = False,
         decision_target_key: tuple[str, str, str] | None = None,
         decision_expires_at: datetime | None = None,
         decision: ValveDecision | None = None,
@@ -2381,10 +2450,25 @@ class ForexMetaValveGate:
         norm_sl = _norm_grant_decimal(stop_loss)
         norm_tp = _norm_grant_decimal(take_profit)
         norm_ticket = str(position_ticket or "").strip()
+        norm_prev_sl = _norm_grant_decimal(previous_stop_loss)
         issued_dt = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
         expires_dt = issued_dt + timedelta(seconds=ttl_f)
         grant_nonce = secrets.token_hex(16)
-        risk_reducing = norm_act in RISK_REDUCING_ACTION_KINDS
+        if norm_act in RISK_REDUCING_ACTION_KINDS:
+            risk_reducing = True
+        elif norm_act == "AMEND_STOP":
+            risk_reducing = _is_monotonic_tightening_amend(
+                side=norm_side,
+                stop_loss=norm_sl,
+                previous_stop_loss=norm_prev_sl,
+            )
+            if require_risk_reducing and not risk_reducing:
+                raise ValveGrantError(
+                    "Risk-reducing AMEND_STOP grant requires authoritative side and non-widening stop vs previous_stop_loss",
+                    decision=decision,
+                )
+        else:
+            risk_reducing = False
         order_digest = _canonical_grant_order_digest(
             broker_id=norm_broker,
             account_id=norm_acct,
@@ -2400,6 +2484,7 @@ class ForexMetaValveGate:
             grant_nonce=grant_nonce,
             issued_at=issued_dt,
             expires_at=expires_dt,
+            previous_stop_loss=norm_prev_sl,
         )
         sig_input = _canonical_grant_sig_input(
             order_digest_sha256=order_digest,
@@ -2429,6 +2514,7 @@ class ForexMetaValveGate:
             risk_reducing=risk_reducing,
             order_digest_sha256=order_digest,
             signature_hmac_sha256=sig_hex,
+            previous_stop_loss=norm_prev_sl,
             _mint_token=_VALVE_GRANT_SENTINEL,
             _gate_id=self._gate_id,
         )
@@ -2481,6 +2567,7 @@ class ForexMetaValveGate:
         order_stop_price: Decimal | str | None = None,
         order_take_profit_price: Decimal | str | None = None,
         order_limit_price: Decimal | str | None = None,
+        previous_stop_loss: Decimal | str | None = None,
         require_risk_reducing: bool = False,
         now: datetime | None = None,
         ttl_seconds: float = DEFAULT_VALVE_GRANT_TTL_SECONDS,
@@ -2497,7 +2584,8 @@ class ForexMetaValveGate:
         if decision.mlp_score < decision.threshold:
             raise ValveGrantError("ForexMetaValveGate score below threshold", decision=decision)
         norm_act = _norm_grant_action(action_kind)
-        if require_risk_reducing and norm_act not in RISK_REDUCING_ACTION_KINDS:
+        eff_rr_allowed = RISK_REDUCING_ACTION_KINDS | CONDITIONAL_MANAGEMENT_ACTION_KINDS
+        if require_risk_reducing and norm_act not in eff_rr_allowed:
             raise ValveGrantError(
                 f"Risk-reducing grant requested, refusing {norm_act!r}", decision=decision
             )
@@ -2534,6 +2622,8 @@ class ForexMetaValveGate:
             decision_sha256=decision_sha,
             now=check_now,
             ttl_seconds=ttl_seconds,
+            previous_stop_loss=previous_stop_loss,
+            require_risk_reducing=require_risk_reducing,
             decision_target_key=target_key,
             decision_expires_at=decision.expires_at,
             decision=decision,
@@ -2553,13 +2643,14 @@ class ForexMetaValveGate:
         volume: Decimal | str | None = None,
         stop_loss: Decimal | str | None = None,
         take_profit: Decimal | str | None = None,
+        previous_stop_loss: Decimal | str | None = None,
         reason: str = "PROTECTIVE_RISK_REDUCTION",
         now: datetime | None = None,
         ttl_seconds: float = DEFAULT_VALVE_GRANT_TTL_SECONDS,
     ) -> ValveOrderGrant:
-        """Always-available risk-reducing grant for protective/emergency CLOSE, REDUCE, or AMEND_STOP."""
+        """Protective grant for CLOSE, REDUCE, or verified monotonic-tightening AMEND_STOP."""
         norm_act = _norm_grant_action(action_kind)
-        if norm_act not in RISK_REDUCING_ACTION_KINDS:
+        if norm_act not in (RISK_REDUCING_ACTION_KINDS | CONDITIONAL_MANAGEMENT_ACTION_KINDS):
             raise ValveGrantError(
                 f"issue_protective_order_grant permits only CLOSE/REDUCE/AMEND_STOP; refused {norm_act!r}"
             )
@@ -2568,8 +2659,15 @@ class ForexMetaValveGate:
             raise ValveGrantError("issue_protective_order_grant requires a non-empty position_ticket")
         if norm_act in ("CLOSE", "REDUCE") and not _norm_grant_decimal(volume):
             raise ValveGrantError(f"issue_protective_order_grant({norm_act}) requires volume")
-        if norm_act == "AMEND_STOP" and not (_norm_grant_decimal(stop_loss) or _norm_grant_decimal(take_profit)):
-            raise ValveGrantError("issue_protective_order_grant(AMEND_STOP) requires stop_loss or take_profit")
+        if norm_act == "AMEND_STOP":
+            if not (_norm_grant_decimal(stop_loss) or _norm_grant_decimal(take_profit)):
+                raise ValveGrantError("issue_protective_order_grant(AMEND_STOP) requires stop_loss or take_profit")
+            if _norm_grant_decimal(stop_loss) and not _is_monotonic_tightening_amend(
+                side=side, stop_loss=stop_loss, previous_stop_loss=previous_stop_loss
+            ):
+                raise ValveGrantError(
+                    "issue_protective_order_grant(AMEND_STOP) requires authoritative side, previous_stop_loss, and non-widening stop"
+                )
         check_now = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
         prot_sha = sha256(
             canonical_bytes({
@@ -2579,6 +2677,7 @@ class ForexMetaValveGate:
                 "account_id": str(account_id).strip(),
                 "position_ticket": norm_ticket,
                 "symbol": _norm_grant_symbol(symbol),
+                "previous_stop_loss": _norm_grant_decimal(previous_stop_loss),
                 "reason": str(reason or "PROTECTIVE_RISK_REDUCTION")[:128],
                 "issued_at": _iso_utc(check_now),
             })
@@ -2598,6 +2697,8 @@ class ForexMetaValveGate:
             decision_sha256=prot_sha,
             now=check_now,
             ttl_seconds=ttl_seconds,
+            previous_stop_loss=previous_stop_loss,
+            require_risk_reducing=True,
         )
 
 

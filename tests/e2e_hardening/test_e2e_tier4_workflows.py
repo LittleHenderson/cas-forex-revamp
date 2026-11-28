@@ -138,6 +138,8 @@ class Tier4WorkflowsE2ETests(unittest.TestCase):
 
             dd_view = default_view(balance="8950", equity="8950", available_margin="8950")
             dd_view["peak_equity"] = "10000"
+            dd_view["position_inventory"] = [{"position_id": "pos-wf2-1", "instrument_id": "EURUSD", "side": "BUY", "stop_price": "1.09500"}]
+            dd_view["position_inventory"] = [{"position_id": "pos-wf2-1", "instrument_id": "EURUSD", "side": "BUY", "stop_price": "1.09500"}]
             open_prop = build_valve_proposal(kind=ActionKind.OPEN, observed_at=T0 + timedelta(seconds=10))
             open_prop.request.state.scope = wf_scope
             dec_refused = gate.evaluate(open_prop, current_view=dd_view, policy=default_policy(), now=T0 + timedelta(seconds=11))

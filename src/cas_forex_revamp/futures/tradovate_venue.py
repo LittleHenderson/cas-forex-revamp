@@ -3767,6 +3767,20 @@ class TradovateMicroFuturesPaperEmulator:
                 pos.root_symbol,
                 _exact_decimal(new_stop_loss_price, "new_stop_loss_price", positive=True),
             )
+            old_sl = pos.stop_loss_price
+            if old_sl is None or old_sl <= Decimal("0"):
+                raise TradovateOrderError(f"Open position {position_id!r} lacks authoritative stop_loss_price for amend_stop")
+            if pos.side == "BUY" and aligned_sl < old_sl:
+                raise TradovateOrderError(f"BUY protective stop cannot be widened from {old_sl} to {aligned_sl}")
+            if pos.side == "SELL" and aligned_sl > old_sl:
+                raise TradovateOrderError(f"SELL protective stop cannot be widened from {old_sl} to {aligned_sl}")
+            q_obj = self._quotes.get(pos.root_symbol)
+            if q_obj is not None:
+                q_bid, q_ask = (q_obj if isinstance(q_obj, tuple) else (q_obj.bid, q_obj.ask))
+                if pos.side == "BUY" and aligned_sl >= q_bid:
+                    raise TradovateOrderError("BUY protective stop must remain strictly below current bid")
+                if pos.side == "SELL" and aligned_sl <= q_ask:
+                    raise TradovateOrderError("SELL protective stop must remain strictly above current ask")
             pos.stop_loss_price = aligned_sl
             pos.updated_at = now
             ord_id = self._next_order_id()
@@ -6794,6 +6808,28 @@ class TradovateMicroFuturesVenue:
                 open_pos.root_symbol,
                 _exact_decimal(new_stop_loss_price, "new_stop_loss_price", positive=True),
             )
+            old_sl = open_pos.stop_loss_price
+            if old_sl is None or old_sl <= Decimal("0"):
+                raise TradovateOrderError(f"Open position {position_id!r} lacks authoritative stop_loss_price for amend_stop")
+            if open_pos.side == "BUY" and aligned_sl < old_sl:
+                raise TradovateOrderError(f"BUY protective stop cannot be widened from {old_sl} to {aligned_sl}")
+            if open_pos.side == "SELL" and aligned_sl > old_sl:
+                raise TradovateOrderError(f"SELL protective stop cannot be widened from {old_sl} to {aligned_sl}")
+            if hasattr(self._transport, "quote") and callable(self._transport.quote):
+                try:
+                    q_pair = self._transport.quote(open_pos.contract_code)
+                except Exception:
+                    q_pair = None
+                q_bid, q_ask = (
+                    q_pair
+                    if isinstance(q_pair, tuple) and len(q_pair) == 2
+                    else ((q_pair.bid, q_pair.ask) if hasattr(q_pair, "bid") and hasattr(q_pair, "ask") else (None, None))
+                )
+                if q_bid is not None and q_ask is not None:
+                    if open_pos.side == "BUY" and aligned_sl >= q_bid:
+                        raise TradovateOrderError("BUY protective stop must remain strictly below current bid")
+                    if open_pos.side == "SELL" and aligned_sl <= q_ask:
+                        raise TradovateOrderError("SELL protective stop must remain strictly above current ask")
             request_id = self._next_request_id("amend")
             stable_key = idempotency_key.strip() if idempotency_key is not None else request_id
             cl_ord_id = _compute_stable_cl_ord_id(

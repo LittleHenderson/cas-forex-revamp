@@ -2127,6 +2127,8 @@ class AutonomousAiTrader:
                         "symbol": pos.symbol,
                         "side": pos.side.value,
                         "volume_lots": decimal_text(pos.volume_lots),
+                        "stop_loss": (None if pos.stop_loss is None else decimal_text(pos.stop_loss)),
+                        "take_profit": (None if pos.take_profit is None else decimal_text(pos.take_profit)),
                     })
             elif isinstance(venue, OandaPracticeFallbackVenue):
                 if callable(getattr(self._router, "is_broker_offline", None)) and self._router.is_broker_offline(broker_id):
@@ -2142,6 +2144,8 @@ class AutonomousAiTrader:
                             "symbol": pos.symbol,
                             "side": pos.side.value,
                             "volume_lots": decimal_text(pos.volume_lots),
+                            "stop_loss": (None if pos.stop_loss is None else decimal_text(pos.stop_loss)),
+                            "take_profit": (None if pos.take_profit is None else decimal_text(pos.take_profit)),
                         })
         balance_val = bal_sum if has_venue_acct and bal_sum > Decimal("0") else total_eq
         margin_val = free_sum if has_venue_acct else total_eq

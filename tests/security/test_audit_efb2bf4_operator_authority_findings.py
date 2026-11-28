@@ -377,17 +377,25 @@ class _FakeOandaRestTransport:
                 closed_units = Decimal(req_units)
                 rem = abs_cur - closed_units
                 tr["currentUnits"] = str(rem if cur_signed > 0 else -rem)
-            self._tx += 1
+            create_tx = self._tx + 1
+            fill_tx = self._tx + 2
+            self._tx = fill_tx
+            is_full = req_units == "ALL" or Decimal(req_units) >= abs_cur
+            fill_doc = {
+                "id": str(fill_tx),
+                "instrument": tr["instrument"],
+                "units": str(-closed_units if cur_signed > 0 else closed_units),
+                "price": "1.26510",
+                "pl": "-45.50",
+            }
+            if is_full:
+                fill_doc["tradesClosed"] = [{"tradeID": trade_id, "units": str(-closed_units if cur_signed > 0 else closed_units), "realizedPL": "-45.50"}]
+            else:
+                fill_doc["tradeReduced"] = {"tradeID": trade_id, "units": str(-closed_units if cur_signed > 0 else closed_units), "realizedPL": "-45.50"}
             resp = {
-                "orderCreateTransaction": {"id": str(self._tx)},
-                "orderFillTransaction": {
-                    "id": str(self._tx + 1),
-                    "instrument": tr["instrument"],
-                    "units": str(-closed_units if cur_signed > 0 else closed_units),
-                    "price": "1.26510",
-                    "pl": "-45.50",
-                    "tradeClosed": {"tradeID": trade_id, "units": str(closed_units), "realizedPL": "-45.50"},
-                },
+                "orderCreateTransaction": {"id": str(create_tx)},
+                "orderFillTransaction": fill_doc,
+                "lastTransactionID": str(fill_tx),
             }
             return json.dumps(resp).encode("utf-8")
         raise RuntimeError("not found")

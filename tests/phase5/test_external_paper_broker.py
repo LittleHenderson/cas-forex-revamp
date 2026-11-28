@@ -433,8 +433,17 @@ class ExternalPaperBrokerPhase5Tests(unittest.TestCase):
                 self.assertEqual(req_json["order"]["units"], "100")
                 return json.dumps(
                     {
-                        "orderCreateTransaction": {"id": "90071992547410001"},
-                        "orderFillTransaction": {"id": "90071992547410002", "price": "1.09882"},
+                        "orderCreateTransaction": {
+                            "id": "90071992547410001",
+                            "clientExtensions": req_json["order"].get("clientExtensions", {}),
+                        },
+                        "orderFillTransaction": {
+                            "id": "90071992547410002",
+                            "instrument": req_json["order"]["instrument"],
+                            "units": req_json["order"]["units"],
+                            "price": "1.09882",
+                            "clientExtensions": req_json["order"].get("clientExtensions", {}),
+                        },
                         "lastTransactionID": "90071992547410002",
                     }
                 ).encode("utf-8")

@@ -1927,6 +1927,7 @@ class OandaPracticePaperClient:
         self._secret: _RedactedSecret | None = None
         self._account_id: str | None = None
         self._last_transaction_id: str | None = None
+        self._seen_confirmed_tx_ids: set[str] = set()
         self._live_auth_context: LiveAuthorizationContext | None = None
         if mutation_journal is not None:
             self._mutation_journal = mutation_journal
@@ -2373,36 +2374,119 @@ class OandaPracticePaperClient:
             raise OandaOutcomeUnknownError(
                 f"OANDA post-dispatch failure for clientExtensions.id={client_order_id} ({err_name}); account frozen until reconciled"
             ) from None
+        ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        obs_now_str = _format_utc_micros(ts, "observed_at")
         fill_tx = doc.get("orderFillTransaction")
         create_tx = doc.get("orderCreateTransaction")
-        ts = datetime.now(timezone.utc) if now is None else utc_time(now, "now")
+        cancel_tx = doc.get("orderCancelTransaction")
+        reject_tx = doc.get("orderRejectTransaction")
+        if type(fill_tx) is not dict and (type(cancel_tx) is dict or type(reject_tx) is dict):
+            reason = (
+                (cancel_tx.get("reason") if type(cancel_tx) is dict else None)
+                or (reject_tx.get("rejectReason") if type(reject_tx) is dict else None)
+                or "OANDA_ORDER_NOT_FILLED"
+            )
+            self._mutation_journal.mark_outcome(
+                client_ext_id=client_order_id,
+                status="CONFIRMED_ABSENT",
+                now_utc=obs_now_str,
+                error_detail=str(reason),
+            )
+            raise PaperBrokerTransportError(f"OANDA market order {client_order_id} was not filled ({reason})")
+        last_tx_str = self._require_bound_last_tx_id(
+            doc,
+            pre_cursor=pre_cursor,
+            client_ext_id=client_order_id,
+            now_utc=obs_now_str,
+            action_label="order",
+        )
+        if type(fill_tx) is not dict:
+            self._fail_unbound_oanda_response(
+                client_ext_id=client_order_id,
+                now_utc=obs_now_str,
+                reason="missing orderFillTransaction in OANDA order response",
+            )
+        fill_id = self._require_fresh_tx_id(
+            fill_tx.get("id"),
+            pre_cursor=pre_cursor,
+            client_ext_id=client_order_id,
+            now_utc=obs_now_str,
+            label="orderFillTransaction.id",
+        )
+        if fill_tx.get("accountID") not in (None, "", acct_id):
+            self._fail_unbound_oanda_response(
+                client_ext_id=client_order_id,
+                now_utc=obs_now_str,
+                reason=f"orderFillTransaction accountID mismatch: {fill_tx.get('accountID')!r} != {acct_id!r}",
+            )
+        if str(fill_tx.get("instrument") or "").strip().upper() != order_spec["instrument"]:
+            self._fail_unbound_oanda_response(
+                client_ext_id=client_order_id,
+                now_utc=obs_now_str,
+                reason=f"orderFillTransaction instrument mismatch: {fill_tx.get('instrument')!r} != {order_spec['instrument']!r}",
+            )
+        raw_fill_units = fill_tx.get("units")
+        try:
+            fill_units_dec = parse_decimal(str(raw_fill_units), "orderFillTransaction.units")
+            req_units_dec = Decimal(signed_units)
+        except Exception:
+            self._fail_unbound_oanda_response(
+                client_ext_id=client_order_id,
+                now_utc=obs_now_str,
+                reason=f"invalid orderFillTransaction units {raw_fill_units!r}",
+            )
+        if fill_units_dec != req_units_dec:
+            self._fail_unbound_oanda_response(
+                client_ext_id=client_order_id,
+                now_utc=obs_now_str,
+                reason=f"orderFillTransaction units mismatch: {fill_units_dec} != {req_units_dec}",
+            )
+        ext_hits = self._extract_ext_ids_from_tx(fill_tx)
+        if type(create_tx) is dict:
+            ext_hits.extend(self._extract_ext_ids_from_tx(create_tx))
+        matched_ext = {eid for eid, _ in ext_hits}
+        if matched_ext and client_order_id not in matched_ext:
+            self._fail_unbound_oanda_response(
+                client_ext_id=client_order_id,
+                now_utc=obs_now_str,
+                reason=f"OANDA response clientExtensions.id mismatch: {sorted(matched_ext)!r} != {client_order_id!r}",
+            )
+        if client_order_id not in matched_ext:
+            self._fail_unbound_oanda_response(
+                client_ext_id=client_order_id,
+                now_utc=obs_now_str,
+                reason=f"OANDA response missing matching clientExtensions.id={client_order_id!r}",
+            )
+        self._seen_confirmed_tx_ids.add(fill_id)
+        if type(create_tx) is dict and str(create_tx.get("id", "")).isdigit():
+            self._seen_confirmed_tx_ids.add(str(create_tx["id"]))
+        self._seen_confirmed_tx_ids.add(last_tx_str)
+        self._last_transaction_id = last_tx_str
         receipt = {
             "provider": self.provider_id,
             "client_order_id": client_order_id,
             "instrument": order_spec["instrument"],
             "side": side.value,
             "requested_units": decimal_text(units),
-            "status": "FILLED" if type(fill_tx) is dict else "CREATED",
+            "status": "FILLED",
             "create_transaction_id": None if type(create_tx) is not dict else str(create_tx.get("id", "")),
-            "fill_transaction_id": None if type(fill_tx) is not dict else str(fill_tx.get("id", "")),
+            "fill_transaction_id": fill_id,
             "fill_price": (
                 None
-                if type(fill_tx) is not dict or "price" not in fill_tx
+                if "price" not in fill_tx or fill_tx["price"] is None
                 else decimal_text(parse_decimal(str(fill_tx["price"]), "fill_price"))
             ),
             "stop_loss_price": None if sl_dec is None else decimal_text(sl_dec),
             "take_profit_price": None if tp_dec is None else decimal_text(tp_dec),
-            "last_transaction_id": str(doc.get("lastTransactionID", "0")),
-            "observed_at": _format_utc_micros(ts, "observed_at"),
+            "last_transaction_id": last_tx_str,
+            "observed_at": obs_now_str,
             "raw_wire_sha256": sha256(raw).hexdigest(),
         }
-        if isinstance(doc.get("lastTransactionID"), (str, int)) and str(doc["lastTransactionID"]).isdigit():
-            self._last_transaction_id = str(doc["lastTransactionID"])
         self._mutation_journal.mark_outcome(
             client_ext_id=client_order_id,
             status="CONFIRMED_FILLED",
-            now_utc=_format_utc_micros(ts, "observed_at"),
-            transaction_id=receipt.get("fill_transaction_id") or receipt.get("create_transaction_id"),
+            now_utc=obs_now_str,
+            transaction_id=fill_id,
         )
         assert_safe_json_numbers(receipt)
         return receipt
@@ -2432,6 +2516,41 @@ class OandaPracticePaperClient:
         ts_now = self._clock() if now is None else utc_time(now, "now")
         self._assert_live_mutation_authorized(now=ts_now)
         norm_sym = symbol.strip().upper() if isinstance(symbol, str) and symbol.strip() else f"TRADE_{tid}"
+        if not isinstance(valve_grant, ValveOrderGrant):
+            raise ValveGrantError("OANDA AMEND_STOP requires a single-use ValveOrderGrant")
+        auth_side: str | None = None
+        prev_sl_dec: Decimal | None = None
+        if sl_dec is not None:
+            open_trades = self.fetch_open_trades(now=ts_now)
+            matched_trade: dict[str, Any] | None = None
+            for tr in open_trades:
+                if str(tr.get("trade_id", "")) == tid:
+                    matched_trade = tr
+                    break
+            if matched_trade is None:
+                raise ContractError(f"AMEND_STOP requires active open OANDA trade {tid} with authoritative stop_loss")
+            tr_sym = str(matched_trade.get("symbol") or "").strip().upper()
+            if tr_sym:
+                if not isinstance(symbol, str) or not symbol.strip():
+                    norm_sym = tr_sym
+                elif tr_sym != norm_sym:
+                    raise ContractError(f"AMEND_STOP symbol mismatch on trade {tid}: {norm_sym!r} != {tr_sym!r}")
+            raw_side = str(matched_trade.get("side") or "").strip().upper()
+            if raw_side not in ("BUY", "SELL"):
+                raise ContractError(f"AMEND_STOP missing authoritative BUY/SELL side on trade {tid}")
+            auth_side = raw_side
+            raw_prev_sl = matched_trade.get("stop_loss_price")
+            if raw_prev_sl is None or not str(raw_prev_sl).strip():
+                raise ContractError(f"AMEND_STOP requires existing positive stop_loss on trade {tid} (cannot widen)")
+            prev_sl_dec = decimal_value(parse_decimal(str(raw_prev_sl), "existing_stop_loss"), "existing_stop_loss", positive=True)
+            if auth_side == "BUY" and sl_dec < prev_sl_dec:
+                raise ContractError(
+                    f"AMEND_STOP cannot widen BUY stop_loss on trade {tid}: requested {sl_dec} < current {prev_sl_dec}"
+                )
+            if auth_side == "SELL" and sl_dec > prev_sl_dec:
+                raise ContractError(
+                    f"AMEND_STOP cannot widen SELL stop_loss on trade {tid}: requested {sl_dec} > current {prev_sl_dec}"
+                )
         verify_and_consume_valve_order_grant(
             valve_grant,
             broker_id=self.broker_id,
@@ -2440,20 +2559,22 @@ class OandaPracticePaperClient:
             execution_mode=self.execution_mode,
             action_kind="AMEND_STOP",
             symbol=norm_sym,
-            side=None,
+            side=auth_side,
             volume=None,
             stop_loss=sl_dec,
             take_profit=tp_dec,
+            previous_stop_loss=prev_sl_dec,
             position_ticket=tid,
             now=ts_now,
             require_risk_reducing=True,
         )
         now_utc_str = _format_utc_micros(ts_now, "observed_at")
         ext_id = "casfx-" + sha256(f"AMEND|{acct_id}|{tid}|{sl_dec}|{tp_dec}|{now_utc_str}".encode("utf-8")).hexdigest()[:24]
+        tp_ext_id = f"{ext_id}-tp"[:32]
         if "stopLoss" in body:
             body["stopLoss"]["clientExtensions"] = {"id": ext_id}
         if "takeProfit" in body:
-            body["takeProfit"]["clientExtensions"] = {"id": f"{ext_id}-tp"[:32]}
+            body["takeProfit"]["clientExtensions"] = {"id": tp_ext_id}
         rel_path = f"accounts/{acct_id}/trades/{tid}/orders"
         pre_cursor = self._last_transaction_id
         self._mutation_journal.record_pending(
@@ -2492,13 +2613,108 @@ class OandaPracticePaperClient:
             raise OandaOutcomeUnknownError(
                 f"OANDA post-dispatch amend failure for {ext_id} ({err_name}); frozen until reconciled"
             ) from None
-        if isinstance(doc.get("lastTransactionID"), (str, int)) and str(doc["lastTransactionID"]).isdigit():
-            self._last_transaction_id = str(doc["lastTransactionID"])
+        last_tx_str = self._require_bound_last_tx_id(
+            doc,
+            pre_cursor=pre_cursor,
+            client_ext_id=ext_id,
+            now_utc=now_utc_str,
+            action_label="amend",
+        )
+        mutated_tx_ids: list[str] = []
+        if sl_dec is not None:
+            sl_tx = doc.get("stopLossOrderTransaction")
+            if type(sl_tx) is not dict:
+                self._fail_unbound_oanda_response(
+                    client_ext_id=ext_id,
+                    now_utc=now_utc_str,
+                    reason="missing stopLossOrderTransaction in OANDA amend response",
+                )
+            sl_tx_id = self._require_fresh_tx_id(
+                sl_tx.get("id"),
+                pre_cursor=pre_cursor,
+                client_ext_id=ext_id,
+                now_utc=now_utc_str,
+                label="stopLossOrderTransaction.id",
+            )
+            if sl_tx.get("accountID") not in (None, "", acct_id):
+                self._fail_unbound_oanda_response(
+                    client_ext_id=ext_id,
+                    now_utc=now_utc_str,
+                    reason=f"stopLossOrderTransaction accountID mismatch: {sl_tx.get('accountID')!r} != {acct_id!r}",
+                )
+            if str(sl_tx.get("tradeID") or "") != tid:
+                self._fail_unbound_oanda_response(
+                    client_ext_id=ext_id,
+                    now_utc=now_utc_str,
+                    reason=f"stopLossOrderTransaction tradeID mismatch: {sl_tx.get('tradeID')!r} != {tid!r}",
+                )
+            if "price" in sl_tx and sl_tx["price"] is not None:
+                if parse_decimal(str(sl_tx["price"]), "stopLossOrderTransaction.price") != sl_dec:
+                    self._fail_unbound_oanda_response(
+                        client_ext_id=ext_id,
+                        now_utc=now_utc_str,
+                        reason=f"stopLossOrderTransaction price mismatch: {sl_tx['price']!r} != {sl_dec}",
+                    )
+            sl_ext = (sl_tx.get("clientExtensions") or {}).get("id") if isinstance(sl_tx.get("clientExtensions"), Mapping) else None
+            if sl_ext != ext_id:
+                self._fail_unbound_oanda_response(
+                    client_ext_id=ext_id,
+                    now_utc=now_utc_str,
+                    reason=f"stopLossOrderTransaction clientExtensions.id mismatch: {sl_ext!r} != {ext_id!r}",
+                )
+            mutated_tx_ids.append(sl_tx_id)
+        if tp_dec is not None:
+            tp_tx = doc.get("takeProfitOrderTransaction")
+            if type(tp_tx) is not dict:
+                self._fail_unbound_oanda_response(
+                    client_ext_id=ext_id,
+                    now_utc=now_utc_str,
+                    reason="missing takeProfitOrderTransaction in OANDA amend response",
+                )
+            tp_tx_id = self._require_fresh_tx_id(
+                tp_tx.get("id"),
+                pre_cursor=pre_cursor,
+                client_ext_id=ext_id,
+                now_utc=now_utc_str,
+                label="takeProfitOrderTransaction.id",
+            )
+            if tp_tx.get("accountID") not in (None, "", acct_id):
+                self._fail_unbound_oanda_response(
+                    client_ext_id=ext_id,
+                    now_utc=now_utc_str,
+                    reason=f"takeProfitOrderTransaction accountID mismatch: {tp_tx.get('accountID')!r} != {acct_id!r}",
+                )
+            if str(tp_tx.get("tradeID") or "") != tid:
+                self._fail_unbound_oanda_response(
+                    client_ext_id=ext_id,
+                    now_utc=now_utc_str,
+                    reason=f"takeProfitOrderTransaction tradeID mismatch: {tp_tx.get('tradeID')!r} != {tid!r}",
+                )
+            if "price" in tp_tx and tp_tx["price"] is not None:
+                if parse_decimal(str(tp_tx["price"]), "takeProfitOrderTransaction.price") != tp_dec:
+                    self._fail_unbound_oanda_response(
+                        client_ext_id=ext_id,
+                        now_utc=now_utc_str,
+                        reason=f"takeProfitOrderTransaction price mismatch: {tp_tx['price']!r} != {tp_dec}",
+                    )
+            tp_ext = (tp_tx.get("clientExtensions") or {}).get("id") if isinstance(tp_tx.get("clientExtensions"), Mapping) else None
+            if tp_ext != tp_ext_id:
+                self._fail_unbound_oanda_response(
+                    client_ext_id=ext_id,
+                    now_utc=now_utc_str,
+                    reason=f"takeProfitOrderTransaction clientExtensions.id mismatch: {tp_ext!r} != {tp_ext_id!r}",
+                )
+            mutated_tx_ids.append(tp_tx_id)
+        for mtx in mutated_tx_ids:
+            self._seen_confirmed_tx_ids.add(mtx)
+        self._seen_confirmed_tx_ids.add(last_tx_str)
+        self._last_transaction_id = last_tx_str
+        primary_tx_id = mutated_tx_ids[0] if mutated_tx_ids else last_tx_str
         self._mutation_journal.mark_outcome(
             client_ext_id=ext_id,
             status="CONFIRMED_FILLED",
             now_utc=now_utc_str,
-            transaction_id=str(doc.get("lastTransactionID", "0")),
+            transaction_id=primary_tx_id,
         )
         ts = ts_now
         receipt = {
@@ -2507,7 +2723,7 @@ class OandaPracticePaperClient:
             "status": "MODIFIED",
             "stop_loss_price": None if sl_dec is None else decimal_text(sl_dec),
             "take_profit_price": None if tp_dec is None else decimal_text(tp_dec),
-            "last_transaction_id": str(doc.get("lastTransactionID", "0")),
+            "last_transaction_id": last_tx_str,
             "observed_at": _format_utc_micros(ts, "observed_at"),
             "raw_wire_sha256": sha256(raw).hexdigest(),
         }
@@ -2678,33 +2894,111 @@ class OandaPracticePaperClient:
 
         fill_tx = doc.get("orderFillTransaction")
         create_tx = doc.get("orderCreateTransaction")
-        if isinstance(doc.get("lastTransactionID"), (str, int)) and str(doc["lastTransactionID"]).isdigit():
-            self._last_transaction_id = str(doc["lastTransactionID"])
+        cancel_tx = doc.get("orderCancelTransaction")
+        if type(fill_tx) is not dict and type(cancel_tx) is dict:
+            reason = cancel_tx.get("reason") or "OANDA_CLOSE_CANCELLED"
+            self._mutation_journal.mark_outcome(
+                client_ext_id=ext_id, status="CONFIRMED_ABSENT", now_utc=now_utc_str, error_detail=str(reason)
+            )
+            raise PaperBrokerTransportError(f"OANDA trade {eff_action} for {tid} was cancelled ({reason})")
+        last_tx_str = self._require_bound_last_tx_id(
+            doc,
+            pre_cursor=pre_cursor,
+            client_ext_id=ext_id,
+            now_utc=now_utc_str,
+            action_label=eff_action,
+        )
+        if type(fill_tx) is not dict:
+            self._fail_unbound_oanda_response(
+                client_ext_id=ext_id,
+                now_utc=now_utc_str,
+                reason=f"missing orderFillTransaction in OANDA {eff_action} response",
+            )
+        fill_id = self._require_fresh_tx_id(
+            fill_tx.get("id"),
+            pre_cursor=pre_cursor,
+            client_ext_id=ext_id,
+            now_utc=now_utc_str,
+            label="orderFillTransaction.id",
+        )
+        if fill_tx.get("accountID") not in (None, "", acct_id):
+            self._fail_unbound_oanda_response(
+                client_ext_id=ext_id,
+                now_utc=now_utc_str,
+                reason=f"close orderFillTransaction accountID mismatch: {fill_tx.get('accountID')!r} != {acct_id!r}",
+            )
+        if norm_sym in _PAIR_METADATA and fill_tx.get("instrument") is not None:
+            expected_oanda_inst = _PAIR_METADATA[norm_sym]["oanda_instrument"]
+            if str(fill_tx.get("instrument") or "").strip().upper() != expected_oanda_inst:
+                self._fail_unbound_oanda_response(
+                    client_ext_id=ext_id,
+                    now_utc=now_utc_str,
+                    reason=f"close orderFillTransaction instrument mismatch: {fill_tx.get('instrument')!r} != {expected_oanda_inst!r}",
+                )
+        matched_trade_units: list[Decimal] = []
+        closed_list = fill_tx.get("tradesClosed")
+        if isinstance(closed_list, list):
+            for c_row in closed_list:
+                if isinstance(c_row, dict) and str(c_row.get("tradeID") or "") == tid:
+                    raw_cu = c_row.get("units")
+                    if raw_cu is not None:
+                        matched_trade_units.append(abs(parse_decimal(str(raw_cu), "tradesClosed.units")))
+                    else:
+                        matched_trade_units.append(Decimal("0"))
+        reduced_row = fill_tx.get("tradeReduced")
+        if isinstance(reduced_row, dict) and str(reduced_row.get("tradeID") or "") == tid:
+            raw_ru = reduced_row.get("units")
+            if raw_ru is not None:
+                matched_trade_units.append(abs(parse_decimal(str(raw_ru), "tradeReduced.units")))
+            else:
+                matched_trade_units.append(Decimal("0"))
+        if not matched_trade_units:
+            self._fail_unbound_oanda_response(
+                client_ext_id=ext_id,
+                now_utc=now_utc_str,
+                reason=f"OANDA {eff_action} response does not reference closed/reduced tradeID={tid!r}",
+            )
+        if units_field != "ALL":
+            req_abs_units = abs(parse_decimal(units_field, "requested_units"))
+            total_closed_units = sum(matched_trade_units, Decimal("0"))
+            if total_closed_units > Decimal("0") and total_closed_units != req_abs_units:
+                self._fail_unbound_oanda_response(
+                    client_ext_id=ext_id,
+                    now_utc=now_utc_str,
+                    reason=f"OANDA {eff_action} closed units mismatch: {total_closed_units} != {req_abs_units}",
+                )
+            if "units" in fill_tx and fill_tx["units"] is not None:
+                fill_abs = abs(parse_decimal(str(fill_tx["units"]), "fill_units"))
+                if fill_abs != req_abs_units:
+                    self._fail_unbound_oanda_response(
+                        client_ext_id=ext_id,
+                        now_utc=now_utc_str,
+                        reason=f"OANDA {eff_action} fill units mismatch: {fill_abs} != {req_abs_units}",
+                    )
         realized_pnl: str | None = None
-        if isinstance(fill_tx, dict):
-            if "pl" in fill_tx and fill_tx["pl"] is not None:
-                realized_pnl = decimal_text(parse_decimal(str(fill_tx["pl"]), "pl"))
-            elif isinstance(fill_tx.get("tradesClosed"), list) and fill_tx["tradesClosed"]:
-                first_closed = fill_tx["tradesClosed"][0]
-                if isinstance(first_closed, dict) and first_closed.get("realizedPL") is not None:
-                    realized_pnl = decimal_text(parse_decimal(str(first_closed["realizedPL"]), "realizedPL"))
-            elif isinstance(fill_tx.get("tradeReduced"), dict) and fill_tx["tradeReduced"].get("realizedPL") is not None:
-                realized_pnl = decimal_text(parse_decimal(str(fill_tx["tradeReduced"]["realizedPL"]), "realizedPL"))
+        if "pl" in fill_tx and fill_tx["pl"] is not None:
+            realized_pnl = decimal_text(parse_decimal(str(fill_tx["pl"]), "pl"))
+        elif isinstance(closed_list, list) and closed_list:
+            first_closed = closed_list[0]
+            if isinstance(first_closed, dict) and first_closed.get("realizedPL") is not None:
+                realized_pnl = decimal_text(parse_decimal(str(first_closed["realizedPL"]), "realizedPL"))
+        elif isinstance(reduced_row, dict) and reduced_row.get("realizedPL") is not None:
+            realized_pnl = decimal_text(parse_decimal(str(reduced_row["realizedPL"]), "realizedPL"))
         fill_price = (
             None
-            if not isinstance(fill_tx, dict) or "price" not in fill_tx or fill_tx["price"] is None
+            if "price" not in fill_tx or fill_tx["price"] is None
             else decimal_text(parse_decimal(str(fill_tx["price"]), "fill_price"))
         )
-        tx_id = (
-            (str(fill_tx.get("id", "")) if isinstance(fill_tx, dict) and fill_tx.get("id") else None)
-            or (str(create_tx.get("id", "")) if isinstance(create_tx, dict) and create_tx.get("id") else None)
-            or str(doc.get("lastTransactionID", "0"))
-        )
+        self._seen_confirmed_tx_ids.add(fill_id)
+        if type(create_tx) is dict and str(create_tx.get("id", "")).isdigit():
+            self._seen_confirmed_tx_ids.add(str(create_tx["id"]))
+        self._seen_confirmed_tx_ids.add(last_tx_str)
+        self._last_transaction_id = last_tx_str
         self._mutation_journal.mark_outcome(
             client_ext_id=ext_id,
             status="CONFIRMED_FILLED",
             now_utc=now_utc_str,
-            transaction_id=tx_id,
+            transaction_id=fill_id,
         )
         receipt = {
             "provider": self.provider_id,
@@ -2715,15 +3009,89 @@ class OandaPracticePaperClient:
             "requested_units": units_field,
             "status": "CLOSED" if eff_action == "CLOSE" else "REDUCED",
             "create_transaction_id": None if not isinstance(create_tx, dict) else str(create_tx.get("id", "")),
-            "fill_transaction_id": None if not isinstance(fill_tx, dict) else str(fill_tx.get("id", "")),
+            "fill_transaction_id": fill_id,
             "fill_price": fill_price,
             "realized_pnl": realized_pnl,
-            "last_transaction_id": str(doc.get("lastTransactionID", "0")),
+            "last_transaction_id": last_tx_str,
             "observed_at": now_utc_str,
             "raw_wire_sha256": sha256(raw).hexdigest(),
         }
         assert_safe_json_numbers(receipt)
         return receipt
+
+    def _fail_unbound_oanda_response(
+        self,
+        *,
+        client_ext_id: str,
+        now_utc: str,
+        reason: str,
+    ) -> None:
+        self._mutation_journal.mark_outcome(
+            client_ext_id=client_ext_id,
+            status="OUTCOME_UNKNOWN",
+            now_utc=now_utc,
+            error_detail=f"UNBOUND_OANDA_RESPONSE:{reason}"[:200],
+        )
+        raise OandaOutcomeUnknownError(
+            f"OANDA unbound/ambiguous response for {client_ext_id} ({reason}); frozen until reconciled"
+        )
+
+    def _require_fresh_tx_id(
+        self,
+        raw_id: Any,
+        *,
+        pre_cursor: str | None,
+        client_ext_id: str,
+        now_utc: str,
+        label: str,
+    ) -> str:
+        s = "" if raw_id is None else str(raw_id).strip()
+        if not s.isdigit() or int(s) <= 0:
+            self._fail_unbound_oanda_response(
+                client_ext_id=client_ext_id,
+                now_utc=now_utc,
+                reason=f"invalid {label}={raw_id!r}",
+            )
+        if s in self._seen_confirmed_tx_ids:
+            self._fail_unbound_oanda_response(
+                client_ext_id=client_ext_id,
+                now_utc=now_utc,
+                reason=f"replayed {label}={s}",
+            )
+        if pre_cursor is not None and str(pre_cursor).isdigit() and int(pre_cursor) > 0:
+            if int(s) <= int(pre_cursor):
+                self._fail_unbound_oanda_response(
+                    client_ext_id=client_ext_id,
+                    now_utc=now_utc,
+                    reason=f"stale {label}={s} <= pre_cursor={pre_cursor}",
+                )
+        return s
+
+    def _require_bound_last_tx_id(
+        self,
+        doc: Mapping[str, Any],
+        *,
+        pre_cursor: str | None,
+        client_ext_id: str,
+        now_utc: str,
+        action_label: str,
+    ) -> str:
+        raw_last = doc.get("lastTransactionID")
+        s = "" if raw_last is None else str(raw_last).strip()
+        if not s.isdigit() or int(s) <= 0:
+            self._fail_unbound_oanda_response(
+                client_ext_id=client_ext_id,
+                now_utc=now_utc,
+                reason=f"missing or non-positive lastTransactionID in OANDA {action_label} response: {raw_last!r}",
+            )
+        if pre_cursor is not None and str(pre_cursor).isdigit() and int(pre_cursor) > 0:
+            if int(s) <= int(pre_cursor):
+                self._fail_unbound_oanda_response(
+                    client_ext_id=client_ext_id,
+                    now_utc=now_utc,
+                    reason=f"non-advancing lastTransactionID={s} <= pre_cursor={pre_cursor}",
+                )
+        return s
 
     @staticmethod
     def _extract_ext_ids_from_tx(row: dict[str, Any]) -> list[tuple[str, str]]:

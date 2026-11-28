@@ -811,6 +811,7 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
         body: bytes,
         *,
         extra_header: bytes = b"",
+        nonblocking: bool = False,
     ) -> None:
         with self._state_lock:
             self._rejected_pre_auth += 1
@@ -822,6 +823,17 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
             + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
             + body
         )
+        if nonblocking:
+            try:
+                sock.setblocking(False)
+                sock.send(payload)
+            except (BlockingIOError, OSError):
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return
         try:
             sock.setblocking(True)
             sock.settimeout(0.15)
@@ -985,7 +997,10 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
                         break
                     continue
 
-                for key, _mask in events:
+                # Prioritize wake -> pending readable sockets -> accept_unix -> accept_tcp (Finding [7])
+                _prio = {"wake": 0, "pending": 1, "accept_unix": 2, "accept_tcp": 3}
+                ordered_events = sorted(events, key=lambda kv: _prio.get(kv[0].data[0], 9))
+                for key, _mask in ordered_events:
                     kind, tag_fd = key.data
                     if kind == "wake":
                         try:
@@ -1002,7 +1017,8 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
                         if listener is None:
                             continue
                         is_unix = kind == "accept_unix"
-                        for _ in range(32):
+                        accept_budget = 32 if is_unix else (8 if pending else 32)
+                        for _ in range(accept_budget):
                             try:
                                 conn, raw_addr = listener.accept()
                             except BlockingIOError:
@@ -1018,6 +1034,7 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
                                         conn,
                                         b"HTTP/1.1 403 Forbidden",
                                         b'{"error": "Loopback clients only"}\n',
+                                        nonblocking=True,
                                     )
                                     continue
                                 eff_addr = (peer_ip, int(raw_addr[1]) if len(raw_addr) > 1 else 0)
@@ -1032,9 +1049,95 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
                                     pass
                                 continue
 
-                            # Evict oldest unauthenticated pending socket when table reaches 64 so owner can NEVER be blocked
+                            # Immediate nonblocking fast-path peek: authenticate & dispatch valid owner requests before queuing behind churn
+                            init_buf = bytearray()
+                            closed_early = False
+                            try:
+                                peek_chunk = conn.recv(4096)
+                                if not peek_chunk:
+                                    closed_early = True
+                                else:
+                                    init_buf.extend(peek_chunk)
+                            except BlockingIOError:
+                                pass
+                            except OSError:
+                                closed_early = True
+
+                            if closed_early:
+                                try:
+                                    conn.close()
+                                except OSError:
+                                    pass
+                                continue
+
+                            hdr_end_fast = init_buf.find(b"\r\n\r\n")
+                            if hdr_end_fast == -1 and len(init_buf) > self._max_header_bytes:
+                                self._reject_pending_socket(
+                                    conn,
+                                    b"HTTP/1.1 431 Request Header Fields Too Large",
+                                    b'{"error": "Emergency pre-auth HTTP headers exceed 8 KiB limit"}\n',
+                                    nonblocking=True,
+                                )
+                                continue
+                            if hdr_end_fast != -1:
+                                if hdr_end_fast + 4 > self._max_header_bytes:
+                                    self._reject_pending_socket(
+                                        conn,
+                                        b"HTTP/1.1 431 Request Header Fields Too Large",
+                                        b'{"error": "Emergency pre-auth HTTP headers exceed 8 KiB limit"}\n',
+                                        nonblocking=True,
+                                    )
+                                    continue
+                                ok_fast, st_fast, err_fast, extra_fast = self._validate_pre_auth_header_block(
+                                    bytes(init_buf[:hdr_end_fast]),
+                                    is_unix_ipc=is_unix,
+                                )
+                                if not ok_fast:
+                                    self._reject_pending_socket(
+                                        conn,
+                                        st_fast,
+                                        err_fast,
+                                        extra_header=extra_fast,
+                                        nonblocking=True,
+                                    )
+                                    continue
+                                if not self._worker_sem.acquire(blocking=False):
+                                    self._reject_pending_socket(
+                                        conn,
+                                        b"HTTP/1.1 503 Service Unavailable",
+                                        b'{"error": "Authenticated emergency worker pool busy"}\n',
+                                        nonblocking=True,
+                                    )
+                                    continue
+                                try:
+                                    conn.setblocking(True)
+                                    conn.settimeout(5.0)
+                                except OSError:
+                                    self._worker_sem.release()
+                                    try:
+                                        conn.close()
+                                    except OSError:
+                                        pass
+                                    continue
+                                prefixed_fast = _PrefixedSocket(conn, bytes(init_buf))
+                                self._dispatch_authenticated(prefixed_fast, eff_addr)
+                                continue
+
+                            # Evict stale unauthenticated TCP socket first (never evict Unix emergency IPC) so owner is never blocked
                             while len(pending) >= self._max_pending_sockets:
-                                _, evicted = pending.popitem(last=False)
+                                evict_key: int | None = None
+                                for cand_fd, cand_conn in pending.items():
+                                    if not cand_conn.is_unix_ipc and len(cand_conn.buf) == 0:
+                                        evict_key = cand_fd
+                                        break
+                                if evict_key is None:
+                                    for cand_fd, cand_conn in pending.items():
+                                        if not cand_conn.is_unix_ipc:
+                                            evict_key = cand_fd
+                                            break
+                                if evict_key is None:
+                                    break
+                                evicted = pending.pop(evict_key)
                                 try:
                                     sel.unregister(evicted.sock)
                                 except Exception as exc_unreg:
@@ -1044,13 +1147,14 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
                                     evicted.sock,
                                     b"HTTP/1.1 408 Request Timeout",
                                     b'{"error": "Emergency pre-auth pending queue evicted slow socket"}\n',
+                                    nonblocking=True,
                                 )
 
                             rec = _PendingEmergencyConn(
                                 sock=conn,
                                 client_address=eff_addr,
                                 deadline_mono=self._mono() + self._header_deadline_seconds,
-                                buf=bytearray(),
+                                buf=init_buf,
                                 is_unix_ipc=is_unix,
                             )
                             try:
@@ -1108,6 +1212,7 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
                                     p_conn.sock,
                                     b"HTTP/1.1 431 Request Header Fields Too Large",
                                     b'{"error": "Emergency pre-auth HTTP headers exceed 8 KiB limit"}\n',
+                                    nonblocking=True,
                                 )
                             continue
 
@@ -1122,6 +1227,7 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
                                 p_conn.sock,
                                 b"HTTP/1.1 431 Request Header Fields Too Large",
                                 b'{"error": "Emergency pre-auth HTTP headers exceed 8 KiB limit"}\n',
+                                nonblocking=True,
                             )
                             continue
 
@@ -1135,6 +1241,7 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
                                 st_line,
                                 err_body,
                                 extra_header=extra_hdr,
+                                nonblocking=True,
                             )
                             continue
 
@@ -1143,6 +1250,7 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
                                 p_conn.sock,
                                 b"HTTP/1.1 503 Service Unavailable",
                                 b'{"error": "Authenticated emergency worker pool busy"}\n',
+                                nonblocking=True,
                             )
                             continue
 
@@ -1160,7 +1268,7 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
                         prefixed = _PrefixedSocket(p_conn.sock, bytes(p_conn.buf))
                         self._dispatch_authenticated(prefixed, p_conn.client_address)
 
-                # Enforce strict monotonic <=1.0s pre-auth header deadline across all pending sockets
+                # Enforce strict monotonic <=1.0s pre-auth header deadline across all pending sockets without blocking selector
                 sweep_now = self._mono()
                 for fd_exp in [fk for fk, pv in pending.items() if sweep_now >= pv.deadline_mono]:
                     exp_conn = pending.pop(fd_exp, None)
@@ -1175,6 +1283,7 @@ class _EmergencyAdmissionHTTPServer(HTTPServer):
                         exp_conn.sock,
                         b"HTTP/1.1 408 Request Timeout",
                         b'{"error": "Emergency pre-auth header deadline exceeded"}\n',
+                        nonblocking=True,
                     )
         finally:
             for rem_conn in list(pending.values()):
@@ -1477,9 +1586,13 @@ def stamp_public_index_provenance(doc: Mapping[str, Any]) -> dict[str, Any]:
         or doc.get("source_broker_id") is not None
     ):
         raise ContractError("Refusing to label broker/MT5 index stream as independent public reference")
-    top_obs = str(doc.get("observed_at") or "").strip()
+    top_prov_obs = str(doc.get("provider_observed_at") or "").strip()
+    top_recv = str(doc.get("received_at") or "").strip()
+    top_obs = top_prov_obs or str(doc.get("observed_at") or "").strip()
     if not top_obs:
         raise ContractError("public index stream missing observed_at")
+    if top_recv and not top_prov_obs:
+        raise ContractError("public index stream carries received_at without provider_observed_at")
     src_prov = str(doc.get("source_provider") or feed_mode or "PUBLIC_US_INDEX_FEED").strip()
     if "MT5" in src_prov.upper() or src_prov.upper() in ("HUGOSWAY_MT5", "LHFX_MT5"):
         raise ContractError(f"Forbidden MT5 source_provider {src_prov!r} on public index stream")
@@ -1487,6 +1600,11 @@ def stamp_public_index_provenance(doc: Mapping[str, Any]) -> dict[str, Any]:
     out["source_provider"] = src_prov
     out["source_broker_id"] = None
     out["is_independent_public"] = True
+    out["observed_at"] = top_obs
+    if top_prov_obs:
+        out["provider_observed_at"] = top_prov_obs
+    if top_recv:
+        out["received_at"] = top_recv
     rows_out: list[dict[str, Any]] = []
     for raw_row in doc.get("markets") or ():
         if not isinstance(raw_row, Mapping):
@@ -1501,7 +1619,17 @@ def stamp_public_index_provenance(doc: Mapping[str, Any]) -> dict[str, Any]:
         r_copy["source_provider"] = str(raw_row.get("source_provider") or src_prov)
         r_copy["source_broker_id"] = None
         r_copy["is_independent_public"] = True
-        r_copy["observed_at"] = str(raw_row.get("observed_at") or top_obs)
+        row_prov_obs = str(raw_row.get("provider_observed_at") or top_prov_obs).strip()
+        row_recv = str(raw_row.get("received_at") or top_recv).strip()
+        if row_recv and not row_prov_obs:
+            raise ContractError("public index row carries received_at without provider_observed_at")
+        if row_prov_obs:
+            r_copy["provider_observed_at"] = row_prov_obs
+            r_copy["observed_at"] = row_prov_obs
+        else:
+            r_copy["observed_at"] = str(raw_row.get("observed_at") or top_obs)
+        if row_recv:
+            r_copy["received_at"] = row_recv
         rows_out.append(r_copy)
     out["markets"] = rows_out
     return out
@@ -1522,9 +1650,13 @@ def build_public_index_reference_map(
         or "MT5" in str(public_doc.get("feed_mode") or "").upper()
     ):
         return {}
-    top_obs = str(public_doc.get("observed_at") or "").strip()
+    top_prov_obs = str(public_doc.get("provider_observed_at") or "").strip()
+    top_recv = str(public_doc.get("received_at") or "").strip()
+    top_obs = top_prov_obs or str(public_doc.get("observed_at") or "").strip()
     top_prov = str(public_doc.get("source_provider") or public_doc.get("feed_mode") or "PUBLIC_US_INDEX_FEED").strip()
     if not top_obs or "MT5" in top_prov.upper() or top_prov.upper() in ("HUGOSWAY_MT5", "LHFX_MT5"):
+        return {}
+    if top_recv and not top_prov_obs:
         return {}
     wanted = {str(s) for s in symbols}
     out: dict[str, dict[str, Any]] = {}
@@ -1541,10 +1673,14 @@ def build_public_index_reference_map(
         ):
             continue
         row_prov = str(row.get("source_provider") or top_prov).strip()
-        row_obs = str(row.get("observed_at") or top_obs).strip()
+        row_prov_obs = str(row.get("provider_observed_at") or top_prov_obs).strip()
+        row_recv = str(row.get("received_at") or top_recv).strip()
+        if row_recv and not row_prov_obs:
+            continue
+        row_obs = row_prov_obs or str(row.get("observed_at") or top_obs).strip()
         if not row_obs or "MT5" in row_prov.upper() or row_prov.upper() in ("HUGOSWAY_MT5", "LHFX_MT5"):
             continue
-        out[sym] = {
+        ref_row: dict[str, Any] = {
             "bid": _parse_dec(str(row["bid"]), "bid"),
             "ask": _parse_dec(str(row["ask"]), "ask"),
             "source_provider": row_prov,
@@ -1552,6 +1688,11 @@ def build_public_index_reference_map(
             "is_independent_public": True,
             "observed_at": row_obs,
         }
+        if row_prov_obs:
+            ref_row["provider_observed_at"] = row_prov_obs
+        if row_recv:
+            ref_row["received_at"] = row_recv
+        out[sym] = ref_row
     return out
 
 
@@ -1833,11 +1974,15 @@ class LoopbackCockpitServer:
             if global_pre_auth_rate_limit is None
             else max(1, int(global_pre_auth_rate_limit))
         )
+        self._emergency_unix_socket_opt_out = (
+            emergency_unix_socket is not None and not str(emergency_unix_socket).strip()
+        )
         self._emergency_unix_socket_cfg = (
             Path(str(emergency_unix_socket).strip())
             if emergency_unix_socket is not None and str(emergency_unix_socket).strip()
             else None
         )
+        self._auto_unix_dir: Path | None = None
         self._emergency_header_deadline_seconds = min(
             DEFAULT_EMERGENCY_HEADER_DEADLINE_SECONDS,
             max(0.05, float(emergency_header_deadline_seconds)),
@@ -5607,6 +5752,16 @@ class LoopbackCockpitServer:
         )
         self._httpd.request_queue_size = 32
         try:
+            eff_unix_path = self._emergency_unix_socket_cfg
+            if (
+                eff_unix_path is None
+                and not self._emergency_unix_socket_opt_out
+                and os.name == "posix"
+                and hasattr(socket, "AF_UNIX")
+            ):
+                auto_dir = Path(tempfile.mkdtemp(prefix="casfx_emerg_"))
+                self._auto_unix_dir = auto_dir
+                eff_unix_path = auto_dir / "emerg.sock"
             self._emergency_httpd = _EmergencyAdmissionHTTPServer(
                 (self._host, self._emergency_port_cfg),
                 _EmergencyHandler,
@@ -5619,7 +5774,7 @@ class LoopbackCockpitServer:
                 verify_owner_bearer_fn=self._verify_emergency_owner_bearer,
                 on_auth_failure=self._record_auth_failure,
                 on_pre_auth_timeout=self._record_pre_auth_timeout,
-                unix_socket_path=self._emergency_unix_socket_cfg,
+                unix_socket_path=eff_unix_path,
                 mono_clock=self._mono,
                 thread_name_prefix="cas-cockpit-emerg",
             )
@@ -5654,6 +5809,13 @@ class LoopbackCockpitServer:
             self._emergency_httpd.shutdown()
             self._emergency_httpd.server_close()
             self._emergency_httpd = None
+        if self._auto_unix_dir is not None:
+            try:
+                if self._auto_unix_dir.exists():
+                    self._auto_unix_dir.rmdir()
+            except OSError:
+                pass
+            self._auto_unix_dir = None
         if self._emergency_thread is not None:
             self._emergency_thread.join(timeout=5.0)
             self._emergency_thread = None

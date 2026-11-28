@@ -304,6 +304,8 @@ class ReferenceQuote:
     source_broker_id: str | None = None
     is_independent_public: bool = False
     observed_at: datetime | None = None
+    provider_observed_at: datetime | None = None
+    received_at: datetime | None = None
 
     def __post_init__(self) -> None:
         bid, ask = _validated_quote(self.symbol, self.bid, self.ask, "reference_quote")
@@ -317,8 +319,21 @@ class ReferenceQuote:
             if not isinstance(self.source_broker_id, str) or not self.source_broker_id.strip():
                 raise QuoteReferenceUnavailableError("ReferenceQuote.source_broker_id must be None or non-empty string")
             object.__setattr__(self, "source_broker_id", self.source_broker_id.strip().upper())
+        if self.provider_observed_at is not None:
+            object.__setattr__(self, "provider_observed_at", _parse_reference_observed_at(self.provider_observed_at))
+        if self.received_at is not None:
+            object.__setattr__(self, "received_at", _parse_reference_observed_at(self.received_at))
+        if self.received_at is not None and self.provider_observed_at is None:
+            raise QuoteReferenceUnavailableError(
+                f"index reference for {self.symbol} carries received_at without provider_observed_at"
+            )
         if self.observed_at is not None:
-            object.__setattr__(self, "observed_at", _parse_reference_observed_at(self.observed_at))
+            parsed_obs = _parse_reference_observed_at(self.observed_at)
+            if self.provider_observed_at is not None:
+                parsed_obs = min(self.provider_observed_at, parsed_obs)
+            object.__setattr__(self, "observed_at", parsed_obs)
+        elif self.provider_observed_at is not None:
+            object.__setattr__(self, "observed_at", self.provider_observed_at)
         if self.is_independent_public:
             if self.source_broker_id in _MT5_BROKER_IDS or _looks_like_mt5_provider(self.source_provider):
                 raise QuoteReferenceUnavailableError(
@@ -348,7 +363,23 @@ class ReferenceQuote:
             ask_d = raw_ask if isinstance(raw_ask, Decimal) else parse_decimal(str(raw_ask), "ask")
         except ContractError as exc:
             raise QuoteReferenceUnavailableError(f"invalid index reference quote price for {symbol}: {exc}") from None
+        prov_obs_dt = (
+            _parse_reference_observed_at(entry["provider_observed_at"])
+            if entry.get("provider_observed_at") is not None and str(entry.get("provider_observed_at")).strip()
+            else None
+        )
+        recv_dt = (
+            _parse_reference_observed_at(entry["received_at"])
+            if entry.get("received_at") is not None and str(entry.get("received_at")).strip()
+            else None
+        )
+        if recv_dt is not None and prov_obs_dt is None:
+            raise QuoteReferenceUnavailableError(
+                f"index reference for {symbol} carries received_at without provider_observed_at"
+            )
         obs_dt = _parse_reference_observed_at(entry["observed_at"])
+        if prov_obs_dt is not None:
+            obs_dt = min(prov_obs_dt, obs_dt)
         raw_broker = entry["source_broker_id"]
         if raw_broker is not None and not isinstance(raw_broker, str):
             raise QuoteReferenceUnavailableError(f"invalid source_broker_id for {symbol}")
@@ -360,6 +391,8 @@ class ReferenceQuote:
             source_broker_id=(None if raw_broker is None else raw_broker),
             is_independent_public=entry["is_independent_public"],
             observed_at=obs_dt,
+            provider_observed_at=prov_obs_dt,
+            received_at=recv_dt,
         )
 
     def assert_fresh(
@@ -368,12 +401,16 @@ class ReferenceQuote:
         now: datetime | None,
         max_age_seconds: float = DEFAULT_INDEX_REFERENCE_MAX_AGE_SECONDS,
     ) -> None:
-        if self.observed_at is None:
+        if self.provider_observed_at is not None and self.observed_at is not None:
+            eff_obs = min(self.provider_observed_at, self.observed_at)
+        else:
+            eff_obs = self.provider_observed_at if self.provider_observed_at is not None else self.observed_at
+        if eff_obs is None:
             raise QuoteReferenceUnavailableError(f"index reference for {self.symbol} missing observed_at timestamp")
         if now is None or max_age_seconds <= 0:
             return
         check_now = utc_time(now, "now")
-        age = (check_now - self.observed_at).total_seconds()
+        age = (check_now - eff_obs).total_seconds()
         if age > max_age_seconds or age < -30.0:
             raise QuoteReferenceUnavailableError(
                 f"index reference for {self.symbol} ({self.source_provider}) is stale or future-skewed "

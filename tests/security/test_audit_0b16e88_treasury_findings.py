@@ -187,7 +187,7 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
             self.assertEqual(row_unk["conversion_status"], CONVERSION_STATUS_NOT_REQUIRED)
             self.assertEqual(row_unk["withdrawal_status"], WITHDRAWAL_STATUS_OUTCOME_UNKNOWN)
 
-            # Migrated withdrawal-only OUTCOME_UNKNOWN row still retries cleanly
+            # Migrated withdrawal-only OUTCOME_UNKNOWN row refuses direct retry until exchange history reconciliation clears it
             rec = OwnerRecoveryVerifier(db_path=db_path, clock=lambda: T0)
             krk_ok = KrakenOfframpClient(
                 api_key="krk-pub-1",
@@ -204,6 +204,29 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
                 reason="retry migrated",
                 kraken_client=krk_ok,
                 retry_transfer_id="tr-legacy-unk",
+            )
+            tok_block = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep["intent_sha256"], now=T0)
+            with self.assertRaises(OfframpSecurityError):
+                vault.execute_offramp_ach_payout(
+                    rail=RAIL_KRAKEN_ACH,
+                    amount_usd=D("75.00"),
+                    owner_request_id="req-mig-retry",
+                    reason="retry migrated blocked before reconcile",
+                    verifier=rec,
+                    recovery_token=tok_block,
+                    kraken_client=krk_ok,
+                    retry_transfer_id="tr-legacy-unk",
+                    intent_id=prep["intent_id"],
+                    intent_sha256=prep["intent_sha256"],
+                )
+            vault.reconcile_withdrawal_outcome(
+                transfer_id="tr-legacy-unk",
+                exchange_history_checker=lambda q: {
+                    "status": "NOT_EXECUTED",
+                    "history_complete": True,
+                    "queried_client_reference_id": q["idempotency_key"],
+                },
+                owner_request_id="req-mig-reconcile",
             )
             tok = rec.mint_token(action_scope="TREASURY_SWEEP", target_ref=prep["intent_sha256"], now=T0)
             out = vault.execute_offramp_ach_payout(
@@ -594,7 +617,16 @@ class Audit0b16e88TreasuryFindingsTests(unittest.TestCase):
                 self.assertEqual(state["conv_calls"], 1)
                 self.assertEqual(state["wd_calls"], 1)
 
-                # Valid retry MUST SKIP Phase 1 conversion completely (0 duplicate conversions!) and complete Phase 2
+                # Reconcile NOT_EXECUTED withdrawal before retry so Phase 1 conversion stays SKIPPED (0 duplicates!)
+                vault.reconcile_withdrawal_outcome(
+                    transfer_id=tid,
+                    exchange_history_checker=lambda q: {
+                        "status": "NOT_EXECUTED",
+                        "history_complete": True,
+                        "queried_client_reference_id": q["idempotency_key"],
+                    },
+                    owner_request_id="req-skip-reconcile",
+                )
                 state["fail_wd"] = False
                 prep2 = vault.prepare_offramp_ach_payout(
                     amount_usd=D("80.00"),

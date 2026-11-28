@@ -257,6 +257,7 @@ class _FakeOandaTransport:
         doc = json.loads(body.decode("utf-8")) if body else {}
         if m == "POST" and url.endswith("/orders"):
             ospec = doc["order"]
+            sl_info = ospec.get("stopLossOnFill") or {}
             self.open_trades[tid] = {
                 "id": tid,
                 "instrument": ospec["instrument"],
@@ -264,14 +265,34 @@ class _FakeOandaTransport:
                 "price": "1.10010",
                 "unrealizedPL": "0.00",
                 "state": "OPEN",
+                **({"stopLossOrder": {"price": str(sl_info["price"])}} if sl_info.get("price") else {}),
             }
             return json.dumps({
                 "lastTransactionID": tid,
-                "orderCreateTransaction": {"id": tid},
-                "orderFillTransaction": {"id": tid, "price": "1.10010"},
+                "orderCreateTransaction": {"id": tid, "clientExtensions": ospec.get("clientExtensions", {})},
+                "orderFillTransaction": {
+                    "id": tid,
+                    "instrument": ospec["instrument"],
+                    "units": ospec["units"],
+                    "price": "1.10010",
+                    "clientExtensions": ospec.get("clientExtensions", {}),
+                },
             }).encode("utf-8")
         if m == "PUT" and url.endswith("/orders"):
-            return json.dumps({"lastTransactionID": tid}).encode("utf-8")
+            parts = url.split("/")
+            target_tid = parts[-2]
+            sl_block = doc.get("stopLoss") or {}
+            if target_tid in self.open_trades and sl_block.get("price"):
+                self.open_trades[target_tid]["stopLossOrder"] = {"price": str(sl_block["price"])}
+            return json.dumps({
+                "lastTransactionID": tid,
+                "stopLossOrderTransaction": {
+                    "id": tid,
+                    "tradeID": target_tid,
+                    "price": str(sl_block.get("price", "1.09600")),
+                    "clientExtensions": sl_block.get("clientExtensions", {}),
+                },
+            }).encode("utf-8")
         if m == "PUT" and url.endswith("/close"):
             parts = url.split("/")
             target_tid = parts[-2]
@@ -280,7 +301,12 @@ class _FakeOandaTransport:
             return json.dumps({
                 "lastTransactionID": tid,
                 "orderCreateTransaction": {"id": tid},
-                "orderFillTransaction": {"id": tid, "price": "1.10050", "pl": "12.50"},
+                "orderFillTransaction": {
+                    "id": tid,
+                    "price": "1.10050",
+                    "pl": "12.50",
+                    "tradesClosed": [{"tradeID": target_tid, "realizedPL": "12.50"}],
+                },
             }).encode("utf-8")
         raise AssertionError(f"Unexpected request {m} {url}")
 

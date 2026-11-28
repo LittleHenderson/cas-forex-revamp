@@ -733,7 +733,16 @@ class ProfitExpansionTests(unittest.TestCase):
                     intent_sha256=prep_retry_hijack["intent_sha256"],
                 )
 
-            # Retrying with exact prepared intent digest and matching destination_bank_id succeeds
+            # Reconcile NOT_EXECUTED withdrawal before retry per Finding [4]
+            vault.reconcile_withdrawal_outcome(
+                transfer_id=tid,
+                exchange_history_checker=lambda q: {
+                    "status": "NOT_EXECUTED",
+                    "history_complete": True,
+                    "queried_client_reference_id": q["idempotency_key"],
+                },
+                owner_request_id="req-retry-reconcile",
+            )
             krk_ok = KrakenOfframpClient(
                 api_key="krk-pub-01",
                 api_secret_b64=base64.b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii"),

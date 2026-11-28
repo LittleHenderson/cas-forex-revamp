@@ -280,6 +280,7 @@ class _StatefulOandaTransport:
             bid, ask = QUOTES[sym]
             units_str = str(order["units"])
             px = ask if not units_str.startswith("-") else bid
+            sl_info = order.get("stopLossOnFill") or {}
             self.open_trades[tid] = {
                 "id": tid,
                 "instrument": inst,
@@ -287,20 +288,47 @@ class _StatefulOandaTransport:
                 "price": str(px),
                 "unrealizedPL": "12.50",
                 "state": "OPEN",
+                **({"stopLossOrder": {"price": str(sl_info["price"])}} if sl_info.get("price") else {}),
             }
             self.transactions.append({"id": create_id, "type": "MARKET_ORDER", "clientExtensions": order.get("clientExtensions", {})})
             self.transactions.append({"id": fill_id, "type": "ORDER_FILL", "clientExtensions": order.get("clientExtensions", {})})
             return json.dumps({
-                "orderCreateTransaction": {"id": create_id},
-                "orderFillTransaction": {"id": fill_id, "price": str(px)},
+                "orderCreateTransaction": {"id": create_id, "clientExtensions": order.get("clientExtensions", {})},
+                "orderFillTransaction": {
+                    "id": fill_id,
+                    "instrument": inst,
+                    "units": units_str,
+                    "price": str(px),
+                    "clientExtensions": order.get("clientExtensions", {}),
+                },
                 "lastTransactionID": str(self._tx),
             }).encode("utf-8")
         if method == "PUT" and parsed.path.endswith("/orders"):
             self._tx += 1
-            return json.dumps({
-                "stopLossOrderTransaction": {"id": str(self._tx)},
-                "lastTransactionID": str(self._tx),
-            }).encode("utf-8")
+            tid_a = parsed.path.split("/")[-2]
+            amend_doc = json.loads((body or b"{}").decode("utf-8"))
+            sl_b = amend_doc.get("stopLoss") or {}
+            tp_b = amend_doc.get("takeProfit") or {}
+            if tid_a in self.open_trades and sl_b.get("price"):
+                self.open_trades[tid_a]["stopLossOrder"] = {"price": str(sl_b["price"])}
+            resp_a: dict[str, object] = {"lastTransactionID": str(self._tx)}
+            if sl_b:
+                resp_a["stopLossOrderTransaction"] = {
+                    "id": str(self._tx),
+                    "tradeID": tid_a,
+                    "price": str(sl_b["price"]),
+                    "clientExtensions": sl_b.get("clientExtensions", {}),
+                }
+            if tp_b:
+                self._tx += 1
+                resp_a["lastTransactionID"] = str(self._tx)
+                resp_a["takeProfitOrderTransaction"] = {
+                    "id": str(self._tx),
+                    "tradeID": tid_a,
+                    "price": str(tp_b["price"]),
+                    "clientExtensions": tp_b.get("clientExtensions", {}),
+                }
+            return json.dumps(resp_a).encode("utf-8")
         if method == "PUT" and parsed.path.endswith("/close"):
             tid = parsed.path.split("/")[-2]
             req_doc = json.loads((body or b"{}").decode("utf-8"))
@@ -928,7 +956,9 @@ class AuditEfb2bf4VenueSecurityTests(unittest.TestCase):
             oanda_calls_before_expiry = len(oanda_stub.mutation_calls)
 
             # 3. Spool transport in LIVE mode
+            from cas_forex_revamp.venue.mt5_broker_bridge import provision_sealed_replay_ledger
             spool_dir = root / "hugosway_mt5"
+            provision_sealed_replay_ledger(spool_dir, broker_channel="hugosway_mt5")
             emu = Mt5SpoolPaperTerminalEmulator(
                 spool_dir, server="Hugo PRO5", login=9001122, quotes=QUOTES, trade_mode="REAL", clock=clock
             )

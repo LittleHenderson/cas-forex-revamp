@@ -256,6 +256,7 @@ class _FakeOandaTransport:
                     "price": decimal_text(px),
                     "pl": "0.00",
                     "time": "2026-11-20T15:00:00.000000000Z",
+                    "clientExtensions": dict(payload["order"].get("clientExtensions") or {}),
                     "tradeOpened": {"tradeID": tid, "units": units_str},
                 },
                 "lastTransactionID": tid,

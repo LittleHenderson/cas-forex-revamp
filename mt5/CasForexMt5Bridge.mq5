@@ -33,6 +33,7 @@ input int    InpMaxDeviationPoints = 30;
 input double InpMaxVolumeLots      = 50.0;
 input bool   InpLiveExecutionMode  = false;
 input string InpLiveArmPhrase      = "";
+input string InpReplayStateDir     = "";
 
 #define SPOOL_PROTOCOL "cas-forex-mt5-spool/2"
 
@@ -82,6 +83,140 @@ string SpoolPath(const string name)
 string RootSpoolPath(const string name)
   {
    return(InpSpoolFolder + "\\" + name);
+  }
+
+string ReplayStatePath(const string name)
+  {
+   string trimmed = InpReplayStateDir;
+   StringTrimLeft(trimmed);
+   StringTrimRight(trimmed);
+   if(StringLen(trimmed) > 0)
+      return(trimmed + "\\" + name);
+   return(RootSpoolPath(name));
+  }
+
+string ReplayHwmGlobalVarName()
+  {
+   return("casfx_hwm_" + InpBrokerChannel);
+  }
+
+bool VerifyAndLoadSealedEaHwm(const string nonce_fname)
+  {
+   string hwm_fname = ReplayStatePath("." + InpBrokerChannel + ".ea_hwm.txt");
+   bool nonce_exists = FileIsExist(nonce_fname, CommonFlag());
+   bool hwm_exists = FileIsExist(hwm_fname, CommonFlag());
+   string gv_name = ReplayHwmGlobalVarName();
+   ulong gv_hwm = 0;
+   if(GlobalVariableCheck(gv_name))
+     {
+      double raw_gv = GlobalVariableGet(gv_name);
+      if(raw_gv > 0.0)
+         gv_hwm = (ulong)MathRound(raw_gv);
+     }
+   if(gv_hwm > 0 && !nonce_exists)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   if(hwm_exists && !nonce_exists)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   if(InpLiveExecutionMode && (!nonce_exists || !hwm_exists))
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   if(!hwm_exists)
+      return(true);
+   int hh = FileOpen(hwm_fname, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(hh == INVALID_HANDLE)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   string raw = "";
+   while(!FileIsEnding(hh))
+      raw += FileReadString(hh);
+   FileClose(hh);
+   raw = TrimAll(raw);
+   int sep = StringFind(raw, "|");
+   if(sep <= 0)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   string n_str = TrimAll(StringSubstr(raw, 0, sep));
+   string mac_str = TrimAll(StringSubstr(raw, sep + 1));
+   if(!IsDigitsOnly(n_str) || StringLen(mac_str) != 64 || !g_hmac_key_loaded)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   string exp_mac = HmacSha256Hex(g_hmac_key, "ea-replay-hwm/1|" + InpBrokerChannel + "|" + n_str);
+   if(!ConstTimeHexEquals(exp_mac, mac_str))
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   ulong sealed_n = (ulong)StringToInteger(n_str);
+   if(sealed_n > g_last_monotonic_nonce)
+      g_last_monotonic_nonce = sealed_n;
+   if(gv_hwm > sealed_n)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   GlobalVariableSet(gv_name, (double)g_last_monotonic_nonce);
+   return(true);
+  }
+
+bool SaveSealedEaHwm(const ulong nonce_val)
+  {
+   if(!g_hmac_key_loaded)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   string n_str = IntegerToString((long)nonce_val);
+   string mac_hex = HmacSha256Hex(g_hmac_key, "ea-replay-hwm/1|" + InpBrokerChannel + "|" + n_str);
+   string payload = n_str + "|" + mac_hex;
+   string hwm_fname = ReplayStatePath("." + InpBrokerChannel + ".ea_hwm.txt");
+   string hwm_tmp = ReplayStatePath("." + InpBrokerChannel + ".ea_hwm.txt.tmp");
+   int hh = FileOpen(hwm_tmp, FILE_WRITE | FILE_TXT | FILE_ANSI | CommonFlag());
+   if(hh == INVALID_HANDLE)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   uint w = FileWriteString(hh, payload);
+   FileFlush(hh);
+   FileClose(hh);
+   if(w == 0)
+     {
+      FileDelete(hwm_tmp, CommonFlag());
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   bool moved = false;
+   for(int a = 0; a < 6; a++)
+     {
+      if(FileMove(hwm_tmp, CommonFlag(), hwm_fname, CommonFlag() | FILE_REWRITE))
+        {
+         moved = true;
+         break;
+        }
+      Sleep(8);
+     }
+   if(!moved)
+     {
+      FileDelete(hwm_tmp, CommonFlag());
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   GlobalVariableSet(ReplayHwmGlobalVarName(), (double)nonce_val);
+   return(true);
   }
 
 string IsoNowUtc()
@@ -484,9 +619,17 @@ bool VerifyValveAdmission(const string text)
 bool LoadGlobalReplayDomain()
   {
    ArrayResize(g_global_seen_ids, 0);
-   string fname = RootSpoolPath(".global_ea_seen.txt");
+   string fname = ReplayStatePath(".global_ea_seen.txt");
+   string hwm_fname = ReplayStatePath("." + InpBrokerChannel + ".ea_hwm.txt");
    if(!FileIsExist(fname, CommonFlag()))
+     {
+      if(FileIsExist(hwm_fname, CommonFlag()) && g_last_monotonic_nonce > 0)
+        {
+         g_replay_ledger_healthy = false;
+         return(false);
+        }
       return(true);
+     }
    int h = FileOpen(fname, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
    if(h == INVALID_HANDLE)
      {
@@ -550,8 +693,8 @@ bool RecordGlobalReplayId(const string req_id)
    ArrayResize(g_global_seen_ids, existing_n + 1);
    g_global_seen_ids[existing_n] = req_id;
    int start = (ArraySize(g_global_seen_ids) > 2048) ? (ArraySize(g_global_seen_ids) - 2048) : 0;
-   string fname = RootSpoolPath(".global_ea_seen.txt");
-   string tmp = RootSpoolPath(".global_ea_seen.txt.tmp");
+   string fname = ReplayStatePath(".global_ea_seen.txt");
+   string tmp = ReplayStatePath(".global_ea_seen.txt.tmp");
    int h = FileOpen(tmp, FILE_WRITE | FILE_TXT | FILE_ANSI | CommonFlag());
    if(h == INVALID_HANDLE)
      {
@@ -618,9 +761,21 @@ bool RecordGlobalReplayId(const string req_id)
 
 bool LoadReplayNonceLedger()
   {
-   string fname = RootSpoolPath("." + InpBrokerChannel + ".ea_nonce.txt");
+   string fname = ReplayStatePath("." + InpBrokerChannel + ".ea_nonce.txt");
+   if(!VerifyAndLoadSealedEaHwm(fname))
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
    if(!FileIsExist(fname, CommonFlag()))
+     {
+      if(InpLiveExecutionMode || g_last_monotonic_nonce > 0)
+        {
+         g_replay_ledger_healthy = false;
+         return(false);
+        }
       return(true);
+     }
    int h = FileOpen(fname, FILE_READ | FILE_TXT | FILE_ANSI | CommonFlag());
    if(h == INVALID_HANDLE)
      {
@@ -643,6 +798,11 @@ bool LoadReplayNonceLedger()
       g_replay_ledger_healthy = false;
       return(false);
      }
+   if(saved < g_last_monotonic_nonce)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
    if(saved > g_last_monotonic_nonce)
       g_last_monotonic_nonce = saved;
    return(true);
@@ -656,8 +816,8 @@ bool SaveReplayNonceLedger(const ulong nonce_val)
       return(false);
      }
    string payload = IntegerToString((long)nonce_val);
-   string fname = RootSpoolPath("." + InpBrokerChannel + ".ea_nonce.txt");
-   string tmp = RootSpoolPath("." + InpBrokerChannel + ".ea_nonce.txt.tmp");
+   string fname = ReplayStatePath("." + InpBrokerChannel + ".ea_nonce.txt");
+   string tmp = ReplayStatePath("." + InpBrokerChannel + ".ea_nonce.txt.tmp");
    int h = FileOpen(tmp, FILE_WRITE | FILE_TXT | FILE_ANSI | CommonFlag());
    if(h == INVALID_HANDLE)
      {
@@ -701,6 +861,11 @@ bool SaveReplayNonceLedger(const ulong nonce_val)
    FileClose(rh);
    reread = TrimAll(reread);
    if(!IsDigitsOnly(reread) || (ulong)StringToInteger(reread) != nonce_val || IntegerToString((long)nonce_val) != reread)
+     {
+      g_replay_ledger_healthy = false;
+      return(false);
+     }
+   if(!SaveSealedEaHwm(nonce_val))
      {
       g_replay_ledger_healthy = false;
       return(false);
@@ -1104,7 +1269,26 @@ void ExecuteRequest(const string request_id, const string text)
       pos_text = IntegerToString((long)ticket);
       if(action == "AMEND_STOP")
         {
-         double eff_sl = (sl > 0.0) ? sl : PositionGetDouble(POSITION_SL);
+         long pos_type = PositionGetInteger(POSITION_TYPE);
+         double cur_sl = PositionGetDouble(POSITION_SL);
+         double sym_bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+         double sym_ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+         string amend_err = "";
+         if(sl > 0.0)
+           {
+            if(cur_sl <= 0.0)
+               amend_err = "cannot widen or add missing protective stop";
+            else if(pos_type == POSITION_TYPE_BUY && (sl < cur_sl || (sym_bid > 0.0 && sl >= sym_bid)))
+               amend_err = "cannot widen BUY stop loss";
+            else if(pos_type == POSITION_TYPE_SELL && (sl > cur_sl || (sym_ask > 0.0 && sl <= sym_ask)))
+               amend_err = "cannot widen SELL stop loss";
+           }
+         if(StringLen(amend_err) > 0)
+           {
+            WriteReceipt(request_id, ReceiptJson(request_id, request_sha, "REJECTED", 10016, "0", "0", "0", "0", "0", "0", amend_err));
+            return;
+           }
+         double eff_sl = (sl > 0.0) ? sl : cur_sl;
          double eff_tp = (tp > 0.0) ? tp : PositionGetDouble(POSITION_TP);
          ok = g_trade.PositionModify(ticket, eff_sl, eff_tp);
         }
@@ -1526,6 +1710,11 @@ int OnInit()
    bool nonce_ok = LoadReplayNonceLedger();
    bool domain_ok = LoadGlobalReplayDomain();
    g_replay_ledger_healthy = (nonce_ok && domain_ok);
+   if(InpLiveExecutionMode && !g_replay_ledger_healthy)
+     {
+      Print("CasForexMt5Bridge: LIVE mode requires healthy pre-sealed replay ledger (.ea_nonce.txt + .ea_hwm.txt)");
+      return(INIT_FAILED);
+     }
    LoadSnapshotSeq();
    g_mode_ok = true;
    ReportInterruptedRequests();

@@ -2802,8 +2802,10 @@ class ProfitSweepVault:
         expected_client_ref: str,
         expected_amount: Decimal,
         expected_dest_bank: str,
+        expected_provider_tx_id: str | None = None,
+        expected_rail: str | None = None,
     ) -> tuple[str, str | None, str]:
-        """Fail-closed parser for exchange ACH withdrawal history evidence.
+        """Fail-closed parser for exchange ACH withdrawal history evidence (Finding [6]).
 
         Returns ``(outcome, provider_tx_id, detail)`` where outcome is one of
         ``"SETTLED"``, ``"ACH_SUBMITTED"``, ``"NOT_EXECUTED"``, or ``"UNRESOLVED"``.
@@ -2811,34 +2813,75 @@ class ProfitSweepVault:
         if not isinstance(evidence, Mapping):
             return ("UNRESOLVED", None, "non-mapping withdrawal history payload")
 
+        if (
+            evidence.get("truncated") is True
+            or evidence.get("has_more") is True
+            or bool(str(evidence.get("next_cursor") or "").strip())
+            or evidence.get("history_complete") is False
+        ):
+            return ("UNRESOLVED", None, "incomplete or truncated withdrawal history response")
+
         history_complete = bool(
             evidence.get("history_complete") is True
             or evidence.get("definitive_not_executed") is True
         )
+        exp_tx = str(expected_provider_tx_id or "").strip()
+        q_ref = str(evidence.get("queried_client_reference_id") or evidence.get("query_client_ref") or "").strip()
+        if q_ref and expected_client_ref and q_ref != expected_client_ref:
+            return ("UNRESOLVED", None, "withdrawal history queried_client_reference_id mismatch")
+
         record: Mapping[str, Any] = evidence
         if isinstance(evidence.get("withdrawal"), Mapping):
             record = evidence["withdrawal"]
         elif isinstance(evidence.get("withdrawals"), list):
             wlist = evidence["withdrawals"]
-            matched_w: Mapping[str, Any] | None = None
+            matches: list[Mapping[str, Any]] = []
             for item in wlist:
                 if not isinstance(item, Mapping):
                     continue
                 iref = str(item.get("client_reference_id") or item.get("client_ref") or "").strip()
+                itx = str(item.get("provider_tx_id") or item.get("refid") or item.get("payout_id") or item.get("id") or "").strip()
                 if expected_client_ref and iref == expected_client_ref:
-                    matched_w = item
-                    break
-            if matched_w is not None:
-                record = matched_w
-            elif len(wlist) == 0 and history_complete:
-                return ("NOT_EXECUTED", None, "empty complete withdrawal history")
+                    matches.append(item)
+                elif not iref and exp_tx and itx == exp_tx:
+                    matches.append(item)
+            if len(matches) > 1:
+                return ("UNRESOLVED", None, "ambiguous duplicate matching records in withdrawal history")
+            if len(matches) == 1:
+                record = matches[0]
+            elif history_complete and (len(wlist) == 0 or evidence.get("definitive_not_executed") is True):
+                if q_ref and expected_client_ref and q_ref != expected_client_ref:
+                    return ("UNRESOLVED", None, "withdrawal history query ref mismatch on empty history")
+                return ("NOT_EXECUTED", None, "complete withdrawal history confirms non-execution")
             else:
-                return ("UNRESOLVED", None, "withdrawal history did not match client_reference_id")
+                return ("UNRESOLVED", None, "withdrawal history did not match client_reference_id or is incomplete")
 
         raw_status = record.get("status")
         if raw_status is None or not str(raw_status).strip():
             return ("UNRESOLVED", None, "missing withdrawal status in exchange history")
         norm_status = str(raw_status).strip().upper()
+
+        settled_statuses = {"SETTLED", "COMPLETED", "COMPLETE", "SUCCESS", "SUCCESSFUL", "PAID"}
+        submitted_statuses = {"ACH_SUBMITTED", "SUBMITTED", "PROCESSING", "PENDING_SETTLEMENT", "IN_PROGRESS", "INITIAL"}
+        not_executed_statuses = {
+            "NOT_EXECUTED",
+            "NOT_FOUND_DEFINITIVE",
+            "CANCELLED",
+            "CANCELED",
+            "REJECTED",
+            "FAILED",
+            "FAILED_NOT_EXECUTED",
+        }
+        if norm_status not in settled_statuses and norm_status not in submitted_statuses and norm_status not in not_executed_statuses and norm_status != "NOT_FOUND":
+            return ("UNRESOLVED", None, f"ambiguous_withdrawal_status={norm_status}")
+
+        raw_tx = (
+            record.get("provider_tx_id")
+            or record.get("refid")
+            or record.get("payout_id")
+            or record.get("id")
+        )
+        tx_id = str(raw_tx).strip() if isinstance(raw_tx, str) and raw_tx.strip() else ""
 
         rec_ref = str(
             record.get("client_reference_id")
@@ -2858,44 +2901,47 @@ class ProfitSweepVault:
         if rec_dest and expected_dest_bank and rec_dest != expected_dest_bank:
             return ("UNRESOLVED", None, "withdrawal history destination_bank_id mismatch")
 
+        raw_currency = record.get("currency") if "currency" in record else evidence.get("currency")
+        if raw_currency is not None and str(raw_currency).strip():
+            if str(raw_currency).strip().upper() != "USD":
+                return ("UNRESOLVED", None, "withdrawal history currency mismatch")
+
+        raw_rail = record.get("rail") if "rail" in record else evidence.get("rail")
+        if expected_rail and raw_rail is not None and str(raw_rail).strip():
+            if str(raw_rail).strip().upper() != str(expected_rail).strip().upper():
+                return ("UNRESOLVED", None, "withdrawal history rail mismatch")
+
         raw_amt = record.get("amount_usd") if "amount_usd" in record else record.get("amount")
         if raw_amt is not None:
             rec_amt = cls._parse_optional_decimal(raw_amt)
             if rec_amt is None or rec_amt.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) != expected_amount:
                 return ("UNRESOLVED", None, "withdrawal history amount mismatch")
 
-        settled_statuses = {"SETTLED", "COMPLETED", "COMPLETE", "SUCCESS", "SUCCESSFUL", "PAID"}
-        submitted_statuses = {"ACH_SUBMITTED", "SUBMITTED", "PROCESSING", "PENDING_SETTLEMENT", "IN_PROGRESS", "INITIAL"}
-        not_executed_statuses = {
-            "NOT_EXECUTED",
-            "NOT_FOUND_DEFINITIVE",
-            "CANCELLED",
-            "CANCELED",
-            "REJECTED",
-            "FAILED",
-            "FAILED_NOT_EXECUTED",
-        }
-
         if norm_status in settled_statuses or norm_status in submitted_statuses:
-            raw_tx = (
-                record.get("provider_tx_id")
-                or record.get("refid")
-                or record.get("payout_id")
-                or record.get("id")
-            )
-            tx_id = str(raw_tx).strip() if isinstance(raw_tx, str) and raw_tx.strip() else ""
             if not tx_id:
                 return ("UNRESOLVED", None, "withdrawal history missing trustworthy provider_tx_id")
+            if expected_client_ref:
+                if not rec_ref and not (exp_tx and tx_id == exp_tx):
+                    return ("UNRESOLVED", None, "withdrawal history missing binding client_reference_id")
+            if expected_dest_bank and not rec_dest:
+                return ("UNRESOLVED", None, "withdrawal history missing binding destination_bank_id")
+            if raw_amt is None:
+                return ("UNRESOLVED", None, "withdrawal history missing binding amount_usd")
             return (
                 "SETTLED" if norm_status in settled_statuses else "ACH_SUBMITTED",
                 tx_id,
                 f"exchange_status={norm_status}",
             )
 
-        if norm_status in not_executed_statuses or (norm_status == "NOT_FOUND" and history_complete):
-            return ("NOT_EXECUTED", None, f"exchange_status={norm_status}")
-
-        return ("UNRESOLVED", None, f"ambiguous_withdrawal_status={norm_status}")
+        if not history_complete:
+            return ("UNRESOLVED", None, f"unsealed_incomplete_not_executed_status={norm_status}")
+        if norm_status == "NOT_FOUND":
+            if expected_client_ref and not (rec_ref == expected_client_ref or q_ref == expected_client_ref):
+                return ("UNRESOLVED", None, "NOT_FOUND missing binding client_reference_id")
+        else:
+            if expected_client_ref and not (rec_ref == expected_client_ref or q_ref == expected_client_ref):
+                return ("UNRESOLVED", None, f"{norm_status} missing binding client_reference_id")
+        return ("NOT_EXECUTED", None, f"exchange_status={norm_status}")
 
     def reconcile_conversion_outcome(
         self,
@@ -3336,6 +3382,8 @@ class ProfitSweepVault:
             expected_client_ref=idem,
             expected_amount=expected_amount,
             expected_dest_bank=expected_dest,
+            expected_provider_tx_id=prov_tx,
+            expected_rail=rail,
         )
 
         if outcome in ("SETTLED", "ACH_SUBMITTED") and rec_tx_id:
@@ -3601,6 +3649,15 @@ class ProfitSweepVault:
                         if existing_status not in ("OUTCOME_UNKNOWN", "RESERVED_PENDING_DISPATCH"):
                             raise ContractError(
                                 f"Transfer {retry_transfer_id!r} cannot be retried from status {existing['status']}"
+                            )
+                        if existing_wd_status in (
+                            WITHDRAWAL_STATUS_OUTCOME_UNKNOWN,
+                            WITHDRAWAL_STATUS_PENDING,
+                        ):
+                            raise OfframpSecurityError(
+                                f"WITHDRAWAL_OUTCOME_UNKNOWN_REQUIRES_RECONCILIATION: transfer {retry_transfer_id!r} "
+                                f"withdrawal is frozen in {existing_wd_status}; reconcile exchange history via "
+                                f"reconcile_withdrawal_outcome() before retrying"
                             )
                         if existing_wd_status == WITHDRAWAL_STATUS_SUBMITTED:
                             raise ContractError(
@@ -4269,14 +4326,14 @@ class ProfitSweepVault:
                         "conversion_tx_id IS NOT NULL AND conversion_tx_id != '' "
                         "AND conversion_realized_usd_text IS NOT NULL AND conversion_realized_usd_text != ''"
                         ")) "
-                        "AND withdrawal_status != ?",
+                        "AND withdrawal_status = ?",
                         (
                             WITHDRAWAL_STATUS_PENDING,
                             transfer_id,
                             self.scope_id,
                             CONVERSION_STATUS_NOT_REQUIRED,
                             CONVERSION_STATUS_CONFIRMED,
-                            WITHDRAWAL_STATUS_SUBMITTED,
+                            WITHDRAWAL_STATUS_NOT_STARTED,
                         ),
                     )
                     if cur_w.rowcount != 1:
