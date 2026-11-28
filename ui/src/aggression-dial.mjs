@@ -459,7 +459,35 @@ export function scaleTierTargets(riskBps, startingCapitalCents) {
   });
 }
 
-function buildTierEntry(def, rawTier, fallbackBps) {
+export function computeTierEffectiveBpsPreview(baseBps, aiDiscretionEnabled, aiDiscretionCeilingBps, marketCondition) {
+  const safeBase = clampRiskBps(baseBps, DEFAULT_MASTER_RISK_BPS);
+  const safeCeil = clampRiskBps(aiDiscretionCeilingBps, DEFAULT_AI_DISCRETION_CEILING_BPS);
+  if (!aiDiscretionEnabled) {
+    return Object.freeze({ effectiveRiskBps: safeBase, aiDiscretionReason: 'MANUAL_LOCK' });
+  }
+  const mode = normalizeMarketCondition(marketCondition);
+  let eff = safeBase;
+  let reason = 'OWNER_BPS_HOLD';
+  if (mode === 'CHOP') {
+    eff = Math.min(safeBase, 40);
+    reason = 'CHOP_RANGE';
+  } else if (mode === 'AFTER_LOSS') {
+    eff = Math.min(safeBase, 30);
+    reason = 'CONSECUTIVE_LOSS_1';
+  } else if (mode === 'TREND') {
+    eff = Math.min(safeCeil, Math.max(safeBase, 85));
+    reason = eff > safeBase ? 'TREND_IGNITION_BOOST' : 'TREND_IGNITION_HOLD';
+  } else if (mode === 'STRONG_TREND') {
+    eff = Math.min(safeCeil, Math.max(safeBase, 95));
+    reason = eff > safeBase ? 'STRONG_TREND_BOOST' : 'STRONG_TREND_HOLD';
+  }
+  return Object.freeze({
+    effectiveRiskBps: clampRiskBps(Math.min(safeCeil, eff), safeBase),
+    aiDiscretionReason: reason,
+  });
+}
+
+function buildTierEntry(def, rawTier, fallbackBps, defaultAiDiscretion = true, aiCeilingBps = DEFAULT_AI_DISCRETION_CEILING_BPS) {
   const rawLabel = cleanStr(rawTier?.label, '', 120);
   const label = (!rawLabel || LEGACY_BACKEND_TIER_LABELS.has(rawLabel)) ? def.label : rawLabel;
   const colorToken = cleanStr(rawTier?.colorToken ?? rawTier?.color_token, def.colorToken, 40);
@@ -481,13 +509,31 @@ function buildTierEntry(def, rawTier, fallbackBps) {
     rawTier?.riskBps ?? rawTier?.risk_bps ?? rawTier?.chosen_risk_bps ?? rawTier?.bps,
     fallbackBps,
   );
+  const rawTierAi = rawTier?.aiDiscretionEnabled ?? rawTier?.ai_discretion_enabled;
+  const aiDiscretionEnabled = typeof rawTierAi === 'boolean' ? rawTierAi : Boolean(defaultAiDiscretion);
+  const tierCeilingBps = clampRiskBps(
+    rawTier?.aiDiscretionCeilingBps ?? rawTier?.ai_discretion_ceiling_bps,
+    aiCeilingBps,
+  );
   const rawEff = rawTier?.effectiveRiskBps ?? rawTier?.effective_risk_bps;
-  const effectiveRiskBps = rawEff !== undefined && rawEff !== null
-    ? clampRiskBps(rawEff, riskBps)
+  const effectiveRiskBps = aiDiscretionEnabled
+    ? (rawEff !== undefined && rawEff !== null
+      ? Math.min(tierCeilingBps, clampRiskBps(rawEff, riskBps))
+      : riskBps)
     : riskBps;
 
   const scaled = scaleTierTargets(effectiveRiskBps, startingCapitalCents);
   const chosenProfile = RISK_BPS_PROFILES[riskBps];
+  const aiDiscretionShifted = aiDiscretionEnabled && effectiveRiskBps !== riskBps;
+  const aiDiscretionDirection = effectiveRiskBps > riskBps
+    ? 'UP'
+    : (effectiveRiskBps < riskBps ? 'DOWN' : 'HOLD');
+  const aiDiscretionReason = aiDiscretionEnabled
+    ? cleanStr(rawTier?.aiDiscretionReason ?? rawTier?.ai_discretion_reason, aiDiscretionShifted ? 'AI_DISCRETION' : 'OWNER_BPS_HOLD', 80)
+    : 'MANUAL_LOCK';
+  const aiShiftText = aiDiscretionShifted
+    ? `Base ${chosenProfile.riskPctLabel} → AI ${scaled.riskPctLabel}`
+    : '';
 
   return Object.freeze({
     tierId: def.tierId,
@@ -495,6 +541,13 @@ function buildTierEntry(def, rawTier, fallbackBps) {
     colorToken,
     riskBps,
     effectiveRiskBps,
+    aiDiscretionEnabled,
+    aiDiscretionCeilingBps: tierCeilingBps,
+    aiDiscretionReason,
+    aiDiscretionShifted,
+    aiDiscretionDirection,
+    aiShiftText,
+    chosenRiskPctLabel: chosenProfile.riskPctLabel,
     zoneLabel: scaled.label,
     chosenZoneLabel: chosenProfile.label,
     cssClass: scaled.cssClass,
@@ -722,7 +775,13 @@ export function normalizeAggressionDial(doc) {
 
   const rawTierMap = extractRawTierMap(source);
   const tiers = Object.freeze(
-    DEFAULT_TIER_DEFINITIONS.map((def) => buildTierEntry(def, rawTierMap.get(def.tierId), DEFAULT_MASTER_RISK_BPS)),
+    DEFAULT_TIER_DEFINITIONS.map((def) => buildTierEntry(
+      def,
+      rawTierMap.get(def.tierId),
+      DEFAULT_MASTER_RISK_BPS,
+      aiDiscretionEnabled,
+      aiDiscretionCeilingBps,
+    )),
   );
 
   const connected = typeof source.connected === 'boolean'
@@ -769,12 +828,26 @@ export function normalizeAggressionDial(doc) {
 export function applyMarketConditionPreview(state, modeId) {
   const dial = normalizeAggressionDial(state);
   const marketCondition = normalizeMarketCondition(modeId);
+  const nextTiers = dial.tiers.map((tier) => {
+    const prev = computeTierEffectiveBpsPreview(
+      tier.riskBps,
+      tier.aiDiscretionEnabled,
+      dial.aiDiscretionCeilingBps,
+      marketCondition,
+    );
+    return {
+      ...tier,
+      effectiveRiskBps: prev.effectiveRiskBps,
+      aiDiscretionReason: prev.aiDiscretionReason,
+    };
+  });
   if (!dial.aiDiscretionEnabled) {
     return normalizeAggressionDial({
       ...dial,
       marketCondition,
       effectiveRiskBps: dial.masterRiskBps,
       aiDiscretionReason: 'MANUAL_LOCK',
+      tiers: nextTiers,
     });
   }
   let effectiveRiskBps = dial.masterRiskBps;
@@ -798,6 +871,7 @@ export function applyMarketConditionPreview(state, modeId) {
     marketCondition,
     effectiveRiskBps,
     aiDiscretionReason,
+    tiers: nextTiers,
   });
 }
 
@@ -818,12 +892,14 @@ export function applyAggressionDialPreset(state, presetId) {
       nextBps[tier.tierId] = tier.riskBps;
     }
   }
+  const syncDiscretion = (code === 'SYNC_MASTER' || code === 'SYNC_ALL_TO_MASTER');
   return normalizeAggressionDial({
     ...dial,
     tiers: dial.tiers.map((tier) => ({
       ...tier,
       riskBps: nextBps[tier.tierId],
       effectiveRiskBps: nextBps[tier.tierId],
+      aiDiscretionEnabled: syncDiscretion ? dial.aiDiscretionEnabled : tier.aiDiscretionEnabled,
     })),
   });
 }
@@ -1051,9 +1127,15 @@ export function renderSectionB5TierDials(state) {
     ? '<span class="dial-pill-tag dial-owner-lock-badge" data-dial-owner-key-required="true">Owner Key Required</span>'
     : '<span class="dial-pill-tag dial-owner-lock-badge" data-dial-owner-key-required="false" hidden></span>';
 
+  const aiOnCount = dial.tiers.filter((t) => t.aiDiscretionEnabled).length;
+  const allTiersAiOn = aiOnCount === dial.tiers.length && dial.tiers.length > 0;
+  const allAiBtnCls = allTiersAiOn ? ' is-on' : ' is-off';
+  const allAiBtnLabel = allTiersAiOn
+    ? `AI Discretion: ${aiOnCount}/${dial.tiers.length} ON`
+    : `AI Discretion: ${aiOnCount}/${dial.tiers.length} (Enable All 5)`;
   const quickButtonsHtml = TIER_QUICK_PRESETS.map((preset) => (
     `<button type="button" class="b5-tier-preset-btn" data-dial-tier-preset="${esc(preset.id)}"${disabledAttr}>${esc(preset.label)}</button>`
-  )).join('');
+  )).join('') + `<button type="button" class="b5-tier-preset-btn b5-tier-ai-all-btn${allAiBtnCls}" data-dial-tier-ai-all="${allTiersAiOn ? 'false' : 'true'}" aria-pressed="${allTiersAiOn ? 'true' : 'false'}"${disabledAttr}>${esc(allAiBtnLabel)}</button>`;
 
   const tierRowsHtml = dial.tiers.map((tier) => {
     const compactButtonsHtml = TIER_COMPACT_PRESETS.map((preset) => {
@@ -1066,18 +1148,31 @@ export function renderSectionB5TierDials(state) {
       !readOnly
       && dial.liveMode === true
       && dial.pendingHighRiskTierId === tier.tierId
-      && dial.pendingHighRiskBps !== null
-      && dial.pendingHighRiskBps >= HIGH_RISK_MIN_BPS
+      && (
+        (dial.pendingHighRiskBps !== null && dial.pendingHighRiskBps >= HIGH_RISK_MIN_BPS)
+        || (dial.pendingAiDiscretionCeilingBps !== null && dial.pendingAiDiscretionCeilingBps >= HIGH_RISK_MIN_BPS)
+      )
     )
-      ? renderHighRiskConfirmBanner(dial.pendingHighRiskBps, tier.label, tier.tierId, disabledAttr, 'tier')
+      ? (dial.pendingAiDiscretionCeilingBps !== null && dial.pendingAiDiscretionCeilingBps >= HIGH_RISK_MIN_BPS
+        ? renderHighRiskConfirmBanner(dial.pendingAiDiscretionCeilingBps, `${tier.label} AI Discretion`, tier.tierId, disabledAttr, 'tier-ai')
+        : renderHighRiskConfirmBanner(dial.pendingHighRiskBps, tier.label, tier.tierId, disabledAttr, 'tier'))
       : '';
 
-    return `<div class="b5-tier-row ${esc(tier.cssClass)}" data-tier-id="${esc(tier.tierId)}" data-tier-bps="${tier.riskBps}">
+    const tSwitchCls = tier.aiDiscretionEnabled ? 'is-on' : 'is-off';
+    const tSwitchLabel = tier.aiDiscretionEnabled ? 'AI: ON' : 'Manual';
+    const tShiftHidden = tier.aiDiscretionShifted ? '' : ' hidden';
+
+    return `<div class="b5-tier-row ${esc(tier.cssClass)}" data-tier-id="${esc(tier.tierId)}" data-tier-bps="${tier.riskBps}" data-tier-effective-bps="${tier.effectiveRiskBps}" data-tier-ai-discretion="${tier.aiDiscretionEnabled ? 'true' : 'false'}">
       <div class="b5-tier-head">
         <div class="b5-tier-identity-row">
           <span class="dial-badge dial-level-badge b5-bps-box ${esc(tier.cssClass)}" data-tier-bps-badge="${tier.riskBps}">${esc(tier.riskPctLabel)}</span>
           <strong class="b5-tier-label">${esc(tier.label)}</strong>
           <span class="dial-pill-tag b5-zone-pill ${esc(tier.cssClass)}" data-tier-zone-pill="true" data-tier-level-name="true">${esc(tier.zoneLabel)}</span>
+          <span class="dial-base-ai-pill b5-tier-ai-shift ${esc(tier.cssClass)}" data-tier-ai-shift="${tier.aiDiscretionShifted ? 'true' : 'false'}"${tShiftHidden}>${esc(tier.aiShiftText)}</span>
+          <button type="button" role="switch" aria-checked="${tier.aiDiscretionEnabled ? 'true' : 'false'}" class="dial-switch b5-tier-ai-switch ${tSwitchCls}" data-dial-tier-ai-toggle="${esc(tier.tierId)}" aria-label="${esc(tier.label)} AI Discretion ${esc(tSwitchLabel)}"${disabledAttr}>
+            <span class="dial-switch-track" aria-hidden="true"><span class="dial-switch-thumb"></span></span>
+            <span class="dial-switch-label" data-tier-ai-switch-label="true">${esc(tSwitchLabel)}</span>
+          </button>
         </div>
         <div class="b5-tier-metrics">
           <span class="b5-tier-metric sr-only"><em>Risk</em> <strong class="dial-metric-value-sm" data-tier-metric="risk">${esc(tier.riskPctLabel)}</strong></span>
@@ -1314,6 +1409,20 @@ export function patchSectionB5TierDialsInPlace(root, nextState) {
     qBtn.disabled = readOnly;
   }
 
+  const aiAllBtn = b5El.querySelector?.('[data-dial-tier-ai-all]');
+  if (aiAllBtn) {
+    const aiOnCount = dial.tiers.filter((t) => t.aiDiscretionEnabled).length;
+    const allTiersAiOn = aiOnCount === dial.tiers.length && dial.tiers.length > 0;
+    aiAllBtn.setAttribute?.('data-dial-tier-ai-all', allTiersAiOn ? 'false' : 'true');
+    aiAllBtn.setAttribute?.('aria-pressed', allTiersAiOn ? 'true' : 'false');
+    aiAllBtn.classList?.toggle('is-on', allTiersAiOn);
+    aiAllBtn.classList?.toggle('is-off', !allTiersAiOn);
+    aiAllBtn.textContent = allTiersAiOn
+      ? `AI Discretion: ${aiOnCount}/${dial.tiers.length} ON`
+      : `AI Discretion: ${aiOnCount}/${dial.tiers.length} (Enable All 5)`;
+    aiAllBtn.disabled = readOnly;
+  }
+
   const tierById = new Map(dial.tiers.map((t) => [t.tierId, t]));
   const rowEls = b5El.querySelectorAll?.('[data-tier-id]') ?? [];
   for (const rowEl of rowEls) {
@@ -1323,6 +1432,8 @@ export function patchSectionB5TierDialsInPlace(root, nextState) {
 
     swapDialLevelClass(rowEl, tier.cssClass);
     rowEl.setAttribute?.('data-tier-bps', String(tier.riskBps));
+    rowEl.setAttribute?.('data-tier-effective-bps', String(tier.effectiveRiskBps));
+    rowEl.setAttribute?.('data-tier-ai-discretion', tier.aiDiscretionEnabled ? 'true' : 'false');
 
     const badgeEl = rowEl.querySelector?.('[data-tier-bps-badge]');
     if (badgeEl) {
@@ -1335,6 +1446,26 @@ export function patchSectionB5TierDialsInPlace(root, nextState) {
     if (zoneEl) {
       swapDialLevelClass(zoneEl, tier.cssClass);
       zoneEl.textContent = tier.zoneLabel;
+    }
+
+    const shiftEl = rowEl.querySelector?.('[data-tier-ai-shift]');
+    if (shiftEl) {
+      swapDialLevelClass(shiftEl, tier.cssClass);
+      shiftEl.setAttribute?.('data-tier-ai-shift', tier.aiDiscretionShifted ? 'true' : 'false');
+      shiftEl.textContent = tier.aiShiftText;
+      setHiddenFlag(shiftEl, !tier.aiDiscretionShifted);
+    }
+
+    const tierSwitchEl = rowEl.querySelector?.('[data-dial-tier-ai-toggle]');
+    if (tierSwitchEl) {
+      tierSwitchEl.classList?.toggle('is-on', tier.aiDiscretionEnabled);
+      tierSwitchEl.classList?.toggle('is-off', !tier.aiDiscretionEnabled);
+      tierSwitchEl.setAttribute?.('aria-checked', tier.aiDiscretionEnabled ? 'true' : 'false');
+      tierSwitchEl.disabled = readOnly;
+      const tLbl = tierSwitchEl.querySelector?.('[data-tier-ai-switch-label]');
+      if (tLbl) {
+        tLbl.textContent = tier.aiDiscretionEnabled ? 'AI: ON' : 'Manual';
+      }
     }
 
     const tierMetrics = {
@@ -2067,6 +2198,38 @@ export const AGGRESSION_DIAL_CSS_SNIPPET = `/* Strict-CSP Trading Aggression Dia
   background: var(--dial-badge-bg);
   border: 1px solid var(--dial-accent);
   color: var(--dial-badge-ink);
+}
+
+.b5-tier-ai-shift {
+  font-size: 11px;
+  padding: 2px 9px;
+}
+
+.b5-tier-ai-switch {
+  min-height: 32px;
+  padding: 4px 10px 4px 6px;
+  font-size: 11px;
+  gap: 7px;
+}
+
+.b5-tier-ai-switch .dial-switch-track {
+  width: 36px;
+  height: 20px;
+}
+
+.b5-tier-ai-switch .dial-switch-thumb {
+  width: 14px;
+  height: 14px;
+}
+
+.b5-tier-ai-switch.is-on .dial-switch-thumb {
+  transform: translateX(16px);
+}
+
+.b5-tier-ai-all-btn.is-on {
+  border-color: rgba(16, 185, 129, 0.55);
+  background: rgba(16, 185, 129, 0.14);
+  color: #6ee7b7;
 }
 
 .b5-tier-metrics {

@@ -58,6 +58,7 @@ import {
   applyAggressionDialPreset,
   applyMarketConditionPreview,
   clampRiskBps,
+  computeTierEffectiveBpsPreview,
   normalizeAggressionDial,
   patchAggressionDialInPlace,
   renderMasterAggressionDial,
@@ -398,7 +399,7 @@ function render(focusMain = false) {
   try { releaseDetachedCanvases(root); } catch { /* Best-effort buffer release. */ }
   replaceSafeHTML(root, renderApp(state));
   if (state.liveStreamConnected && !isOwnerControlSession(state)) {
-    for (const el of root.querySelectorAll('[data-thinking-depth], [data-select-ai-model], [data-treasury-rail], [data-treasury-action], [data-dial-master-slider], [data-dial-master-preset], [data-dial-market-mode], [data-dial-action], [data-dial-tier-slider], [data-dial-tier-bps], [data-dial-tier-preset], [data-dial-confirm-high-risk], [data-dial-cancel-high-risk], [data-compounding-action]')) {
+    for (const el of root.querySelectorAll('[data-thinking-depth], [data-select-ai-model], [data-treasury-rail], [data-treasury-action], [data-dial-master-slider], [data-dial-master-preset], [data-dial-market-mode], [data-dial-action], [data-dial-tier-slider], [data-dial-tier-bps], [data-dial-tier-preset], [data-dial-tier-ai-toggle], [data-dial-tier-ai-all], [data-dial-confirm-high-risk], [data-dial-cancel-high-risk], [data-compounding-action]')) {
       el.disabled = true;
     }
   }
@@ -594,11 +595,12 @@ function handleSseEvent(eventName, dataText) {
     } catch { /* Ignore malformed parallel_tiers frame. */ }
   } else if (eventName === 'aggression_dial') {
     try {
+      if (isDialSliderDragging() || isDialMutationBusy()) {
+        return;
+      }
       const nextDial = normalizeAggressionDial(parseUniqueJSON(dataText, MAX_AI_PAYLOAD_BYTES));
       state.aggressionDial = nextDial;
-      if (!isDialSliderDragging()) {
-        syncAggressionDialDom();
-      }
+      syncAggressionDialDom();
     } catch { /* Ignore malformed aggression_dial frame. */ }
   } else if (eventName === 'compounding') {
     try {
@@ -1028,7 +1030,9 @@ async function pollLiveCockpitState() {
       const rawTrader = await readStatic(new URL('/api/ai-trader', window.location.origin), MAX_AI_PAYLOAD_BYTES);
       state.aiTrader = normalizeAiTrader(parseUniqueJSON(rawTrader, MAX_AI_PAYLOAD_BYTES));
     } catch { /* Keep prior verified trader snapshot. */ }
-    await readAggressionDial();
+    if (!isDialSliderDragging() && !isDialMutationBusy()) {
+      await readAggressionDial();
+    }
     await readCompounding();
     await readOptionBDemo();
     await readDemoHighGrowth();
@@ -1037,7 +1041,7 @@ async function pollLiveCockpitState() {
       const rawTg = await readStatic(new URL('/api/telegram-alerts', window.location.origin), MAX_AI_PAYLOAD_BYTES);
       state.telegramAlerts = parseUniqueJSON(rawTg, MAX_AI_PAYLOAD_BYTES);
     } catch { /* Optional read-only endpoint. */ }
-    if (!isDialSliderDragging()) {
+    if (!isDialSliderDragging() && !isDialMutationBusy()) {
       syncAggressionDialDom();
     }
     syncCompoundingDom();
@@ -1116,6 +1120,9 @@ async function submitCompoundingMutation(payload, focusSelector = null) {
 }
 
 let dialDebounceTimer = null;
+let dialMutationSeq = 0;
+let dialMutationsInFlight = 0;
+let dialLastCommitMono = 0;
 let pendingDialPresetConfirm = null;
 
 function isDialSliderDragging() {
@@ -1124,13 +1131,24 @@ function isDialSliderDragging() {
   return Boolean(active?.dataset?.dialMasterSlider || active?.dataset?.dialTierSlider);
 }
 
+function isDialMutationBusy() {
+  if (dialDebounceTimer !== null || dialMutationsInFlight > 0) return true;
+  if (dialLastCommitMono > 0 && (performance.now() - dialLastCommitMono) < 900) return true;
+  return false;
+}
+
 async function readAggressionDial() {
+  const startSeq = dialMutationSeq;
   try {
     const rawDial = await readStatic(new URL('/api/aggression-dial', window.location.origin), MAX_AI_PAYLOAD_BYTES);
+    if (startSeq !== dialMutationSeq || isDialSliderDragging() || isDialMutationBusy()) return;
     state.aggressionDial = normalizeAggressionDial(parseUniqueJSON(rawDial, MAX_AI_PAYLOAD_BYTES));
   } catch {
-    if (state.aiTrader?.aggressionDial) state.aggressionDial = state.aiTrader.aggressionDial;
-    else if (state.parallelTiers?.aggressionDial) state.aggressionDial = state.parallelTiers.aggressionDial;
+    // Never overwrite a connected dial containing 5-tier bps with a tier-less fallback summary (prevents $6,000 Accelerator snapping back to 0.60%).
+    if (!state.aggressionDial?.connected) {
+      if (state.aiTrader?.aggressionDial) state.aggressionDial = state.aiTrader.aggressionDial;
+      else if (state.parallelTiers?.aggressionDial) state.aggressionDial = state.parallelTiers.aggressionDial;
+    }
   }
 }
 
@@ -1187,14 +1205,19 @@ function buildHighRiskDialConfirmation(scopeId, action, { tierId = null, targetB
 function submitAggressionDialMutation(payload, { debounceMs = 0, onHighRiskConflict = null } = {}) {
   if (!state.liveStreamConnected) return;
   if (!requireOwnerControlOrWarn('Aggression dial update')) return;
+  dialMutationSeq += 1;
+  const mySeq = dialMutationSeq;
   if (dialDebounceTimer !== null) {
     window.clearTimeout(dialDebounceTimer);
     dialDebounceTimer = null;
   }
   const execPost = async () => {
     dialDebounceTimer = null;
+    dialMutationsInFlight += 1;
     try {
       const res = await postLoopbackJson('/api/aggression-dial', payload);
+      if (mySeq !== dialMutationSeq) return;
+      dialLastCommitMono = performance.now();
       if (res && typeof res === 'object' && (res.schema === AGGRESSION_DIAL_SCHEMA || res.master_risk_bps !== undefined)) {
         state.aggressionDial = normalizeAggressionDial(res);
       } else {
@@ -1203,14 +1226,18 @@ function submitAggressionDialMutation(payload, { debounceMs = 0, onHighRiskConfl
       state.aiIssue = null;
       syncAggressionDialDom();
     } catch (error) {
+      if (mySeq !== dialMutationSeq) return;
       if (error?.status === 409 || error?.code === 'HIGH_RISK_CONFIRMATION_REQUIRED') {
         if (typeof onHighRiskConflict === 'function') onHighRiskConflict();
         return;
       }
       state.aiIssue = error instanceof Error ? error.message : 'Aggression dial update failed.';
       announce(state.aiIssue);
+      dialLastCommitMono = 0;
       await readAggressionDial();
       syncAggressionDialDom(null, true);
+    } finally {
+      dialMutationsInFlight = Math.max(0, dialMutationsInFlight - 1);
     }
   };
   if (debounceMs > 0) {
@@ -1286,9 +1313,11 @@ function applyTierDialSelection(tierId, bps, focusSelector = null, debounceMs = 
     pendingHighRiskBps: null,
     pendingHighRiskTierId: null,
     pendingAiDiscretionCeilingBps: null,
-    tiers: cur.tiers.map((t) => (
-      t.tierId === cleanTierId ? { ...t, riskBps: safeBps, effectiveRiskBps: safeBps } : t
-    )),
+    tiers: cur.tiers.map((t) => {
+      if (t.tierId !== cleanTierId) return t;
+      const prev = computeTierEffectiveBpsPreview(safeBps, t.aiDiscretionEnabled, cur.aiDiscretionCeilingBps, cur.marketCondition);
+      return { ...t, riskBps: safeBps, effectiveRiskBps: prev.effectiveRiskBps, aiDiscretionReason: prev.aiDiscretionReason };
+    }),
   });
   syncAggressionDialDom(focusSelector);
   submitAggressionDialMutation(
@@ -1947,6 +1976,82 @@ root.addEventListener('click', (event) => {
     applyTierDialSelection(tierId, bps, `[data-dial-tier-id="${tierId}"][data-dial-tier-bps="${bps}"]`, 0, false);
     return;
   }
+  if (target.dataset.dialTierAiToggle) {
+    if (state.liveStreamConnected && !requireOwnerControlOrWarn('Tier AI Discretion toggle')) return;
+    const tierId = String(target.dataset.dialTierAiToggle || '').replace(/[^A-Z0-9_]/gi, '');
+    if (!tierId) return;
+    const cur = resolveCockpitAggressionDial(state);
+    const tierObj = cur.tiers.find((t) => t.tierId === tierId);
+    if (!tierObj) return;
+    const nextEnabled = !tierObj.aiDiscretionEnabled;
+    if (cur.liveMode && nextEnabled && cur.aiDiscretionCeilingBps >= HIGH_RISK_MIN_BPS) {
+      pendingDialPresetConfirm = null;
+      state.aggressionDial = normalizeAggressionDial({
+        ...cur,
+        pendingHighRiskBps: null,
+        pendingHighRiskTierId: tierId,
+        pendingAiDiscretionCeilingBps: cur.aiDiscretionCeilingBps,
+      });
+      syncAggressionDialDom('[data-dial-confirm-high-risk="true"]', true);
+      announce(`Confirm live AI Discretion high-risk ceiling for ${tierObj.label}.`);
+      return;
+    }
+    pendingDialPresetConfirm = null;
+    state.aggressionDial = normalizeAggressionDial({
+      ...cur,
+      pendingHighRiskBps: null,
+      pendingHighRiskTierId: null,
+      pendingAiDiscretionCeilingBps: null,
+      tiers: cur.tiers.map((t) => {
+        if (t.tierId !== tierId) return t;
+        const prev = computeTierEffectiveBpsPreview(t.riskBps, nextEnabled, cur.aiDiscretionCeilingBps, cur.marketCondition);
+        return { ...t, aiDiscretionEnabled: nextEnabled, effectiveRiskBps: prev.effectiveRiskBps, aiDiscretionReason: prev.aiDiscretionReason };
+      }),
+    });
+    syncAggressionDialDom(`[data-dial-tier-ai-toggle="${tierId}"]`);
+    submitAggressionDialMutation({
+      action: 'SET_TIER_AI_DISCRETION',
+      tier_id: tierId,
+      ai_discretion_enabled: nextEnabled,
+      high_risk_confirmed: false,
+    });
+    return;
+  }
+  if (target.dataset.dialTierAiAll) {
+    if (state.liveStreamConnected && !requireOwnerControlOrWarn('All-tier AI Discretion toggle')) return;
+    const cur = resolveCockpitAggressionDial(state);
+    const nextEnabled = target.dataset.dialTierAiAll === 'true';
+    if (cur.liveMode && nextEnabled && cur.aiDiscretionCeilingBps >= HIGH_RISK_MIN_BPS) {
+      pendingDialPresetConfirm = 'ALL_TIERS_AI_ON';
+      state.aggressionDial = normalizeAggressionDial({
+        ...cur,
+        pendingHighRiskBps: null,
+        pendingHighRiskTierId: null,
+        pendingAiDiscretionCeilingBps: cur.aiDiscretionCeilingBps,
+      });
+      syncAggressionDialDom('[data-dial-confirm-high-risk="true"]', true);
+      announce('Confirm live AI Discretion across all 5 tiers.');
+      return;
+    }
+    pendingDialPresetConfirm = null;
+    state.aggressionDial = normalizeAggressionDial({
+      ...cur,
+      pendingHighRiskBps: null,
+      pendingHighRiskTierId: null,
+      pendingAiDiscretionCeilingBps: null,
+      tiers: cur.tiers.map((t) => {
+        const prev = computeTierEffectiveBpsPreview(t.riskBps, nextEnabled, cur.aiDiscretionCeilingBps, cur.marketCondition);
+        return { ...t, aiDiscretionEnabled: nextEnabled, effectiveRiskBps: prev.effectiveRiskBps, aiDiscretionReason: prev.aiDiscretionReason };
+      }),
+    });
+    syncAggressionDialDom('[data-dial-tier-ai-all]');
+    submitAggressionDialMutation({
+      action: 'SET_ALL_TIERS_AI_DISCRETION',
+      ai_discretion_enabled: nextEnabled,
+      high_risk_confirmed: false,
+    });
+    return;
+  }
   if (target.dataset.dialTierPreset) {
     const presetId = String(target.dataset.dialTierPreset || '').replace(/[^A-Z0-9_]/gi, '').toUpperCase();
     applyAllTiersPresetSelection(presetId, `[data-dial-tier-preset="${presetId}"]`, false);
@@ -1957,10 +2062,55 @@ root.addEventListener('click', (event) => {
     const kind = String(target.dataset.dialConfirmKind || 'bps');
     const confirmBps = clampRiskBps(target.dataset.dialConfirmBps);
     const confirmTierId = String(target.dataset.dialConfirmTierId || '').replace(/[^A-Z0-9_]/gi, '');
+    if (pendingDialPresetConfirm === 'ALL_TIERS_AI_ON') {
+      pendingDialPresetConfirm = null;
+      const cur = resolveCockpitAggressionDial(state);
+      state.aggressionDial = normalizeAggressionDial({
+        ...cur,
+        pendingHighRiskBps: null,
+        pendingHighRiskTierId: null,
+        pendingAiDiscretionCeilingBps: null,
+        tiers: cur.tiers.map((t) => {
+          const prev = computeTierEffectiveBpsPreview(t.riskBps, true, cur.aiDiscretionCeilingBps, cur.marketCondition);
+          return { ...t, aiDiscretionEnabled: true, effectiveRiskBps: prev.effectiveRiskBps, aiDiscretionReason: prev.aiDiscretionReason };
+        }),
+      });
+      syncAggressionDialDom('[data-dial-tier-ai-all]', true);
+      submitAggressionDialMutation({
+        action: 'SET_ALL_TIERS_AI_DISCRETION',
+        ai_discretion_enabled: true,
+        high_risk_confirmed: true,
+        high_risk_confirmation: buildHighRiskDialConfirmation(cur.scopeId, 'SET_ALL_TIERS_AI_DISCRETION', { aiCeilingBps: confirmBps }),
+      });
+      return;
+    }
     if (pendingDialPresetConfirm) {
       const presetToRun = pendingDialPresetConfirm;
       pendingDialPresetConfirm = null;
       applyAllTiersPresetSelection(presetToRun, `[data-dial-tier-preset="${presetToRun}"]`, true);
+      return;
+    }
+    if (kind === 'tier-ai' && confirmTierId) {
+      const cur = resolveCockpitAggressionDial(state);
+      state.aggressionDial = normalizeAggressionDial({
+        ...cur,
+        pendingHighRiskBps: null,
+        pendingHighRiskTierId: null,
+        pendingAiDiscretionCeilingBps: null,
+        tiers: cur.tiers.map((t) => {
+          if (t.tierId !== confirmTierId) return t;
+          const prev = computeTierEffectiveBpsPreview(t.riskBps, true, cur.aiDiscretionCeilingBps, cur.marketCondition);
+          return { ...t, aiDiscretionEnabled: true, effectiveRiskBps: prev.effectiveRiskBps, aiDiscretionReason: prev.aiDiscretionReason };
+        }),
+      });
+      syncAggressionDialDom(`[data-dial-tier-ai-toggle="${confirmTierId}"]`, true);
+      submitAggressionDialMutation({
+        action: 'SET_TIER_AI_DISCRETION',
+        tier_id: confirmTierId,
+        ai_discretion_enabled: true,
+        high_risk_confirmed: true,
+        high_risk_confirmation: buildHighRiskDialConfirmation(cur.scopeId, 'SET_TIER_AI_DISCRETION', { tierId: confirmTierId, aiCeilingBps: confirmBps }),
+      });
       return;
     }
     if (kind === 'ai-ceiling') {

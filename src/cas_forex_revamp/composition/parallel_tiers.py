@@ -365,6 +365,8 @@ class ParallelTierEngine:
         self._regime = TrendRegimeDetector()
         self._peak_store = PeakEquityStore(db_path)
         self._aggression_dial: AggressionDialStore | None = aggression_dial
+        self._last_signal_regime: str = "NEUTRAL"
+        self._last_signal_valve_score: Decimal = Decimal("0.60")
         self._default_sweep_ratio = decimal_value(sweep_ratio, "sweep_ratio")
         self._demo_high_growth: DemoHighGrowthProfile = (
             demo_high_growth if demo_high_growth is not None else DemoHighGrowthProfile(enabled=False)
@@ -772,6 +774,15 @@ class ParallelTierEngine:
                 raw_tp = signal.get("take_profit_price")
                 sig_tp = _parse_positive_signal_decimal(raw_tp, "signal.take_profit_price") if raw_tp is not None else None
                 sig_regime = str(signal.get("regime") or "TREND_IGNITION")
+                self._last_signal_regime = sig_regime
+                raw_sig_vs = signal.get("valve_score")
+                if raw_sig_vs is not None:
+                    try:
+                        parsed_sig_vs = Decimal(str(raw_sig_vs))
+                        if parsed_sig_vs.is_finite() and Decimal("0") <= parsed_sig_vs <= Decimal("1"):
+                            self._last_signal_valve_score = parsed_sig_vs
+                    except Exception:
+                        pass
 
         dial_store = self.aggression_dial
         dial_snap = dial_store.snapshot() if dial_store is not None else None
@@ -789,15 +800,7 @@ class ParallelTierEngine:
                 for spec in self._specs:
                     tid = spec.tier_id
                     raw_tier_dial = dial_tiers_map.get(tid)
-                    tier_eff: dict[str, Any] | None = (
-                        resolve_dial_effective_params(
-                            int(raw_tier_dial["risk_bps"]),
-                            spec.starting_capital_usd,
-                            ai_discretion_enabled=False,
-                        )
-                        if isinstance(raw_tier_dial, Mapping) and "risk_bps" in raw_tier_dial
-                        else None
-                    )
+                    tier_eff: dict[str, Any] | None = None
                     pending_closes: list[tuple[str, str, str, Decimal, Decimal]] = []
                     open_unrealized = Decimal("0")
                     used_margin = Decimal("0")
@@ -1033,6 +1036,36 @@ class ParallelTierEngine:
                             is_add = len(existing_rows) > 0
                             req_kind = ActionKind.ADD if is_add else ActionKind.OPEN
 
+                            if isinstance(raw_tier_dial, Mapping) and "risk_bps" in raw_tier_dial:
+                                t_ai_enabled = bool(
+                                    raw_tier_dial.get(
+                                        "ai_discretion_enabled",
+                                        dial_snap.get("ai_discretion_enabled", True) if isinstance(dial_snap, Mapping) else True,
+                                    )
+                                )
+                                t_ai_ceiling = int(
+                                    raw_tier_dial.get(
+                                        "ai_discretion_ceiling_bps",
+                                        dial_snap.get("ai_discretion_ceiling_bps", 100) if isinstance(dial_snap, Mapping) else 100,
+                                    )
+                                )
+                                t_dd_live = (
+                                    max(Decimal("0"), (pk_val - equity) / pk_val)
+                                    if pk_val > Decimal("0")
+                                    else Decimal("0")
+                                )
+                                t_q_pre = self._quotas[tid].snapshot(now=ts_dt, starting_equity=equity)
+                                t_consec_live = max(0, int(t_q_pre.get("consecutive_losses", 0)))
+                                tier_eff = resolve_dial_effective_params(
+                                    int(raw_tier_dial["risk_bps"]),
+                                    spec.starting_capital_usd,
+                                    ai_discretion_enabled=t_ai_enabled,
+                                    ai_discretion_ceiling_bps=t_ai_ceiling,
+                                    regime=regime or self._last_signal_regime,
+                                    consecutive_losses=t_consec_live,
+                                    drawdown_pct=t_dd_live,
+                                    valve_score=self._last_signal_valve_score,
+                                )
                             tier_risk_pct_val: Decimal | None = None
                             tier_min_prob_val: Decimal | None = None
                             dhg_active = self._demo_high_growth
@@ -1722,6 +1755,29 @@ class ParallelTierEngine:
                 "observed_at": ts,
             }
 
+    def tier_dial_contexts(self, *, now: datetime | None = None) -> dict[str, dict[str, Any]]:
+        """Read-only per-tier drawdown and consecutive-loss context for live AggressionDial snapshots."""
+        ts_dt = self._clock() if now is None else now
+        out_ctx: dict[str, dict[str, Any]] = {}
+        with self._lock, closing(self._connect_ro()) as conn:
+            for spec in self._specs:
+                tid = spec.tier_id
+                acct = conn.execute(
+                    "SELECT equity_usd, peak_equity_usd FROM tier_accounts WHERE tier_id = ?",
+                    (tid,),
+                ).fetchone()
+                if acct is None:
+                    continue
+                eq_v = Decimal(str(acct["equity_usd"]))
+                pk_v = Decimal(str(acct["peak_equity_usd"]))
+                dd_v = max(Decimal("0"), (pk_v - eq_v) / pk_v) if pk_v > Decimal("0") else Decimal("0")
+                q_s = self._quotas[tid].snapshot(now=ts_dt, starting_equity=eq_v)
+                out_ctx[tid] = {
+                    "drawdown_pct": dd_v.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP),
+                    "consecutive_losses": max(0, int(q_s.get("consecutive_losses", 0))),
+                }
+        return out_ctx
+
     def snapshot(self) -> dict[str, Any]:
         dial_store = self.aggression_dial
         dial_snap = dial_store.snapshot() if dial_store is not None else None
@@ -1825,15 +1881,44 @@ class ParallelTierEngine:
                 total_repl_cum += Decimal(str(tier_item["cumulative_replenished_usd"]))
                 raw_td = dial_tiers_map.get(tid)
                 if isinstance(raw_td, Mapping) and "risk_bps" in raw_td:
+                    td_ai_en = bool(
+                        raw_td.get(
+                            "ai_discretion_enabled",
+                            dial_snap.get("ai_discretion_enabled", True) if isinstance(dial_snap, Mapping) else True,
+                        )
+                    )
+                    td_ai_ceil = int(
+                        raw_td.get(
+                            "ai_discretion_ceiling_bps",
+                            dial_snap.get("ai_discretion_ceiling_bps", 100) if isinstance(dial_snap, Mapping) else 100,
+                        )
+                    )
+                    td_dd = (
+                        max(Decimal("0"), (pk_v - eq_v) / pk_v)
+                        if pk_v > Decimal("0")
+                        else Decimal("0")
+                    )
+                    td_q_snap = self._quotas[tid].snapshot(now=self._clock(), starting_equity=eq_v)
+                    td_consec = max(0, int(td_q_snap.get("consecutive_losses", 0)))
                     td_eff = resolve_dial_effective_params(
                         int(raw_td["risk_bps"]),
                         start_v,
-                        ai_discretion_enabled=False,
+                        ai_discretion_enabled=td_ai_en,
+                        ai_discretion_ceiling_bps=td_ai_ceil,
+                        regime=self._last_signal_regime,
+                        consecutive_losses=td_consec,
+                        drawdown_pct=td_dd,
+                        valve_score=self._last_signal_valve_score,
                     )
                     tier_item["aggression_dial"] = {
                         "tier_id": tid,
                         "risk_bps": int(td_eff["requested_risk_bps"]),
                         "risk_pct": str(td_eff["risk_pct"]),
+                        "ai_discretion_enabled": td_ai_en,
+                        "ai_discretion_ceiling_bps": td_ai_ceil,
+                        "ai_discretion_reason": str(td_eff["ai_discretion_reason"]),
+                        "ai_discretion_shifted": bool(td_eff["ai_discretion_shifted"]),
+                        "ai_discretion_direction": str(td_eff["ai_discretion_direction"]),
                         "effective_risk_bps": int(td_eff["effective_risk_bps"]),
                         "effective_risk_pct": str(td_eff["effective_risk_pct"]),
                         "effective_label": str(td_eff["effective_label"]),

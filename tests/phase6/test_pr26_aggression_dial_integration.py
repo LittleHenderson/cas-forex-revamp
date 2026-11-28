@@ -766,6 +766,7 @@ class Pr26AggressionDialIntegrationTests(unittest.TestCase):
             # 1. Per-tier risk_pct (25 bps vs 100 bps) & max_open_trades (1 vs 2+)
             dial = AggressionDialStore(root / "dial.sqlite3", now_fn=clock)
             dial.apply_tier_preset(PRESET_STAGGER_SAFE_TO_EXTREME, actor="wakil")
+            dial.set_all_tiers_ai_discretion(False, actor="wakil")
             tiers = ParallelTierEngine(root / "tiers.sqlite3", valve_gate=base_gate, aggression_dial=dial, clock=clock)
 
             # Tight 25-pip stop on EURUSD (1.10010 -> 1.09760 = 0.00250 => $2.50 risk on 0.01 lot)
@@ -818,6 +819,7 @@ class Pr26AggressionDialIntegrationTests(unittest.TestCase):
             gate_62 = _FixedScoreValveGate(base_gate, forced_score=0.62)
             dial2 = AggressionDialStore(root / "dial2.sqlite3", now_fn=clock)
             dial2.apply_tier_preset(PRESET_STAGGER_SAFE_TO_EXTREME, actor="wakil")
+            dial2.set_all_tiers_ai_discretion(False, actor="wakil")
             tiers2 = ParallelTierEngine(root / "tiers2.sqlite3", valve_gate=gate_62, aggression_dial=dial2, clock=clock)
             snap_prob = tiers2.process_tick(
                 quotes=BASE_QUOTES,
@@ -1044,6 +1046,121 @@ class Pr26AggressionDialIntegrationTests(unittest.TestCase):
             cli_doc = json.loads(buf_out.getvalue())
             self.assertEqual(cli_doc["aggression_dial_master_bps"], 60)
             self.assertTrue((cli_state / "aggression_dial.sqlite3").is_file())
+
+
+    def test_five_tier_ai_discretion_live_engine_per_tier_toggles_and_legacy_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            clock = _StepClock()
+            base_gate = load_default_forex_valve_gate(peak_equity_store=PeakEquityStore(root / "pk.sqlite3"))
+
+            # 1. Legacy SQLite migration: existing dial_tiers without ai_discretion_enabled upgrades cleanly to ON (1)
+            legacy_db = root / "legacy_dial.sqlite3"
+            with closing(sqlite3.connect(str(legacy_db))) as conn:
+                conn.execute(
+                    "CREATE TABLE dial_state (scope_id TEXT PRIMARY KEY, master_risk_bps INTEGER NOT NULL, "
+                    "auto_shift_enabled INTEGER NOT NULL, ai_discretion_enabled INTEGER NOT NULL DEFAULT 1, "
+                    "ai_discretion_ceiling_bps INTEGER NOT NULL DEFAULT 100, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)"
+                )
+                conn.execute(
+                    "CREATE TABLE dial_tiers (scope_id TEXT NOT NULL, tier_id TEXT NOT NULL, risk_bps INTEGER NOT NULL, "
+                    "capital_usd TEXT NOT NULL, label TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, "
+                    "PRIMARY KEY (scope_id, tier_id))"
+                )
+                conn.execute(
+                    "INSERT INTO dial_state VALUES ('default', 60, 1, 1, 100, '2026-11-20T00:00:00Z', 'legacy')"
+                )
+                conn.execute(
+                    "INSERT INTO dial_tiers VALUES ('default', 'TIER_4_6000', 93, '6000.00', 'Tier $6,000 Accelerator', '2026-11-20T00:00:00Z', 'legacy')"
+                )
+                conn.commit()
+            migrated = AggressionDialStore(legacy_db, now_fn=clock)
+            mig_snap = migrated.snapshot(regime="STRONG_TREND")
+            self.assertTrue(mig_snap["tiers_by_id"]["TIER_4_6000"]["ai_discretion_enabled"])
+            self.assertEqual(mig_snap["tiers_by_id"]["TIER_4_6000"]["risk_bps"], 93)
+            self.assertEqual(mig_snap["tiers_by_id"]["TIER_4_6000"]["effective_risk_bps"], 95)
+
+            # 2. Live 5-tier ParallelTierEngine: AI Discretion ON boosts TIER_1_CURRENT (base 25 bps -> 95 bps = 1,140,000 units)
+            # while individually locking TIER_4_6000 (base 45 bps -> stays 45 bps = $27.00 / 0.0025 = 10,000 units ROUND_FLOOR)!
+            dial = AggressionDialStore(root / "dial.sqlite3", now_fn=clock)
+            dial.apply_tier_preset(PRESET_STAGGER_SAFE_TO_EXTREME, actor="wakil")
+            dial.set_tier_ai_discretion("TIER_4_6000", False, actor="wakil")
+            tiers = ParallelTierEngine(root / "tiers.sqlite3", valve_gate=base_gate, aggression_dial=dial, clock=clock)
+
+            snap_st = tiers.process_tick(
+                quotes=BASE_QUOTES,
+                signal={
+                    "symbol": "EURUSD",
+                    "side": "BUY",
+                    "stop_price": "1.09760",
+                    "take_profit_price": "1.10600",
+                    "regime": "STRONG_TREND",
+                },
+                now=clock(),
+            )
+            by_id = {t["tier_id"]: t for t in snap_st["tiers"]}
+            self.assertTrue(by_id["TIER_1_CURRENT"]["aggression_dial"]["ai_discretion_enabled"])
+            self.assertEqual(by_id["TIER_1_CURRENT"]["aggression_dial"]["effective_risk_bps"], 95)
+            self.assertTrue(by_id["TIER_1_CURRENT"]["aggression_dial"]["ai_discretion_shifted"])
+            self.assertFalse(by_id["TIER_4_6000"]["aggression_dial"]["ai_discretion_enabled"])
+            self.assertEqual(by_id["TIER_4_6000"]["aggression_dial"]["effective_risk_bps"], 45)
+            self.assertFalse(by_id["TIER_4_6000"]["aggression_dial"]["ai_discretion_shifted"])
+
+            with closing(sqlite3.connect(str(root / "tiers.sqlite3"))) as conn:
+                u_t1 = Decimal(conn.execute("SELECT units FROM tier_positions WHERE tier_id = 'TIER_1_CURRENT'").fetchone()[0])
+                u_t4 = Decimal(conn.execute("SELECT units FROM tier_positions WHERE tier_id = 'TIER_4_6000'").fetchone()[0])
+            self.assertEqual(u_t1, D("1140000"))
+            self.assertEqual(u_t4, D("10000"))
+
+            # 3. Cockpit API SET_TIER_AI_DISCRETION & SET_ALL_TIERS_AI_DISCRETION + contract validation
+            srv = LoopbackCockpitServer(
+                repo_root=REPO_ROOT,
+                port=0,
+                broker_router_reader=lambda: {"execution_mode": "DEMO", "live_trading_armed": False},
+                aggression_dial=dial,
+                parallel_tiers=tiers,
+            )
+            srv.start()
+            try:
+                st_live_blk, _ = self._http_json(
+                    srv,
+                    "POST",
+                    "/api/aggression-dial",
+                    headers=srv.auth_headers(),
+                    body_obj={
+                        "action": "SET_TIER_AI_DISCRETION",
+                        "tier_id": "TIER_4_6000",
+                        "ai_discretion_enabled": True,
+                        "live_mode": True,
+                    },
+                )
+                self.assertEqual(st_live_blk, 409)
+
+                st_on, doc_on = self._http_json(
+                    srv,
+                    "POST",
+                    "/api/aggression-dial",
+                    headers=srv.auth_headers(),
+                    body_obj={"action": "SET_TIER_AI_DISCRETION", "tier_id": "TIER_4_6000", "ai_discretion_enabled": True},
+                )
+                self.assertEqual(st_on, 200)
+                self.assertTrue(doc_on["tiers_by_id"]["TIER_4_6000"]["ai_discretion_enabled"])
+                ad_schema = _load_schema("aggression-dial.schema.json")
+                validate_contract_schema(doc_on, ad_schema, ad_schema, "$")
+
+                st_all, doc_all = self._http_json(
+                    srv,
+                    "POST",
+                    "/api/aggression-dial",
+                    headers=srv.auth_headers(),
+                    body_obj={"action": "SET_ALL_TIERS_AI_DISCRETION", "ai_discretion_enabled": False},
+                )
+                self.assertEqual(st_all, 200)
+                self.assertTrue(all(not t["ai_discretion_enabled"] for t in doc_all["tiers"]))
+                validate_contract_schema(doc_all, ad_schema, ad_schema, "$")
+                self.assertTrue(dial.verify_audit_chain())
+            finally:
+                srv.stop()
 
     def test_pr26_backend_source_hygiene_zero_assert_zero_crlf(self) -> None:
         owned_files = [

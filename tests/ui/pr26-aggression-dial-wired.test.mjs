@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import {
   AGGRESSION_DIAL_CSS_SNIPPET,
+  renderSectionB5TierDials,
   AGGRESSION_DIAL_SCHEMA,
   DEFAULT_TIER_DEFINITIONS,
   applyAggressionDialPreset,
@@ -430,4 +431,48 @@ test('PR26_04 app.mjs & styles.css wire /api/aggression-dial, SSE aggression_dia
       assert.equal(inlineStyleRe.test(raw), false, `Inline style prohibited in ${rel}`);
     }
   }
+});
+
+
+test('PR51_01 5-tier AI Discretion switches, Base->AI shift pills, Market Mode tier preview, and $6,000 Accelerator snap-back guards', async () => {
+  const shifted = applyMarketConditionPreview({
+    masterRiskBps: 60,
+    aiDiscretionEnabled: true,
+    aiDiscretionCeilingBps: 100,
+    tiers: [
+      { tier_id: 'TIER_1_CURRENT', risk_bps: 60, ai_discretion_enabled: true },
+      { tier_id: 'TIER_4_6000', risk_bps: 93, ai_discretion_enabled: true },
+      { tier_id: 'TIER_3_3000', risk_bps: 62, ai_discretion_enabled: false },
+      { tier_id: 'TIER_2_1000', risk_bps: 60, ai_discretion_enabled: true },
+      { tier_id: 'TIER_5_300', risk_bps: 60, ai_discretion_enabled: true },
+    ],
+  }, 'STRONG_TREND');
+
+  const t1 = shifted.tiers.find((t) => t.tierId === 'TIER_1_CURRENT');
+  const t4 = shifted.tiers.find((t) => t.tierId === 'TIER_4_6000');
+  const t3 = shifted.tiers.find((t) => t.tierId === 'TIER_3_3000');
+  assert.equal(t1.effectiveRiskBps, 95);
+  assert.equal(t1.aiDiscretionShifted, true);
+  assert.equal(t1.aiShiftText, 'Base 0.60% → AI 0.95%');
+  assert.equal(t4.riskBps, 93);
+  assert.equal(t4.effectiveRiskBps, 95);
+  assert.equal(t4.aiShiftText, 'Base 0.93% → AI 0.95%');
+  assert.equal(t3.aiDiscretionEnabled, false);
+  assert.equal(t3.effectiveRiskBps, 62);
+  assert.equal(t3.aiDiscretionShifted, false);
+
+  const b5Html = renderSectionB5TierDials(shifted);
+  assert.match(b5Html, /data-dial-tier-ai-all="true"/);
+  assert.match(b5Html, /AI Discretion: 4\/5 \(Enable All 5\)/);
+  assert.match(b5Html, /data-dial-tier-ai-toggle="TIER_4_6000"/);
+  assert.match(b5Html, /Base 0\.93% → AI 0\.95%/);
+  assert.match(b5Html, /data-tier-id="TIER_3_3000"[^>]*data-tier-ai-discretion="false"/);
+  assert.equal(/\bstyle\s*=/i.test(b5Html), false);
+
+  const appSrc = await readFile(new URL('../../ui/src/app.mjs', import.meta.url), 'utf8');
+  assert.match(appSrc, /SET_TIER_AI_DISCRETION/);
+  assert.match(appSrc, /SET_ALL_TIERS_AI_DISCRETION/);
+  assert.match(appSrc, /isDialMutationBusy\(/);
+  assert.match(appSrc, /dialMutationSeq/);
+  assert.match(appSrc, /if \(!state\.aggressionDial\?\.connected\)/);
 });

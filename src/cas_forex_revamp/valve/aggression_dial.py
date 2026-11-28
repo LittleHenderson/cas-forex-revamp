@@ -995,12 +995,22 @@ class AggressionDialStore:
                         risk_bps INTEGER NOT NULL,
                         capital_usd TEXT NOT NULL,
                         label TEXT NOT NULL,
+                        ai_discretion_enabled INTEGER NOT NULL DEFAULT 1,
                         updated_at TEXT NOT NULL,
                         updated_by TEXT NOT NULL,
                         PRIMARY KEY (scope_id, tier_id)
                     )
                     """
                 )
+                tier_cols = {
+                    str(r["name"])
+                    for r in conn.execute("PRAGMA table_info(dial_tiers)").fetchall()
+                }
+                if "ai_discretion_enabled" not in tier_cols:
+                    conn.execute(
+                        "ALTER TABLE dial_tiers "
+                        "ADD COLUMN ai_discretion_enabled INTEGER NOT NULL DEFAULT 1"
+                    )
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS dial_audit (
@@ -1045,14 +1055,15 @@ class AggressionDialStore:
                     for tid in self._tier_order:
                         conn.execute(
                             "INSERT INTO dial_tiers "
-                            "(scope_id, tier_id, risk_bps, capital_usd, label, updated_at, updated_by) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            "(scope_id, tier_id, risk_bps, capital_usd, label, ai_discretion_enabled, updated_at, updated_by) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                             (
                                 self._scope_id,
                                 tid,
                                 initial_tier_risk_bps[tid],
                                 format(self._tier_capitals[tid], "f"),
                                 self._tier_labels[tid],
+                                flag_int,
                                 now_iso,
                                 "system_init",
                             ),
@@ -1336,6 +1347,143 @@ class AggressionDialStore:
 
         return self.snapshot(owner_controls_allowed=owner_controls_allowed)
 
+    def set_tier_ai_discretion(
+        self,
+        tier_id: str,
+        enabled: bool,
+        *,
+        live_mode: bool = False,
+        high_risk_confirmed: bool = False,
+        owner_controls_allowed: bool = True,
+        actor: str = "owner",
+    ) -> dict[str, Any]:
+        """Enable or disable AI Discretion on an individual Section B.5 tier."""
+        _enforce_owner_controls(owner_controls_allowed, f"set_tier_ai_discretion({tier_id})")
+        if not isinstance(tier_id, str) or tier_id not in self._tier_capitals:
+            raise AggressionDialError(
+                f"Unknown tier_id {tier_id!r}; expected one of {list(self._tier_order)}"
+            )
+        clean_enabled = _validate_bool(enabled, "enabled")
+        clean_actor = _validate_actor(actor)
+        _validate_bool(live_mode, "live_mode")
+        _validate_bool(high_risk_confirmed, "high_risk_confirmed")
+
+        now_iso = _iso_utc(self._now())
+        with self._lock, closing(self._connect_rw()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                master_cur = conn.execute(
+                    "SELECT ai_discretion_ceiling_bps FROM dial_state WHERE scope_id = ?",
+                    (self._scope_id,),
+                ).fetchone()
+                if master_cur is None:
+                    raise AggressionDialError(
+                        f"Missing dial_state row for scope {self._scope_id!r}"
+                    )
+                ceiling_bps = int(master_cur["ai_discretion_ceiling_bps"])
+                if clean_enabled:
+                    _enforce_live_high_risk_gate(
+                        risk_bps=ceiling_bps,
+                        live_mode=live_mode,
+                        high_risk_confirmed=high_risk_confirmed,
+                        context=f"tier {tier_id} ai_discretion_ceiling_bps",
+                    )
+                cur = conn.execute(
+                    "SELECT ai_discretion_enabled FROM dial_tiers WHERE scope_id = ? AND tier_id = ?",
+                    (self._scope_id, tier_id),
+                ).fetchone()
+                if cur is None:
+                    raise AggressionDialError(f"Missing dial_tiers row for {tier_id!r}")
+                prev_enabled = bool(int(cur["ai_discretion_enabled"]))
+                flag_int = 1 if clean_enabled else 0
+                conn.execute(
+                    "UPDATE dial_tiers SET ai_discretion_enabled = ?, updated_at = ?, updated_by = ? "
+                    "WHERE scope_id = ? AND tier_id = ?",
+                    (flag_int, now_iso, clean_actor, self._scope_id, tier_id),
+                )
+                self._append_audit_locked(
+                    conn,
+                    action="SET_TIER_AI_DISCRETION",
+                    actor=clean_actor,
+                    payload={
+                        "tier_id": tier_id,
+                        "previous_ai_discretion_enabled": prev_enabled,
+                        "ai_discretion_enabled": clean_enabled,
+                        "ai_discretion_ceiling_bps": ceiling_bps,
+                        "live_mode": live_mode,
+                        "high_risk_confirmed": high_risk_confirmed,
+                    },
+                    occurred_at=now_iso,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        return self.snapshot(owner_controls_allowed=owner_controls_allowed)
+
+    def set_all_tiers_ai_discretion(
+        self,
+        enabled: bool,
+        *,
+        live_mode: bool = False,
+        high_risk_confirmed: bool = False,
+        owner_controls_allowed: bool = True,
+        actor: str = "owner",
+    ) -> dict[str, Any]:
+        """Enable or disable AI Discretion across all 5 Section B.5 tiers simultaneously."""
+        _enforce_owner_controls(owner_controls_allowed, "set_all_tiers_ai_discretion")
+        clean_enabled = _validate_bool(enabled, "enabled")
+        clean_actor = _validate_actor(actor)
+        _validate_bool(live_mode, "live_mode")
+        _validate_bool(high_risk_confirmed, "high_risk_confirmed")
+
+        now_iso = _iso_utc(self._now())
+        with self._lock, closing(self._connect_rw()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                master_cur = conn.execute(
+                    "SELECT ai_discretion_ceiling_bps FROM dial_state WHERE scope_id = ?",
+                    (self._scope_id,),
+                ).fetchone()
+                if master_cur is None:
+                    raise AggressionDialError(
+                        f"Missing dial_state row for scope {self._scope_id!r}"
+                    )
+                ceiling_bps = int(master_cur["ai_discretion_ceiling_bps"])
+                if clean_enabled:
+                    _enforce_live_high_risk_gate(
+                        risk_bps=ceiling_bps,
+                        live_mode=live_mode,
+                        high_risk_confirmed=high_risk_confirmed,
+                        context="all_tiers ai_discretion_ceiling_bps",
+                    )
+                flag_int = 1 if clean_enabled else 0
+                conn.execute(
+                    "UPDATE dial_tiers SET ai_discretion_enabled = ?, updated_at = ?, updated_by = ? "
+                    "WHERE scope_id = ?",
+                    (flag_int, now_iso, clean_actor, self._scope_id),
+                )
+                self._append_audit_locked(
+                    conn,
+                    action="SET_ALL_TIERS_AI_DISCRETION",
+                    actor=clean_actor,
+                    payload={
+                        "ai_discretion_enabled": clean_enabled,
+                        "tier_ai_discretion": {tid: clean_enabled for tid in self._tier_order},
+                        "ai_discretion_ceiling_bps": ceiling_bps,
+                        "live_mode": live_mode,
+                        "high_risk_confirmed": high_risk_confirmed,
+                    },
+                    occurred_at=now_iso,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        return self.snapshot(owner_controls_allowed=owner_controls_allowed)
+
     def sync_all_tiers_to_master(
         self,
         *,
@@ -1355,7 +1503,7 @@ class AggressionDialStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = conn.execute(
-                    "SELECT master_risk_bps FROM dial_state WHERE scope_id = ?",
+                    "SELECT master_risk_bps, ai_discretion_enabled FROM dial_state WHERE scope_id = ?",
                     (self._scope_id,),
                 ).fetchone()
                 if cur is None:
@@ -1363,6 +1511,7 @@ class AggressionDialStore:
                         f"Missing dial_state row for scope {self._scope_id!r}"
                     )
                 master_bps = int(cur["master_risk_bps"])
+                master_ai_int = int(cur["ai_discretion_enabled"])
                 _enforce_live_high_risk_gate(
                     risk_bps=master_bps,
                     live_mode=live_mode,
@@ -1370,9 +1519,9 @@ class AggressionDialStore:
                     context="sync_all_tiers_to_master",
                 )
                 conn.execute(
-                    "UPDATE dial_tiers SET risk_bps = ?, updated_at = ?, updated_by = ? "
+                    "UPDATE dial_tiers SET risk_bps = ?, ai_discretion_enabled = ?, updated_at = ?, updated_by = ? "
                     "WHERE scope_id = ?",
-                    (master_bps, now_iso, clean_actor, self._scope_id),
+                    (master_bps, master_ai_int, now_iso, clean_actor, self._scope_id),
                 )
                 self._append_audit_locked(
                     conn,
@@ -1496,6 +1645,7 @@ class AggressionDialStore:
         drawdown_pct: Decimal = Decimal("0"),
         valve_score: Decimal = Decimal("0.60"),
         owner_controls_allowed: bool = True,
+        tier_contexts: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Strictly zero-write read-only snapshot (?mode=ro + PRAGMA query_only=ON).
 
@@ -1520,7 +1670,7 @@ class AggressionDialStore:
                 )
 
             tier_rows = conn.execute(
-                "SELECT tier_id, risk_bps, capital_usd, label, updated_at, updated_by "
+                "SELECT tier_id, risk_bps, ai_discretion_enabled, capital_usd, label, updated_at, updated_by "
                 "FROM dial_tiers WHERE scope_id = ?",
                 (self._scope_id,),
             ).fetchall()
@@ -1565,21 +1715,48 @@ class AggressionDialStore:
                 t_cap = _q2(Decimal(str(row["capital_usd"])))
             except InvalidOperation as exc:
                 raise AggressionDialError(f"Corrupted capital_usd for tier {tid!r}") from exc
+            row_keys = set(row.keys())
+            t_ai_disc = (
+                bool(int(row["ai_discretion_enabled"]))
+                if "ai_discretion_enabled" in row_keys and row["ai_discretion_enabled"] is not None
+                else ai_discretion_enabled
+            )
+            t_ctx = tier_contexts.get(tid) if isinstance(tier_contexts, Mapping) else None
+            t_reg = norm_regime
+            t_losses = losses
+            t_dd = dd
+            t_vs = v_score
+            if isinstance(t_ctx, Mapping):
+                if t_ctx.get("regime"):
+                    t_reg = _validate_regime(str(t_ctx["regime"]))
+                if "consecutive_losses" in t_ctx and t_ctx["consecutive_losses"] is not None:
+                    t_losses = _validate_non_negative_int(int(t_ctx["consecutive_losses"]), "consecutive_losses")
+                if "drawdown_pct" in t_ctx and t_ctx["drawdown_pct"] is not None:
+                    t_dd = _validate_decimal(t_ctx["drawdown_pct"], "drawdown_pct", non_negative=True)
+                if "valve_score" in t_ctx and t_ctx["valve_score"] is not None:
+                    t_vs = _validate_valve_score(t_ctx["valve_score"])
             t_effective = resolve_effective_params(
                 t_bps,
                 t_cap,
-                ai_discretion_enabled=ai_discretion_enabled,
+                ai_discretion_enabled=t_ai_disc,
                 ai_discretion_ceiling_bps=ai_discretion_ceiling,
-                regime=norm_regime,
-                consecutive_losses=losses,
-                drawdown_pct=dd,
-                valve_score=v_score,
+                regime=t_reg,
+                consecutive_losses=t_losses,
+                drawdown_pct=t_dd,
+                valve_score=t_vs,
             )
+            t_chosen_prof = AGGRESSION_BPS_PROFILES[t_bps]
             entry = {
                 "tier_id": tid,
                 "label": str(row["label"]),
                 "capital_usd": format(t_cap, "f"),
                 "risk_bps": t_bps,
+                "chosen_risk_pct": format(t_chosen_prof.risk_pct, "f"),
+                "chosen_label": t_chosen_prof.label,
+                "ai_discretion_enabled": t_ai_disc,
+                "ai_discretion_ceiling_bps": ai_discretion_ceiling,
+                "ai_discretion_shifted": bool(t_effective["ai_discretion_shifted"]),
+                "ai_discretion_direction": str(t_effective["ai_discretion_direction"]),
                 "effective_risk_bps": t_effective["effective_risk_bps"],
                 "effective_risk_pct": t_effective["effective_risk_pct"],
                 "effective_label": t_effective["effective_label"],
